@@ -42,6 +42,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    startupQuiescenceMs: 5_000,  // Codex loads MCP servers at startup — needs longer wait
     altScreen: false,   // --no-alt-screen disables alternate screen
   };
 }

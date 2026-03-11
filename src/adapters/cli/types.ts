@@ -33,6 +33,11 @@ export interface CliAdapter {
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
 
+  /** Override quiescence timeout for the first idle detection (startup).
+   *  Some CLIs (e.g. CoCo) have long startup pauses (MCP loading) that
+   *  cause the default 2s quiescence to fire prematurely. */
+  readonly startupQuiescenceMs?: number;
+
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
 }

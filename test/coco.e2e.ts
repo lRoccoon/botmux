@@ -208,23 +208,150 @@ describe('CoCo adapter: PTY spawn', () => {
     const hasError = /unknown flag|unknown option|error.*--yolo|error.*--session-id/i.test(plain);
     expect(hasError, `unexpected error in output: ${plain.substring(0, 300)}`).toBe(false);
   }, 45_000);
+});
 
-  it('submits a prompt and gets a response', async () => {
+// ─── First-input submission tests ─────────────────────────────────────────────
+
+/**
+ * Check whether the prompt was actually submitted (not just echoed into
+ * the input box). After real submission, coco produces new output like
+ * tool calls, model responses, or spinners.
+ */
+function wasSubmitted(session: PtySession, writeTs: number): boolean {
+  const after = session.outputAfter(writeTs + 500);
+  const stripped = after.replace(/\s+/g, '').trim();
+  return stripped.length > 10;
+}
+
+describe('CoCo first-input submission (IdleDetector simulation)', () => {
+  let session: PtySession | null = null;
+
+  afterEach(() => {
+    if (session) {
+      try { session.proc.kill(); } catch {}
+      session = null;
+    }
+  });
+
+  it('IdleDetector with default 2s quiescence fires too early (bug)', async () => {
+    // Simulate the daemon flow: spawn → idle detector → flush pending
+    const { IdleDetector } = await import('../src/utils/idle-detector.js');
     const adapter = createCocoAdapter();
-    const sid = `e2e-rt-${Date.now()}`;
+    const sid = `e2e-bug-${Date.now()}`;
     const args = adapter.buildArgs({ sessionId: sid, resume: false });
 
     session = spawnCoco(args);
-    await waitForQuiescence(session, 3000);
+    // Create idle detector with a FAKE adapter that has NO startup override (simulates the old bug)
+    const fakeAdapter = { ...adapter, startupQuiescenceMs: undefined };
+    const detector = new IdleDetector(fakeAdapter as any);
 
-    const writeTs = Date.now();
-    await adapter.writeInput(session.proc, 'just say the word PONG and nothing else');
+    let idleFiredAt = 0;
+    detector.onIdle(() => { if (!idleFiredAt) idleFiredAt = Date.now(); });
 
-    // Wait for response
-    await delay(15_000);
-    const afterWrite = session.outputAfter(writeTs + 500);
-    const stripped = afterWrite.replace(/\s+/g, '').trim();
+    const spawnTs = Date.now();
+    session.proc.onData(data => detector.feed(data));
 
-    expect(stripped.length, `expected response output, got: ${afterWrite.substring(0, 300)}`).toBeGreaterThan(10);
+    // Wait up to 20s for idle to fire
+    await new Promise<void>(resolve => {
+      const check = setInterval(() => {
+        if (idleFiredAt || Date.now() - spawnTs > 20_000) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 200);
+    });
+
+    const elapsed = idleFiredAt ? idleFiredAt - spawnTs : -1;
+    console.log(`[bug] IdleDetector (2s) fired after ${elapsed}ms`);
+
+    // With default 2s quiescence, idle fires very early (< 5s) before CoCo TUI is ready
+    expect(idleFiredAt).toBeGreaterThan(0);
+    expect(elapsed, 'should fire early (< 5s) — this is the bug').toBeLessThan(5000);
+
+    detector.dispose();
+  }, 30_000);
+
+  it('IdleDetector with 5s startupQuiescenceMs fires at the right time', async () => {
+    const { IdleDetector } = await import('../src/utils/idle-detector.js');
+    const adapter = createCocoAdapter(); // has startupQuiescenceMs: 5000
+    const sid = `e2e-fix-${Date.now()}`;
+    const args = adapter.buildArgs({ sessionId: sid, resume: false });
+
+    session = spawnCoco(args);
+    const detector = new IdleDetector(adapter);
+
+    let idleFiredAt = 0;
+    detector.onIdle(() => { if (!idleFiredAt) idleFiredAt = Date.now(); });
+
+    const spawnTs = Date.now();
+    session.proc.onData(data => detector.feed(data));
+
+    // Wait up to 30s
+    await new Promise<void>(resolve => {
+      const check = setInterval(() => {
+        if (idleFiredAt || Date.now() - spawnTs > 30_000) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 200);
+    });
+
+    const elapsed = idleFiredAt ? idleFiredAt - spawnTs : -1;
+    console.log(`[fix] IdleDetector (5s startup) fired after ${elapsed}ms`);
+
+    // With 5s startup quiescence, idle fires after CoCo TUI is fully rendered (>= 5s)
+    expect(idleFiredAt).toBeGreaterThan(0);
+    expect(elapsed, 'should fire after TUI ready (>= 5s)').toBeGreaterThanOrEqual(5000);
+
+    detector.dispose();
   }, 45_000);
+
+  it('full daemon flow: IdleDetector + writeInput submits correctly', async () => {
+    const { IdleDetector } = await import('../src/utils/idle-detector.js');
+    const adapter = createCocoAdapter();
+    const sid = `e2e-full-${Date.now()}`;
+    const args = adapter.buildArgs({ sessionId: sid, resume: false });
+
+    session = spawnCoco(args);
+    const detector = new IdleDetector(adapter);
+
+    // Simulate daemon: queue prompt, flush when idle
+    const pendingPrompt = 'just say PONG';
+    let writeTs = 0;
+
+    detector.onIdle(() => {
+      if (!writeTs) {
+        writeTs = Date.now();
+        console.log(`[full] IdleDetector fired, writing prompt at ${writeTs - spawnTs}ms`);
+        adapter.writeInput(session!.proc, pendingPrompt);
+      }
+    });
+
+    const spawnTs = Date.now();
+    session.proc.onData(data => detector.feed(data));
+
+    // Wait for prompt submission + response (up to 40s)
+    await new Promise<void>(resolve => {
+      const check = setInterval(() => {
+        if (writeTs && Date.now() - writeTs > 15_000) {
+          clearInterval(check);
+          resolve();
+        }
+        if (Date.now() - spawnTs > 40_000) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 500);
+    });
+
+    expect(writeTs, 'prompt should have been sent').toBeGreaterThan(0);
+
+    const submitted = wasSubmitted(session, writeTs);
+    console.log(`[full] Submitted: ${submitted}`);
+    console.log('[full] Output after write:\n' + session.outputAfter(writeTs).slice(0, 500));
+
+    expect(submitted, 'prompt should be submitted and CoCo should respond').toBe(true);
+
+    detector.dispose();
+  }, 60_000);
 });

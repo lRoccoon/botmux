@@ -13,11 +13,14 @@ export class IdleDetector {
   private lastSpinnerAt = 0;
   private quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
   private isIdle = false;
+  private firstIdleFired = false;
   private idleCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
+  private startupQuiescenceMs: number;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
+    this.startupQuiescenceMs = cli.startupQuiescenceMs ?? QUIESCENCE_MS;
   }
 
   onIdle(cb: () => void): void {
@@ -46,8 +49,10 @@ export class IdleDetector {
     }
 
     // Strategy 2: quiescence (PTY silence + no recent spinner)
+    // Use longer timeout before first idle fires (CLI may still be starting up)
+    const timeout = this.firstIdleFired ? QUIESCENCE_MS : this.startupQuiescenceMs;
     this.clearTimer();
-    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), QUIESCENCE_MS);
+    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), timeout);
   }
 
   reset(): void {
@@ -78,6 +83,7 @@ export class IdleDetector {
 
   private markIdle(): void {
     this.isIdle = true;
+    this.firstIdleFired = true;
     this.outputTail = '';
     this.clearTimer();
     this.idleCallback?.();
