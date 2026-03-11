@@ -33,10 +33,13 @@ export interface CliAdapter {
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
 
-  /** Override quiescence timeout for the first idle detection (startup).
-   *  Some CLIs (e.g. CoCo) have long startup pauses (MCP loading) that
-   *  cause the default 2s quiescence to fire prematurely. */
-  readonly startupQuiescenceMs?: number;
+  /** Ready marker regex — matches when the CLI's input prompt is rendered and
+   *  functional.  When set, the idle detector suppresses quiescence-based idle
+   *  until this pattern appears in the PTY output.  Checked every cycle (reset
+   *  after each prompt), so it gates EVERY idle detection, not just startup.
+   *
+   *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
+  readonly readyPattern?: RegExp;
 
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;

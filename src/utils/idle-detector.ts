@@ -13,14 +13,14 @@ export class IdleDetector {
   private lastSpinnerAt = 0;
   private quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
   private isIdle = false;
-  private firstIdleFired = false;
   private idleCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
-  private startupQuiescenceMs: number;
+  private readyPattern: RegExp | undefined;
+  private readySeen = false;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
-    this.startupQuiescenceMs = cli.startupQuiescenceMs ?? QUIESCENCE_MS;
+    this.readyPattern = cli.readyPattern;
   }
 
   onIdle(cb: () => void): void {
@@ -32,6 +32,13 @@ export class IdleDetector {
 
     const stripped = this.stripAnsi(data);
     this.outputTail = (this.outputTail + stripped).slice(-500);
+
+    // Track when the CLI's input prompt appears
+    if (this.readyPattern && !this.readySeen) {
+      if (this.readyPattern.test(this.outputTail)) {
+        this.readySeen = true;
+      }
+    }
 
     // Track spinner — but not if it's part of completion marker
     if (SPINNER_RE.test(stripped) && !(this.completionPattern?.test(this.outputTail))) {
@@ -49,15 +56,17 @@ export class IdleDetector {
     }
 
     // Strategy 2: quiescence (PTY silence + no recent spinner)
-    // Use longer timeout before first idle fires (CLI may still be starting up)
-    const timeout = this.firstIdleFired ? QUIESCENCE_MS : this.startupQuiescenceMs;
+    // When readyPattern is set, suppress quiescence until the input prompt appears.
+    if (this.readyPattern && !this.readySeen) return;
+
     this.clearTimer();
-    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), timeout);
+    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), QUIESCENCE_MS);
   }
 
   reset(): void {
     this.isIdle = false;
     this.outputTail = '';
+    this.readySeen = false;
     this.lastSpinnerAt = Date.now();
     this.clearTimer();
   }
@@ -83,7 +92,6 @@ export class IdleDetector {
 
   private markIdle(): void {
     this.isIdle = true;
-    this.firstIdleFired = true;
     this.outputTail = '';
     this.clearTimer();
     this.idleCallback?.();

@@ -42,7 +42,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    startupQuiescenceMs: 5_000,  // CoCo loads MCP servers at startup — needs longer wait
+    readyPattern: /⏵⏵/,   // status bar indicator — present when CoCo's TUI is rendered
     altScreen: false,
   };
 }

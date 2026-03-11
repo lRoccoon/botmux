@@ -42,7 +42,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    startupQuiescenceMs: 5_000,  // Codex loads MCP servers at startup — needs longer wait
+    readyPattern: /›/,  // prompt indicator — present when Codex's input box is rendered
     altScreen: false,   // --no-alt-screen disables alternate screen
   };
 }
