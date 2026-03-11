@@ -16,6 +16,7 @@ import * as scheduler from './scheduler.js';
 import * as scheduleStore from './services/schedule-store.js';
 import { scanProjects } from './services/project-scanner.js';
 import { buildRepoSelectCard, buildSessionCard, buildStreamingCard } from './utils/card-builder.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -92,37 +93,38 @@ function removePidFile(): void {
 
 // ─── Version tracking ────────────────────────────────────────────────────────
 
-function getClaudeVersion(): string {
-  try {
-    const output = execFileSync(config.daemon.claudePath, ['--version'], {
-      timeout: 10_000,
-      encoding: 'utf-8',
-      env: { ...process.env, CLAUDECODE: undefined } as NodeJS.ProcessEnv,
-    });
-    return output.trim();
-  } catch {
-    return 'unknown';
-  }
-}
-
-/** Returns true if version changed */
 function refreshClaudeVersion(): boolean {
   const now = Date.now();
   if (now - lastVersionCheckAt < VERSION_CHECK_INTERVAL) return false;
   lastVersionCheckAt = now;
 
-  const newVersion = getClaudeVersion();
-  if (newVersion === 'unknown') return false;
+  try {
+    const adapter = createCliAdapterSync(
+      config.daemon.cliId,
+      config.daemon.cliPathOverride,
+    );
+    const raw = execFileSync(adapter.resolvedBin, ['--version'], {
+      encoding: 'utf-8',
+      timeout: 5_000,
+    }).trim();
+    const newVersion = raw.replace(/^[^0-9]*/, '');
 
-  if (currentClaudeVersion !== 'unknown' && newVersion !== currentClaudeVersion) {
-    const old = currentClaudeVersion;
+    if (newVersion === 'unknown' || !newVersion) return false;
+
+    if (currentClaudeVersion !== 'unknown' && newVersion !== currentClaudeVersion) {
+      const old = currentClaudeVersion;
+      currentClaudeVersion = newVersion;
+      logger.info(`CLI version updated: ${old} → ${newVersion} (${adapter.id})`);
+      return true;
+    }
+
     currentClaudeVersion = newVersion;
-    logger.info(`Claude version updated: ${old} → ${newVersion}`);
-    return true;
+    logger.info(`CLI version: ${currentClaudeVersion} (${adapter.id})`);
+    return false;
+  } catch (err: any) {
+    logger.warn(`Failed to get CLI version: ${err.message}`);
+    return false;
   }
-
-  currentClaudeVersion = newVersion;
-  return false;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -234,54 +236,23 @@ const restartCounts = new Map<string, { count: number; lastAt: number }>();
 
 /**
  * Ensure the claude-code-robot MCP server is registered globally.
- * Checks Claude Code (~/.claude.json), Aiden (~/.aiden/.mcp.json), and Trae (~/.trae/.mcp.json).
- * Only writes if the entry is missing or the script path has changed.
+ * Delegates to the CLI adapter which knows the correct config file location.
  */
 function ensureMcpConfig(): void {
+  const adapter = createCliAdapterSync(
+    config.daemon.cliId,
+    config.daemon.cliPathOverride,
+  );
   const serverScript = join(__dirname, 'index.js');
-  const serverEntry = {
+  adapter.ensureMcpConfig({
+    name: 'claude-code-robot',
     command: 'node',
     args: [serverScript],
     env: {
       LARK_APP_ID: config.lark.appId,
       LARK_APP_SECRET: config.lark.appSecret,
     },
-  };
-  const serverName = 'claude-code-robot';
-  const p = config.daemon.claudePath.toLowerCase();
-  const isAiden = /\baiden\b/.test(p);
-  const isTrae = /\btrae\b|traecli|trae-cli/.test(p);
-
-  // Determine global config path based on CLI type
-  // Claude Code: ~/.claude.json (mcpServers at top level)
-  // Aiden: ~/.aiden/.mcp.json (mcpServers at top level)
-  // Trae: ~/.trae/.mcp.json (mcpServers at top level)
-  const globalPath = isAiden
-    ? join(homedir(), '.aiden', '.mcp.json')
-    : isTrae
-      ? join(homedir(), '.trae', '.mcp.json')
-      : join(homedir(), '.claude.json');
-
-  try {
-    let data: any = {};
-    if (existsSync(globalPath)) {
-      data = JSON.parse(readFileSync(globalPath, 'utf-8'));
-    }
-    if (!data.mcpServers) data.mcpServers = {};
-
-    const existing = data.mcpServers[serverName];
-    if (existing && existing.args?.[0] === serverScript) return; // already up to date
-
-    // Ensure parent directory exists for nested config locations (e.g. ~/.aiden, ~/.trae)
-    const parent = dirname(globalPath);
-    if (!existsSync(parent)) mkdirSync(parent, { recursive: true });
-
-    data.mcpServers[serverName] = serverEntry;
-    writeFileSync(globalPath, JSON.stringify(data, null, 2) + '\n');
-    logger.info(`Installed MCP server "${serverName}" to ${globalPath}`);
-  } catch (err: any) {
-    logger.warn(`Failed to install MCP config to ${globalPath}: ${err.message}`);
-  }
+  });
 }
 
 /** Track whether ensureMcpConfig has run this daemon lifecycle */
@@ -1364,10 +1335,11 @@ export async function startDaemon(): Promise<void> {
   validateConfig();
   writePidFile();
 
-  // Get initial Claude version
-  currentClaudeVersion = getClaudeVersion();
-  logger.info(`Claude version: ${currentClaudeVersion}`);
-  lastVersionCheckAt = Date.now();
+  // Get initial CLI version
+  refreshClaudeVersion();
+  if (currentClaudeVersion === 'unknown') {
+    logger.warn('Could not detect CLI version at startup');
+  }
 
   // Resolve email prefixes in ALLOWED_USERS to open_ids
   if (config.daemon.allowedUsers.length > 0) {
