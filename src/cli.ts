@@ -231,7 +231,7 @@ botmux — IM ↔ AI 编程 CLI 桥接
   upgrade     升级到最新版本
 
 配置目录: ~/.botmux/
-文档: https://github.com/nicepkg/botmux
+文档: https://github.com/deepcoldy/botmux
 `);
 }
 
