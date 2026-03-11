@@ -11,7 +11,7 @@ import * as sessionStore from '../../services/session-store.js';
 import { forkWorker, killWorker } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt } from '../../core/session-manager.js';
 import type { DaemonToWorker } from '../../types.js';
-import type { DaemonSession } from '../../daemon.js';
+import type { DaemonSession } from '../../core/types.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────

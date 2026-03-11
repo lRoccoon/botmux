@@ -6,6 +6,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
+import { expandHome } from './session-manager.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -30,10 +31,6 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cacheRead: 
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function expandHome(p: string): string {
-  return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
-}
 
 export function getSessionJsonlPath(sessionId: string, cwd: string): string | null {
   const resolvedCwd = resolve(expandHome(cwd));

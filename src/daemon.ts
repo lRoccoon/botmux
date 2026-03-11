@@ -1,4 +1,4 @@
-import { ChildProcess, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config, validateConfig } from './config.js';
@@ -7,7 +7,9 @@ import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage } from './im/lark/message-parser.js';
 import { logger } from './utils/logger.js';
-import type { Session, DaemonToWorker } from './types.js';
+import type { DaemonToWorker } from './types.js';
+export type { DaemonSession } from './core/types.js';
+import type { DaemonSession } from './core/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects } from './services/project-scanner.js';
 import { buildRepoSelectCard, buildStreamingCard } from './im/lark/card-builder.js';
@@ -33,31 +35,6 @@ import {
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import { probeBotOpenId, startLarkEventDispatcher } from './im/lark/event-dispatcher.js';
-
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-export interface DaemonSession {
-  session: Session;
-  worker: ChildProcess | null;   // fork'd worker process
-  workerPort: number | null;     // HTTP port for xterm.js
-  workerToken: string | null;    // write token for xterm.js
-  chatId: string;
-  chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
-  spawnedAt: number;
-  claudeVersion: string;
-  lastMessageAt: number;
-  hasHistory: boolean;   // true after Claude has run at least once for this session
-  workingDir?: string;
-  initConfig?: DaemonToWorker;   // stored for restart
-  pendingRepo?: boolean;         // waiting for repo selection before spawning Claude
-  pendingPrompt?: string;        // original user message to send after repo is selected
-  pendingAttachments?: import('./types.js').LarkAttachment[];
-  ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
-  streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
-  streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
-  lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
-  currentTurnTitle?: string;      // title for the current turn's streaming card
-}
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -182,7 +159,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string, chat
         session,
         worker: null,
         workerPort: null,
-    workerToken: null,
+        workerToken: null,
         chatId,
         chatType,
         spawnedAt: Date.now(),

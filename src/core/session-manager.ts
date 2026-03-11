@@ -14,7 +14,7 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, killStalePids, getCurrentClaudeVersion } from './worker-pool.js';
 import type { LarkAttachment, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
-import type { DaemonSession } from '../daemon.js';
+import type { DaemonSession } from './types.js';
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 

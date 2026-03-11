@@ -3,7 +3,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -14,30 +14,15 @@ import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { getSessionCost, formatNumber } from './cost-calculator.js';
 import { killWorker, forkWorker, getCurrentClaudeVersion } from './worker-pool.js';
+import { expandHome, getSessionWorkingDir, getProjectScanDir } from './session-manager.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
-import type { DaemonSession } from '../daemon.js';
+import type { DaemonSession } from './types.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
 export const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/cost', '/schedule']);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function expandHome(p: string): string {
-  return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
-}
-
-function getSessionWorkingDir(ds?: DaemonSession): string {
-  return expandHome(ds?.workingDir ?? config.daemon.workingDir);
-}
-
-function getProjectScanDir(ds?: DaemonSession): string {
-  if (config.daemon.projectScanDir) {
-    return expandHome(config.daemon.projectScanDir);
-  }
-  const cwd = getSessionWorkingDir(ds);
-  return resolve(cwd, '..');
-}
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);

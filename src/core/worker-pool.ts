@@ -12,7 +12,7 @@ import { buildStreamingCard, buildSessionCard } from '../im/lark/card-builder.js
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { DaemonToWorker, WorkerToDaemon, Session } from '../types.js';
-import type { DaemonSession } from '../daemon.js';
+import type { DaemonSession } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
