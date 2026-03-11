@@ -4,6 +4,10 @@
 
 Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens for Lark messages and automatically spawns an independent CLI process (supporting Claude Code, Aiden, CoCo, Codex) for each new topic thread, with live streaming cards and a web-based terminal.
 
+## Demo
+
+<video src="https://github.com/deepcoldy/botmux/releases/download/v1.0.0/introduce.mp4" width="100%" controls></video>
+
 ## Features
 
 - **One topic = one AI coding session** — each Lark thread gets its own isolated CLI process

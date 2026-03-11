@@ -4,6 +4,10 @@
 
 飞书话题群与 AI 编程 CLI 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 CLI 进程（支持 Claude Code、Aiden、CoCo、Codex），提供实时流式卡片和 Web 终端。
 
+## 演示
+
+<video src="https://github.com/deepcoldy/botmux/releases/download/v1.0.0/introduce.mp4" width="100%" controls></video>
+
 ## 功能特性
 
 - **一个话题 = 一个 AI 编程会话** — 每个飞书话题线程对应一个独立的 CLI 进程
