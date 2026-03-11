@@ -292,6 +292,16 @@ function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
   const cwd = getSessionWorkingDir(ds);
   const t = tag(ds);
 
+  // Guard against double-fork: if a worker is already running, kill it first
+  if (ds.worker && !ds.worker.killed) {
+    logger.warn(`[${t}] Worker already running (pid: ${ds.worker.pid}), killing before re-fork`);
+    try { ds.worker.send({ type: 'close' } as DaemonToWorker); } catch { /* ignore */ }
+    try { ds.worker.kill(); } catch { /* ignore */ }
+    ds.worker = null;
+    ds.workerPort = null;
+    ds.workerToken = null;
+  }
+
   if (!mcpConfigDone) {
     ensureMcpConfig();
     mcpConfigDone = true;
