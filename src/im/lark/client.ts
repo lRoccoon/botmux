@@ -1,34 +1,10 @@
-import * as Lark from '@larksuiteoapi/node-sdk';
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { config } from '../../config.js';
+import { getBotClient } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
 
-let client: Lark.Client;
-
-export function getLarkClient(): Lark.Client {
-  if (!client) {
-    // Provide a custom logger that writes to stderr.
-    // The default Lark SDK logger uses console.log (stdout), which corrupts
-    // MCP stdio protocol when the server is spawned as an MCP child process.
-    const stderrLogger = {
-      error: (...msg: any[]) => { process.stderr.write(`[lark:error] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-      warn:  (...msg: any[]) => { process.stderr.write(`[lark:warn] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-      info:  (...msg: any[]) => { process.stderr.write(`[lark:info] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-      debug: (...msg: any[]) => { process.stderr.write(`[lark:debug] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-      trace: (...msg: any[]) => { process.stderr.write(`[lark:trace] ${msg.map(m => JSON.stringify(m)).join(' ')}\n`); },
-    };
-    client = new Lark.Client({
-      appId: config.lark.appId,
-      appSecret: config.lark.appSecret,
-      logger: stderrLogger,
-    });
-  }
-  return client;
-}
-
-export async function sendMessage(chatId: string, content: string, msgType: string = 'text'): Promise<string> {
-  const c = getLarkClient();
+export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text'): Promise<string> {
+  const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
   const res = await c.im.v1.message.create({
@@ -50,8 +26,8 @@ export async function sendMessage(chatId: string, content: string, msgType: stri
   return messageId;
 }
 
-export async function replyMessage(messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false): Promise<string> {
-  const c = getLarkClient();
+export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false): Promise<string> {
+  const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
   const res = await c.im.v1.message.reply({
@@ -73,8 +49,8 @@ export async function replyMessage(messageId: string, content: string, msgType: 
   return replyId;
 }
 
-export async function addReaction(messageId: string, emojiType: string): Promise<string> {
-  const c = getLarkClient();
+export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
+  const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageReaction.create({
     path: { message_id: messageId },
     data: { reaction_type: { emoji_type: emojiType } },
@@ -87,8 +63,8 @@ export async function addReaction(messageId: string, emojiType: string): Promise
   return reactionId ?? '';
 }
 
-export async function removeReaction(messageId: string, reactionId: string): Promise<void> {
-  const c = getLarkClient();
+export async function removeReaction(larkAppId: string, messageId: string, reactionId: string): Promise<void> {
+  const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageReaction.delete({
     path: { message_id: messageId, reaction_id: reactionId },
   });
@@ -98,8 +74,8 @@ export async function removeReaction(messageId: string, reactionId: string): Pro
   logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
 }
 
-export async function sendUserMessage(openId: string, content: string, msgType: string = 'text'): Promise<string> {
-  const c = getLarkClient();
+export async function sendUserMessage(larkAppId: string, openId: string, content: string, msgType: string = 'text'): Promise<string> {
+  const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
   const res = await c.im.v1.message.create({
@@ -121,8 +97,8 @@ export async function sendUserMessage(openId: string, content: string, msgType: 
   return messageId;
 }
 
-export async function getChatInfo(chatId: string): Promise<{ userCount: number }> {
-  const c = getLarkClient();
+export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ userCount: number }> {
+  const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.chat.get({
     path: { chat_id: chatId },
   });
@@ -133,8 +109,8 @@ export async function getChatInfo(chatId: string): Promise<{ userCount: number }
   return { userCount: Number(res.data?.user_count ?? 0) };
 }
 
-export async function updateMessage(messageId: string, cardJson: string): Promise<void> {
-  const c = getLarkClient();
+export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
+  const c = getBotClient(larkAppId);
   const res = await c.im.v1.message.patch({
     path: { message_id: messageId },
     data: { content: cardJson },
@@ -144,8 +120,8 @@ export async function updateMessage(messageId: string, cardJson: string): Promis
   }
 }
 
-export async function getMessageDetail(messageId: string): Promise<any> {
-  const c = getLarkClient();
+export async function getMessageDetail(larkAppId: string, messageId: string): Promise<any> {
+  const c = getBotClient(larkAppId);
   const res = await c.im.v1.message.get({
     path: { message_id: messageId },
   });
@@ -155,8 +131,8 @@ export async function getMessageDetail(messageId: string): Promise<any> {
   return res.data;
 }
 
-export async function downloadMessageResource(messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
-  const c = getLarkClient();
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+  const c = getBotClient(larkAppId);
 
   const dir = dirname(savePath);
   if (!existsSync(dir)) {
@@ -190,7 +166,7 @@ export async function downloadMessageResource(messageId: string, fileKey: string
  * must be a full email address (e.g. "alice@example.com") and is looked up.
  * Returns an array of open_ids (unresolvable entries are dropped with a warning).
  */
-export async function resolveAllowedUsers(raw: string[]): Promise<string[]> {
+export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Promise<string[]> {
   const openIds: string[] = [];
   const emails: string[] = [];
   for (const v of raw) {
@@ -202,7 +178,7 @@ export async function resolveAllowedUsers(raw: string[]): Promise<string[]> {
   }
   if (emails.length === 0) return openIds;
 
-  const c = getLarkClient();
+  const c = getBotClient(larkAppId);
   try {
     const res = await (c as any).contact.v3.user.batchGetId({
       params: { user_id_type: 'open_id' },
@@ -227,8 +203,8 @@ export async function resolveAllowedUsers(raw: string[]): Promise<string[]> {
   return openIds;
 }
 
-export async function listThreadMessages(chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
-  const c = getLarkClient();
+export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
+  const c = getBotClient(larkAppId);
   const allMessages: any[] = [];
   let pageToken: string | undefined;
 

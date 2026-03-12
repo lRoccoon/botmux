@@ -1,0 +1,16 @@
+[
+  {
+    "larkAppId": "cli_xxx_bot1",
+    "larkAppSecret": "your_secret_1",
+    "cliId": "claude-code",
+    "allowedUsers": ["alice@company.com"],
+    "workingDir": "~/projects"
+  },
+  {
+    "larkAppId": "cli_xxx_bot2",
+    "larkAppSecret": "your_secret_2",
+    "cliId": "aiden",
+    "allowedUsers": ["bob@company.com"],
+    "workingDir": "~/work"
+  }
+]
