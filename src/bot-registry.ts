@@ -45,7 +45,7 @@ export function registerBot(cfg: BotConfig): BotState {
   const state: BotState = {
     config: cfg,
     client,
-    resolvedAllowedUsers: [],
+    resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
   };
   bots.set(cfg.larkAppId, state);
   return state;
