@@ -4,6 +4,7 @@
  */
 import { fork } from 'node:child_process';
 import { join, dirname } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -304,16 +305,38 @@ export function killStalePids(activeSessions_: Session[]): void {
     }
   }
 
-  // Clean orphaned tmux sessions: kill bmx-* sessions not in active set
+  // Tmux cleanup
   if (config.daemon.backendType === 'tmux') {
-    const activeNames = new Set(
-      activeSessions_.map(s => TmuxBackend.sessionName(s.sessionId)),
-    );
-    for (const name of TmuxBackend.listBotmuxSessions()) {
-      if (!activeNames.has(name)) {
-        logger.info(`Killing orphaned tmux session: ${name}`);
+    // If CLI_ID changed since last run, kill ALL tmux sessions (old CLI patterns won't match)
+    const cliIdFile = join(config.session.dataDir, 'last-cli-id');
+    let lastCliId: string | undefined;
+    try { lastCliId = readFileSync(cliIdFile, 'utf-8').trim(); } catch { /* first run */ }
+    const currentCliId = config.daemon.cliId;
+
+    if (lastCliId && lastCliId !== currentCliId) {
+      logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all tmux sessions`);
+      for (const name of TmuxBackend.listBotmuxSessions()) {
         TmuxBackend.killSession(name);
       }
+    } else {
+      // Clean orphaned tmux sessions: kill bmx-* sessions not in active set
+      const activeNames = new Set(
+        activeSessions_.map(s => TmuxBackend.sessionName(s.sessionId)),
+      );
+      for (const name of TmuxBackend.listBotmuxSessions()) {
+        if (!activeNames.has(name)) {
+          logger.info(`Killing orphaned tmux session: ${name}`);
+          TmuxBackend.killSession(name);
+        }
+      }
+    }
+
+    // Persist current CLI_ID for next restart
+    try {
+      mkdirSync(config.session.dataDir, { recursive: true });
+      writeFileSync(cliIdFile, currentCliId);
+    } catch (err) {
+      logger.warn(`Failed to write ${cliIdFile}: ${err}`);
     }
   }
 }
