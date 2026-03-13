@@ -10,11 +10,12 @@
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade        — upgrade to latest version
- *   botmux list           — list all active sessions
+ *   botmux list           — interactive session picker (TUI), attach to tmux
+ *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  */
-import { execSync, spawn } from 'node:child_process';
+import { execSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -468,20 +469,33 @@ function loadBotConfigsForDisplay(): Array<{ larkAppId: string; cliId?: string }
   return [];
 }
 
-function cmdList(): void {
-  const sessions = loadSessions();
-  const active = [...sessions.values()].filter(s => s.status === 'active');
-
-  if (active.length === 0) {
-    console.log('没有活跃会话。');
-    return;
+/** Format a single session row for display (used by both plain table and TUI). */
+function formatSessionRow(
+  s: SessionData,
+  multiBot: boolean,
+  botLabels: Map<string, string>,
+  cols: { id: number; bot?: number; title: number; dir: number; pid: number; uptime: number; status: number },
+): { text: string; alive: boolean } {
+  const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
+  const parts = [id];
+  if (multiBot) {
+    const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 18)) : '-';
+    parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
   }
+  const title = padEndDisplay(truncate(s.title || '(untitled)', cols.title), cols.title);
+  const dir = padEndDisplay(truncate(s.workingDir || '-', cols.dir), cols.dir);
+  const pid = s.pid ? String(s.pid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
+  const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
+  const alive = !!(s.pid && isProcessAlive(s.pid));
+  const status = (alive ? 'online' : s.pid ? 'stopped' : 'idle').padEnd(cols.status);
+  parts.push(title, dir, pid, uptime, status);
+  return { text: parts.join(' │ '), alive };
+}
 
-  // Detect multi-bot mode: show bot column if bots.json exists or sessions have different larkAppIds
+/** Print plain session table (non-interactive). */
+function printSessionTable(active: SessionData[]): void {
   const botConfigs = loadBotConfigsForDisplay();
   const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
-
-  // Build a larkAppId → short label map (e.g. "bot1 (claude-code)")
   const botLabels = new Map<string, string>();
   for (let i = 0; i < botConfigs.length; i++) {
     const b = botConfigs[i];
@@ -507,25 +521,178 @@ function cmdList(): void {
   console.log(separator);
 
   for (const s of active) {
-    const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
-    const parts = [id];
-    if (multiBot) {
-      const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 18)) : '-';
-      parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
-    }
-    const title = padEndDisplay(truncate(s.title || '(untitled)', cols.title), cols.title);
-    const dir = padEndDisplay(truncate(s.workingDir || '-', cols.dir), cols.dir);
-    const pid = s.pid ? String(s.pid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
-    const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
-    const alive = s.pid && isProcessAlive(s.pid);
-    const status = (alive ? 'online' : s.pid ? 'stopped' : 'idle').padEnd(cols.status);
-
-    parts.push(title, dir, pid, uptime, status);
-    console.log(parts.join(' │ '));
+    const { text } = formatSessionRow(s, multiBot, botLabels, cols);
+    console.log(text);
   }
 
   console.log(separator);
   console.log(`共 ${active.length} 个活跃会话`);
+}
+
+/** Check if a tmux session exists. */
+function tmuxSessionExists(name: string): boolean {
+  try {
+    execSync(`tmux has-session -t ${name} 2>/dev/null`, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Interactive TUI session picker — returns a promise that resolves when done. */
+function interactiveSessionPicker(active: SessionData[]): Promise<void> {
+  const botConfigs = loadBotConfigsForDisplay();
+  const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
+  const botLabels = new Map<string, string>();
+  for (let i = 0; i < botConfigs.length; i++) {
+    const b = botConfigs[i];
+    botLabels.set(b.larkAppId, `bot${i + 1} (${b.cliId ?? 'claude-code'})`);
+  }
+
+  const cols = { id: 10, ...(multiBot ? { bot: 22 } : {}), title: 28, dir: 28, pid: 8, uptime: 8, status: 8 };
+
+  // Pre-render all rows
+  const rows = active.map(s => {
+    const { text, alive } = formatSessionRow(s, multiBot, botLabels, cols);
+    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+    const hasTmux = tmuxSessionExists(tmuxName);
+    return { session: s, text, alive, tmuxName, hasTmux };
+  });
+
+  // Build header
+  const headerParts = ['   ', 'id'.padEnd(cols.id)];
+  if (multiBot) headerParts.push('bot'.padEnd(cols.bot!));
+  headerParts.push(
+    'title'.padEnd(cols.title),
+    'working dir'.padEnd(cols.dir),
+    'pid'.padEnd(cols.pid),
+    'uptime'.padEnd(cols.uptime),
+    'status'.padEnd(cols.status),
+  );
+  const header = headerParts.join(' │ ');
+  const totalWidth = displayWidth(header);
+  const separator = '─'.repeat(totalWidth);
+
+  let cursor = 0;
+
+  function render(): void {
+    // Move cursor to top and clear
+    process.stdout.write('\x1b[H\x1b[J');
+
+    // Title
+    process.stdout.write('\x1b[1m botmux sessions\x1b[0m\n\n');
+
+    // Header
+    process.stdout.write(`  ${separator}\n`);
+    process.stdout.write(`  \x1b[2m${header}\x1b[0m\n`);
+    process.stdout.write(`  ${separator}\n`);
+
+    // Rows
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const pointer = i === cursor ? '\x1b[36m❯\x1b[0m' : ' ';
+      const tmuxIcon = r.hasTmux ? '\x1b[32m⬤\x1b[0m' : '\x1b[2m○\x1b[0m';
+
+      if (i === cursor) {
+        process.stdout.write(`  ${pointer} \x1b[7m${r.text}\x1b[0m\n`);
+      } else {
+        process.stdout.write(`  ${pointer} ${r.text}\n`);
+      }
+    }
+
+    process.stdout.write(`  ${separator}\n`);
+
+    // Footer
+    const selected = rows[cursor];
+    const tmuxHint = selected.hasTmux
+      ? `\x1b[32mtmux: ${selected.tmuxName}\x1b[0m`
+      : `\x1b[2mtmux: 无会话\x1b[0m`;
+    process.stdout.write(`\n  ${tmuxHint}\n`);
+    process.stdout.write(`\n  \x1b[2m↑/↓ 选择  ⏎ 连接tmux  q 退出\x1b[0m\n`);
+  }
+
+  return new Promise<void>((resolve) => {
+    // Enter raw mode
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf-8');
+
+    // Hide cursor
+    process.stdout.write('\x1b[?25l');
+    // Switch to alt screen
+    process.stdout.write('\x1b[?1049h');
+
+    render();
+
+    function cleanup(): void {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      // Show cursor
+      process.stdout.write('\x1b[?25h');
+      // Leave alt screen
+      process.stdout.write('\x1b[?1049l');
+    }
+
+    process.stdin.on('data', (key: string) => {
+      // Ctrl-C or q or Esc
+      if (key === '\x03' || key === 'q' || key === '\x1b') {
+        cleanup();
+        resolve();
+        return;
+      }
+
+      // Arrow up or k
+      if (key === '\x1b[A' || key === 'k') {
+        cursor = (cursor - 1 + rows.length) % rows.length;
+        render();
+        return;
+      }
+
+      // Arrow down or j
+      if (key === '\x1b[B' || key === 'j') {
+        cursor = (cursor + 1) % rows.length;
+        render();
+        return;
+      }
+
+      // Enter — attach to tmux
+      if (key === '\r' || key === '\n') {
+        const selected = rows[cursor];
+        if (!selected.hasTmux) {
+          // Flash a message on the footer area
+          process.stdout.write(`\x1b[${rows.length + 8};1H`);
+          process.stdout.write(`  \x1b[33m该会话没有 tmux 进程，无法连接\x1b[0m   `);
+          return;
+        }
+        cleanup();
+        // Attach to tmux — this replaces our terminal
+        spawnSync('tmux', ['attach-session', '-t', selected.tmuxName], {
+          stdio: 'inherit',
+        });
+        resolve();
+        return;
+      }
+    });
+  });
+}
+
+async function cmdList(): Promise<void> {
+  const sessions = loadSessions();
+  const active = [...sessions.values()].filter(s => s.status === 'active');
+
+  if (active.length === 0) {
+    console.log('没有活跃会话。');
+    return;
+  }
+
+  // Non-TTY (piped output) or explicit --plain flag: plain table
+  if (!process.stdout.isTTY || process.argv.includes('--plain')) {
+    printSessionTable(active);
+    return;
+  }
+
+  // Interactive TUI
+  await interactiveSessionPicker(active);
 }
 
 function cmdDelete(): void {
@@ -607,7 +774,8 @@ botmux — IM ↔ AI 编程 CLI 桥接
   logs        查看 daemon 日志（--lines N）
   status      查看 daemon 状态
   upgrade     升级到最新版本
-  list        列出所有活跃会话
+  list        列出活跃会话（交互式选择并连接 tmux）
+              --plain  纯文本表格输出（管道/脚本场景）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
   delete all       关闭所有活跃会话
   delete stopped   清理所有进程已退出的僵尸会话
@@ -630,7 +798,7 @@ switch (command) {
   case 'status':  cmdStatus(); break;
   case 'upgrade': cmdUpgrade(); break;
   case 'list':
-  case 'ls':      cmdList(); break;
+  case 'ls':      await cmdList(); break;
   case 'delete':
   case 'del':
   case 'rm':      cmdDelete(); break;
