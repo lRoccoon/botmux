@@ -23,7 +23,7 @@
 ## 前置要求
 
 - **Node.js** >= 20
-- **AI 编程 CLI** 已安装并完成认证（`claude`、`aiden`、`coco`、`codex` 或 `gemini` 在 PATH 中）
+- **AI 编程 CLI** 已安装并完成认证（`claude`、`aiden`、`coco`、`codex`、`gemini` 或 `opencode` 在 PATH 中）
 - **飞书应用** 具备机器人和消息权限（WebSocket 事件订阅）
 - **tmux** >= 3.x（可选，安装后自动启用会话常驻）
 
@@ -79,7 +79,7 @@ botmux start
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`、`gemini`） |
+| `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`、`gemini`、`opencode`） |
 | `CLI_PATH` | _(按 CLI_ID 自动检测)_ | CLI 可执行文件路径覆盖 |
 | `BACKEND_TYPE` | _(自动检测)_ | 会话后端：有 tmux 则用 `tmux`，否则 `pty` |
 | `WORKING_DIR` | `~` | 默认工作目录，支持逗号分隔多个目录（如 `~/a,~/b`），`/repo` 会扫描所有目录 |
@@ -224,16 +224,18 @@ botmux setup
 **核心收益：Daemon 重启不中断 CLI。** `botmux restart` 时 worker 进程退出，但 tmux session（及其中的 CLI 进程）保持运行。下次收到消息时 worker 自动 re-attach，无需 `--resume` 重载上下文。
 
 ```bash
-# 查看活跃的 botmux tmux 会话
-tmux list-sessions | grep bmx-
+# 推荐：交互式会话列表 — 选择后直接 attach 到 tmux
+npx botmux list
 
-# 手动 attach 调试（实时观察 CLI 终端）
+# 也可以手动 attach（会话名 = bmx-<sessionId 前 8 位>）
 tmux attach -t bmx-<session-id-前8位>
 # Ctrl+B, D 退出 attach，不影响 CLI 继续运行
 
 # 强制降级到纯 pty 模式（不使用 tmux）
 BACKEND_TYPE=pty botmux start
 ```
+
+`botmux list` 提供交互式 TUI，显示所有活跃会话的 ID、标题、工作目录、PID、运行时长和状态，方向键选择后回车即可 attach。也支持 `botmux list --plain` 输出纯文本表格供脚本使用。
 
 **tmux 会话命名规则：** `bmx-<sessionId 前 8 位>`
 

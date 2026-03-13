@@ -23,7 +23,7 @@ Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens
 ## Prerequisites
 
 - **Node.js** >= 20
-- **AI coding CLI** installed and authenticated (`claude`, `aiden`, `coco`, `codex`, or `gemini` in PATH)
+- **AI coding CLI** installed and authenticated (`claude`, `aiden`, `coco`, `codex`, `gemini`, or `opencode` in PATH)
 - **Lark app** with Bot and Message permissions (WebSocket event subscription)
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 
@@ -79,7 +79,7 @@ Configuration is stored at `~/.botmux/.env`. Run `botmux setup` to create it int
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLI_ID` | `claude-code` | CLI adapter (`claude-code`, `aiden`, `coco`, `codex`, `gemini`) |
+| `CLI_ID` | `claude-code` | CLI adapter (`claude-code`, `aiden`, `coco`, `codex`, `gemini`, `opencode`) |
 | `CLI_PATH` | _(auto-detect by CLI_ID)_ | CLI binary path override |
 | `BACKEND_TYPE` | _(auto-detect)_ | Session backend: `tmux` if available, otherwise `pty` |
 | `WORKING_DIR` | `~` | Default working directory; supports comma-separated multiple dirs (e.g. `~/a,~/b`), `/repo` scans all |
@@ -224,16 +224,18 @@ When tmux is installed, botmux automatically uses the tmux backend. CLI processe
 **Key benefit: daemon restarts don't interrupt the CLI.** During `botmux restart`, the worker process exits but the tmux session (and the CLI inside it) keeps running. The next incoming message triggers a re-attach — no `--resume` context reload needed.
 
 ```bash
-# List active botmux tmux sessions
-tmux list-sessions | grep bmx-
+# Recommended: interactive session picker — select and attach to tmux
+npx botmux list
 
-# Manually attach for debugging (observe CLI in real time)
+# Or manually attach (session name = bmx-<first 8 chars of session ID>)
 tmux attach -t bmx-<first-8-chars-of-session-id>
 # Ctrl+B, D to detach — CLI keeps running
 
 # Force pure pty mode (disable tmux)
 BACKEND_TYPE=pty botmux start
 ```
+
+`botmux list` provides an interactive TUI showing all active sessions with ID, title, working directory, PID, uptime, and status. Use arrow keys to select and Enter to attach. Use `botmux list --plain` for plain-text table output suitable for scripting.
 
 **Session naming:** `bmx-<first 8 chars of session UUID>`
 

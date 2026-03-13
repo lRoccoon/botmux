@@ -6,6 +6,7 @@ import { createAidenAdapter } from './aiden.js';
 import { createCocoAdapter } from './coco.js';
 import { createCodexAdapter } from './codex.js';
 import { createGeminiAdapter } from './gemini.js';
+import { createOpenCodeAdapter } from './opencode.js';
 
 /** Resolve a command name to its absolute path via login-shell `which`. */
 export function resolveCommand(cmd: string): string {
@@ -31,7 +32,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createGeminiAdapter };
+export { createClaudeCodeAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createGeminiAdapter, createOpenCodeAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -41,6 +42,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'coco': return createCocoAdapter(pathOverride);
     case 'codex': return createCodexAdapter(pathOverride);
     case 'gemini': return createGeminiAdapter(pathOverride);
+    case 'opencode': return createOpenCodeAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }
