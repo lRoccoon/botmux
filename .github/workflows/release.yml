@@ -24,7 +24,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
 
       - run: pnpm build
 
