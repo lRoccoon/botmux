@@ -12,7 +12,7 @@ export interface ProjectInfo {
 
 function getGitBranch(dir: string): string {
   try {
-    return execSync('git rev-parse --abbrev-ref HEAD', { cwd: dir, timeout: 5000, encoding: 'utf-8' }).trim();
+    return execSync('git rev-parse --abbrev-ref HEAD', { cwd: dir, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
   } catch {
     return 'unknown';
   }
@@ -20,7 +20,7 @@ function getGitBranch(dir: string): string {
 
 function getWorktrees(repoPath: string): ProjectInfo[] {
   try {
-    const output = execSync('git worktree list --porcelain', { cwd: repoPath, timeout: 5000, encoding: 'utf-8' });
+    const output = execSync('git worktree list --porcelain', { cwd: repoPath, timeout: 5000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
     const worktrees: ProjectInfo[] = [];
     let currentPath = '';
     let currentBranch = '';
