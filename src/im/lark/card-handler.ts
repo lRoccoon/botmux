@@ -54,7 +54,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     const ds = rootId ? activeSessions.get(rootId) : undefined;
@@ -119,6 +119,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           writeUrl,
           ds.session.title || getCliDisplayName(botCfg.cliId),
           botCfg.cliId,
+          true, // showManageButtons — DM card includes restart & close
         );
         sendUserMessage(ds.larkAppId, operatorOpenId, dmCardJson, 'interactive').catch(err =>
           logger.warn(`[${tag(ds)}] Failed to DM write link: ${err}`),

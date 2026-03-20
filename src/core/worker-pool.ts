@@ -52,6 +52,11 @@ function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
 }
 
+// Sentinel value for streamCardId while a POST (new card) is in-flight.
+// Prevents duplicate card POSTs when multiple screen_updates arrive before
+// the first POST returns a real message_id.
+const CARD_POSTING_SENTINEL = '__posting__';
+
 // ─── Card PATCH serialization queue ─────────────────────────────────────────
 // Only one PATCH in-flight at a time per session. New PATCHes queue on
 // ds.pendingCardJson (latest wins). When the in-flight PATCH completes,
@@ -73,7 +78,7 @@ export function scheduleCardPatch(ds: DaemonSession, cardJson: string): void {
 function flushCardPatch(ds: DaemonSession): void {
   const json = ds.pendingCardJson;
   const cardId = ds.streamCardId;
-  if (!json || !cardId) {
+  if (!json || !cardId || cardId === CARD_POSTING_SENTINEL) {
     ds.pendingCardJson = undefined;
     return;
   }
@@ -223,6 +228,9 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
 
         // Send streaming card to group thread (read-only link, will be PATCHed with live output)
+        // Set sentinel BEFORE await so concurrent screen_update messages
+        // (which can arrive while the POST is in-flight) don't POST a duplicate card.
+        ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
           const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
@@ -246,6 +254,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             break;
           }
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
+          // Clear sentinel so screen_updates can create a streaming card later
+          ds.streamCardId = undefined;
           // Fallback: send static session card
           try {
             const cardJson = buildSessionCard(
@@ -284,6 +294,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
 
         if (ds.streamCardPending || !ds.streamCardId) {
+          // If a POST is already in-flight, drop this update — it will be
+          // picked up by subsequent screen_updates once the card ID lands.
+          if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
+
           // New turn — create a fresh card, old card freezes at its last state.
           // Generate new nonce so old card buttons are distinguishable.
           ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -298,10 +312,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             ds.streamExpanded,
             ds.streamCardNonce,
           );
-          // Clear streamCardId immediately so that screen_updates arriving while
-          // the POST is in-flight are dropped rather than PATCHed onto the old card.
+          // Mark POST in-flight so subsequent screen_updates are dropped,
+          // not POSTed as duplicate cards.
           ds.streamCardPending = false;
-          ds.streamCardId = undefined;
+          ds.streamCardId = CARD_POSTING_SENTINEL;
           cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId)
             .then(msgId => { ds.streamCardId = msgId; })
             .catch(err => {
@@ -312,6 +326,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
                 return;
               }
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
+              ds.streamCardId = undefined;
             });
         } else {
           // Same turn — queue PATCH (serialized, latest-wins), reuse existing nonce

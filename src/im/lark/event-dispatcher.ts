@@ -224,11 +224,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
         const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
 
-        console.log('Received message:', message);
+        logger.debug('Received message:', message);
         // Group new topics (no rootId): check @mention + permissions
         if (chatType === 'group' && !rootId) {
           const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
-          console.log('Group message access check:', access);
+          logger.debug('Group message access check:', access);
           if (access === 'not_allowed') {
             replyMessage(larkAppId, messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
               .catch(err => logger.debug(`Failed to send permission denied: ${err}`));

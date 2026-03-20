@@ -20,7 +20,8 @@ function escapeMd(s: string): string {
 }
 
 /**
- * Build a Feishu interactive card with terminal link + restart/close buttons.
+ * Build a Feishu interactive card with terminal button + action buttons.
+ * @param showManageButtons - When true, include restart & close buttons (used in DM cards with write token).
  */
 export function buildSessionCard(
   sessionId: string,
@@ -28,8 +29,43 @@ export function buildSessionCard(
   terminalUrl: string,
   title: string,
   cliId?: CliId,
+  showManageButtons?: boolean,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  const actions: any[] = [
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: '🖥️ 打开终端' },
+      type: 'primary',
+      multi_url: {
+        url: terminalUrl,
+        pc_url: terminalUrl,
+        android_url: terminalUrl,
+        ios_url: terminalUrl,
+      },
+    },
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: '🔑 获取操作链接' },
+      type: 'default',
+      value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
+    },
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: '❌ 关闭会话' },
+      type: 'danger',
+      value: { action: 'close', root_id: rootId, session_id: sessionId },
+    },
+  ];
+  if (showManageButtons) {
+    // Insert restart button before close (second-to-last position)
+    actions.splice(-1, 0, {
+      tag: 'button',
+      text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
+      type: 'default',
+      value: { action: 'restart', root_id: rootId, session_id: sessionId },
+    });
+  }
   const card = {
     config: { wide_screen_mode: true },
     header: {
@@ -37,47 +73,7 @@ export function buildSessionCard(
       template: 'blue',
     },
     elements: [
-      {
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `**终端地址：** [${terminalUrl}](${terminalUrl})`,
-        },
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '🖥️ 打开终端' },
-            type: 'primary',
-            multi_url: {
-              url: terminalUrl,
-              pc_url: terminalUrl,
-              android_url: terminalUrl,
-              ios_url: terminalUrl,
-            },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '🔑 获取操作链接' },
-            type: 'default',
-            value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
-            type: 'default',
-            value: { action: 'restart', root_id: rootId, session_id: sessionId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '❌ 关闭会话' },
-            type: 'danger',
-            value: { action: 'close', root_id: rootId, session_id: sessionId },
-          },
-        ],
-      },
+      { tag: 'action', actions },
     ],
   };
   return JSON.stringify(card);
@@ -110,11 +106,6 @@ export function buildStreamingCard(
     elements.push({ tag: 'hr' });
   }
 
-  elements.push({
-    tag: 'markdown',
-    content: `**终端：** [${terminalUrl}](${terminalUrl})`,
-  });
-
   const toggleBtn = {
     tag: 'button',
     text: { tag: 'plain_text', content: expanded ? '📕 收起输出' : '📖 展开输出' },
@@ -142,12 +133,6 @@ export function buildStreamingCard(
         text: { tag: 'plain_text', content: '🔑 获取操作链接' },
         type: 'default',
         value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
-      },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: `🔄 重启 ${cliName}` },
-        type: 'default',
-        value: { action: 'restart', root_id: rootId, session_id: sessionId },
       },
       {
         tag: 'button',
