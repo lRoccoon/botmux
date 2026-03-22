@@ -884,12 +884,12 @@ async function cmdList(): Promise<void> {
 
   // Non-TTY (piped output) or explicit --plain flag: plain table
   if (!process.stdout.isTTY || process.argv.includes('--plain')) {
-    printSessionTable(active);
+    printSessionTable(live);
     return;
   }
 
   // Interactive TUI
-  await interactiveSessionPicker(active);
+  await interactiveSessionPicker(live);
 }
 
 function cmdDelete(): void {
