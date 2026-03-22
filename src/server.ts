@@ -25,10 +25,13 @@ export function createServer(): McpServer {
     sessionStore.init(appId);
   }
 
-  // Only inject instructions when running inside a botmux session (LARK_APP_ID
-  // is set by the worker process). When the MCP server is used standalone (e.g.
-  // user runs Claude Code directly), skip instructions to save context.
-  const instructions = appId
+  // BOTMUX env var is set in the static MCP config (written by ensureMcpConfig),
+  // so it's always available in botmux sessions regardless of env inheritance.
+  // LARK_APP_ID relies on process inheritance (worker → CLI → MCP) which some
+  // CLIs (e.g. Aiden) may not pass through to MCP server subprocesses.
+  const isBotmuxSession = process.env.BOTMUX === '1';
+
+  const instructions = isBotmuxSession
     ? [
         'You are connected to a Lark (Feishu) topic group. The user reads Lark, not your terminal.',
         'Anything you want the user to see MUST go through the send_to_thread tool — your terminal output never reaches the chat.',
@@ -52,9 +55,9 @@ export function createServer(): McpServer {
     },
   );
 
-  // Only register tools inside botmux sessions. Outside botmux (no LARK_APP_ID),
-  // tools would fail anyway and just waste tool-description context tokens.
-  if (appId) {
+  // Only register tools inside botmux sessions. Outside botmux, tools would
+  // fail anyway and just waste tool-description context tokens.
+  if (isBotmuxSession) {
     for (const [name, tool] of Object.entries(tools)) {
       server.tool(name, tool.description, tool.schema.shape, async (args: any) => {
         logger.info(`Tool called: ${name}`, args);
@@ -65,7 +68,7 @@ export function createServer(): McpServer {
       });
     }
   } else {
-    logger.info('MCP server: no LARK_APP_ID — running as empty shell (no tools, no instructions)');
+    logger.info('MCP server: not a botmux session — running as empty shell (no tools, no instructions)');
   }
 
   return server;

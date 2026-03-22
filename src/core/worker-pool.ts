@@ -124,11 +124,10 @@ export function ensureMcpConfig(cliId: CliId, cliPathOverride?: string): void {
     command: 'node',
     args: [serverScript],
     env: {
+      BOTMUX: '1',  // Static flag so MCP server knows it's a botmux session
       SESSION_DATA_DIR: config.session.dataDir,
-      // LARK_APP_ID/SECRET come from worker process env at runtime.
-      // BOTMUX_LARK_APP_ID is used by the MCP server to scope session store
-      // to the correct per-bot file. It's set here as a placeholder — the
-      // actual value comes from the worker's inherited env (LARK_APP_ID).
+      // LARK_APP_ID/SECRET come from worker process env at runtime
+      // (inherited through worker → CLI → MCP server process chain).
     },
   });
   mcpConfiguredCliIds.add(cliId);
