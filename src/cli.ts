@@ -856,7 +856,28 @@ async function cmdList(): Promise<void> {
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
 
-  if (active.length === 0) {
+  // Auto-prune unrecoverable sessions: process dead and no tmux session
+  const pruned: SessionData[] = [];
+  const live: SessionData[] = [];
+  for (const s of active) {
+    const hasPid = !!(s.pid && isProcessAlive(s.pid));
+    const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
+    if (s.pid && !hasPid && !hasTmux) {
+      pruned.push(s);
+    } else {
+      live.push(s);
+    }
+  }
+  if (pruned.length > 0) {
+    for (const s of pruned) {
+      s.status = 'closed';
+      s.closedAt = new Date().toISOString();
+      saveSession(s);
+    }
+    console.log(`已自动清理 ${pruned.length} 个不可恢复的会话（进程已死且无 tmux session）`);
+  }
+
+  if (live.length === 0) {
     console.log('没有活跃会话。');
     return;
   }
