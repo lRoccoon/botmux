@@ -280,7 +280,10 @@ export async function waitForStreamingCard(
     checkIntervalMs: 3_000,
   });
 
-  // Step 3: Handle repo selection card if present
+  // Step 3: Scroll thread panel to bottom to reveal latest content
+  await scrollThreadToBottom(agent);
+
+  // Step 4: Handle repo selection card if present
   const hasSkipButton = await agent.aiBoolean(
     '话题面板中可以看到"直接开启会话"按钮',
   );
@@ -288,10 +291,24 @@ export async function waitForStreamingCard(
     await agent.aiAct('点击话题面板中的"▶️ 直接开启会话"按钮');
   }
 
-  // Step 4: Wait for streaming card
+  // Step 5: Wait for streaming card
   await agent.aiWaitFor(
     '话题面板中出现了标题包含"启动中"或"工作中"或"就绪"的流式卡片',
     { timeoutMs, checkIntervalMs: 5_000 },
+  );
+}
+
+/**
+ * Scroll the thread panel to the bottom to reveal the latest replies.
+ * Call this before asserting on bot replies in the thread, because
+ * the panel doesn't always auto-scroll to show new messages.
+ */
+export async function scrollThreadToBottom(
+  agent: PlaywrightAgent,
+): Promise<void> {
+  await agent.aiScroll(
+    '右侧话题详情面板',
+    { direction: 'down', scrollCount: 10 },
   );
 }
 

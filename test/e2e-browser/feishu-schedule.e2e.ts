@@ -24,6 +24,7 @@ import {
   navigateToMessenger,
   openChat,
   waitForStreamingCard,
+  scrollThreadToBottom,
   closeSession,
 } from './helpers.js';
 
@@ -76,13 +77,17 @@ describe('scheduled task topic creation', () => {
     await sendThreadReply(agent, `/schedule 每小时 ${label}`);
     await page.waitForTimeout(5000);
 
-    // Extract the task ID from the bot's response (may appear in thread panel or main chat)
+    // Scroll thread panel to bottom to reveal the bot's response
+    await scrollThreadToBottom(agent);
+    await page.waitForTimeout(2000);
+
+    // Extract the task ID from the bot's response in the thread panel
     await agent.aiWaitFor(
-      '页面上出现了包含"✅ 定时任务已创建"的消息',
+      '话题面板中出现了包含"✅ 定时任务已创建"的消息',
       { timeoutMs: 30_000, checkIntervalMs: 3_000 },
     );
     const taskId = await agent.aiString(
-      '"定时任务已创建"消息中，"ID:"后面的值是什么（8个字符的ID）',
+      '话题面板中"定时任务已创建"消息里，"ID:"后面的值是什么（8个字符的ID）',
     );
 
     // Step 3: Trigger the task immediately
