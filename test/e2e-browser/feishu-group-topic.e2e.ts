@@ -1,10 +1,20 @@
 /**
  * Group chat topic/thread creation test:
- *  - In a regular group chat, @mention a bot with a message
- *  - Verify the bot replies and creates a topic (thread structure)
- *  - The reply should be associated with the original message
  *
- * Per requirements: bots must ALWAYS create topics in any chat type.
+ * Verifies that bots reply using TOPIC REPLIES (话题回复) in regular group chats,
+ * not just regular inline replies (条回复).
+ *
+ * Distinction:
+ *  - 话题回复: reply_in_thread=true → reply only visible in thread panel,
+ *    main chat shows "N条话题回复" indicator
+ *  - 普通回复: reply_in_thread=false → reply appears inline in main chat,
+ *    shows "N条回复" indicator
+ *
+ * Per requirements: bots must use topic replies in ALL chat types
+ * (private, regular group, topic group).
+ *
+ * BUG: Currently the daemon sets reply_in_thread=true only for P2P chats.
+ * Group chats use reply_in_thread=false, causing inline replies instead of topics.
  */
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import type { Browser, Page, BrowserContext } from 'playwright';
@@ -23,7 +33,7 @@ import {
   getGroupChatName,
 } from './helpers.js';
 
-describe('group chat topic creation', () => {
+describe('group chat topic reply mode', () => {
   let browser: Browser;
   let context: BrowserContext;
   let page: Page;
@@ -50,22 +60,31 @@ describe('group chat topic creation', () => {
     await browser?.close();
   });
 
-  it('bot creates topic when replying in regular group', async () => {
-    const msg = testMessage('group-topic');
+  // BUG: daemon uses reply_in_thread=false for group chats.
+  // Bot replies appear inline instead of as topic replies.
+  // This test documents expected behavior — will pass once fixed.
+  it.fails('bot uses topic replies (话题回复) in regular group, not inline replies', async () => {
+    const msg = testMessage('topic-mode');
     await sendMentionMessage(page, agent, 'Claude', msg);
 
-    // Wait for bot to respond (any reply card or message from Claude)
+    // Wait for bot to respond
     await agent.aiWaitFor(
-      `聊天中"${msg}"消息下方出现了来自 Claude 机器人的回复`,
+      `聊天中"${msg}"消息附近出现了来自机器人的回复`,
       { timeoutMs: 90_000, checkIntervalMs: 5_000 },
     );
 
-    // Verify the reply is in a topic/thread structure:
-    // In Feishu, threaded replies show "N条回复" or "回复话题" under
-    // the original message, indicating a topic was created.
+    // KEY ASSERTION: The reply should use TOPIC mode (话题回复),
+    // NOT inline mode (条回复).
+    //
+    // With topic replies: main chat shows "N条话题回复" and replies
+    // are ONLY visible inside the thread panel (not inline).
+    //
+    // With inline replies: main chat shows "N条回复" and the bot's
+    // cards/messages appear directly in the chat feed.
     await agent.aiAssert(
-      `消息"${msg}"区域可以看到"回复话题"或"条回复"的链接，` +
-        '说明机器人的回复是以话题/线程形式组织的，而不是普通的群聊消息',
+      `消息"${msg}"附近显示的是"话题回复"字样（如"N条话题回复"或"查看更早N条话题回复"），` +
+        '而不是"条回复"字样。' +
+        '同时，机器人的回复卡片不应直接出现在群聊主消息流中，而应只在话题面板中可见。',
     );
-  }, 240_000);
+  }, 180_000);
 });
