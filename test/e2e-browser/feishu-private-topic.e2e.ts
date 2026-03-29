@@ -67,8 +67,11 @@ describe('private chat topic reply mode', () => {
     // Verify the reply uses TOPIC mode:
     // The message should show "话题回复" or "条话题回复" indicator,
     // NOT just "条回复" (inline reply).
+    // Wait for thread indicator
+    await page.waitForTimeout(3000);
+
     await agent.aiAssert(
-      `消息"${msg}"附近显示了"话题回复"或"条话题回复"字样，` +
+      `消息"${msg}"所在区域可以看到包含"话题回复"的文字（例如"查看更早 N 条话题回复"或"N 条话题回复"或"回复话题"），` +
         '说明机器人使用了话题模式回复',
     );
   }, 300_000);

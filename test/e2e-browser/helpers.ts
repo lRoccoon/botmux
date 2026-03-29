@@ -40,8 +40,14 @@ export function getMessengerUrl(): string {
   return `${url.origin}/next/messenger`;
 }
 
+/** Regular group chat name (普通群). */
 export function getGroupChatName(): string {
   return process.env.FEISHU_TEST_GROUP_CHAT_NAME ?? '普通群聊';
+}
+
+/** Topic group chat name (话题群). */
+export function getTopicGroupChatName(): string {
+  return process.env.FEISHU_TEST_TOPIC_GROUP_NAME ?? '话题群聊';
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +145,7 @@ export async function openChat(
   // Try clicking directly first
   try {
     await agent.aiAct(
-      `在左侧聊天列表中，点击名称包含"${chatName}"的对话`,
+      `在左侧聊天列表中，点击名称完全匹配"${chatName}"的对话（群聊或私聊入口，不是话题里的消息）`,
     );
   } catch {
     // Chat not visible in sidebar — use search to find it
@@ -148,14 +154,17 @@ export async function openChat(
     await page.keyboard.type(chatName);
     await page.waitForTimeout(2000);
     await agent.aiAct(
-      `在搜索结果中，点击名称包含"${chatName}"的对话`,
+      `在搜索结果中，点击名称为"${chatName}"的群聊或对话`,
     );
+    // Close search overlay if still open
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(500);
   }
-  // Wait for chat to load
-  await agent.aiWaitFor(`右侧聊天区域显示了与"${chatName}"的对话`, {
-    timeoutMs: 15_000,
-    checkIntervalMs: 3_000,
-  });
+  // Wait for chat to load — verify by checking the chat header
+  await agent.aiWaitFor(
+    `右侧聊天区域顶部标题栏显示"${chatName}"`,
+    { timeoutMs: 15_000, checkIntervalMs: 3_000 },
+  );
 }
 
 // ---------------------------------------------------------------------------
