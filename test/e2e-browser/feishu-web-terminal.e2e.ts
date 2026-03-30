@@ -80,7 +80,7 @@ describe('feishu web terminal', () => {
     expect(cardContent).toBeTruthy();
 
     // Scroll down in thread panel to reveal card buttons below expanded content
-    await agent.aiScroll(undefined, { direction: 'down', scrollCount: 3 });
+    await agent.aiScroll(undefined, { direction: 'down', scrollType: 'untilBottom' });
     await page.waitForTimeout(1000);
 
     // Open terminal: listen for popup OR navigation simultaneously

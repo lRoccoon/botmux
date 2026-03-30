@@ -75,7 +75,7 @@ export function checkPrerequisites(): void {
   if (missing.length > 0) {
     throw new Error(
       `Missing env vars: ${missing.join(', ')}\n` +
-        'Copy .env.example to .env and fill in your values.',
+      'Copy .env.example to .env and fill in your values.',
     );
   }
 
@@ -88,8 +88,8 @@ export function checkPrerequisites(): void {
     const installCmd = missingFonts.map((f) => f.name).join(' ');
     console.warn(
       `Warning: missing fonts (${missingFonts.map((f) => f.purpose).join(', ')}):\n` +
-        `  apt install ${installCmd}\n` +
-        'Tests will run but emoji/CJK may render as squares.',
+      `  apt install ${installCmd}\n` +
+      'Tests will run but emoji/CJK may render as squares.',
     );
   }
 }
@@ -145,7 +145,7 @@ export async function openChat(
   // Try clicking directly first
   try {
     await agent.aiAct(
-      `在左侧聊天列表中，点击名称完全匹配"${chatName}"的对话（群聊或私聊入口，不是话题里的消息）`,
+      `在左侧"消息"列表中或者"消息"列表的置顶会话中，点击名称完全匹配"${chatName}"的对话（群聊或私聊入口，不是话题里的消息）`,
     );
   } catch {
     // Chat not visible in sidebar — use search to find it
@@ -322,7 +322,7 @@ export async function scrollThreadToBottom(
 ): Promise<void> {
   await agent.aiScroll(
     '右侧话题详情面板',
-    { direction: 'down', scrollCount: 10 },
+    { direction: 'down', scrollType: 'untilBottom' },
   );
 }
 
