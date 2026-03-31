@@ -1030,7 +1030,7 @@ function cmdDelete(): void {
 
 function showHelp(): void {
   console.log(`
-botmux — IM ↔ AI 编程 CLI 桥接
+botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 
 命令:
   setup       交互式配置（首次使用 / 添加机器人）
@@ -1053,9 +1053,21 @@ botmux — IM ↔ AI 编程 CLI 桥接
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+function getVersion(): string {
+  const pkgPath = join(PKG_ROOT, 'package.json');
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    return pkg.version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 const command = process.argv[2];
 
 switch (command) {
+  case '--version':
+  case '-v':      console.log(getVersion()); break;
   case 'setup':   await cmdSetup(); break;
   case 'start':   cmdStart(); break;
   case 'stop':    cmdStop(); break;
