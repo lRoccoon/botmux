@@ -40,7 +40,8 @@ Worker (worker.ts) -- forked per session
     |-- IPC: daemon communication
     |
 AI Coding CLI (interactive TTY)
-    |-- MCP Server (stdio): send_to_thread, get_thread_messages, react_to_message
+    |-- Auto-installed Skills (~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/)
+    |-- ~/.botmux/bin/botmux wrapper on PATH → `botmux send/schedule/bots/thread` subcommands
     |
 Lark API
     |-- Replies, reactions, card updates, DMs
@@ -50,12 +51,11 @@ Lark API
 
 ```
 src/
-  cli.ts                    # CLI entry (setup/start/stop/restart/logs/list/delete)
+  cli.ts                    # CLI entry (setup/start/stop/restart/logs/list/delete + send/bots/schedule/thread subcommands)
   daemon.ts                 # Daemon orchestrator
   worker.ts                 # Worker: CLI + PTY management, web terminal
   bot-registry.ts           # Multi-bot registry
   config.ts                 # Environment config
-  server.ts                 # MCP server
   types.ts                  # IPC message types
   adapters/
     cli/
@@ -83,11 +83,9 @@ src/
       card-handler.ts       # Lark card interaction handling
       card-builder.ts       # Lark interactive card builders
       message-parser.ts     # Lark event message parsing
-  tools/
-    index.ts                # MCP tool registry
-    send-to-thread.ts       # MCP: send message to thread
-    get-thread-messages.ts  # MCP: read thread messages
-    react-to-message.ts     # MCP: emoji reactions
+  skills/
+    definitions.ts          # Built-in Skill markdown (botmux-send/schedule/bots/thread-messages)
+    installer.ts            # Syncs skills into each CLI's native skills dir
   services/
     session-store.ts        # Session persistence (JSON)
     schedule-store.ts       # Scheduled task persistence
@@ -99,17 +97,46 @@ src/
     logger.ts               # Logging utility
 ```
 
-## MCP Tools
+## CLI-Agent Interaction (Skills + CLI subcommands)
 
-The CLI communicates with Lark through three MCP tools exposed via stdio:
+botmux previously exposed its Lark-interaction capabilities as MCP tools.
+As of April 2026, everything has been migrated to **CLI subcommands** (`botmux send`,
+`botmux schedule`, `botmux bots`, `botmux thread messages`) paired with
+auto-installed **Skills** that teach the agent when/how to use them.
 
-| Tool | Description |
-|------|-------------|
-| `send_to_thread` | Send a message (plain text or rich post) to the Lark thread |
-| `get_thread_messages` | Retrieve message history from the thread |
-| `react_to_message` | Add or remove emoji reactions on messages |
+**Runtime setup per CLI worker spawn** (see `src/core/worker-pool.ts`):
 
-MCP config is auto-injected by each CLI adapter's `ensureMcpConfig()` method at session startup.
+1. `ensureCliSkills(cliId)` — writes `src/skills/definitions.ts` content
+   into the CLI's native skill dir (`~/.claude/skills/`, `~/.gemini/skills/`,
+   `~/.config/opencode/skills/`). Synchronous, idempotent per lifecycle.
+2. `cleanupLegacyMcpConfig(cliId)` — best-effort removes the stale `botmux`
+   MCP entry from `~/.claude.json` / `~/.aiden/.mcp.json` /
+   `~/.config/opencode/opencode.json` / `<cli> mcp remove botmux`, so users
+   upgrading from the pre-migration version don't see "MCP server failed" errors.
+3. Worker `PATH` is prepended with `~/.botmux/bin`, which contains a
+   `botmux` shell wrapper written by the daemon at startup (points at the
+   running daemon's `dist/cli.js` — always in sync).
+4. `--append-system-prompt` flag injects the routing instruction
+   ("user reads Lark, not terminal — use `botmux send` for user-facing content")
+   into each CLI session.
+5. Every user message carries a per-message hint (`[回复请用 botmux send]`)
+   appended in `buildFollowUpContent` to keep the instruction near the attention
+   window even in long conversations.
+
+### CLI subcommands (agent-facing)
+
+| Subcommand | Description |
+|------------|-------------|
+| `botmux send [content]` | Send message to current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--mention` flags) |
+| `botmux bots list` | List bots in current chat with their `open_id`s |
+| `botmux thread messages [--limit N]` | Fetch thread message history (JSON) |
+| `botmux schedule add <schedule> <prompt>` | Create scheduled task bound to current thread |
+| `botmux schedule list/remove/pause/resume/run` | Manage tasks |
+
+All agent-facing subcommands auto-detect session context by walking the
+process tree looking for a CLI-pid marker written by the worker
+(`{dataDir}/.botmux-cli-pids/{pid}`). No MCP needed — works across every
+CLI that can spawn child processes.
 
 ## Adding a New CLI Adapter
 
@@ -126,7 +153,7 @@ The `CliAdapter` interface requires:
 | `resolvedBin` | Path to the CLI binary |
 | `buildArgs()` | Construct CLI launch arguments |
 | `writeInput()` | Write user input to the PTY (handles multi-line, Enter key timing) |
-| `ensureMcpConfig()` | Register the botmux MCP server in the CLI's config |
+| `skillsDir` | Absolute path to the CLI's skills directory (optional; Skills only installed when set) |
 | `completionPattern` | Regex to detect when a turn is complete (optional) |
 | `readyPattern` | Regex to detect when the CLI is ready for input (optional) |
 | `systemHints` | System-level hints injected into the CLI (optional) |
@@ -135,9 +162,8 @@ The `CliAdapter` interface requires:
 ## Tests
 
 ```bash
-pnpm test                # Run all tests
-pnpm test:codex          # Codex input E2E test
-pnpm test:mcp            # Codex MCP E2E test
-pnpm test:claude-mcp     # Claude Code MCP E2E test
-pnpm test:gemini         # Gemini CLI input E2E test
+pnpm test                # Run all tests (unit + E2E)
+pnpm test:codex          # Codex input E2E
+pnpm test:gemini         # Gemini CLI input E2E
+# MCP-specific test scripts have been removed along with the MCP server
 ```

@@ -124,26 +124,33 @@ BACKEND_TYPE=pty botmux start
 ```
 
 - **共享模式** — Botmux 接入后，iTerm2 和飞书双向同步：流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端
-- **一键接管** — 点击流式卡片上的「🔄 接管」按钮，Botmux 以 `--resume` 重建会话，启用 MCP，转为标准 Botmux 会话
+- **一键接管** — 点击流式卡片上的「🔄 接管」按钮，Botmux 以 `--resume` 重建会话，转为标准 Botmux 会话
 - **安全断开** — 点击「⏏ 断开」，Botmux 退出观察，原 CLI 不受影响
 
 ### 定时任务
 
-基于 Cron 的周期性任务，支持中文自然语言配置。
+支持三种调度类型 + 中文自然语言，支持原话题延续（到点在同一话题内继续，不另开 thread）。
 
-```
-/schedule 每日17:50 帮我看看AI圈有什么新闻
-/schedule 工作日每天9:00 检查服务状态
-/schedule 每周一10:00 生成周报
-```
+**两种创建方式**：
+- **斜杠命令**（快捷）：`/schedule 每日17:50 帮我看看AI圈有什么新闻`
+- **对话触发**（灵活）：直接跟 agent 说「帮我加个每天 18:00 检查部署的定时任务」，自动触发 `botmux-schedule` Skill
 
-### MCP 集成
+支持的调度格式：
+- 中文自然语言：`每日17:50` / `每周一10:00` / `30分钟后` / `明天9:00`
+- 英文 duration/interval：`30m` / `2h` / `every 30m` / `every 2h`
+- Cron 表达式：`0 9 * * *`
+- ISO 时间戳：`2026-05-01T10:00`
 
-CLI 可通过 MCP 工具与飞书话题交互：
+### 与飞书话题的交互（Skill + CLI）
 
-- 回复飞书话题
-- 读取消息历史
-- 添加表情回应
+CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一组开箱即用的 Skill：
+
+- `botmux send` — 向当前话题发消息（支持文本、图片、文件、@mention）
+- `botmux thread messages` — 读取当前话题的历史消息
+- `botmux bots list` — 查询当前群聊的机器人及 open_id
+- `botmux schedule` — 增删改查定时任务
+
+这些能力通过 `--append-system-prompt` 注入和 Skill 描述自动引导 agent 使用，老用户熟悉的 MCP 入口已移除（旧配置会被自动清理）。
 
 ---
 
@@ -254,7 +261,7 @@ botmux start
 4. 话题中出现实时流式卡片，展示终端输出并支持 Markdown 渲染
 5. 每次回复创建新的流式卡片，上一轮卡片冻结在最后状态
 6. 点击卡片上的「🔑 获取操作链接」通过私聊获取可写终端链接
-7. CLI 通过 MCP 工具在话题中回复
+7. CLI 通过 `botmux send` 命令在话题中回复（由 `botmux-send` Skill 自动引导）
 
 ### 斜杠命令
 
@@ -275,12 +282,27 @@ botmux start
 
 ### 定时任务管理
 
-用自然语言创建周期性任务：
+**推荐方式：跟 agent 对话**
+直接说「每天 9:00 帮我生成昨天 PR 汇总」，agent 会用 `botmux-schedule` Skill 处理并跟你确认。
+
+**斜杠命令方式（快捷）**
 
 ```
+# 中文自然语言
 /schedule 每日17:50 帮我看看AI圈有什么新闻
 /schedule 工作日每天9:00 检查服务状态
 /schedule 每周一10:00 生成周报
+
+# 一次性任务
+/schedule 30分钟后 检查部署状态
+/schedule 明天9:00 发早会提醒
+
+# 英文语法
+/schedule every 2h 巡检服务
+/schedule 30m 提醒我喝水
+
+# 标准 cron
+/schedule 0 9 * * * 早安问候
 ```
 
 管理任务：
@@ -292,6 +314,8 @@ botmux start
 /schedule disable <id>
 /schedule run <id>
 ```
+
+**任务执行行为**：到点会在**创建任务的原话题**内续一条消息并执行，不会另开 thread。工作目录与创建时一致。如果原话题的会话还活着，prompt 直接注入现有会话（不另起 worker）。
 
 ---
 
@@ -310,6 +334,20 @@ botmux start
 | `botmux delete <id>` | 关闭指定会话，支持 ID 前缀匹配（别名 `del`/`rm`） |
 | `botmux delete all` | 关闭所有活跃会话 |
 | `botmux delete stopped` | 清理所有进程已退出的僵尸会话 |
+
+### 会话内子命令（给 CLI agent 用）
+
+会话内的 agent 可以直接调用这些命令，session 信息通过祖先进程标记自动推断：
+
+| 命令 | 说明 |
+|------|------|
+| `botmux send [content]` | 向当前话题发消息。支持 stdin / heredoc / `--content-file` 传内容，`--images`/`--files`/`--mention` 附加资源 |
+| `botmux bots list` | 列出当前群聊中的机器人（含 open_id，供 `--mention` 使用） |
+| `botmux thread messages [--limit N]` | 拉取当前话题的消息历史（JSON） |
+| `botmux schedule add <schedule> <prompt>` | 创建定时任务（自动绑定当前话题） |
+| `botmux schedule list/remove/pause/resume/run` | 管理定时任务 |
+
+这些命令依赖 `~/.botmux/bin/botmux` 这个 wrapper 脚本，daemon 启动时自动写入并加入 worker 的 PATH，版本始终与 daemon 一致（不需要 `npm i -g`）。
 
 ---
 

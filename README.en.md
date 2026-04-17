@@ -220,26 +220,35 @@ Seamlessly connect Botmux to CLI processes already running in tmux — monitor a
 ```
 
 - **Shared mode** — After adopting, iTerm2 and Lark stay in sync: streaming card shows real-time terminal output, Lark chat input is forwarded directly to the terminal
-- **One-click takeover** — Click the "Takeover" button on the streaming card to rebuild the session with `--resume`, enable MCP, and convert to a standard Botmux session
+- **One-click takeover** — Click the "Takeover" button on the streaming card to rebuild the session with `--resume` and convert to a standard Botmux session
 - **Safe disconnect** — Click "Disconnect" to detach Botmux without affecting the original CLI
 
 ### Scheduled Tasks
 
-Create recurring tasks with natural language:
+Three schedule types (once / interval / cron) with Chinese/English natural
+language, executed inside the original thread (no new topic per run).
 
-```
-/schedule every day at 17:50 check AI news
-/schedule weekdays at 9:00 run health check
-/schedule every Monday at 10:00 generate weekly report
-```
+**Two ways to create**:
+- **Slash command** (quick): `/schedule 每日17:50 check AI news`
+- **Conversation** (flexible): just tell the agent "add a reminder for every day at 9:00 to check deploys" — the `botmux-schedule` Skill fires automatically.
 
-### MCP Integration
+Supported formats: Chinese NL (`每日17:50` / `30分钟后` / `明天9:00`),
+English duration (`30m`), interval (`every 2h`), cron (`0 9 * * *`),
+ISO timestamp (`2026-05-01T10:00`).
 
-botmux exposes MCP tools so the CLI can interact with Lark directly:
+### Lark integration (Skill + CLI)
 
-- Reply to the current Lark thread
-- Read message history from the thread
-- Add emoji reactions to messages
+When a CLI spawns inside a botmux session it automatically gets
+`~/.botmux/bin` on PATH plus a set of ready-to-use Skills:
+
+- `botmux send` — send a message to the current thread (text, images, files, @mention)
+- `botmux thread messages` — fetch thread history
+- `botmux bots list` — discover bots + their `open_id`s
+- `botmux schedule` — manage scheduled tasks
+
+These capabilities are wired via `--append-system-prompt` and Skill
+descriptions, so the agent picks them up automatically. The pre-April-2026
+MCP entry point has been removed (stale config is auto-cleaned on upgrade).
 
 ---
 
@@ -253,7 +262,7 @@ botmux exposes MCP tools so the CLI can interact with Lark directly:
 4. A live streaming card appears in the thread, showing real-time terminal output with markdown rendering
 5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
 6. Click "Get Write Link" on the card to receive a write-enabled terminal URL via DM
-7. The CLI replies in the thread via MCP tools
+7. The CLI replies in the thread via the `botmux send` command (wired through the `botmux-send` Skill)
 
 ### Slash Commands
 
@@ -274,6 +283,31 @@ botmux exposes MCP tools so the CLI can interact with Lark directly:
 
 ### Scheduled Task Management
 
+**Recommended: talk to the agent**
+Just say "add a reminder to summarize yesterday's PRs every morning at 9:00" — the `botmux-schedule` Skill handles it and confirms with you.
+
+**Slash command (quick)**
+
+```
+# Chinese NL
+/schedule 每日17:50 check AI news
+/schedule 工作日每天9:00 run health check
+/schedule 每周一10:00 generate weekly report
+
+# One-shot
+/schedule 30分钟后 verify deployment
+/schedule 明天9:00 standup reminder
+
+# English
+/schedule every 2h probe services
+/schedule 30m remind me to drink water
+
+# Cron
+/schedule 0 9 * * * good morning
+```
+
+Manage tasks:
+
 ```
 /schedule list
 /schedule remove <id>
@@ -281,6 +315,8 @@ botmux exposes MCP tools so the CLI can interact with Lark directly:
 /schedule disable <id>
 /schedule run <id>
 ```
+
+**Execution behavior**: the task fires inside the **original thread where it was created** — no new topic per run. Working directory is preserved. If the original session is still alive, the prompt is injected into it; otherwise a fresh worker spawns bound to the same thread root.
 
 ---
 
@@ -361,6 +397,20 @@ botmux setup
 | `botmux delete <id>` | Close a session by ID prefix (alias: `del`/`rm`) |
 | `botmux delete all` | Close all active sessions |
 | `botmux delete stopped` | Clean up zombie sessions with dead processes |
+
+### Agent-facing subcommands
+
+Run from inside a botmux-spawned CLI session — session context is auto-detected via ancestor process markers:
+
+| Subcommand | Description |
+|------------|-------------|
+| `botmux send [content]` | Send a message to the current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--mention` flags) |
+| `botmux bots list` | List bots in the current chat (includes `open_id` for `--mention`) |
+| `botmux thread messages [--limit N]` | Fetch thread message history (JSON) |
+| `botmux schedule add <schedule> <prompt>` | Create a scheduled task bound to the current thread |
+| `botmux schedule list/remove/pause/resume/run` | Manage scheduled tasks |
+
+These require the `~/.botmux/bin/botmux` wrapper, which the daemon writes at startup and prepends to the worker's `PATH` — always matches the running daemon's version (no `npm i -g` needed).
 
 ---
 
