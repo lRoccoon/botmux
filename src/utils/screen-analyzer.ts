@@ -81,6 +81,12 @@ toggleKey: the key used to toggle a checkbox item. Read the hint line at the bot
 confirmKey: the key used to confirm/submit. Usually "Enter".
 multiSelect: true if checkboxes ([ ]/[✓]/[✗], "可多选"), false for single-select (❯ cursor).
 
+IMPORTANT for multiSelect prompts:
+- There is almost always a Submit/Next/Done button. Look for items like "Submit", "Next", "Submit answers", "Done" — they are navigable items with type "confirm".
+- "Submit" may appear AFTER "Type something" as a sub-item or on the next line. It is still a separate navigable option — include it with its own index.
+- If the cursor (❯) is pointing at "Submit" or "Next", that is a confirm-type option.
+- Count its index correctly — it is a navigable position between "Type something" and "Chat about this".
+
 Important: "index" is the COUNT of ↓ presses needed to reach this option from the FIRST option (index 0). The first option is always index 0.
 
 Rules for checkAgainWhen:
@@ -194,6 +200,10 @@ export class ScreenAnalyzer {
     let analysis: ScreenAnalysis;
     try {
       analysis = await this.callAI(snapshot);
+      if (analysis.needsInteraction) {
+        this.callbacks.log(`ScreenAnalyzer AI input:\n${snapshot.slice(-1500)}`);
+        this.callbacks.log(`ScreenAnalyzer AI response: ${JSON.stringify(analysis)}`);
+      }
     } catch (err: any) {
       this.callbacks.log(`ScreenAnalyzer AI call failed: ${err.message}`);
       this.waitingForContentChange = true;
@@ -220,6 +230,21 @@ export class ScreenAnalyzer {
       // Generate keys deterministically in code, using AI-provided index + toggleKey/confirmKey
       const toggleKey = analysis.toggleKey || 'Space';
       const confirmKey = analysis.confirmKey || 'Enter';
+
+      // Fallback: if multiSelect but AI didn't return any confirm option,
+      // add a synthetic "Submit" confirm at the end (uses Enter at current position)
+      if (analysis.multiSelect && !analysis.options.some(o => o.type === 'confirm')) {
+        const maxIndex = Math.max(...analysis.options.map(o => o.index));
+        analysis.options.push({
+          label: '✅',
+          text: 'Submit',
+          selected: false,
+          type: 'confirm',
+          index: maxIndex + 1,
+        });
+        this.callbacks.log('ScreenAnalyzer: auto-added fallback confirm button');
+      }
+
       for (const opt of analysis.options) {
         const keys: string[] = [];
         for (let i = 0; i < opt.index; i++) keys.push('Down');

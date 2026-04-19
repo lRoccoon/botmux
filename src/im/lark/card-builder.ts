@@ -392,6 +392,7 @@ export function buildTuiPromptCard(
   // Form with input field for "Type something" options
   if (hasInputOption) {
     const inputOpt = options.find(o => o.type === 'input');
+    elements.push({ tag: 'hr' });
     elements.push({
       tag: 'form',
       name: 'tui_input_form',
@@ -403,7 +404,7 @@ export function buildTuiPromptCard(
         },
         {
           tag: 'button',
-          text: { tag: 'plain_text', content: '发送' },
+          text: { tag: 'plain_text', content: '📝 发送自定义回复' },
           type: 'primary',
           name: 'tui_input_submit',
           action_type: 'form_submit',
