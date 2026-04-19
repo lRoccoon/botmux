@@ -331,9 +331,11 @@ function killCli(): void {
 
 function startWebServer(host: string, preferredPort?: number): Promise<number> {
   return new Promise((resolve, reject) => {
-    httpServer = createHttpServer((_req, res) => {
+    httpServer = createHttpServer((req, res) => {
+      const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+      const hasWrite = url.searchParams.get('token') === writeToken;
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml());
+      res.end(getTerminalHtml(hasWrite));
     });
 
     wss = new WebSocketServer({ server: httpServer });
@@ -441,7 +443,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
   });
 }
 
-function getTerminalHtml(): string {
+function getTerminalHtml(hasWrite: boolean): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
 <html>
@@ -471,10 +473,16 @@ body{display:flex;flex-direction:column}
   color:#565f89;background:#1a1b26cc;padding:2px 8px;border-radius:4px}
 #status.ok{color:#9ece6a}
 #status.err{color:#f7768e}
+#readonly-banner{display:none;position:fixed;top:0;left:0;right:0;z-index:50;
+  padding:6px 12px;text-align:center;font:12px monospace;color:#f7768e;
+  background:rgba(247,118,142,0.12);border-bottom:1px solid rgba(247,118,142,0.35);
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);pointer-events:none}
+#readonly-banner.show{display:block}
 </style>
 </head>
 <body>
 <div id="terminal"></div>
+<div id="readonly-banner">只读模式 · 无写入权限</div>
 <div id="toolbar">
   <button data-k="esc">Esc</button>
   <button data-k="ctrlc">^C</button>
@@ -494,6 +502,8 @@ body{display:flex;flex-direction:column}
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch)document.getElementById('vp').content='width=1100,viewport-fit=cover';
+var hasToken=${hasWrite};
+if(!hasToken)document.getElementById('readonly-banner').classList.add('show');
 
 var term=new Terminal({
   theme:{background:'#1a1b26',foreground:'#a9b1d6',cursor:'#c0caf5',
@@ -527,11 +537,26 @@ function _showCopied(){
   setTimeout(function(){d.style.opacity='0'},800);
   setTimeout(function(){document.body.removeChild(d)},1200);
 }
+var _roToastT=0;
+function _showReadonlyToast(){
+  var now=Date.now();
+  if(now-_roToastT<2000)return;
+  _roToastT=now;
+  var d=document.createElement('div');
+  d.textContent='只读模式，无法输入';
+  d.style.cssText='position:fixed;top:40px;left:50%;transform:translateX(-50%);z-index:999;background:#f7768e;color:#1a1b26;padding:4px 16px;border-radius:4px;font:13px monospace;pointer-events:none;opacity:1;transition:opacity .4s';
+  document.body.appendChild(d);
+  setTimeout(function(){d.style.opacity='0'},1200);
+  setTimeout(function(){if(d.parentNode)d.parentNode.removeChild(d)},1600);
+}
 document.getElementById('terminal').addEventListener('contextmenu',function(e){e.preventDefault()});
 
 // ── WebSocket ──
 var ws_=null,el=document.getElementById('status');
-term.onData(function(d){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}))});
+term.onData(function(d){
+  if(!hasToken){_showReadonlyToast();return;}
+  if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}));
+});
 function sendResize(){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'resize',cols:term.cols,rows:term.rows}))}
 window.addEventListener('resize',function(){fit.fit();sendResize()});
 (function connect(){
@@ -551,7 +576,6 @@ window.addEventListener('resize',function(){fit.fit();sendResize()});
 })();
 
 // ── Read-only scroll handling ──
-var hasToken=!!new URLSearchParams(location.search).get('token');
 if(!hasToken&&!${isTmuxMode}){
   // Non-tmux read-only: CLI mouse mode blocks local scroll, override with scrollLines
   document.getElementById('terminal').addEventListener('wheel',function(e){
