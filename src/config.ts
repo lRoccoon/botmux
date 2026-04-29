@@ -41,6 +41,14 @@ export const config = {
     host: process.env.WEB_HOST ?? '0.0.0.0',
     externalHost: process.env.WEB_EXTERNAL_HOST ?? getLocalIp(),
   },
+  dashboard: {
+    host: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
+    port: Number(process.env.BOTMUX_DASHBOARD_PORT) || 7891,
+    externalHost: process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST
+      ?? process.env.WEB_EXTERNAL_HOST
+      ?? getLocalIp(),
+    ipcBasePort: Number(process.env.BOTMUX_DAEMON_IPC_BASE_PORT) || 7892,
+  },
   screenAnalyzer: {
     enabled: (process.env.SCREEN_ANALYZER_ENABLED ?? '').toLowerCase() === 'true',
     baseUrl: process.env.SCREEN_ANALYZER_BASE_URL ?? '',

@@ -36,7 +36,7 @@ import {
   CARD_POSTING_SENTINEL,
   closeSession as closeSessionHelper,
 } from './core/worker-pool.js';
-import { setBotName } from './core/dashboard-ipc-server.js';
+import { setBotName, startIpcServer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -788,8 +788,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Publish self-descriptor for the dashboard registry. The dashboard sibling
   // process discovers running daemons by scanning ~/.botmux/data/dashboard-daemons/
   // and watching for mtime updates (heartbeat) / file removal (shutdown).
-  // ipcPort is allocated here but the IPC server itself is bound by a later task.
-  const ipcPort = (Number(process.env.BOTMUX_DAEMON_IPC_BASE_PORT) || 7892) + idx;
+  const ipcPort = config.dashboard.ipcBasePort + idx;
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
     botName: cfg.larkAppId,
@@ -827,6 +826,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // /bot/v3/info is wired into the registry descriptor (above) but the IPC server
   // also needs its own copy for SessionRow.botName.
   setBotName(cfg.larkAppId);
+
+  // Bind dashboard IPC HTTP server. Binds to 127.0.0.1 only — the dashboard
+  // sibling process is the sole consumer and runs on the same host.
+  const ipcHandle = await startIpcServer({ port: ipcPort, host: '127.0.0.1' });
+  logger.info(`[dashboard-ipc] listening on 127.0.0.1:${ipcHandle.port} (bot ${idx})`);
 
   // Per-bot initialization
   for (const bot of getAllBots()) {
@@ -897,6 +901,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     scheduler.stopScheduler();
     clearInterval(descriptorHeartbeat);
     removeDaemonDescriptor(cfg.larkAppId);
+    ipcHandle.close().catch(() => { /* swallow */ });
     for (const [, ds] of activeSessions) {
       if (ds.worker && !ds.worker.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
