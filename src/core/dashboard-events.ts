@@ -1,5 +1,4 @@
 // src/core/dashboard-events.ts
-import type { CliId } from '../adapters/cli/types.js';
 
 /** Event union — every payload is JSON-serialisable. */
 export type DashboardEvent =
