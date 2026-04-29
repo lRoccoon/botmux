@@ -17,7 +17,7 @@
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd)
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -378,6 +378,24 @@ function cmdStart(): void {
   }
 }
 
+/**
+ * Wipe stale dashboard-daemon descriptors (mtime older than 5 minutes).
+ * Live daemons refresh their descriptor every 30s via heartbeat; anything
+ * older is from a daemon that exited without cleaning up. Called as part of
+ * the pm2 zombie-cleanup flow so the dashboard registry stays consistent.
+ */
+function cleanupStaleDaemonDescriptors(): void {
+  const regDir = join(DATA_DIR, 'dashboard-daemons');
+  if (!existsSync(regDir)) return;
+  for (const f of readdirSync(regDir)) {
+    const fp = join(regDir, f);
+    try {
+      const stat = statSync(fp);
+      if (Date.now() - stat.mtimeMs > 5 * 60_000) unlinkSync(fp);
+    } catch { /* ignore */ }
+  }
+}
+
 /** Delete all pm2 processes matching botmux / botmux-* under the given PM2_HOME. */
 function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
   try {
@@ -442,6 +460,8 @@ function cmdStop(): void {
       }
     }
   } catch { /* */ }
+  // Wipe abandoned dashboard-daemon descriptors left behind by stopped daemons.
+  cleanupStaleDaemonDescriptors();
   if (!stopped) console.log('daemon 未在运行。');
 }
 
@@ -456,6 +476,8 @@ function cmdRestart(): void {
   cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
+  // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
+  cleanupStaleDaemonDescriptors();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {

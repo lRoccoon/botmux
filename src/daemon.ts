@@ -137,6 +137,37 @@ function removePidFile(): void {
   }
 }
 
+// ─── Daemon descriptor (dashboard registry) ─────────────────────────────────
+// Each per-bot daemon publishes a self-descriptor JSON at
+// ~/.botmux/data/dashboard-daemons/<larkAppId>.json so the dashboard sibling
+// process can discover all running daemons. The file is touched every 30s as
+// a heartbeat (mtime drives offline detection) and removed on graceful exit.
+
+const DAEMON_REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
+
+interface DaemonDescriptor {
+  larkAppId: string;
+  botName: string;
+  botIndex: number;
+  ipcPort: number;
+  pid: number;
+  startedAt: number;
+  lastHeartbeat: number;
+}
+
+function writeDaemonDescriptor(d: DaemonDescriptor): void {
+  mkdirSync(DAEMON_REGISTRY_DIR, { recursive: true });
+  const fp = join(DAEMON_REGISTRY_DIR, `${d.larkAppId}.json`);
+  writeFileSync(fp, JSON.stringify(d), { mode: 0o600 });
+}
+
+function removeDaemonDescriptor(larkAppId: string): void {
+  const fp = join(DAEMON_REGISTRY_DIR, `${larkAppId}.json`);
+  if (existsSync(fp)) {
+    try { unlinkSync(fp); } catch { /* ignore */ }
+  }
+}
+
 // ─── Version tracking ────────────────────────────────────────────────────────
 
 function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
@@ -747,6 +778,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   writePidFile();
 
+  // Publish self-descriptor for the dashboard registry. The dashboard sibling
+  // process discovers running daemons by scanning ~/.botmux/data/dashboard-daemons/
+  // and watching for mtime updates (heartbeat) / file removal (shutdown).
+  // ipcPort is allocated here but the IPC server itself is bound by a later task.
+  const ipcPort = (Number(process.env.BOTMUX_DAEMON_IPC_BASE_PORT) || 7892) + idx;
+  const desc: DaemonDescriptor = {
+    larkAppId: cfg.larkAppId,
+    botName: cfg.larkAppId,
+    botIndex: idx,
+    ipcPort,
+    pid: process.pid,
+    startedAt: Date.now(),
+    lastHeartbeat: Date.now(),
+  };
+  writeDaemonDescriptor(desc);
+  const descriptorHeartbeat = setInterval(() => {
+    desc.lastHeartbeat = Date.now();
+    try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+  }, 30_000);
+  // Don't keep the event loop alive on this interval alone.
+  if (typeof descriptorHeartbeat.unref === 'function') descriptorHeartbeat.unref();
+
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -819,6 +872,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const shutdown = () => {
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
     scheduler.stopScheduler();
+    clearInterval(descriptorHeartbeat);
+    removeDaemonDescriptor(cfg.larkAppId);
     for (const [, ds] of activeSessions) {
       if (ds.worker && !ds.worker.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
@@ -843,6 +898,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+  // Best-effort cleanup on plain `exit` (e.g. uncaught fatal). No worker
+  // shutdown here since the process is already on its way out — just remove
+  // the descriptor so the dashboard doesn't see a phantom daemon.
+  process.on('exit', () => {
+    clearInterval(descriptorHeartbeat);
+    removeDaemonDescriptor(cfg.larkAppId);
+  });
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');
 }
