@@ -832,9 +832,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     }
 
-    // Probe bot open_id and persist to bots-info.json
+    // Probe bot open_id and persist to bots-info.json. When the friendly
+    // botName comes back from /bot/v3/info, refresh the dashboard descriptor
+    // so the registry shows "Claude" / "Codex" instead of the raw app id.
     probeBotOpenId(cfg.larkAppId).then(() => {
       writeBotInfoFile(config.session.dataDir);
+      const probedName = bot.botName;
+      if (probedName && probedName !== desc.botName) {
+        desc.botName = probedName;
+        try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+      }
     }).catch(err => {
       logger.warn(`[${cfg.larkAppId}] Bot open_id probe failed: ${err.message}`);
     });

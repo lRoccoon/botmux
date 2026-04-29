@@ -388,6 +388,7 @@ function cleanupStaleDaemonDescriptors(): void {
   const regDir = join(DATA_DIR, 'dashboard-daemons');
   if (!existsSync(regDir)) return;
   for (const f of readdirSync(regDir)) {
+    if (!f.endsWith('.json')) continue;
     const fp = join(regDir, f);
     try {
       const stat = statSync(fp);
