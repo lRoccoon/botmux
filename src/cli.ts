@@ -2012,14 +2012,25 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (targetAppIds.size > 0) {
       const signalDir = join(dataDir, 'bot-mentions');
       if (!existsSync(signalDir)) mkdirSync(signalDir, { recursive: true });
+      // Routing scope of the OUTBOUND message (not the sender's session):
+      //   - --top-level / --chat-id forced the message into chat-container
+      //     addressing → receivers should target their chat-scope session at
+      //     `effectiveChatId`, NOT the sender's thread root.
+      //   - otherwise inherit the sender's session scope, since the message
+      //     was a normal in-thread reply (or a chat-scope continuation).
+      const effectiveScope: 'thread' | 'chat' = (sendTopLevel || overrideChatId || isChatScope)
+        ? 'chat'
+        : (s.scope ?? 'thread');
+      const effectiveChatId = targetChatId;
       for (const targetApp of targetAppIds) {
         const te = botEntries.find(e => e.larkAppId === targetApp);
         const signal = {
-          rootMessageId: s.rootMessageId, chatId: s.chatId, chatType: s.chatType,
-          // Routing scope of the SENDER's session — receivers use this to pick
-          // the right activeSessions key (chatId for chat-scope, rootMessageId
-          // for thread-scope).
-          scope: s.scope ?? 'thread',
+          // Carry both addresses; receivers pick by `scope` but legacy fields
+          // remain for back-compat with older daemons.
+          rootMessageId: s.rootMessageId,
+          chatId: effectiveChatId,
+          chatType: s.chatType,
+          scope: effectiveScope,
           senderAppId: appId, targetBotOpenId: te?.botOpenId ?? targetApp,
           content: text, messageId, timestamp: Date.now(),
         };
