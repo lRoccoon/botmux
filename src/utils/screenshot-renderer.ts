@@ -5,6 +5,7 @@
  */
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import xtermHeadless from '@xterm/headless';
@@ -40,8 +41,11 @@ function ensureFontRegistered(): void {
   }
 
   // 2. CJK monospace — primary for Latin + Han glyphs.
-  //    Linux: Noto Sans CJK（需要 fonts-noto-cjk 包）；macOS: 系统自带 PingFang/Hiragino。
+  //    Linux: Noto Sans CJK（需要 fonts-noto-cjk 包，或 botmux setup 自动下载到 ~/.botmux/fonts/）；
+  //    macOS: 系统自带 PingFang/Hiragino。
+  const userFontDir = join(homedir(), '.botmux', 'fonts');
   const cjkCandidates: Array<{ regular: string; bold?: string; family: string }> = [
+    { regular: join(userFontDir, 'NotoSansMonoCJKsc-Regular.otf'), bold: join(userFontDir, 'NotoSansMonoCJKsc-Bold.otf'), family: 'Noto Sans Mono CJK SC' },
     { regular: '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
     { regular: '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
     { regular: '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc', bold: '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc', family: 'Noto Sans Mono CJK SC' },
@@ -59,18 +63,20 @@ function ensureFontRegistered(): void {
     }
   }
 
-  // 3. Latin monospace — DejaVu/Liberation cover dingbats (❯, ✓, etc.) and
-  //    most box-drawing/geometric symbols not in CJK font.
+  // 3. Latin monospace — DejaVu/Liberation/JetBrains Mono cover dingbats (❯,
+  //    ✓, etc.) and most box-drawing/geometric symbols not in CJK font.
   const latinCandidates: Array<[string, string]> = [
+    [join(userFontDir, 'JetBrainsMono-Regular.ttf'), 'JetBrains Mono'],
     ['/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 'DejaVu Sans Mono'],
     ['/usr/share/fonts/dejavu/DejaVuSansMono.ttf', 'DejaVu Sans Mono'],
     ['/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf', 'Liberation Mono'],
     ['/usr/share/fonts/liberation/LiberationMono-Regular.ttf', 'Liberation Mono'],
+    ['/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf', 'JetBrains Mono'],
   ];
   for (const [p, name] of latinCandidates) {
     if (tryRegister(p)) {
-      // Best-effort bold companion
-      tryRegister(p.replace(/Regular\.ttf$/, 'Bold.ttf'));
+      // Best-effort bold companion. Same dir, replace -Regular with -Bold.
+      tryRegister(p.replace(/-Regular\.ttf$/, '-Bold.ttf'));
       tryRegister(p.replace(/SansMono\.ttf$/, 'SansMono-Bold.ttf'));
       fontFamilyChain.push(name);
       break;
@@ -80,6 +86,7 @@ function ensureFontRegistered(): void {
   // 4. Color emoji — Noto Color Emoji on Linux, Apple Color Emoji on macOS.
   //    skia handles CBDT/CBLC + COLR/CPAL color formats.
   const emojiCandidates: Array<[string, string]> = [
+    [join(userFontDir, 'NotoColorEmoji.ttf'), 'Noto Color Emoji'],
     ['/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf', 'Noto Color Emoji'],
     ['/usr/share/fonts/noto/NotoColorEmoji.ttf', 'Noto Color Emoji'],
     ['/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf', 'Noto Color Emoji'],
