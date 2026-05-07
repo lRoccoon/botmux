@@ -28,6 +28,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff } from './services/codex-transcript.js';
+import { cocoEventsPathForSession, drainCocoEvents } from './services/coco-transcript.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -1144,10 +1145,20 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 // shared with the Claude path.
 
 function codexBridgeFallbackActive(): boolean {
-  // True for both adopt and non-adopt Codex sessions. The two modes
-  // differ in: emit gate (adopt skips marker check), local-turn synthesis
-  // (adopt only), and how the rollout path is resolved.
+  // True for transcript-backed CLIs whose final output can be harvested
+  // from append-only JSONL when the model forgets to call `botmux send`.
+  // Codex uses ~/.codex rollouts; CoCo uses ~/.cache/coco events.
+  return lastInitConfig?.cliId === 'codex' || (lastInitConfig?.cliId === 'coco' && lastInitConfig?.adoptMode !== true);
+}
+
+function structuredBridgeIsCodex(): boolean {
   return lastInitConfig?.cliId === 'codex';
+}
+
+function structuredBridgeIngestPath(path: string, offset: number) {
+  return structuredBridgeIsCodex()
+    ? drainCodexRollout(path, offset)
+    : drainCocoEvents(path, offset);
 }
 
 function codexBridgeStartTimer(): void {
@@ -1221,7 +1232,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     // the live events too, silently dropping anything the user did
     // between adopt and rollout-discovery — that's the user-reported
     // "iTerm 手动输入飞书没收到" symptom under late-attach.
-    const result = drainCodexRollout(rolloutPath, 0);
+    const result = structuredBridgeIngestPath(rolloutPath, 0);
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
@@ -1240,7 +1251,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     codexBridgeBaselineDone = true;
     log(`Codex bridge split-live degraded to fresh (file missing): ${rolloutPath}`);
   } else if (existsSync(rolloutPath)) {
-    const result = drainCodexRollout(rolloutPath, 0);
+    const result = structuredBridgeIngestPath(rolloutPath, 0);
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeQueue.absorb(result.events);
@@ -1280,7 +1291,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
 
 function codexBridgeIngest(): void {
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
-  const result = drainCodexRollout(codexBridgeRolloutPath, codexBridgeOffset);
+  const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
   codexBridgeQueue.ingest(result.events);
@@ -2214,28 +2225,27 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     });
   }
 
-  // Codex bridge fallback: same intent as the Claude block above but a
-  // different transcript layout. Resume-with-known-cliSessionId can attach
-  // immediately; new sessions / resume-without-id rely on flushPending to
-  // late-attach once writeInput returns the cliSessionId.
+  // Structured transcript bridge fallback: if the model finishes without
+  // calling `botmux send`, harvest the final answer from the CLI transcript
+  // and post it to Lark. Codex needs late attach because its rollout id is
+  // discovered after the first submit; CoCo's events path is deterministic
+  // from botmux sessionId.
   if (cfg.cliId === 'codex') {
     if (cfg.cliSessionId) {
       const rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
       if (rolloutPath) {
         codexBridgeAttach(rolloutPath, 'baseline-existing');
       } else {
-        // Resume but the rollout file isn't where we expected — start the
-        // poller so we keep looking; if the user submits and a new file
-        // appears, late-attach kicks in via writeInput's cliSessionId.
         codexBridgePendingSessionId = cfg.cliSessionId;
         codexBridgeStartTimer();
       }
     } else {
-      // Brand-new Codex session: no path until first submit. Start the
-      // poller anyway so the CLI is ready to attach the moment we have
-      // a cliSessionId.
       codexBridgeStartTimer();
     }
+  } else if (cfg.cliId === 'coco') {
+    const eventsPath = cocoEventsPathForSession(cfg.sessionId);
+    codexBridgeAttach(eventsPath, cfg.resume ? 'baseline-existing' : 'fresh-empty');
+    codexBridgeStartTimer();
   }
 
   // Set up idle detection
