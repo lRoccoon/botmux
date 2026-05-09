@@ -36,10 +36,22 @@ export async function buildForwardedTree(
   numberer: ReturnType<typeof createImgNumberer>,
   maxDepth: number,
 ): Promise<{ nodes: ForwardedNode[]; extraResources: MessageResource[] }> {
-  // user_card_content combined with merge_forward triggers HTTP 500 — keep
-  // it off. Sub-messages come back in the simplified "Format A" card shape
-  // which extractCardContent already handles.
-  const detail = await getMessageDetail(larkAppId, rootMessageId, { userCardContent: false });
+  // Pass userCardContent:true so interactive sub-cards return their real v2
+  // body (schema/body/elements) instead of the simplified "请升级至最新版本"
+  // fallback. Lark previously 500'd on this combo (see fd0f688 — Apr 2026);
+  // they've since fixed it for the cases we care about, but other shapes may
+  // still regress, so fall back to userCardContent:false on any error rather
+  // than dropping the whole forward tree. Per-sub refetch isn't an option
+  // here: forwarded cards from another tenant return 232010 ("Operator and
+  // chat can NOT be in different tenants") on the single-message endpoint
+  // even when the parent merge_forward is readable.
+  let detail: any;
+  try {
+    detail = await getMessageDetail(larkAppId, rootMessageId, { userCardContent: true });
+  } catch (err) {
+    logger.debug(`[merge_forward] userCardContent:true failed for ${rootMessageId}, falling back to false: ${describeAxiosErr(err)}`);
+    detail = await getMessageDetail(larkAppId, rootMessageId, { userCardContent: false });
+  }
   const allItems: any[] = detail?.items ?? [];
   const extraResources: MessageResource[] = [];
 
@@ -63,11 +75,9 @@ export async function buildForwardedTree(
         : 'unknown';
       const senderOpenId = msg.sender?.id ?? '';
 
-      // Interactive sub-messages arrive via REST as a simplified fallback.
-      // Lark's im.message.get never returns user_dsl (even for the bot's own
-      // messages), so we can only unwrap when a user_dsl somehow got through.
-      // For third-party cards whose simplified form is the "请升级至最新版本"
-      // fallback, the real body is unrecoverable from REST.
+      // userCardContent:true above usually delivers the real card. Fallback
+      // path (false) leaves the simplified shape; we still try user_dsl
+      // unwrap on the off-chance it's there, but don't refetch — see above.
       if (msg.msg_type === 'interactive') {
         const unwrapped = unwrapUserDslContent(msg.body?.content ?? '');
         if (unwrapped !== null) {
