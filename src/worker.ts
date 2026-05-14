@@ -40,9 +40,9 @@ import {
   MAX_RENDER_COLS,
   MAX_RENDER_ROWS,
   MIN_RENDER_COLS,
-  MIN_RENDER_ROWS,
   clamp,
   resolveRenderDimensions,
+  resolveScreenshotViewport,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds } from './adapters/cli/claude-code.js';
@@ -1675,13 +1675,16 @@ async function captureAndUpload(): Promise<void> {
       // still drive the long-lived renderer.
       if (!renderer) { logScreenshotSkip('renderer=null'); return; }
       const term = renderer.xterm;
-      const startY = term.buffer.active.baseY;
+      const { startY, rows: screenshotRows } = resolveScreenshotViewport(
+        term.rows,
+        term.buffer.active.baseY,
+      );
       const snap = renderer.rawSnapshot();
       const hash = createHash('md5').update(snap).digest('hex');
       if (hash === lastShotHash) return;
       lastShotHash = hash;
       const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
-      const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+      const shotRows = clamp(screenshotRows, 1, MAX_RENDER_ROWS);
       png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
     }
   } catch (err: any) {
