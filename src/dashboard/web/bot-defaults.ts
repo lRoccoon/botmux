@@ -81,11 +81,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     );
     if (loadError) {
       listEl.innerHTML = `<p class="hint-warn">无法加载 bot 列表：${escapeHtml(loadError)}<br>` +
-        `常见原因：dashboard / daemon 进程还在跑旧代码，执行 <code>pnpm daemon:restart</code> 后刷新。</p>`;
+        `常见原因：dashboard / daemon 进程还在跑旧代码，执行 <code>botmux restart</code> 后刷新。</p>`;
       return;
     }
     if (filtered.length === 0) {
-      listEl.innerHTML = `<p class="empty">没有在线的 bot。先 \`pnpm daemon:restart\` 让 daemon 上线。</p>`;
+      listEl.innerHTML = `<p class="empty">没有在线的 bot。先 \`botmux restart\` 让 daemon 上线。</p>`;
       return;
     }
     listEl.innerHTML = filtered.map(renderBotCard).join('');

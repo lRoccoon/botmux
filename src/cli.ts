@@ -608,7 +608,7 @@ function cmdUpgrade(): void {
 async function cmdDashboard(): Promise<void> {
   const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
   if (!existsSync(SECRET_PATH)) {
-    console.error('Dashboard not initialised. Run `pnpm daemon:restart` first.');
+    console.error('Dashboard not initialised. Run `botmux restart` first.');
     process.exit(1);
   }
   const secret = readFileSync(SECRET_PATH, 'utf8').trim();
@@ -629,7 +629,7 @@ async function cmdDashboard(): Promise<void> {
     });
   } catch {
     console.error(
-      `dashboard process not reachable on 127.0.0.1:${port} — \`pnpm daemon:restart\` will start it`,
+      `dashboard process not reachable on 127.0.0.1:${port} — \`botmux restart\` will start it`,
     );
     process.exit(1);
   }
