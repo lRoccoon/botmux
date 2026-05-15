@@ -151,10 +151,11 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // scope 列表。这种"鸡生蛋"情况单独提示：让 admin 开通免审批的
     // self_manage 后下次重启就能自检了。
     if (infoData.code === 99991672) {
-      const authUrl = `https://open.feishu.cn/app/${bot.config.larkAppId}/auth?q=${encodeURIComponent(SELF_MANAGE_SCOPE)}&op_from=openapi&token_type=tenant`;
+      const selfManageAuthUrl = `https://open.feishu.cn/app/${bot.config.larkAppId}/auth?q=${encodeURIComponent(SELF_MANAGE_SCOPE)}&op_from=openapi&token_type=tenant`;
+      const targetAuthUrl = `https://open.feishu.cn/app/${bot.config.larkAppId}/auth?q=${encodeURIComponent(REQUIRED_BOT_AT_SCOPE)}&op_from=openapi&token_type=tenant`;
       logger.warn(
         `[${larkAppId}] scope 自检 API 被拒（99991672）：应用缺少 ${SELF_MANAGE_SCOPE}（免审批）。` +
-        `开通后下次 daemon 重启即可自动核验跨 bot @ 必需权限 ${REQUIRED_BOT_AT_SCOPE}。申请链接：${authUrl}`,
+        `开通后下次 daemon 重启即可自动核验跨 bot @ 必需权限 ${REQUIRED_BOT_AT_SCOPE}。申请链接：${selfManageAuthUrl}`,
       );
       const adminOpenId = getAdminOpenId(bot);
       if (!adminOpenId) {
@@ -164,8 +165,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       const dm =
         `⚠️ botmux 想自动核验机器人 "${bot.botName ?? larkAppId}" 是否开通了跨 bot @ 必需权限，但发现应用自身缺少一个**免审批**的辅助权限，因此查不到 scope 列表。\n\n` +
         `**操作步骤（点链接 → 申请开通 → 重启 daemon）**：\n` +
-        `1. 开通 ${SELF_MANAGE_SCOPE}（免审批，自动通过）：\n   ${authUrl}\n\n` +
-        `2. 顺便确认/开通真正的目标权限 ${REQUIRED_BOT_AT_SCOPE}（"获取群组中其他机器人和用户@当前机器人的消息"，需要管理员审批）。\n\n` +
+        `1. 开通 ${SELF_MANAGE_SCOPE}（免审批，自动通过）：\n   ${selfManageAuthUrl}\n\n` +
+        `2. 顺便确认/开通真正的目标权限 ${REQUIRED_BOT_AT_SCOPE}（"获取群组中其他机器人和用户@当前机器人的消息"，免审批，自动通过）：\n   ${targetAuthUrl}\n\n` +
         `3. \`botmux restart\`，启动后 botmux 会自动复核，结果会再次发到这里。\n\n` +
         `**为什么需要**：botmux 多机器人协作（A 机器人 @ B 机器人）依赖目标权限把跨 bot 事件推送过来；不开通则跨 bot @ 完全失效。`;
       await dmAdmin(larkAppId, adminOpenId, dm, 'self_manage scope (auto-approved) missing');
@@ -210,9 +211,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       `scope: ${REQUIRED_BOT_AT_SCOPE}\n\n` +
       `没开通的话，跨机器人 @ 收不到事件，botmux 多机器人协作的整套场景都失效。\n\n` +
       `**操作步骤**：\n` +
-      `1. 申请权限：${authUrl}\n` +
-      `2. 等管理员审批通过\n` +
-      `3. \`botmux restart\``;
+      `1. 点链接申请权限（免审批，自动通过）：${authUrl}\n` +
+      `2. \`botmux restart\``;
     await dmAdmin(larkAppId, adminOpenId, dm, 'required scope missing');
   } catch (err: any) {
     logger.debug(`[${larkAppId}] scope check errored: ${err?.message ?? err}`);
