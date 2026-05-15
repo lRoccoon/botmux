@@ -71,6 +71,8 @@ let backend: SessionBackend | null = null;
  *  delayed final Enter/retry path fires). Capture this epoch before awaiting
  *  writeInput so stale tmux send-keys failures don't crash the worker. */
 let backendEpoch = 0;
+const EXIT_DIAG_MAX_CHARS = 20_000;
+let recentPtyOutput = '';
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
@@ -1833,7 +1835,28 @@ let trustHandled = false;
 
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
+function recordRecentPtyOutput(data: string): void {
+  if (!data) return;
+  recentPtyOutput += data;
+  if (recentPtyOutput.length > EXIT_DIAG_MAX_CHARS) {
+    recentPtyOutput = recentPtyOutput.slice(-EXIT_DIAG_MAX_CHARS);
+  }
+}
+
+function stripAnsiForLog(data: string): string {
+  return data
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(Boolean)
+    .join('\n')
+    .slice(-4000);
+}
+
 function onPtyData(data: string): void {
+  recordRecentPtyOutput(data);
   renderer?.write(data);
 
   // In tmux-attach mode, each web client has its own tmux attach PTY —
@@ -2299,6 +2322,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   isTmuxMode = useTmux;
   const tmuxBe = useTmux ? new TmuxBackend(TmuxBackend.sessionName(cfg.sessionId)) : null;
   backend = tmuxBe ?? new PtyBackend();
+  backendEpoch++;
+  recentPtyOutput = '';
 
   // Claude Code appends a line to ~/.claude/projects/<cwd-hash>/<sid>.jsonl each
   // time the user submits. The adapter uses this file to verify paste+Enter
@@ -2442,7 +2467,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
   backend.onData(onPtyData);
   backend.onExit((code, signal) => {
+    const exitSnapshot = stripAnsiForLog(recentPtyOutput);
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
+    if (exitSnapshot) {
+      log(`${cliName()} exit screen tail:\n${exitSnapshot}`);
+    }
     backend = null;
     isPromptReady = false;
     send({ type: 'claude_exit', code, signal });
@@ -2464,6 +2493,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
 function killCli(): void {
   backendEpoch++;
+  recentPtyOutput = '';
   idleDetector?.dispose();
   idleDetector = null;
   stopScreenAnalyzer();
