@@ -17,7 +17,7 @@ function userMsg(content: string, extra: any = {}, ts = '2026-04-30T02:33:13.000
 }
 function assistantMsg(
   content: string,
-  finishReason: 'stop' | 'tool_calls' = 'stop',
+  finishReason: 'stop' | 'tool_calls' | 'completed' = 'stop',
   ts = '2026-04-30T02:33:13.000+08:00',
 ) {
   return {
@@ -77,6 +77,17 @@ describe('drainCocoEvents', () => {
     expect(r.events.map(e => [e.kind, e.text])).toEqual([
       ['user', 'run the tests'],
       ['assistant_final', 'All 35 tests passed.'],
+    ]);
+  });
+
+  it('treats completed finish reason as assistant final for older CoCo events', () => {
+    writeFileSync(path,
+      line(originalUser('summarize the issue')) +
+      line(assistantMsg('The issue is missing resources.', 'completed')));
+    const r = drainCocoEvents(path, 0);
+    expect(r.events.map(e => [e.kind, e.text])).toEqual([
+      ['user', 'summarize the issue'],
+      ['assistant_final', 'The issue is missing resources.'],
     ]);
   });
 
