@@ -226,7 +226,7 @@ cat ~/.botmux/lark-scopes.json | xclip -selection clipboard
 cat ~/.botmux/lark-scopes.json | wl-copy
 ```
 
-> 扫码建出来的 PersonalAgent 应用，botmux 维护者实测默认已订阅 `im.message.receive_v1` + `card.action.trigger` 并开通 bot 能力，所以主线流程不再要求手动配。但飞书没在公开文档里承诺这是稳定行为，**如果配好后机器人完全收不到消息**，参见下方「Step 7: 机器人收不到消息时的自查」。
+> 扫码建出来的 PersonalAgent 应用，botmux 维护者实测默认已订阅 `im.message.receive_v1` + `card.action.trigger` 并开通 bot 能力，所以主线流程不再要求手动配。但飞书没在公开文档里承诺这是稳定行为，**如果配好后机器人完全收不到消息**，参见下方「Step 8: 机器人收不到消息时的自查」。
 
 ### Step 5: 添加重定向 URL（按需）
 

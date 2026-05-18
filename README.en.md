@@ -125,7 +125,7 @@ cat ~/.botmux/lark-scopes.json | xclip -selection clipboard
 cat ~/.botmux/lark-scopes.json | wl-copy
 ```
 
-> Scan-created PersonalAgent apps have `im.message.receive_v1` + `card.action.trigger` subscribed and the bot capability enabled out of the box, per botmux maintainer testing. Lark hasn't documented this as stable behavior, so **if the bot receives no messages at all after setup**, see "Step 7: Troubleshoot — bot not receiving messages" below for a manual fallback.
+> Scan-created PersonalAgent apps have `im.message.receive_v1` + `card.action.trigger` subscribed and the bot capability enabled out of the box, per botmux maintainer testing. Lark hasn't documented this as stable behavior, so **if the bot receives no messages at all after setup**, see "Step 8: Troubleshoot — bot not receiving messages" below for a manual fallback.
 
 ### Step 5: Add Redirect URL (optional)
 

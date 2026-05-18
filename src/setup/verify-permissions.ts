@@ -297,26 +297,22 @@ export async function applyScopesUnverified(
 // ─── Remaining-steps printer ──────────────────────────────────────────────
 
 /**
- * setup 主路径调用: 拿到凭证后输出"剩余手动步骤". 严格按"未自动完成"的口径写,
- * 不承诺 scope 或事件订阅已配好.
+ * setup 后 "还要手动点的步骤" 结构化数据. 跟 cli.ts 的 printRemainingSteps + README
+ * "5 分钟快速接入" 一致: 主线就两步 (权限申请 + 按需重定向 URL); PersonalAgent
+ * 应用默认订阅事件 + bot 能力, 不在主线提示, 收不到消息时见 README 的 fallback
+ * 自查清单.
  */
 export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): RemainingStep[] {
-  const steps: RemainingStep[] = [];
-
-  steps.push({
-    title: '在开放平台开启 botmux 所需的 scope (im:message / im:message.group_at_msg / im:resource / im:chat / contact:user.base:readonly), 并提交审批',
-    url: `${buildAppHomeDeepLink(appId, brand)}/auth`,
-  });
-
-  steps.push({
-    title: '配置事件订阅 — 使用"长连接"模式, 订阅 im.message.receive_v1 + card.action.trigger',
-    url: buildEventSubDeepLink(appId, brand),
-  });
-
-  steps.push({
-    title: '开通 bot 能力 (应用功能 → 机器人), 取一个 bot 名字和头像',
-    url: `${buildAppHomeDeepLink(appId, brand)}/feature/bot`,
-  });
-
-  return steps;
+  return [
+    {
+      title:
+        '申请权限 (一次性导入完整 JSON 提交审批) — 进入「权限管理」→「批量导入/导出权限」, 粘贴 ~/.botmux/lark-scopes.json',
+      url: `${buildAppHomeDeepLink(appId, brand)}/auth`,
+    },
+    {
+      title:
+        '添加重定向 URL http://127.0.0.1:9768/callback (按需, 用于 botmux 内 /login 跨用户调 API)',
+      url: `${buildAppHomeDeepLink(appId, brand)}/safe`,
+    },
+  ];
 }

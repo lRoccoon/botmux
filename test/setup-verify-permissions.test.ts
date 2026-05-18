@@ -222,7 +222,8 @@ describe('deep-link builders', () => {
   it('buildEventSubDeepLink + buildRemainingSteps point to correct host for lark brand', () => {
     expect(buildEventSubDeepLink('cli_x', 'lark')).toContain('open.larksuite.com');
     const steps = buildRemainingSteps('cli_x', 'lark');
-    expect(steps.length).toBeGreaterThanOrEqual(3);
+    // 主线收敛到 2 步: 权限申请 + 重定向 URL (PersonalAgent 默认配好事件/bot 不再列)
+    expect(steps.length).toBe(2);
     for (const s of steps) expect(s.url).toContain('open.larksuite.com');
   });
 });
