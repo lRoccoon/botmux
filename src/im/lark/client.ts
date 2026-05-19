@@ -663,11 +663,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   );
   const configured: ChatBotMember[] = configuredResults.filter((r): r is ChatBotMember => r !== null);
 
-  // Merge in observed entries (from /introduce), dedup by openId (configured wins).
+  // Merge in observed entries (from /introduce) — scoped to the caller's
+  // observer app so the open_ids match how THIS daemon should @-mention them
+  // (Lark open_id is per-app scoped). Dedup by openId (configured wins).
   const seenOpenIds = new Set(configured.map(b => b.openId));
   let observed: ChatBotMember[] = [];
   try {
-    const observedList = listObservedBots(config.session.dataDir, chatId);
+    const observedList = listObservedBots(config.session.dataDir, larkAppId, chatId);
     observed = observedList
       .filter(o => !seenOpenIds.has(o.openId))
       .map(o => ({

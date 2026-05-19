@@ -1153,7 +1153,8 @@ describe('im.message.receive_v1 — /introduce command', () => {
     await capturedHandlers['im.message.receive_v1'](event);
 
     expect(mockRecordObservedBots).toHaveBeenCalledTimes(1);
-    const [, chatIdArg, botsArg, sourceArg] = mockRecordObservedBots.mock.calls[0];
+    const [, larkAppIdArg, chatIdArg, botsArg, sourceArg] = mockRecordObservedBots.mock.calls[0];
+    expect(larkAppIdArg).toBe(MY_APP_ID);
     expect(chatIdArg).toBe('chat-intro-001');
     expect(sourceArg).toBe('introduce');
     expect((botsArg as Array<{ openId: string; name: string }>).sort((a, b) => a.openId.localeCompare(b.openId)))
@@ -1275,7 +1276,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    const [, , botsArg] = mockRecordObservedBots.mock.calls[0];
+    const [, , , botsArg] = mockRecordObservedBots.mock.calls[0];
     expect((botsArg as Array<{ openId: string }>).map(b => b.openId).sort())
       .toEqual([MY_OPEN_ID, OTHER_BOT_OPEN_ID, OTHER_BOT_OPEN_ID_2].sort());
   });
@@ -1316,6 +1317,43 @@ describe('im.message.receive_v1 — /introduce command', () => {
     await capturedHandlers['im.message.receive_v1'](event);
 
     expect(mockRecordObservedBots).not.toHaveBeenCalled();
+  });
+
+  it('does NOT trigger when /introduce appears mid-message (must be at command position)', async () => {
+    // Codex review finding: "请运行 /introduce" 之类的引用/说明文本不应触发。
+    // 命令位置 = 消息文本(去前导 @mention 后)以 /introduce 开头。
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '请运行 /introduce 然后看 ack' }),
+      mentions: [
+        { key: '@_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } },
+      ],
+      chatType: 'group',
+      messageId: 'msg-mid-introduce',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockRecordObservedBots).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('triggers when @mention prefixes /introduce (command position after stripping leading @mentions)', async () => {
+    // 真实使用形态: 用户先 @ 一串 bot 再喊 /introduce
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA @BotB /introduce' }),
+      mentions: [
+        { key: '@_a', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } },
+      ],
+      chatType: 'group',
+      messageId: 'msg-prefixed-introduce',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockRecordObservedBots).toHaveBeenCalledTimes(1);
   });
 });
 

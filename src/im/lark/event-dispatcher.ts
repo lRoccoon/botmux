@@ -348,9 +348,12 @@ export function updateBotOpenIdCrossRef(
 // 飞书没有任何公开接口能列出群里 bot 的 open_id（chat-members/get 明文跳过
 // bot 成员），这是当前条件下能拿到陌生 bot open_id 的唯一可靠路径。
 
-/** Token boundary match: `/introduce` must be whitespace-bounded so it doesn't
- *  trigger on `/introducer` or be hidden inside `s/introduce/foo/g` etc. */
-const INTRODUCE_RE = /(?:^|\s)\/introduce(?=\s|$)/;
+/** Command-position match: after stripping leading @mentions, the remaining
+ *  text must begin with `/introduce` (optionally followed by whitespace).
+ *  This is the same approach `parseForceTopicInvocation` takes for /t /topic.
+ *  Stricter than a bare token match — "please run /introduce" or similar
+ *  quoted/explanatory text won't trigger. */
+const INTRODUCE_RE = /^\/introduce(?:\s|$)/i;
 
 /**
  * If `message` is a /introduce command, side-effect it (record observed bots
@@ -370,7 +373,11 @@ export async function tryHandleIntroduceCommand(
   isAllowed: boolean,
 ): Promise<boolean> {
   const text = extractMessageTextForRouting(message);
-  if (!text || !INTRODUCE_RE.test(text)) return false;
+  if (!text) return false;
+  // Strip leading @<mention> tokens (using the message's mentions list to
+  // tolerate names with spaces) before checking the command position.
+  const stripped = stripLeadingMentions(text.trim(), message?.mentions ?? []);
+  if (!INTRODUCE_RE.test(stripped)) return false;
 
   if (!isAllowed) {
     logger.debug(`[${larkAppId}] /introduce from non-allowed user ${senderOpenId} — silent drop`);
@@ -390,7 +397,10 @@ export async function tryHandleIntroduceCommand(
 
   const chatId = message.chat_id as string;
   try {
-    recordObservedBots(config.session.dataDir, chatId, all, 'introduce');
+    // Persist to the observer-scoped store: these open_ids are scoped to the
+    // receiving app (larkAppId), so they're correct for THIS daemon to use
+    // when @-mentioning back.
+    recordObservedBots(config.session.dataDir, larkAppId, chatId, all, 'introduce');
   } catch (err) {
     logger.warn(`[${larkAppId}] /introduce: failed to persist observed bots: ${err}`);
   }
