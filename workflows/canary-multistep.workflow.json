@@ -1,0 +1,56 @@
+{
+  "workflowId": "canary-multistep",
+  "version": 1,
+  "defaults": {
+    "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
+    "timeoutMs": 60000,
+    "maxOutputBytes": 4096
+  },
+  "nodes": {
+    "draft": {
+      "type": "subagent",
+      "bot": "claude-loopy",
+      "prompt": "Create a short canary message. Return JSON: {\"preview\": string, \"text\": string}.",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["preview", "text"],
+        "properties": {
+          "preview": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      }
+    },
+    "confirm": {
+      "type": "subagent",
+      "bot": "claude-loopy",
+      "depends": ["draft"],
+      "humanGate": {
+        "stage": "before",
+        "prompt": { "$ref": "draft.output.preview" },
+        "deadlineMs": 600000,
+        "onTimeout": "fail"
+      },
+      "prompt": { "$ref": "draft.output.text" },
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["approvedText"],
+        "properties": {
+          "approvedText": { "type": "string" }
+        }
+      }
+    },
+    "send": {
+      "type": "hostExecutor",
+      "executor": "feishu-send",
+      "depends": ["confirm"],
+      "input": {
+        "larkAppId": "cli_canary_PLACEHOLDER",
+        "chatId": "oc_canary_PLACEHOLDER",
+        "content": { "$ref": "confirm.output.approvedText" },
+        "msgType": "text"
+      }
+    }
+  }
+}
