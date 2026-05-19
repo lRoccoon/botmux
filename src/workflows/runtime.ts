@@ -52,6 +52,7 @@ import { createWait } from './wait.js';
 import { executeSideEffect } from './hostExecutors/protocol.js';
 import type { HostExecutorRegistry, RegisteredHostExecutor } from './hostExecutors/registry.js';
 import type { HostExecutorContext } from './hostExecutors/types.js';
+import type { ProviderReconciler } from './resume.js';
 
 // ─── Worker spawn contract ────────────────────────────────────────────────
 
@@ -111,6 +112,20 @@ export type WorkflowRuntimeContext = {
   def: WorkflowDefinition;
   spawnSubagent: WorkerSpawnFn;
   hostExecutors?: HostExecutorRegistry;
+  /**
+   * Per-provider reconcilers consulted by `runLoop`'s recovery phase when
+   * a snapshot has `danglingEffectAttempted` entries (effectAttempted
+   * written but no terminal).  Default factory:
+   * `createDefaultProviderReconcilers()`.  When omitted, runLoop refuses
+   * to advance past dangling effects (returns `no-progress`).
+   */
+  reconcilers?: Map<string, ProviderReconciler>;
+  /**
+   * Materializer for the effect-input sidecar used by `requiresEffectInput`
+   * providers (Feishu).  Default in CLI/IM entry points wraps
+   * `loadEffectInputSidecar(log, activityId, attemptId)`.
+   */
+  loadEffectInput?: (activityId: string, attemptId: string) => Promise<unknown>;
   /** Wall-clock source — injectable for deterministic tests. */
   now?: () => number;
 };

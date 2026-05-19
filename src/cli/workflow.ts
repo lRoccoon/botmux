@@ -17,7 +17,11 @@ import { runLoop } from '../workflows/loop.js';
 import { mintWorkflowRunId } from '../workflows/run-id.js';
 import { createRun, type BotResolver } from '../workflows/run-init.js';
 import { getRunsDir } from '../workflows/runs-dir.js';
-import { createDefaultHostExecutorRegistry } from '../workflows/hostExecutors/registry.js';
+import {
+  createDefaultHostExecutorRegistry,
+  createDefaultProviderReconcilers,
+} from '../workflows/hostExecutors/registry.js';
+import { loadEffectInputSidecar } from '../workflows/effect-input.js';
 import {
   createStubSpawnFn,
   type StubSpawnHandler,
@@ -131,6 +135,9 @@ async function cmdWorkflowRun(rest: string[]): Promise<void> {
     def,
     spawnSubagent,
     hostExecutors: createDefaultHostExecutorRegistry(),
+    reconcilers: createDefaultProviderReconcilers(),
+    loadEffectInput: (activityId, attemptId) =>
+      loadEffectInputSidecar(log, activityId, attemptId),
   };
   const result = await runLoop(ctx, { maxTicks: 200 });
 

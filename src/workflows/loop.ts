@@ -22,6 +22,7 @@ import {
   type OrchestratorAction,
 } from './orchestrator.js';
 import { replay, type Snapshot } from './events/replay.js';
+import { resume } from './resume.js';
 import {
   completeNodeFailed,
   completeNodeSucceeded,
@@ -31,6 +32,7 @@ import {
   dispatchWork,
   type WorkflowRuntimeContext,
 } from './runtime.js';
+import { logger } from '../utils/logger.js';
 
 export type RunLoopStopReason =
   | 'terminal' // run reached succeeded / failed / cancelled
@@ -64,6 +66,44 @@ export async function runLoop(
   while (ticks < maxTicks) {
     if (isTerminalStatus(snapshot)) {
       return { reason: 'terminal', ticks, lastSnapshot: snapshot };
+    }
+
+    // ─── Recovery phase ────────────────────────────────────────────────
+    // Side-effect family contract: `effectAttempted` written, terminal
+    // missing.  Run resume() with the registered reconcilers to close
+    // those out before any forward decision.  Without reconcilers we
+    // CANNOT silently proceed — the dangling effect represents real
+    // external state we'd be ignoring.
+    if (snapshot.danglingEffectAttempted.length > 0) {
+      if (!ctx.reconcilers || ctx.reconcilers.size === 0) {
+        logger.warn?.(
+          `runLoop(${ctx.log.runId}): danglingEffectAttempted=${snapshot.danglingEffectAttempted.length} but ctx.reconcilers missing/empty — stopping with no-progress.`,
+        );
+        return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
+      }
+      const before = new Set(snapshot.danglingEffectAttempted);
+      await resume({
+        log: ctx.log,
+        runId: ctx.log.runId,
+        daemonId: 'runloop',
+        reconcilers: ctx.reconcilers,
+        loadEffectInput: ctx.loadEffectInput,
+        now: ctx.now,
+      });
+      snapshot = replay(await ctx.log.readAll());
+      // If the same set of dangling effects survived recovery, the
+      // reconcilers concluded manual/transient.  Don't dispatch new work
+      // — operator needs to look at the failed reconcile evidence.
+      const stillDangling = snapshot.danglingEffectAttempted.filter((a) => before.has(a));
+      if (stillDangling.length === before.size) {
+        logger.warn?.(
+          `runLoop(${ctx.log.runId}): resume() made no progress on ${stillDangling.length} dangling effect(s) — stopping with no-progress.`,
+        );
+        return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
+      }
+      // Progress made; re-enter loop with fresh snapshot before
+      // computing actions.
+      continue;
     }
 
     const actions = decideNextActions(snapshot, ctx.def);
