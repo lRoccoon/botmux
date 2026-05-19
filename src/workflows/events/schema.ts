@@ -79,8 +79,13 @@ const EnvelopeBase = {
  * `type` and the type's payload schema.  The payload can be inline (the
  * payload zod object) OR a ref to a blob file when it exceeds the inline
  * size cap (see INLINE_PAYLOAD_MAX_BYTES below).
+ *
+ * Note the generic constraint `L extends string`: without it, callers
+ * passing `'runCreated'` would have the literal widened to `string`, which
+ * destroys discriminator narrowing on `z.infer<>` and breaks exhaustive
+ * `switch (e.type)` checks downstream (replay, dispatchers, etc.).
  */
-function event<T extends z.ZodTypeAny>(typeLiteral: string, payloadSchema: T) {
+function event<L extends string, T extends z.ZodTypeAny>(typeLiteral: L, payloadSchema: T) {
   return z.object({
     ...EnvelopeBase,
     type: z.literal(typeLiteral),
@@ -172,30 +177,87 @@ const EVENT_SCHEMAS = [
   ReconcileResultEventSchema,
 ] as const;
 
-export const EventSchema = z
-  .discriminatedUnion('type', [...EVENT_SCHEMAS])
-  // payloadHash invariant: must be present iff payload is ref, absent iff inline.
-  // v0.1.2 ratifies this rule (Section 1.1).
-  .superRefine((event, ctx) => {
-    const isRef = isPayloadRef(event.payload);
-    if (isRef && !event.payloadHash) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'payloadHash required when payload is a ref',
-        path: ['payloadHash'],
-      });
-    }
-    if (!isRef && event.payloadHash !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'payloadHash must be absent when payload is inline',
-        path: ['payloadHash'],
-      });
-    }
-  });
+/**
+ * The discriminated union over all 31 event types — pure, no refinements.
+ *
+ * Why pure: zod's `.superRefine` wraps the union in `ZodEffects`, which
+ * breaks `z.infer<>` narrowing on the discriminator at compile time
+ * (`switch (e.type)` won't exhaustively narrow).  The payloadHash
+ * invariant (events doc §1.1) lives in `parseEvent` / `safeParseEvent`
+ * instead, applied as a post-parse check.
+ */
+export const EventSchema = z.discriminatedUnion('type', [...EVENT_SCHEMAS]);
 
 export type WorkflowEvent = z.infer<typeof EventSchema>;
 export type WorkflowEventType = WorkflowEvent['type'];
+
+// ─── payloadHash invariant + canonical parse helpers ────────────────────────
+
+/**
+ * Check the payloadHash <-> payload-ref invariant from events doc §1.1:
+ *   - inline payload: payloadHash MUST be absent
+ *   - ref payload:    payloadHash MUST be present
+ *
+ * Returns `null` if the event respects the invariant; otherwise a human
+ * readable reason string.  Pure function — no side effects, no throws.
+ */
+export function checkPayloadHashInvariant(event: WorkflowEvent): string | null {
+  const isRef = isPayloadRef(event.payload);
+  if (isRef && !event.payloadHash) {
+    return 'payloadHash required when payload is a ref';
+  }
+  if (!isRef && event.payloadHash !== undefined) {
+    return 'payloadHash must be absent when payload is inline';
+  }
+  return null;
+}
+
+/**
+ * Parse + validate an unknown value as a WorkflowEvent.  Combines the
+ * discriminated-union schema check with the payloadHash invariant.
+ * Throws ZodError on failure.
+ */
+export function parseEvent(raw: unknown): WorkflowEvent {
+  const event = EventSchema.parse(raw);
+  const reason = checkPayloadHashInvariant(event);
+  if (reason) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['payloadHash'],
+        message: reason,
+      },
+    ]);
+  }
+  return event;
+}
+
+/**
+ * Safe variant of `parseEvent`: returns a result object instead of throwing.
+ * Mirrors `ZodType.safeParse` API for ergonomic call sites.
+ */
+export function safeParseEvent(
+  raw: unknown,
+):
+  | { success: true; data: WorkflowEvent }
+  | { success: false; error: z.ZodError } {
+  const parsed = EventSchema.safeParse(raw);
+  if (!parsed.success) return { success: false, error: parsed.error };
+  const reason = checkPayloadHashInvariant(parsed.data);
+  if (reason) {
+    return {
+      success: false,
+      error: new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['payloadHash'],
+          message: reason,
+        },
+      ]),
+    };
+  }
+  return { success: true, data: parsed.data };
+}
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 

@@ -2,10 +2,10 @@ import { promises as fs, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
-  EventSchema,
   INLINE_PAYLOAD_MAX_BYTES,
   PayloadRefSchema,
   isPayloadRef,
+  parseEvent,
 } from './schema.js';
 import type { WorkflowEvent } from './schema.js';
 
@@ -136,7 +136,7 @@ export class EventLog {
         // already did.
       }
 
-      const parsed = EventSchema.parse(candidate);
+      const parsed = parseEvent(candidate);
 
       // Append a single line to the NDJSON log.  Single-write append on
       // Linux ext4 is atomic for our sizes (kernel write() syscall holds
@@ -168,7 +168,7 @@ export class EventLog {
       if (!raw) continue;
       try {
         const obj = JSON.parse(raw);
-        events.push(EventSchema.parse(obj));
+        events.push(parseEvent(obj));
       } catch (err) {
         throw new Error(
           `EventLog(${this.runId}): corrupt event at line ${lineNo}: ${

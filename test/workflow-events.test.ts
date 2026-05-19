@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import {
   EventSchema,
+  safeParseEvent,
+  parseEvent,
   PayloadRefSchema,
   INLINE_PAYLOAD_MAX_BYTES,
   PROVIDER_TTL_MS,
@@ -54,7 +56,7 @@ describe('event schema — envelope', () => {
         initiator: 'user:sensuosss',
       },
     };
-    expect(() => EventSchema.parse(e)).not.toThrow();
+    expect(() => parseEvent(e)).not.toThrow();
   });
 
   it('rejects eventId that does not match <runId>-<seq>', () => {
@@ -65,7 +67,7 @@ describe('event schema — envelope', () => {
       actor: 'scheduler' as const,
       payload: {},
     };
-    const r = EventSchema.safeParse(bad);
+    const r = safeParseEvent(bad);
     expect(r.success).toBe(false);
   });
 
@@ -77,7 +79,7 @@ describe('event schema — envelope', () => {
       actor: 'scheduler' as const,
       payload: {},
     };
-    const r = EventSchema.safeParse(bad);
+    const r = safeParseEvent(bad);
     expect(r.success).toBe(false);
   });
 
@@ -89,7 +91,7 @@ describe('event schema — envelope', () => {
       actor: 'scheduler',
       payload: {},
     };
-    const r = EventSchema.safeParse(bad);
+    const r = safeParseEvent(bad);
     expect(r.success).toBe(false);
   });
 
@@ -101,7 +103,7 @@ describe('event schema — envelope', () => {
       actor: 'martian',
       payload: {},
     };
-    const r = EventSchema.safeParse(bad);
+    const r = safeParseEvent(bad);
     expect(r.success).toBe(false);
   });
 
@@ -114,7 +116,7 @@ describe('event schema — envelope', () => {
       actor: 'scheduler',
       payload: {},
     };
-    const r = EventSchema.safeParse(bad);
+    const r = safeParseEvent(bad);
     expect(r.success).toBe(false);
   });
 });
@@ -128,7 +130,7 @@ describe('event schema — payloadHash invariant (v0.1.2 §1.1)', () => {
       actor: 'scheduler' as const,
       payload: {},
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 
   it('inline payload + payloadHash present: REJECTED', () => {
@@ -140,7 +142,7 @@ describe('event schema — payloadHash invariant (v0.1.2 §1.1)', () => {
       payload: {},
       payloadHash: SHA,
     };
-    const r = EventSchema.safeParse(e);
+    const r = safeParseEvent(e);
     expect(r.success).toBe(false);
     if (!r.success) {
       const msgs = r.error.issues.map((i) => i.message).join(';');
@@ -157,7 +159,7 @@ describe('event schema — payloadHash invariant (v0.1.2 §1.1)', () => {
       payload: { ref: 'runs/x/blobs/abc', bytes: 8192, schemaVersion: 1 },
       payloadHash: SHA,
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 
   it('ref payload + payloadHash absent: REJECTED', () => {
@@ -168,7 +170,7 @@ describe('event schema — payloadHash invariant (v0.1.2 §1.1)', () => {
       actor: 'scheduler' as const,
       payload: { ref: 'runs/x/blobs/abc', bytes: 8192, schemaVersion: 1 },
     };
-    const r = EventSchema.safeParse(e);
+    const r = safeParseEvent(e);
     expect(r.success).toBe(false);
     if (!r.success) {
       const msgs = r.error.issues.map((i) => i.message).join(';');
@@ -192,7 +194,7 @@ describe('event schema — activityTimedOut payload v0.1.2', () => {
         errorClass: 'retryable' as const,
       },
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 
   it('rejects wrong reason literal', () => {
@@ -209,7 +211,7 @@ describe('event schema — activityTimedOut payload v0.1.2', () => {
         errorClass: 'retryable',
       },
     };
-    expect(EventSchema.safeParse(e).success).toBe(false);
+    expect(safeParseEvent(e).success).toBe(false);
   });
 
   it('rejects wrong errorClass literal (must be retryable)', () => {
@@ -226,7 +228,7 @@ describe('event schema — activityTimedOut payload v0.1.2', () => {
         errorClass: 'fatal',
       },
     };
-    expect(EventSchema.safeParse(e).success).toBe(false);
+    expect(safeParseEvent(e).success).toBe(false);
   });
 });
 
@@ -248,7 +250,7 @@ describe('event schema — effectAttempted idempotencyKey bounds', () => {
       actor: 'hostExecutor' as const,
       payload: validPayload,
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 
   it('rejects idempotencyKey > 50 chars (Feishu uuid limit)', () => {
@@ -259,7 +261,7 @@ describe('event schema — effectAttempted idempotencyKey bounds', () => {
       actor: 'hostExecutor',
       payload: { ...validPayload, idempotencyKey: 'wf_' + 'a'.repeat(60) },
     };
-    expect(EventSchema.safeParse(e).success).toBe(false);
+    expect(safeParseEvent(e).success).toBe(false);
   });
 
   it('rejects empty idempotencyKey', () => {
@@ -270,7 +272,7 @@ describe('event schema — effectAttempted idempotencyKey bounds', () => {
       actor: 'hostExecutor',
       payload: { ...validPayload, idempotencyKey: '' },
     };
-    expect(EventSchema.safeParse(e).success).toBe(false);
+    expect(safeParseEvent(e).success).toBe(false);
   });
 
   it('rejects malformed inputHash', () => {
@@ -281,7 +283,7 @@ describe('event schema — effectAttempted idempotencyKey bounds', () => {
       actor: 'hostExecutor',
       payload: { ...validPayload, inputHash: 'not-a-sha' },
     };
-    expect(EventSchema.safeParse(e).success).toBe(false);
+    expect(safeParseEvent(e).success).toBe(false);
   });
 });
 
@@ -298,7 +300,7 @@ describe('event schema — activitySucceeded externalRefs', () => {
         outputRef: sampleOutputRef,
       },
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 
   it('accepts send-shape externalRefs', () => {
@@ -314,7 +316,7 @@ describe('event schema — activitySucceeded externalRefs', () => {
         externalRefs: { messageId: 'om_xxx' },
       },
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 
   it('accepts schedule-shape externalRefs', () => {
@@ -330,7 +332,7 @@ describe('event schema — activitySucceeded externalRefs', () => {
         externalRefs: { taskId: 'wf_abc12345' },
       },
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 });
 
@@ -347,7 +349,7 @@ describe('event schema — cancelRequested target discrim union', () => {
       actor: 'human' as const,
       payload: { target, reason: 'user requested', by: 'sensuosss' },
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 
   it('rejects unknown target.kind', () => {
@@ -358,7 +360,7 @@ describe('event schema — cancelRequested target discrim union', () => {
       actor: 'human',
       payload: { target: { kind: 'sandwich' }, reason: 'x', by: 'y' },
     };
-    expect(EventSchema.safeParse(e).success).toBe(false);
+    expect(safeParseEvent(e).success).toBe(false);
   });
 });
 
@@ -386,7 +388,7 @@ describe('event schema — reconcileResult decision matrix', () => {
         evidence: { messageId: 'om_x' },
       },
     };
-    expect(EventSchema.safeParse(e).success).toBe(true);
+    expect(safeParseEvent(e).success).toBe(true);
   });
 
   it('rejects unknown decision', () => {
@@ -400,7 +402,7 @@ describe('event schema — reconcileResult decision matrix', () => {
         evidence: {},
       },
     };
-    expect(EventSchema.safeParse(e).success).toBe(false);
+    expect(safeParseEvent(e).success).toBe(false);
   });
 });
 
