@@ -42,17 +42,25 @@ export class IdempotencyConflictError extends Error {
  *
  * Includes only the fields that callers control as task **input** (events
  * doc v0.1.2 §3.5 ScheduleCanonicalInput).  Excludes:
- *   - `parsed` (derived from `schedule`)
  *   - `chatType` (advisory, derived)
  *   - `creator*` (audit metadata, not input)
  *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastError`,
  *     `lastDeliveryError` (runtime state, mutates over task lifetime)
  *   - `createdAt` (metadata)
  *   - `repeat.completed` (counter, mutates per run)
+ *   - `parsed.display` (UI-facing string, redundant given `expr`/`runAt`)
+ *
+ * Codex round 4 finding 4: `parsed` is NOT purely derived for one-shot or
+ * relative schedules.  `30m`/`2h`/`明天9:00`/`5分钟后` etc compute a
+ * concrete `runAt` at parse time using "now"; if a workflow retry re-
+ * parses the same raw `schedule`, it gets a different `runAt`.  So the
+ * canonical input freezes the resolved schedule shape (`parsed.kind` and
+ * whichever of `parsed.runAt`/`parsed.minutes`/`parsed.expr` applies).
  */
 function canonicalScheduleInput(t: {
   name: string;
   schedule: string;
+  parsed?: ParsedSchedule;
   prompt: string;
   workingDir: string;
   chatId: string;
@@ -65,6 +73,17 @@ function canonicalScheduleInput(t: {
   return {
     name: t.name,
     schedule: t.schedule,
+    parsed: t.parsed
+      ? {
+          kind: t.parsed.kind,
+          // Only one of these is present per parsed.kind, but inlining all
+          // three keeps the canonical shape uniform — `undefined` slots are
+          // dropped by `computeInputHash` upstream.
+          runAt: t.parsed.runAt,
+          minutes: t.parsed.minutes,
+          expr: t.parsed.expr,
+        }
+      : undefined,
     prompt: t.prompt,
     workingDir: t.workingDir,
     chatId: t.chatId,

@@ -1,6 +1,5 @@
 import { promises as fs, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import {
   INLINE_PAYLOAD_MAX_BYTES,
   PayloadRefSchema,
@@ -8,15 +7,12 @@ import {
   parseEvent,
 } from './schema.js';
 import type { WorkflowEvent } from './schema.js';
+import { withFileLock } from '../../utils/file-lock.js';
 
-// ─── Mutex (per-runId append serialization) ─────────────────────────────────
+// ─── Mutex (per-runId append serialization, in-process) ─────────────────────
 
 /**
- * Minimal promise-chain mutex.  v0 botmux is single-process per bot daemon,
- * so cross-process file locking is out of scope — we only need to serialize
- * concurrent in-process appends to the same run log.  Cross-process writers
- * (external CLI like `botmux schedule add`) must proxy through the daemon
- * process; they do not write workflow event logs directly.
+ * Minimal promise-chain mutex.  Single-process serialization layer.
  */
 class Mutex {
   private tail: Promise<unknown> = Promise.resolve();
@@ -36,27 +32,40 @@ class Mutex {
   }
 }
 
+/**
+ * Module-level mutex map keyed by runId.  Codex round 4 fix: a single
+ * instance's mutex doesn't protect against two `new EventLog(runId, base)`
+ * instances inside the same process — they would each hold a fresh mutex
+ * and race on seq assignment.  Sharing the mutex per-runId at module scope
+ * closes that hole.  Cross-process is closed by `withFileLock` (below).
+ */
+const RUN_MUTEXES = new Map<string, Mutex>();
+function getRunMutex(runId: string): Mutex {
+  let m = RUN_MUTEXES.get(runId);
+  if (!m) {
+    m = new Mutex();
+    RUN_MUTEXES.set(runId, m);
+  }
+  return m;
+}
+
 // ─── Event draft (what callers pass into append) ────────────────────────────
 
 /**
  * What the runtime supplies to `append`.  The append path fills in
- * `eventId`, `schemaVersion`, and conditionally `payloadHash`/payload-ref
- * conversion.  Callers must supply `runId`, `type`, `actor`, `payload`, and
- * may optionally pass `timestamp` (defaults to Date.now()).
+ * `eventId` and `schemaVersion`.  Callers must supply `runId`, `type`,
+ * `actor`, `payload`, and may optionally pass `timestamp` (defaults to
+ * Date.now()) and/or `payloadHash` (only when payload is a ref — see
+ * events doc §1.1).
  *
  * The discriminated union over WorkflowEvent distributes through Omit, so
  * each event type's payload shape is preserved at the call site.
  */
-export type EventDraft = Omit<WorkflowEvent, 'eventId' | 'schemaVersion' | 'payloadHash'> & {
+export type EventDraft = Omit<WorkflowEvent, 'eventId' | 'schemaVersion'> & {
   timestamp?: number;
 };
 
 // ─── EventLog ───────────────────────────────────────────────────────────────
-
-const SHA256_HEX = (buf: Buffer | string): string =>
-  createHash('sha256')
-    .update(typeof buf === 'string' ? Buffer.from(buf, 'utf-8') : buf)
-    .digest('hex');
 
 export class EventLog {
   readonly runId: string;
@@ -64,9 +73,11 @@ export class EventLog {
   readonly eventsFile: string;
   readonly blobDir: string;
 
-  private mutex = new Mutex();
+  // Cached seq + file metadata for cross-process change detection.
   private seq = 0;
   private seqLoaded = false;
+  private cachedMtimeMs = 0;
+  private cachedSize = 0;
 
   constructor(runId: string, baseDir: string) {
     if (!runId) throw new Error('EventLog: runId required');
@@ -80,73 +91,77 @@ export class EventLog {
   }
 
   /**
-   * Append one event.  Atomic with respect to other appends to the same
-   * EventLog instance (in-process mutex).  Side effects:
-   *  - assigns the next seq, fills eventId = `<runId>-<seq>`
-   *  - if payload JSON exceeds INLINE_PAYLOAD_MAX_BYTES, writes a
-   *    content-addressed blob first and replaces payload with a ref +
-   *    payloadHash.  Blob is written before the event line, so a recovered
-   *    event always points to an existing blob (events doc §4.1).
-   *  - validates the final shape against EventSchema, returning the parsed
-   *    event.
+   * Append one event.  Atomic across:
+   *   1. all EventLog instances for the same runId in this process
+   *      (module-level mutex map), and
+   *   2. other OS processes touching the same events file
+   *      (`withFileLock` over `events.ndjson.lock`).
+   *
+   * Codex round 4 finding 1: payload envelope MUST be inline.  Large
+   * business data goes through `OutputRef`-shaped fields (e.g.
+   * `runCreated.inputRef`, `activitySucceeded.outputRef`); the caller is
+   * responsible for writing the blob and passing a fully-formed
+   * `OutputRef` inline.  The append path no longer auto-spills payloads —
+   * doing so silently broke replay for any ref-payload event because the
+   * existing replay projection unconditionally skipped the ref branch.
+   *
+   * Payload-ref payloads (`{ ref, bytes, schemaVersion }`) are still
+   * supported for callers who genuinely need to ref-out the envelope
+   * payload (e.g. a custom dashboard projection), but the caller must
+   * supply both the blob and `payloadHash` upfront; this path is not
+   * exercised by the v0 runtime.
    */
   async append(draft: EventDraft): Promise<WorkflowEvent> {
-    return this.mutex.run(async () => {
-      await this.ensureSeqLoaded();
+    return getRunMutex(this.runId).run(() =>
+      withFileLock(this.eventsFile, () => this.appendLocked(draft)),
+    );
+  }
 
-      const nextSeq = this.seq + 1;
-      const timestamp = draft.timestamp ?? Date.now();
-      const candidate: Record<string, unknown> = {
-        eventId: `${this.runId}-${nextSeq}`,
-        runId: this.runId,
-        timestamp,
-        type: draft.type,
-        schemaVersion: 1,
-        actor: draft.actor,
-        payload: draft.payload,
-      };
+  private async appendLocked(draft: EventDraft): Promise<WorkflowEvent> {
+    await this.refreshSeqIfStale();
 
-      // Inline-vs-ref decision: if caller already passed a PayloadRef, keep
-      // it (caller is responsible for the blob); otherwise measure and spill
-      // automatically when too large.
-      const payloadIsRef = isPayloadRef(draft.payload);
-      if (!payloadIsRef) {
-        const inlineJson = JSON.stringify(draft.payload);
-        const inlineBytes = Buffer.byteLength(inlineJson, 'utf-8');
-        if (inlineBytes > INLINE_PAYLOAD_MAX_BYTES) {
-          const buf = Buffer.from(inlineJson, 'utf-8');
-          const hash = SHA256_HEX(buf);
-          const blobPath = join(this.blobDir, hash);
-          // Write blob FIRST.  Content-addressed: same hash → same content,
-          // so re-writes are idempotent and safe under crash-replay.
-          if (!existsSync(blobPath)) {
-            await fs.writeFile(blobPath, buf);
-          }
-          candidate.payload = {
-            ref: blobPath,
-            bytes: buf.length,
-            schemaVersion: 1,
-          };
-          candidate.payloadHash = `sha256:${hash}`;
-        }
-      } else {
-        // Caller-provided ref must come with payloadHash (events doc §1.1
-        // invariant).  Validator will reject if missing; we don't synth one
-        // here because we'd have to read+hash the blob, which the caller
-        // already did.
+    const nextSeq = this.seq + 1;
+    const timestamp = draft.timestamp ?? Date.now();
+    const candidate: Record<string, unknown> = {
+      eventId: `${this.runId}-${nextSeq}`,
+      runId: this.runId,
+      timestamp,
+      type: draft.type,
+      schemaVersion: 1,
+      actor: draft.actor,
+      payload: draft.payload,
+    };
+    if ('payloadHash' in draft && draft.payloadHash !== undefined) {
+      candidate.payloadHash = draft.payloadHash;
+    }
+
+    // Reject inline payloads that exceed the cap.  The runtime should
+    // restructure to use `OutputRef`-shaped fields for large business
+    // data; envelope payloads are metadata + small refs only.
+    if (!isPayloadRef(draft.payload)) {
+      const inlineSize = Buffer.byteLength(JSON.stringify(draft.payload), 'utf-8');
+      if (inlineSize > INLINE_PAYLOAD_MAX_BYTES) {
+        throw new Error(
+          `EventLog(${this.runId}).append: inline payload (${inlineSize} bytes) exceeds ` +
+            `INLINE_PAYLOAD_MAX_BYTES (${INLINE_PAYLOAD_MAX_BYTES}).  Restructure large fields ` +
+            `to use OutputRef-shaped fields (events doc v0.1.2 §3.1) instead of stuffing them ` +
+            `into the envelope payload.`,
+        );
       }
+    }
 
-      const parsed = parseEvent(candidate);
+    const parsed = parseEvent(candidate);
 
-      // Append a single line to the NDJSON log.  Single-write append on
-      // Linux ext4 is atomic for our sizes (kernel write() syscall holds
-      // the inode lock for the duration of the write under O_APPEND).
-      const line = JSON.stringify(parsed) + '\n';
-      await fs.appendFile(this.eventsFile, line, 'utf-8');
+    const line = JSON.stringify(parsed) + '\n';
+    await fs.appendFile(this.eventsFile, line, 'utf-8');
 
-      this.seq = nextSeq;
-      return parsed;
-    });
+    // Cache update — we just wrote, so size grew.  Stat would also work.
+    const stat = await fs.stat(this.eventsFile);
+    this.seq = nextSeq;
+    this.cachedMtimeMs = stat.mtimeMs;
+    this.cachedSize = stat.size;
+    this.seqLoaded = true;
+    return parsed;
   }
 
   /**
@@ -181,10 +196,9 @@ export class EventLog {
   }
 
   /**
-   * Read the blob referenced by a ref-payload event.  `ref` is the full
-   * path stored on the event (we use absolute paths so callers don't have
-   * to know the run dir).  The replay path uses this to materialize
-   * ref-payloads into in-memory state.
+   * Read the blob referenced by a ref-payload event.  Used when a caller
+   * elected to spill their own OutputRef payload to disk; not used by
+   * envelope-payload paths since v0.1.2 round-4 disallows envelope spill.
    */
   async readBlob(ref: string): Promise<Buffer> {
     return fs.readFile(ref);
@@ -192,17 +206,38 @@ export class EventLog {
 
   /** Current seq counter — exposed for tests / dashboard. */
   async currentSeq(): Promise<number> {
-    await this.ensureSeqLoaded();
-    return this.seq;
+    return getRunMutex(this.runId).run(() =>
+      withFileLock(this.eventsFile, async () => {
+        await this.refreshSeqIfStale();
+        return this.seq;
+      }),
+    );
   }
 
-  private async ensureSeqLoaded(): Promise<void> {
-    if (this.seqLoaded) return;
+  /**
+   * Refresh `this.seq` if the events file has changed since we last loaded.
+   * Stat is cheap; full re-scan only fires when the cached mtime/size differ
+   * from disk — protects against another process having appended since our
+   * last write.
+   */
+  private async refreshSeqIfStale(): Promise<void> {
     if (!existsSync(this.eventsFile)) {
       this.seq = 0;
       this.seqLoaded = true;
+      this.cachedMtimeMs = 0;
+      this.cachedSize = 0;
       return;
     }
+    const stat = await fs.stat(this.eventsFile);
+    if (
+      this.seqLoaded &&
+      stat.mtimeMs === this.cachedMtimeMs &&
+      stat.size === this.cachedSize
+    ) {
+      return;
+    }
+    // Rescan from disk.  Linear in events for v0; future optimization
+    // could read from end-of-file backwards to find the last seq line.
     const events = await this.readAll();
     let maxSeq = 0;
     for (const e of events) {
@@ -213,6 +248,8 @@ export class EventLog {
       }
     }
     this.seq = maxSeq;
+    this.cachedMtimeMs = stat.mtimeMs;
+    this.cachedSize = stat.size;
     this.seqLoaded = true;
   }
 }

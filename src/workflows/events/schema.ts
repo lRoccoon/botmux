@@ -213,22 +213,89 @@ export function checkPayloadHashInvariant(event: WorkflowEvent): string | null {
 }
 
 /**
+ * `reconcileResult.capability` × `decision` legal combinations (codex
+ * round 4 + events doc §4.3.1):
+ *
+ *   | decision                       | required capability    |
+ *   |--------------------------------|------------------------|
+ *   | replayed                       | none (no provider work)|
+ *   | completedByIdempotentSubmit    | idempotentSubmit       |
+ *   | freshRetry                     | readOnlyLookup         |
+ *   | manual                         | none                   |
+ *
+ * Rationale:
+ *   - `replayed` means the event log already had a terminal — resume
+ *     scans the log, no provider call, capability is `none`.
+ *   - `completedByIdempotentSubmit` is the outcome of calling provider
+ *     with idempotent submit; capability MUST be `idempotentSubmit`.
+ *   - `freshRetry` means provider was checked via `readOnlyLookup` and
+ *     confirmed not to have the effect; capability MUST be
+ *     `readOnlyLookup`.
+ *   - `manual` means all available capabilities failed or none were
+ *     applicable; capability records what was tried — `none` is the
+ *     canonical zero value for "we didn't try anything that succeeded".
+ *
+ * Returns `null` if legal, otherwise a reason string.
+ */
+export function checkReconcileResultInvariant(event: WorkflowEvent): string | null {
+  if (event.type !== 'reconcileResult') return null;
+  if (isPayloadRef(event.payload)) return null; // can't inspect ref payload
+  const { capability, decision } = event.payload as {
+    capability: 'readOnlyLookup' | 'idempotentSubmit' | 'none';
+    decision: 'replayed' | 'completedByIdempotentSubmit' | 'manual' | 'freshRetry';
+  };
+  const expected: Record<typeof decision, typeof capability> = {
+    replayed: 'none',
+    completedByIdempotentSubmit: 'idempotentSubmit',
+    freshRetry: 'readOnlyLookup',
+    manual: 'none',
+  };
+  if (expected[decision] !== capability) {
+    return `reconcileResult: decision='${decision}' requires capability='${expected[decision]}', got '${capability}'`;
+  }
+  return null;
+}
+
+/**
+ * Run every post-parse invariant against a WorkflowEvent.  Each entry is
+ * a `(event) => string | null` checker; the first failure wins and gets
+ * surfaced as a ZodIssue.  Adding new invariants here means they apply
+ * uniformly to parseEvent / safeParseEvent / append paths.
+ */
+const POST_PARSE_INVARIANTS: Array<{
+  path: (string | number)[];
+  check: (event: WorkflowEvent) => string | null;
+}> = [
+  { path: ['payloadHash'], check: checkPayloadHashInvariant },
+  { path: ['payload'], check: checkReconcileResultInvariant },
+];
+
+function applyInvariants(event: WorkflowEvent): z.ZodError | null {
+  for (const { path, check } of POST_PARSE_INVARIANTS) {
+    const reason = check(event);
+    if (reason) {
+      return new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path,
+          message: reason,
+        },
+      ]);
+    }
+  }
+  return null;
+}
+
+/**
  * Parse + validate an unknown value as a WorkflowEvent.  Combines the
- * discriminated-union schema check with the payloadHash invariant.
- * Throws ZodError on failure.
+ * discriminated-union schema check with the post-parse invariants
+ * (payloadHash, reconcileResult capability×decision).  Throws ZodError
+ * on failure.
  */
 export function parseEvent(raw: unknown): WorkflowEvent {
   const event = EventSchema.parse(raw);
-  const reason = checkPayloadHashInvariant(event);
-  if (reason) {
-    throw new z.ZodError([
-      {
-        code: z.ZodIssueCode.custom,
-        path: ['payloadHash'],
-        message: reason,
-      },
-    ]);
-  }
+  const err = applyInvariants(event);
+  if (err) throw err;
   return event;
 }
 
@@ -243,19 +310,8 @@ export function safeParseEvent(
   | { success: false; error: z.ZodError } {
   const parsed = EventSchema.safeParse(raw);
   if (!parsed.success) return { success: false, error: parsed.error };
-  const reason = checkPayloadHashInvariant(parsed.data);
-  if (reason) {
-    return {
-      success: false,
-      error: new z.ZodError([
-        {
-          code: z.ZodIssueCode.custom,
-          path: ['payloadHash'],
-          message: reason,
-        },
-      ]),
-    };
-  }
+  const err = applyInvariants(parsed.data);
+  if (err) return { success: false, error: err };
   return { success: true, data: parsed.data };
 }
 

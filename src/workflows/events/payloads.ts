@@ -168,6 +168,12 @@ export const LeaseSignedPayload = z.object({
 });
 
 export const AttemptCreatedPayload = z.object({
+  // Codex round 4 finding 3: nodeId is REQUIRED.  Without it, replay
+  // can't project node.status idle→triggered when the first attempt is
+  // created, so node state stays idle until an explicit terminal
+  // node event arrives — and no event in the schema covers
+  // "triggered/running" entry.  attemptCreated.nodeId fills that gap.
+  nodeId: z.string(),
   activityId: z.string(),
   attemptId: z.string(),
   attemptNumber: z.number().int().positive(),

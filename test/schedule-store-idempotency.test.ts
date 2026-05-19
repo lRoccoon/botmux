@@ -212,6 +212,69 @@ describe('createTask — id provided, task exists with DIFFERENT canonical input
   });
 });
 
+describe('createTask — canonical input includes parsed.runAt (codex round 4)', () => {
+  it('returns existing when same raw schedule + same parsed.runAt', async () => {
+    const { createTask } = await freshImport();
+    const id = 'wf_parsed_match';
+    const runAt = '2026-05-19T12:00:00Z';
+    const a = createTask({
+      ...BASE_PARAMS,
+      id,
+      schedule: '30m',
+      parsed: { kind: 'once', runAt, display: '30 分钟后' },
+    });
+    const b = createTask({
+      ...BASE_PARAMS,
+      id,
+      schedule: '30m',
+      parsed: { kind: 'once', runAt, display: '30 分钟后' },
+    });
+    expect(b.id).toBe(a.id);
+  });
+
+  it('THROWS when same raw schedule but parsed.runAt differs (re-parsed at different time)', async () => {
+    // Reproduces the codex round 4 scenario: workflow retry re-parses
+    // `30m` and gets a different concrete runAt.  Canonical input must
+    // freeze the resolved schedule, otherwise the retry mutates state
+    // silently.
+    const { createTask, IdempotencyConflictError } = await freshImport();
+    const id = 'wf_parsed_drift';
+    createTask({
+      ...BASE_PARAMS,
+      id,
+      schedule: '30m',
+      parsed: { kind: 'once', runAt: '2026-05-19T12:00:00Z', display: '30 分钟后' },
+    });
+    expect(() =>
+      createTask({
+        ...BASE_PARAMS,
+        id,
+        schedule: '30m',
+        parsed: { kind: 'once', runAt: '2026-05-19T13:00:00Z', display: '30 分钟后' },
+      }),
+    ).toThrow(IdempotencyConflictError);
+  });
+
+  it('ignores parsed.display changes (UI string only)', async () => {
+    const { createTask } = await freshImport();
+    const id = 'wf_display_drift';
+    const a = createTask({
+      ...BASE_PARAMS,
+      id,
+      schedule: '30m',
+      parsed: { kind: 'once', runAt: '2026-05-19T12:00:00Z', display: '30 分钟后' },
+    });
+    const b = createTask({
+      ...BASE_PARAMS,
+      id,
+      schedule: '30m',
+      // Different display string (e.g. i18n change) shouldn't trigger conflict.
+      parsed: { kind: 'once', runAt: '2026-05-19T12:00:00Z', display: 'in 30 min' },
+    });
+    expect(b.id).toBe(a.id);
+  });
+});
+
 describe('createTask — id namespace isolation', () => {
   it('wf_ prefixed id and 8-char random id coexist', async () => {
     const { createTask, listTasks } = await freshImport();

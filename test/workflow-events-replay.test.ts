@@ -208,12 +208,13 @@ describe('replay — Node lifecycle', () => {
 });
 
 describe('replay — Activity attempts + status', () => {
-  it('attemptCreated → activity.status=pending, attempt registered', async () => {
+  it('attemptCreated → activity.status=pending, attempt registered, node→activity mapping built', async () => {
     const s = await snapshotAfter(runCreated, {
       runId: RUN_ID,
       type: 'attemptCreated',
       actor: 'scheduler',
       payload: {
+        nodeId: 'n1',
         activityId: 'a1',
         attemptId: 'at1',
         attemptNumber: 1,
@@ -225,6 +226,73 @@ describe('replay — Activity attempts + status', () => {
     expect(a?.attempts).toHaveLength(1);
     expect(a?.attempts[0].attemptId).toBe('at1');
     expect(a?.currentAttemptId).toBe('at1');
+    expect(a?.ownerNodeId).toBe('n1');
+    // Codex round 4: first attempt projects node.status idle→triggered
+    expect(s.nodes.get('n1')?.status).toBe('triggered');
+    expect(s.nodes.get('n1')?.activityId).toBe('a1');
+  });
+
+  it('activityRunning projects node.status triggered → running via owner mapping', async () => {
+    const s = await snapshotAfter(
+      runCreated,
+      {
+        runId: RUN_ID,
+        type: 'attemptCreated',
+        actor: 'scheduler',
+        payload: {
+          nodeId: 'n1',
+          activityId: 'a1',
+          attemptId: 'at1',
+          attemptNumber: 1,
+          inputRef: sampleOutputRef,
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'activityRunning',
+        actor: 'worker',
+        payload: { activityId: 'a1', attemptId: 'at1', leaseId: 'L1' },
+      },
+    );
+    expect(s.activities.get('a1')?.status).toBe('running');
+    expect(s.nodes.get('n1')?.status).toBe('running');
+  });
+
+  it('retry (attemptNumber > 1) does NOT overwrite node.status — nodeRetrying owns that', async () => {
+    const s = await snapshotAfter(
+      runCreated,
+      {
+        runId: RUN_ID,
+        type: 'attemptCreated',
+        actor: 'scheduler',
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+      },
+      {
+        runId: RUN_ID,
+        type: 'activityFailed',
+        actor: 'worker',
+        payload: {
+          activityId: 'a1',
+          attemptId: 'at1',
+          error: { errorCode: 'NetworkError', errorClass: 'retryable', errorMessage: 'x' },
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'nodeRetrying',
+        actor: 'scheduler',
+        payload: { nodeId: 'n1', lastAttemptId: 'at1', nextBackoffMs: 1000 },
+      },
+      {
+        runId: RUN_ID,
+        type: 'attemptCreated',
+        actor: 'scheduler',
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at2', attemptNumber: 2, inputRef: sampleOutputRef },
+      },
+    );
+    // node.status stays 'retrying' (set by nodeRetrying), not overwritten
+    // back to 'triggered' by the new attempt.
+    expect(s.nodes.get('n1')?.status).toBe('retrying');
   });
 
   it('leaseSigned attaches lease info to current attempt', async () => {
@@ -234,7 +302,7 @@ describe('replay — Activity attempts + status', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -262,7 +330,7 @@ describe('replay — Activity attempts + status', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -282,7 +350,7 @@ describe('replay — Activity attempts + status', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -309,7 +377,7 @@ describe('replay — Activity attempts + status', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -336,7 +404,7 @@ describe('replay — Activity attempts + status', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -359,7 +427,7 @@ describe('replay — side effect: effectAttempted + terminal projection', () => 
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -388,7 +456,7 @@ describe('replay — side effect: effectAttempted + terminal projection', () => 
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -437,7 +505,7 @@ describe('replay — dangling sets', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
     );
     expect(s.danglingActivities).toEqual(['a1']);
@@ -451,7 +519,7 @@ describe('replay — dangling sets', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -478,7 +546,7 @@ describe('replay — dangling sets', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -573,7 +641,7 @@ describe('replay — retry: multiple attempts in same Activity', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
       },
       {
         runId: RUN_ID,
@@ -593,7 +661,7 @@ describe('replay — retry: multiple attempts in same Activity', () => {
         runId: RUN_ID,
         type: 'attemptCreated',
         actor: 'scheduler',
-        payload: { activityId: 'a1', attemptId: 'at2', attemptNumber: 2, inputRef: sampleOutputRef },
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at2', attemptNumber: 2, inputRef: sampleOutputRef },
       },
     );
     const a = s.activities.get('a1');

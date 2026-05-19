@@ -373,11 +373,11 @@ describe('event schema — reconcileResult decision matrix', () => {
   };
 
   it.each([
-    ['replayed', 'readOnlyLookup'],
+    ['replayed', 'none'],
     ['completedByIdempotentSubmit', 'idempotentSubmit'],
     ['manual', 'none'],
     ['freshRetry', 'readOnlyLookup'],
-  ] as const)('accepts decision=%s capability=%s', (decision, capability) => {
+  ] as const)('accepts decision=%s capability=%s (legal combo)', (decision, capability) => {
     const e = {
       ...base,
       payload: {
@@ -389,6 +389,35 @@ describe('event schema — reconcileResult decision matrix', () => {
       },
     };
     expect(safeParseEvent(e).success).toBe(true);
+  });
+
+  it.each([
+    // Each row is an illegal capability×decision pairing (codex round 4).
+    ['replayed', 'idempotentSubmit'],
+    ['replayed', 'readOnlyLookup'],
+    ['completedByIdempotentSubmit', 'none'],
+    ['completedByIdempotentSubmit', 'readOnlyLookup'],
+    ['freshRetry', 'none'],
+    ['freshRetry', 'idempotentSubmit'],
+    ['manual', 'idempotentSubmit'],
+    ['manual', 'readOnlyLookup'],
+  ] as const)('rejects decision=%s capability=%s (illegal combo)', (decision, capability) => {
+    const e = {
+      ...base,
+      payload: {
+        activityId: 'a1',
+        idempotencyKey: 'wf_test_idem',
+        capability,
+        decision,
+        evidence: {},
+      },
+    };
+    const r = safeParseEvent(e);
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      const msgs = r.error.issues.map((i) => i.message).join(';');
+      expect(msgs).toMatch(/reconcileResult: decision/);
+    }
   });
 
   it('rejects unknown decision', () => {

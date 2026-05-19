@@ -95,6 +95,12 @@ export type ActivityState = {
   // Latest-attempt projection (mirrors latest attempt's status).
   status: ActivityStatus;
   currentAttemptId?: string;
+  /**
+   * Node that owns this Activity (recorded from `attemptCreated.nodeId`).
+   * Lets us project node.status when activity-level events arrive
+   * (e.g. activityRunning → node.status = 'running').
+   */
+  ownerNodeId?: string;
 };
 
 export type NodeState = {
@@ -333,6 +339,20 @@ export function replay(events: WorkflowEvent[]): Snapshot {
           });
           a.currentAttemptId = p.attemptId;
           a.status = 'pending';
+          // Codex round 4 fix: capture activity→node ownership so we can
+          // project node.status on later activity-level events.
+          a.ownerNodeId = p.nodeId;
+          // First attempt creates the "this node is now triggered" signal:
+          // before attemptCreated the node has no activity to point at.
+          // For retries (attemptNumber > 1) we DON'T overwrite — by then
+          // the node has typically already been routed through
+          // `nodeRetrying` and we should let `nodeRetrying`'s explicit
+          // event own the status.
+          const n = getNode(p.nodeId);
+          n.activityId = p.activityId;
+          if (p.attemptNumber === 1 && n.status === 'idle') {
+            n.status = 'triggered';
+          }
         }
         break;
       }
@@ -445,6 +465,16 @@ export function replay(events: WorkflowEvent[]): Snapshot {
           if (at) {
             at.status = 'running';
             a.status = 'running';
+          }
+          // Project node.status from triggered/retrying → running when
+          // the activity's worker actually starts work.  Skip if the
+          // node has already reached waiting/terminal — those are owned
+          // by explicit node-level events.
+          if (a.ownerNodeId) {
+            const n = getNode(a.ownerNodeId);
+            if (n.status === 'triggered' || n.status === 'retrying') {
+              n.status = 'running';
+            }
           }
         }
         break;

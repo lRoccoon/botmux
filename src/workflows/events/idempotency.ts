@@ -117,10 +117,14 @@ export function deriveIdempotencyKey(
       throw new Error(`deriveIdempotencyKey: tuple.${k} must be non-empty string, got ${String(v)}`);
     }
   }
-  // Use a delimiter (`:`) that's improbable inside any single field — for v0
-  // we trust callers not to put `:` inside ids.  If that changes, switch to
-  // a length-prefixed canonical encoding.
-  const seed = `${tuple.workflowId}:${tuple.revisionId}:${tuple.runId}:${tuple.nodeId}:${tuple.attemptId}`;
+  // Codex round 4 minor: original implementation `${a}:${b}:${c}:${d}:${e}`
+  // had a theoretical collision: two distinct tuples whose fields happen
+  // to span `:` boundaries differently can produce the same seed (e.g.
+  // `{a:'x:y', b:'z', ...}` collides with `{a:'x', b:'y:z', ...}`).
+  // Hashing canonicalJson(tuple) — same canonical form used everywhere
+  // else for hash-stable serialization — closes the hole without any
+  // call-site change.
+  const seed = canonicalJson(tuple);
   const hash = createHash('sha256').update(seed, 'utf-8').digest('hex');
   return namespace + hash.substring(0, maxLength - namespace.length);
 }

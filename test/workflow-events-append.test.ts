@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { promises as fs, existsSync, readFileSync } from 'node:fs';
+import { promises as fs, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -109,9 +109,39 @@ describe('EventLog.append — concurrent appends serialize', () => {
     const seqs = results.map((e) => parseInt(e.eventId.split('-').pop()!, 10)).sort((a, b) => a - b);
     expect(seqs).toEqual(Array.from({ length: N }, (_, i) => i + 1));
   });
+
+  it('two EventLog instances for the same runId share a mutex — no seq collision', async () => {
+    // Codex round 4 fix: instance-local mutex would let two parallel
+    // EventLog instances both load seq=0, both assign seq=1 to their first
+    // append, and both write `runId-1` lines.  The module-level mutex map
+    // closes that hole.
+    const logA = new EventLog(RUN_ID, baseDir);
+    const logB = new EventLog(RUN_ID, baseDir);
+    const N = 10;
+    const promises = [
+      ...Array.from({ length: N }, () =>
+        logA.append(
+          smallDraft('nodeWaiting', { payload: { nodeId: 'A', waitReason: 'r' } } as Partial<EventDraft>),
+        ),
+      ),
+      ...Array.from({ length: N }, () =>
+        logB.append(
+          smallDraft('nodeWaiting', { payload: { nodeId: 'B', waitReason: 'r' } } as Partial<EventDraft>),
+        ),
+      ),
+    ];
+    const results = await Promise.all(promises);
+    const seqs = results.map((e) => parseInt(e.eventId.split('-').pop()!, 10)).sort((a, b) => a - b);
+    expect(seqs).toEqual(Array.from({ length: 2 * N }, (_, i) => i + 1));
+    // Final on-disk file should have 20 lines, all unique eventIds.
+    const events = await logA.readAll();
+    const ids = events.map((e) => e.eventId);
+    expect(ids).toHaveLength(2 * N);
+    expect(new Set(ids).size).toBe(2 * N);
+  });
 });
 
-describe('EventLog.append — inline vs ref payload spill', () => {
+describe('EventLog.append — inline payload size cap (codex round 4: no auto-spill)', () => {
   it('small payload stays inline, no payloadHash', async () => {
     const log = new EventLog(RUN_ID, baseDir);
     const e = await log.append(
@@ -123,47 +153,35 @@ describe('EventLog.append — inline vs ref payload spill', () => {
     expect('ref' in (e.payload as object)).toBe(false);
   });
 
-  it('payload > INLINE_PAYLOAD_MAX_BYTES spills to blob + sets payloadHash', async () => {
+  it('payload > INLINE_PAYLOAD_MAX_BYTES THROWS — caller must use OutputRef-shaped fields', async () => {
     const log = new EventLog(RUN_ID, baseDir);
-    // Build a "fat" payload by stuffing nodeId with a long string.
     const fatString = 'x'.repeat(INLINE_PAYLOAD_MAX_BYTES + 100);
-    const e = await log.append(
-      smallDraft('nodeWaiting', {
-        payload: { nodeId: fatString, waitReason: 'large' },
-      } as Partial<EventDraft>),
-    );
-    expect(e.payloadHash).toBeDefined();
-    expect(e.payloadHash).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect('ref' in (e.payload as object)).toBe(true);
-    // Blob file should exist on disk
-    const ref = (e.payload as any).ref;
-    expect(existsSync(ref)).toBe(true);
+    await expect(
+      log.append(
+        smallDraft('nodeWaiting', {
+          payload: { nodeId: fatString, waitReason: 'large' },
+        } as Partial<EventDraft>),
+      ),
+    ).rejects.toThrow(/inline payload .* exceeds INLINE_PAYLOAD_MAX_BYTES/);
   });
 
-  it('payloadHash matches sha256 of the inline JSON that was spilled', async () => {
+  it('caller-provided PayloadRef is accepted (own-blob path, with payloadHash)', async () => {
     const log = new EventLog(RUN_ID, baseDir);
-    const fat = 'x'.repeat(INLINE_PAYLOAD_MAX_BYTES + 100);
-    const draftPayload = { nodeId: fat, waitReason: 'r' };
-    const e = await log.append(
-      smallDraft('nodeWaiting', { payload: draftPayload } as Partial<EventDraft>),
-    );
-    const expected = 'sha256:' + createHash('sha256').update(JSON.stringify(draftPayload), 'utf-8').digest('hex');
-    expect(e.payloadHash).toBe(expected);
-  });
-
-  it('same fat content twice → single blob file (idempotent write)', async () => {
-    const log = new EventLog(RUN_ID, baseDir);
-    const fat = 'y'.repeat(INLINE_PAYLOAD_MAX_BYTES + 100);
-    const payload = { nodeId: fat, waitReason: 'r' };
-    const a = await log.append(
-      smallDraft('nodeWaiting', { payload } as Partial<EventDraft>),
-    );
-    const b = await log.append(
-      smallDraft('nodeWaiting', { payload } as Partial<EventDraft>),
-    );
-    expect((a.payload as any).ref).toBe((b.payload as any).ref);
-    const dirContents = await fs.readdir(log.blobDir);
-    expect(dirContents.length).toBe(1);
+    // Caller wrote their own blob and supplies ref + hash.  This codepath
+    // is permitted by the schema for custom-dashboard projections; the v0
+    // runtime doesn't exercise it but we keep the door open.
+    const blobPath = join(log.blobDir, 'caller-blob');
+    writeFileSync(blobPath, JSON.stringify({ x: 1 }), 'utf-8');
+    const hash = 'sha256:' + createHash('sha256').update('{"x":1}', 'utf-8').digest('hex');
+    const e = await log.append({
+      runId: RUN_ID,
+      type: 'runStarted',
+      actor: 'scheduler',
+      payload: { ref: blobPath, bytes: 8, schemaVersion: 1 },
+      payloadHash: hash,
+    } as EventDraft);
+    expect(e.payloadHash).toBe(hash);
+    expect((e.payload as any).ref).toBe(blobPath);
   });
 });
 
@@ -230,15 +248,16 @@ describe('EventLog seq recovery on restart', () => {
 });
 
 describe('EventLog.readBlob', () => {
-  it('reads back a spilled blob and content matches', async () => {
+  it('reads back a caller-written blob and content matches', async () => {
     const log = new EventLog(RUN_ID, baseDir);
-    const fat = 'z'.repeat(INLINE_PAYLOAD_MAX_BYTES + 100);
-    const payload = { nodeId: fat, waitReason: 'r' };
-    const e = await log.append(
-      smallDraft('nodeWaiting', { payload } as Partial<EventDraft>),
-    );
-    const blob = await log.readBlob((e.payload as any).ref);
-    expect(blob.toString('utf-8')).toBe(JSON.stringify(payload));
+    // No auto-spill anymore (codex round 4): the caller writes its own
+    // blob.  Read-back path is still useful for resume/replay that needs
+    // to materialize OutputRef-shaped business data.
+    const content = JSON.stringify({ hello: 'world' });
+    const blobPath = join(log.blobDir, 'manual-blob');
+    writeFileSync(blobPath, content, 'utf-8');
+    const blob = await log.readBlob(blobPath);
+    expect(blob.toString('utf-8')).toBe(content);
   });
 });
 
