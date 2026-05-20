@@ -52,6 +52,6 @@ describe('built-in botmux-workflow-create skill', () => {
     expect(skill!.content).toContain('feishu-reply');
     expect(skill!.content).toContain('botmux-schedule');
     expect(skill!.content).toContain('当前没有字符串模板语言');
-    expect(skill!.content).toContain('不支持 `params.*`');
+    expect(skill!.content).toContain('"$ref": "params.<path>"');
   });
 });

@@ -405,7 +405,9 @@ description: 根据用户自然语言描述生成 botmux workflow JSON 定义文
 4. 写完必须跑 \`botmux workflow validate <path>\`，失败就按错误修到通过。
 5. 高风险节点主动建议 \`humanGate\`：发消息、写文件、外部 API、git push、删除/覆盖。纯读、草稿、纯计算通常不加 gate。
 6. 当前没有字符串模板语言：不要写 \`{{params.name}}\` 或 \`{{draft.output}}\` 期望 runtime 展开。
-7. 当前 \`$ref\` 只支持整值替换 \`<nodeId>.output.<path>\`，不支持 \`params.*\`，也不能拼接字符串。
+7. \`$ref\` 只支持整值替换，**不能拼接字符串**。两种合法形式：
+   - \`{ "$ref": "<nodeId>.output.<path>" }\` 引上游节点输出
+   - \`{ "$ref": "params.<path>" }\` 引启动时的入参（嵌套字段也支持，例如 \`params.user.email\`）
 
 ## 工作流程
 
@@ -479,7 +481,7 @@ botmux workflow run <workflowId>
 }
 \`\`\`
 
-注意：\`params\` 当前用于 CLI/IM 入参校验和 run 记录，不会自动注入 prompt，也不能用 \`$ref: "params.x"\`。
+\`params\` 是启动 run 时通过 \`--param key=value\` 传入的入参，会被 type/required 校验。在节点里通过 \`{ "$ref": "params.<path>" }\` 注入到 \`prompt\` / \`humanGate.prompt\` / \`hostExecutor.input\` 任意字段。嵌套对象用点号路径：\`params.user.email\`。
 
 subagent node：
 
@@ -610,12 +612,18 @@ humanGate：
 }
 \`\`\`
 
-## 范例 B — subagent → gated feishu-send
+## 范例 B — subagent → gated feishu-send（演示 params 注入）
+
+启动：\`botmux workflow run weekly-report --param larkAppId=cli_xxx --param chatId=oc_xxx\`
 
 \`\`\`json
 {
   "workflowId": "weekly-report",
   "version": 1,
+  "params": {
+    "larkAppId": { "type": "string", "required": true, "description": "Target Lark app for the send" },
+    "chatId": { "type": "string", "required": true, "description": "Target chat (open_chat_id)" }
+  },
   "defaults": {
     "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
     "timeoutMs": 60000,
@@ -625,7 +633,7 @@ humanGate：
     "draft": {
       "type": "subagent",
       "bot": "claude-loopy",
-      "prompt": "Draft a weekly report. Return JSON: {\\"preview\\": string, \\"text\\": string}.",
+      "prompt": "Draft a weekly report covering this week's PRs, decisions, and blockers. Return JSON: {\\"preview\\": string, \\"text\\": string}.",
       "outputSchema": {
         "type": "object",
         "required": ["preview", "text"],
@@ -634,7 +642,7 @@ humanGate：
           "text": { "type": "string" }
         }
       },
-      "description": "Draft content before any side effect."
+      "description": "Generate report content. Prompt is static instruction; bot owns content."
     },
     "send": {
       "type": "hostExecutor",
@@ -647,21 +655,24 @@ humanGate：
         "onTimeout": "fail"
       },
       "input": {
-        "larkAppId": "cli_PLACEHOLDER",
-        "chatId": "oc_PLACEHOLDER",
+        "larkAppId": { "$ref": "params.larkAppId" },
+        "chatId": { "$ref": "params.chatId" },
         "content": { "$ref": "draft.output.text" },
         "msgType": "text"
       },
-      "description": "Send is an irreversible side effect, so it is gated."
+      "description": "Target chat parameterized via params — same workflow can target any chat."
     }
   }
 }
 \`\`\`
 
+**Params 注入最适合的场景**：路由信息（chat id / app id / recipient）、模式开关（mode='draft'|'send'）、配置（threshold、超时）。**不适合**：放完整 prompt 指令——因为 \`$ref\` 不能拼接字符串，prompt 应该是节点设计时确定的固定指令，让 bot 拿 params 当上下文 input 不如直接固定 prompt 简单。
+\`\`\`
+
 ## 常见错误
 
 - 写 \`{{...}}\` 模板：当前 runtime 不展开，改成整字段 \`$ref\` 或让上游输出完整字符串。
-- 写 \`{ "$ref": "params.x" }\`：不支持。参数当前不能作为 binding 来源。
+- \`$ref\` 字符串里没有 \`.output.\` 也不是 \`params.*\` 开头：parse 会报错。
 - \`$ref\` 引用的 node 没写进 \`depends\`：validate 可能过，运行时顺序不可靠。
 - \`humanGate.stage: "after"\`：不支持。
 - \`$ref\` 对象还有其他 key：schema 会拒绝。

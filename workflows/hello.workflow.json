@@ -1,9 +1,6 @@
 {
   "workflowId": "hello",
   "version": 1,
-  "params": {
-    "name": { "type": "string", "required": true }
-  },
   "defaults": {
     "retryPolicy": { "maxAttempts": 1, "backoff": "fixed", "baseMs": 1000 },
     "timeoutMs": 60000,
@@ -13,12 +10,15 @@
     "greet": {
       "type": "subagent",
       "bot": "claude-loopy",
-      "prompt": "Greet {{params.name}} in a friendly tone. Return JSON: {\"greeting\": string}.",
+      "prompt": "Write a short, friendly greeting message. Return JSON with two fields: `preview` (the greeting text shown to the human approver) and `finalPrompt` (a string instructing the next node to echo the greeting back verbatim as the final signed-off message). Schema: {\"preview\": string, \"finalPrompt\": string}.",
       "outputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
-        "required": ["greeting"],
-        "properties": { "greeting": { "type": "string" } }
+        "required": ["preview", "finalPrompt"],
+        "properties": {
+          "preview": { "type": "string" },
+          "finalPrompt": { "type": "string" }
+        }
       }
     },
     "confirm": {
@@ -27,11 +27,11 @@
       "depends": ["greet"],
       "humanGate": {
         "stage": "before",
-        "prompt": "Should we send this greeting? Preview: {{greet.output}}",
+        "prompt": { "$ref": "greet.output.preview" },
         "deadlineMs": 600000,
         "onTimeout": "fail"
       },
-      "prompt": "Echo the greeting from {{greet.output}} back as the final, signed-off message. Return JSON: {\"message\": string}.",
+      "prompt": { "$ref": "greet.output.finalPrompt" },
       "outputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
