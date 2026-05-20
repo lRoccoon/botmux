@@ -1,8 +1,10 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
+import { logger } from '../../utils/logger.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 /** Global submit log — CoCo appends one JSON line here on every successful
@@ -20,6 +22,22 @@ function delay(ms: number): Promise<void> {
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
+}
+
+function contentHash(content: string): string {
+  return createHash('sha256').update(content).digest('hex').slice(0, 12);
+}
+
+function historyState(path: string, baseByte: number): { exists: boolean; size: number; delta: number } {
+  const size = currentFileSize(path);
+  return { exists: existsSync(path), size, delta: Math.max(0, size - baseByte) };
+}
+
+function cocoDiag(id: string, event: string, fields: Record<string, unknown> = {}): void {
+  // Intentionally never log raw content/prefix. The hash+length are enough to
+  // correlate paste/Enter/history polling across a real failure without
+  // leaking user prompts into daemon logs.
+  logger.info(`[coco-submit:${id}] ${event}`, fields);
 }
 
 /** Scan `path` for a JSON line newer than `fromByte` that's a user-submit
@@ -57,12 +75,34 @@ function historyDeltaContains(path: string, fromByte: number, prefix: string): b
 }
 
 async function waitForHistoryAppend(
-  path: string, fromByte: number, prefix: string, timeoutMs: number,
+  path: string,
+  fromByte: number,
+  prefix: string,
+  timeoutMs: number,
+  diag?: { id: string; phase: string },
 ): Promise<boolean> {
+  const startedAt = Date.now();
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (historyDeltaContains(path, fromByte, prefix)) return true;
+    if (historyDeltaContains(path, fromByte, prefix)) {
+      if (diag) {
+        cocoDiag(diag.id, 'history-hit', {
+          phase: diag.phase,
+          elapsedMs: Date.now() - startedAt,
+          history: historyState(path, fromByte),
+        });
+      }
+      return true;
+    }
     await delay(100);
+  }
+  if (diag) {
+    cocoDiag(diag.id, 'history-timeout', {
+      phase: diag.phase,
+      timeoutMs,
+      elapsedMs: Date.now() - startedAt,
+      history: historyState(path, fromByte),
+    });
   }
   return false;
 }
@@ -136,21 +176,37 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // for the worker's deferred recheck + Lark warning path.
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
       const submitDelay = hasImagePath ? 800 : 500;
+      const diagId = randomBytes(4).toString('hex');
+      const contentMeta = {
+        length: content.length,
+        lines: content.length === 0 ? 0 : content.split('\n').length,
+        sha256: contentHash(content),
+        hasImagePath,
+      };
 
-      const trySendEnter = (): boolean => {
+      const trySendEnter = (phase: string): boolean => {
         try {
           if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
           else pty.write('\r');
+          cocoDiag(diagId, 'enter-sent', { phase });
           return true;
-        } catch {
+        } catch (err: any) {
           // tmux session is gone (CLI exited mid-write) — bail cleanly
           // rather than crashing the worker on unhandled execFileSync.
+          cocoDiag(diagId, 'enter-failed', { phase, error: err?.message ?? String(err) });
           return false;
         }
       };
 
       const baseByte = currentFileSize(HISTORY_PATH);
       const prefix = submitPrefix(content);
+      cocoDiag(diagId, 'start', {
+        content: contentMeta,
+        submitDelay,
+        historyPath: HISTORY_PATH,
+        history: historyState(HISTORY_PATH, baseByte),
+        transport: pty.pasteText ? 'tmux-pasteText' : 'raw-pty-bracketed-paste',
+      });
 
       try {
         if (pty.pasteText) {
@@ -161,15 +217,19 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
           // newline and the message strands. `-d` deletes the buffer after
           // pasting so it doesn't accumulate across writes.
           pty.pasteText(content);
+          cocoDiag(diagId, 'paste-sent', { transport: 'tmux-pasteText', content: contentMeta });
         } else {
           // Non-tmux fallback (raw PTY): wrap markers ourselves.
           pty.write('\x1b[200~' + content + '\x1b[201~');
+          cocoDiag(diagId, 'paste-sent', { transport: 'raw-pty-bracketed-paste', content: contentMeta });
         }
-      } catch {
+      } catch (err: any) {
+        cocoDiag(diagId, 'paste-failed', { error: err?.message ?? String(err), content: contentMeta });
         return { submitted: false };
       }
+      cocoDiag(diagId, 'submit-delay', { ms: submitDelay });
       await delay(submitDelay);
-      if (!trySendEnter()) return { submitted: false };
+      if (!trySendEnter('initial')) return { submitted: false };
 
       // Fresh-install short-wait: when history.jsonl is absent at submit
       // time, give CoCo up to 1.2s to create it. If our marker shows up →
@@ -179,10 +239,13 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // through to the normal retry/failure loop — better to warn than to
       // silently mask a real submit failure on a new install.
       if (!existsSync(HISTORY_PATH) && baseByte === 0) {
-        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 1200)) {
+        cocoDiag(diagId, 'fresh-install-short-wait-start', { history: historyState(HISTORY_PATH, baseByte) });
+        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 1200, { id: diagId, phase: 'fresh-install' })) {
+          cocoDiag(diagId, 'submitted-confirmed', { phase: 'fresh-install' });
           return undefined;
         }
         if (!existsSync(HISTORY_PATH)) {
+          cocoDiag(diagId, 'fresh-install-no-history-trust-enter', { history: historyState(HISTORY_PATH, baseByte) });
           return undefined;
         }
         // File appeared during the wait but our marker isn't in it — fall
@@ -191,19 +254,27 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       }
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
+        const phase = `retry-${attempt + 1}-pre-enter`;
+        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800, { id: diagId, phase })) {
+          cocoDiag(diagId, 'submitted-confirmed', { phase });
           return undefined;
         }
-        if (!trySendEnter()) return { submitted: false };
+        if (!trySendEnter(`retry-${attempt + 1}`)) return { submitted: false };
       }
-      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
+      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800, { id: diagId, phase: 'final' })) {
+        cocoDiag(diagId, 'submitted-confirmed', { phase: 'final' });
         return undefined;
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a slow
       // CoCo (cold start, large initial prompt, heavy hooks) may still
       // append our marker after retries gave up. Worker re-scans after a
       // delay before deciding whether to warn the user.
-      const recheck = (): boolean => historyDeltaContains(HISTORY_PATH, baseByte, prefix);
+      cocoDiag(diagId, 'submitted-unconfirmed-return-recheck', { history: historyState(HISTORY_PATH, baseByte) });
+      const recheck = (): boolean => {
+        const ok = historyDeltaContains(HISTORY_PATH, baseByte, prefix);
+        cocoDiag(diagId, 'deferred-recheck', { ok, history: historyState(HISTORY_PATH, baseByte) });
+        return ok;
+      };
       return { submitted: false, recheck };
     },
 

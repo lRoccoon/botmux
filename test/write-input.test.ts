@@ -44,6 +44,7 @@ import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
+import { logger } from '../src/utils/logger.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -1002,5 +1003,27 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
     const result = await adapter.writeInput(pty, 'hello');
     expect(result).toBeUndefined();
+  });
+
+  it('diagnostic logs correlate submit attempts without leaking raw content', async () => {
+    resetCocoHistory();
+    appendCocoHistory('seed prior submit so file exists');
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    try {
+      const adapter = createCocoAdapter('/bin/coco');
+      const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
+      await adapter.writeInput(pty, 'secret prompt body\nwith second line');
+
+      const logText = infoSpy.mock.calls
+        .map(call => call.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' '))
+        .join('\n');
+      expect(logText).toContain('[coco-submit:');
+      expect(logText).toContain('sha256');
+      expect(logText).toContain('length');
+      expect(logText).not.toContain('secret prompt body');
+      expect(logText).not.toContain('with second line');
+    } finally {
+      infoSpy.mockRestore();
+    }
   });
 });
