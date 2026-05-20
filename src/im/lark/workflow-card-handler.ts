@@ -7,9 +7,15 @@ import {
   type ResolveWaitInput,
   type ResolveWaitResult,
 } from '../../workflows/wait.js';
+import {
+  requestCancel,
+  type RequestCancelInput,
+} from '../../workflows/cancel.js';
+import type { CancelRequestedEvent } from '../../workflows/events/types.js';
 import type { FrozenCard } from '../../core/types.js';
 import {
   WORKFLOW_APPROVE_ACTION,
+  WORKFLOW_CANCEL_ACTION,
   WORKFLOW_COMMENT_FIELD,
   WORKFLOW_REJECT_ACTION,
 } from './workflow-cards.js';
@@ -28,16 +34,30 @@ export type WorkflowApprovalHandlerDeps = {
   runsDir?: string;
   makeEventLog?: (runId: string, runsDir: string) => EventLog;
   resolveWaitFn?: (log: EventLog, input: ResolveWaitInput) => Promise<ResolveWaitResult>;
+  requestCancelFn?: (
+    log: EventLog,
+    input: RequestCancelInput,
+    actor: 'human',
+  ) => Promise<CancelRequestedEvent>;
   loadFrozenCardsFn?: (storeId: string) => Map<string, FrozenCard>;
   saveFrozenCardsFn?: (storeId: string, cards: Map<string, FrozenCard>) => void;
 };
 
 export type WorkflowApprovalHandlerResult =
   | { ok: true; duplicate: true; cardNonce: string }
-  | { ok: true; duplicate: false; cardNonce: string; result: ResolveWaitResult };
+  | {
+      ok: true;
+      duplicate: false;
+      cardNonce: string;
+      result: ResolveWaitResult | CancelRequestedEvent;
+    };
 
 export function isWorkflowApprovalAction(action?: string): boolean {
-  return action === WORKFLOW_APPROVE_ACTION || action === WORKFLOW_REJECT_ACTION;
+  return (
+    action === WORKFLOW_APPROVE_ACTION ||
+    action === WORKFLOW_REJECT_ACTION ||
+    action === WORKFLOW_CANCEL_ACTION
+  );
 }
 
 export function workflowRunsDir(): string {
@@ -74,15 +94,26 @@ export async function handleWorkflowApprovalAction(
 
   const runsDir = deps.runsDir ?? workflowRunsDir();
   const makeEventLog = deps.makeEventLog ?? ((rid, base) => new EventLog(rid, base));
-  const resolve = deps.resolveWaitFn ?? resolveWait;
+  const log = makeEventLog(runId, runsDir);
   const comment = cleanComment(data.action?.form_value?.[WORKFLOW_COMMENT_FIELD]);
-  const result = await resolve(makeEventLog(runId, runsDir), {
-    activityId,
-    attemptId,
-    resolution: action === WORKFLOW_APPROVE_ACTION ? 'approved' : 'rejected',
-    by,
-    comment,
-  });
+  const result =
+    action === WORKFLOW_CANCEL_ACTION
+      ? await (deps.requestCancelFn ?? requestCancel)(
+          log,
+          {
+            target: { kind: 'run', runId },
+            reason: cancelReason(comment),
+            by,
+          },
+          'human',
+        )
+      : await (deps.resolveWaitFn ?? resolveWait)(log, {
+          activityId,
+          attemptId,
+          resolution: action === WORKFLOW_APPROVE_ACTION ? 'approved' : 'rejected',
+          by,
+          comment,
+        });
 
   frozenCards.set(cardNonce, {
     messageId: data.context?.open_message_id ?? data.open_message_id ?? '',
@@ -91,13 +122,22 @@ export async function handleWorkflowApprovalAction(
       runId,
       activityId,
       attemptId,
-      resolution: action === WORKFLOW_APPROVE_ACTION ? 'approved' : 'rejected',
+      resolution:
+        action === WORKFLOW_APPROVE_ACTION
+          ? 'approved'
+          : action === WORKFLOW_REJECT_ACTION
+            ? 'rejected'
+            : 'cancelled',
       by,
       ...(comment ? { comment } : {}),
     }),
   });
   saveCards(storeId, frozenCards);
-  logger.info(`[workflow:${runId}] wait ${activityId}/${attemptId} resolved by ${by}`);
+  if (action === WORKFLOW_CANCEL_ACTION) {
+    logger.info(`[workflow:${runId}] run cancel requested from approval card by ${by}`);
+  } else {
+    logger.info(`[workflow:${runId}] wait ${activityId}/${attemptId} resolved by ${by}`);
+  }
 
   return { ok: true, duplicate: false, cardNonce, result };
 }
@@ -111,4 +151,8 @@ function requiredValue(value: Record<string, string> | undefined, key: string): 
 function cleanComment(s: string | undefined): string | undefined {
   const trimmed = s?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function cancelReason(comment: string | undefined): string {
+  return comment ? `cancelled from approval card: ${comment}` : 'cancelled from approval card';
 }

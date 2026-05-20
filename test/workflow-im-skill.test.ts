@@ -11,6 +11,7 @@ import {
 } from '../src/im/lark/workflow-slash-command.js';
 import {
   WORKFLOW_APPROVE_ACTION,
+  WORKFLOW_CANCEL_ACTION,
   WORKFLOW_COMMENT_FIELD,
   workflowApprovalCardNonce,
 } from '../src/im/lark/workflow-cards.js';
@@ -337,6 +338,55 @@ describe('workflow approval card re-entry hook', () => {
           resolveWaitFn: vi.fn(async () => ({
             resolutionEvent: { type: 'waitResolved' },
             terminalEvent: { type: 'activitySucceeded' },
+          })) as any,
+        },
+      },
+    );
+
+    expect(workflowApprovalResolved).toHaveBeenCalledWith(runId);
+  });
+
+  it('triggers workflowApprovalResolved after a non-duplicate approval-card cancel click', async () => {
+    const runId = 'workflow-hello-test';
+    const cardNonce = workflowApprovalCardNonce(runId, 'gate-confirm', 'gate-confirm::att-1');
+    const workflowApprovalResolved = vi.fn();
+
+    await handleCardAction(
+      {
+        operator: { open_id: 'ou_approver' },
+        action: {
+          value: {
+            action: WORKFLOW_CANCEL_ACTION,
+            run_id: runId,
+            activity_id: 'gate-confirm',
+            attempt_id: 'gate-confirm::att-1',
+            card_nonce: cardNonce,
+          },
+          form_value: { [WORKFLOW_COMMENT_FIELD]: 'stop' },
+        },
+        context: { open_message_id: 'om_card' },
+      },
+      {
+        activeSessions: new Map(),
+        sessionReply: vi.fn(),
+        lastRepoScan: new Map(),
+        workflowApprovalResolved,
+        workflowApprovalDeps: {
+          runsDir: baseDir,
+          loadFrozenCardsFn: () => new Map(),
+          saveFrozenCardsFn: () => undefined,
+          requestCancelFn: vi.fn(async () => ({
+            runId,
+            eventId: `${runId}-7`,
+            schemaVersion: 1,
+            type: 'cancelRequested',
+            timestamp: 1,
+            actor: 'human',
+            payload: {
+              target: { kind: 'run', runId },
+              reason: 'cancelled from approval card: stop',
+              by: 'ou_approver',
+            },
           })) as any,
         },
       },

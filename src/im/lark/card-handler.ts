@@ -134,7 +134,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`

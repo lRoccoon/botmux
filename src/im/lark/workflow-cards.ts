@@ -5,6 +5,7 @@ import { isPayloadRef } from '../../workflows/events/schema.js';
 
 export const WORKFLOW_APPROVE_ACTION = 'wf_approve';
 export const WORKFLOW_REJECT_ACTION = 'wf_reject';
+export const WORKFLOW_CANCEL_ACTION = 'wf_cancel';
 export const WORKFLOW_COMMENT_FIELD = 'wf_comment';
 export const WORKFLOW_APPROVAL_FORM = 'wf_approval_form';
 
@@ -136,6 +137,14 @@ export function buildWorkflowApprovalCard(
             name: 'workflow_reject',
             action_type: 'form_submit',
             value: actionValue(ctx, WORKFLOW_REJECT_ACTION),
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '取消 Run' },
+            type: 'default',
+            name: 'workflow_cancel',
+            action_type: 'form_submit',
+            value: actionValue(ctx, WORKFLOW_CANCEL_ACTION),
           },
         ],
       },

@@ -11,6 +11,7 @@ import { createWait } from '../src/workflows/wait.js';
 import {
   buildWorkflowApprovalCard,
   WORKFLOW_APPROVE_ACTION,
+  WORKFLOW_CANCEL_ACTION,
   WORKFLOW_COMMENT_FIELD,
   WORKFLOW_REJECT_ACTION,
   workflowApprovalCardNonce,
@@ -124,6 +125,7 @@ describe('buildWorkflowApprovalCard', () => {
     const text = cardText(card);
     expect(text).toContain(WORKFLOW_APPROVE_ACTION);
     expect(text).toContain(WORKFLOW_REJECT_ACTION);
+    expect(text).toContain(WORKFLOW_CANCEL_ACTION);
     expect(text).toContain(RUN_ID);
     expect(text).toContain(ACTIVITY_ID);
     expect(text).toContain(ATTEMPT_ID);
@@ -225,5 +227,66 @@ describe('handleWorkflowApprovalAction', () => {
     expect(first).toMatchObject({ ok: true, duplicate: false });
     expect(second).toMatchObject({ ok: true, duplicate: true });
     expect(resolveWaitFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancel click writes run-level cancelRequested without resolving the wait', async () => {
+    await bootstrapWait();
+
+    await handleWorkflowApprovalAction(cardActionData(WORKFLOW_CANCEL_ACTION, 'stop it'), {
+      runsDir: baseDir,
+      loadFrozenCardsFn: () => new Map(),
+      saveFrozenCardsFn: () => undefined,
+    });
+
+    const events = await log.readAll();
+    const cancel = events.find((e) => e.type === 'cancelRequested');
+    expect(cancel?.payload).toMatchObject({
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'cancelled from approval card: stop it',
+      by: 'ou_approver',
+    });
+    expect(events.find((e) => e.type === 'waitResolved')).toBeUndefined();
+    expect(replay(events).cancelledRunIntent).toMatchObject({
+      requestedBy: 'ou_approver',
+      reason: 'cancelled from approval card: stop it',
+    });
+  });
+
+  it('freezes the approval card so approve after cancel is ignored', async () => {
+    let cards = new Map<string, FrozenCard>();
+    const resolveWaitFn = vi.fn(async () => ({
+      resolutionEvent: { type: 'waitResolved' },
+      terminalEvent: { type: 'activitySucceeded' },
+    })) as any;
+    const requestCancelFn = vi.fn(async () => ({
+      runId: RUN_ID,
+      eventId: `${RUN_ID}-99`,
+      schemaVersion: 1,
+      type: 'cancelRequested',
+      timestamp: 1,
+      actor: 'human',
+      payload: {
+        target: { kind: 'run', runId: RUN_ID },
+        reason: 'cancelled from approval card',
+        by: 'ou_approver',
+      },
+    })) as any;
+    const deps = {
+      runsDir: baseDir,
+      resolveWaitFn,
+      requestCancelFn,
+      loadFrozenCardsFn: () => new Map(cards),
+      saveFrozenCardsFn: (_storeId: string, nextCards: Map<string, FrozenCard>) => {
+        cards = new Map(nextCards);
+      },
+    };
+
+    const first = await handleWorkflowApprovalAction(cardActionData(WORKFLOW_CANCEL_ACTION), deps);
+    const second = await handleWorkflowApprovalAction(cardActionData(WORKFLOW_APPROVE_ACTION), deps);
+
+    expect(first).toMatchObject({ ok: true, duplicate: false });
+    expect(second).toMatchObject({ ok: true, duplicate: true });
+    expect(requestCancelFn).toHaveBeenCalledTimes(1);
+    expect(resolveWaitFn).not.toHaveBeenCalled();
   });
 });
