@@ -276,6 +276,7 @@ Gemini / OpenCode), with no MCP protocol support required.
 - One-click locate back to the Feishu thread / open Web Terminal / multi-select batch close
 - Create a new group with auto owner-transfer + @-mention notification
 - Disband or leave a chat (associated sessions auto-closed)
+- **Workflows console** (read-only): Run List polls every 5s; clicking through opens Run Detail with summary, dangling-work red panel, node/activity table, and event timeline (2s poll, auto-stops once the run reaches a terminal state). Mutations (`run` / `resume` / `cancel`) still go through the `botmux workflow` CLI or IM cards — the v0 UI is observation-only.
 
 <img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
 
