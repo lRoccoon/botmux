@@ -109,6 +109,7 @@ type CancelRunResponse = {
   hint?: string;
   status?: string;
   alreadyTerminal?: boolean;
+  pending?: boolean;
   lastSeq?: number;
 };
 
@@ -495,7 +496,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
       if (!res.ok || !body.ok) {
         throw new Error(body.hint ?? body.error ?? `cancel HTTP ${res.status}`);
       }
-      setError(null);
+      setError(body.pending ? 'cancel pending; waiting for running activity to drain' : null);
       await poll();
     } catch (err: any) {
       setError(err?.message ?? String(err));

@@ -375,6 +375,7 @@ async function cancelWorkflowRunFromDashboard(
   alreadyTerminal: boolean;
   cancelEventId?: string;
   loopReason?: string;
+  pending?: boolean;
   lastSeq: number;
 } | {
   ok: false;
@@ -416,6 +417,7 @@ async function cancelWorkflowRunFromDashboard(
       alreadyTerminal: false,
       cancelEventId,
       loopReason: 'already-running',
+      pending: true,
       lastSeq: after.lastSeq,
     };
   }
