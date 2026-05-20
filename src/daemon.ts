@@ -81,8 +81,7 @@ import { runLoop } from './workflows/loop.js';
 import type { RunLoopResult } from './workflows/loop.js';
 import { createWorkflowDaemonSpawn } from './workflows/daemon-spawn.js';
 import { createDaemonSpawnFn } from './workflows/spawn-bot.js';
-import { scanColdWorkflowRuns } from './workflows/cold-scan.js';
-import { EventLog } from './workflows/events/append.js';
+import { attachColdWorkflowRunsForDaemon } from './workflows/cold-attach.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { loadEffectInputSidecar } from './workflows/effect-input.js';
 import {
@@ -468,20 +467,11 @@ async function cancelWorkflowRunOnDaemon(
 
 async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
   const runsDir = getRunsDir();
-  const runs = await scanColdWorkflowRuns({
+  const result = await attachColdWorkflowRunsForDaemon({
     runsDir,
     ownerLarkAppId,
-    onSkip: (runId, reason) => logger.debug(`[workflow:${runId}] cold-scan skipped: ${reason}`),
-  });
-  if (runs.length === 0) {
-    logger.info(`[workflow] cold-scan: no active runs for ${ownerLarkAppId}`);
-    return;
-  }
-
-  for (const run of runs) {
-    if (workflowRuns.has(run.runId)) continue;
-    const log = new EventLog(run.runId, runsDir);
-    const ctx: WorkflowRuntimeContext = {
+    isAttached: (runId) => workflowRuns.has(runId),
+    makeContext: (run, log) => ({
       log,
       def: run.def,
       spawnSubagent: workflowSpawnFn(),
@@ -489,25 +479,27 @@ async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
       reconcilers: createDefaultProviderReconcilers(),
       loadEffectInput: (activityId, attemptId) =>
         loadEffectInputSidecar(log, activityId, attemptId),
-    };
-    const watcher = attachWorkflowEventWatcher(run.runId, ctx);
-    try {
-      await watcher.ready;
-    } catch {
-      continue;
-    }
-    logger.info(
-      `[workflow:${run.runId}] cold-attached status=${run.snapshot.run.status} ` +
-        `danglingEffects=${run.snapshot.danglingEffectAttempted.length} ` +
-        `danglingWaits=${run.snapshot.danglingWaits.length}`,
-    );
-    driveWorkflowRun(run.runId).catch((err) => {
+    }),
+    attachWatcher: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
+    driveRun: (runId) => driveWorkflowRun(runId),
+    onSkip: (runId, reason) => logger.debug(`[workflow:${runId}] cold-scan skipped: ${reason}`),
+    onAttached: (run) => {
+      logger.info(
+        `[workflow:${run.runId}] cold-attached status=${run.snapshot.run.status} ` +
+          `danglingEffects=${run.snapshot.danglingEffectAttempted.length} ` +
+          `danglingWaits=${run.snapshot.danglingWaits.length}`,
+      );
+    },
+    onDriveError: (runId, err) => {
       logger.warn(
-        `[workflow:${run.runId}] cold-scan drive failed: ${
+        `[workflow:${runId}] cold-scan drive failed: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
-    });
+    },
+  });
+  if (result.discovered === 0) {
+    logger.info(`[workflow] cold-scan: no active runs for ${ownerLarkAppId}`);
   }
 }
 
