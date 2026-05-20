@@ -106,7 +106,8 @@ input.row-select { cursor: pointer; }
 /* Workflow detail */
 .wf-detail-head { display: flex; align-items: flex-start; gap: 0.8rem; margin-bottom: 0.8rem; }
 .wf-detail-head h2 { margin: 0 0 0.15rem; font-size: 18px; line-height: 1.25; }
-.wf-detail-head #wf-detail-refresh { margin-left: auto; white-space: nowrap; }
+.wf-detail-head #wf-cancel-run { margin-left: auto; }
+.wf-detail-head #wf-detail-refresh { white-space: nowrap; }
 .wf-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.6rem; margin-bottom: 0.8rem; }
 .wf-summary-item { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.6rem; min-width: 0; }
 .wf-summary-item span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; margin-bottom: 0.2rem; }

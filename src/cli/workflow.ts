@@ -14,7 +14,7 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import { EventLog } from '../workflows/events/append.js';
-import { replay, type Snapshot } from '../workflows/events/replay.js';
+import { replay } from '../workflows/events/replay.js';
 import { parseWorkflowDefinition } from '../workflows/definition.js';
 import { loadWorkflowDefinition } from '../workflows/loader.js';
 import { runLoop } from '../workflows/loop.js';
@@ -27,10 +27,9 @@ import {
 } from '../workflows/hostExecutors/registry.js';
 import { loadEffectInputSidecar } from '../workflows/effect-input.js';
 import {
-  completeNodeCancel,
-  completeRunCancel,
-  requestCancel,
-} from '../workflows/cancel.js';
+  cancelWorkflowRun,
+  isTerminalRunStatus,
+} from '../workflows/cancel-run.js';
 import {
   createStubSpawnFn,
   type StubSpawnHandler,
@@ -386,32 +385,28 @@ async function cmdWorkflowCancel(rest: string[]): Promise<void> {
     return;
   }
 
-  if (!snapshot.cancelledRunIntent) {
-    const cancel = await requestCancel(
-      log,
-      {
-        target: { kind: 'run', runId },
-        reason,
-        by: 'cli',
-      },
-      'human',
+  const ctx = workflowCliRuntimeContext(log, def, cliResumeSpawnSubagent);
+  const result = await cancelWorkflowRun({
+    ctx,
+    reason,
+    by: 'cli',
+    actor: 'human',
+    maxTicks: 200,
+  });
+  snapshot = result.snapshot;
+
+  if (result.cancelEventId) {
+    console.log(
+      result.cancelAlreadyRequested
+        ? `cancel already requested: ${result.cancelEventId}`
+        : `cancelRequested: ${result.cancelEventId}`,
     );
-    console.log(`cancelRequested: ${cancel.eventId}`);
-  } else {
-    console.log(`cancel already requested: ${snapshot.cancelledRunIntent.cancelOriginEventId}`);
   }
 
-  snapshot = replay(await log.readAll());
-  await finalizeRunCancelIfPossible(log, def, snapshot);
-
-  const ctx = workflowCliRuntimeContext(log, def, cliResumeSpawnSubagent);
-  const result = await runLoop(ctx, { maxTicks: 200 });
-
-  snapshot = replay(await log.readAll());
-  await finalizeRunCancelIfPossible(log, def, snapshot);
-  snapshot = replay(await log.readAll());
-
-  console.log(`\nloop stopped: ${result.reason} after ${result.ticks} tick(s)`);
+  console.log(
+    `\nloop stopped: ${result.loopResult?.reason ?? 'terminal'} ` +
+      `after ${result.loopResult?.ticks ?? 0} tick(s)`,
+  );
   console.log(`run.status=${snapshot.run.status}`);
   console.log(`events: ${snapshot.lastSeq}`);
   if (snapshot.danglingCancels.length > 0) {
@@ -492,70 +487,6 @@ async function readExistingRunEvents(
     process.exit(1);
   }
   return events;
-}
-
-function isTerminalRunStatus(status: string): boolean {
-  return status === 'succeeded' || status === 'failed' || status === 'cancelled';
-}
-
-async function finalizeRunCancelIfPossible(
-  log: EventLog,
-  def: Awaited<ReturnType<typeof loadRunWorkflowDefinition>>,
-  snapshot: Snapshot,
-): Promise<void> {
-  const intent = snapshot.cancelledRunIntent;
-  if (!intent) return;
-
-  for (const nodeId of Object.keys(def.nodes)) {
-    const nodeStatus = snapshot.nodes.get(nodeId)?.status ?? 'idle';
-    if (isTerminalNodeStatus(nodeStatus)) continue;
-    const ownedActivities = [...snapshot.activities.values()].filter(
-      (activity) => activity.ownerNodeId === nodeId,
-    );
-    const hasNonTerminalActivity = ownedActivities.some(
-      (activity) => !isTerminalActivityStatus(activity.status),
-    );
-    if (hasNonTerminalActivity) continue;
-    await completeNodeCancel(
-      log,
-      {
-        nodeId,
-        cancelOriginEventId: intent.cancelOriginEventId,
-      },
-      'scheduler',
-    );
-  }
-
-  const afterNodes = replay(await log.readAll());
-  if (!afterNodes.cancelledRunIntent) return;
-  const allNodesTerminal = Object.keys(def.nodes).every((nodeId) =>
-    isTerminalNodeStatus(afterNodes.nodes.get(nodeId)?.status ?? 'idle'),
-  );
-  if (!allNodesTerminal) return;
-
-  await completeRunCancel(
-    log,
-    { cancelOriginEventId: afterNodes.cancelledRunIntent.cancelOriginEventId },
-    'scheduler',
-  );
-}
-
-function isTerminalNodeStatus(status: string): boolean {
-  return (
-    status === 'succeeded' ||
-    status === 'failed' ||
-    status === 'skipped' ||
-    status === 'cancelled'
-  );
-}
-
-function isTerminalActivityStatus(status: string): boolean {
-  return (
-    status === 'succeeded' ||
-    status === 'failed' ||
-    status === 'timedOut' ||
-    status === 'cancelled'
-  );
 }
 
 function collectParams(rest: string[]): Record<string, unknown> {

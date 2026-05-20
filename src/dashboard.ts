@@ -18,6 +18,8 @@ import {
   listRuns,
   readRunSnapshot,
   readEventWindow,
+  isValidRunId,
+  TERMINAL_RUN_STATUSES,
 } from './workflows/ops-projection.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 
@@ -151,6 +153,13 @@ function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  if (chunks.length === 0) return {} as T;
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
 async function proxyToDaemon(
   larkAppId: string, daemonPath: string, init: RequestInit,
 ): Promise<Response> {
@@ -277,11 +286,14 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Workflows (D0 — read-only) ──────────────────────────────────────────
+    // ─── Workflows (D0 read-only + D1 cancel mutation) ───────────────────────
     //
     // Dashboard reads runsDir directly (single-process; cross-daemon ownership
     // doesn't matter for read-only).  All readers in `ops-projection` are
     // pure: no mkdir, no EventLog instantiation.  Unknown / corrupt run → 404.
+    // Mutations are intentionally proxied to the owner daemon from
+    // chat-binding.larkAppId so only the daemon with live workflow runtime
+    // context writes the event log.
 
     if (req.method === 'GET' && url.pathname === '/api/workflows/runs') {
       const all = url.searchParams.get('all') === '1';
@@ -325,6 +337,50 @@ const server = createServer(async (req, res) => {
       });
       if (!window) return jsonRes(res, 404, { error: 'unknown_run' });
       return jsonRes(res, 200, window);
+    }
+
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/cancel$/))) {
+      const runId = decodeURIComponent(m[1]);
+      if (!isValidRunId(runId)) {
+        return jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
+      }
+      let body: { reason?: unknown };
+      try {
+        body = await readJsonBody<{ reason?: string }>(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const reason =
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason.trim()
+          : 'cancelled via dashboard';
+      const snap = await readRunSnapshot(getRunsDir(), runId);
+      if (!snap) return jsonRes(res, 404, { ok: false, error: 'unknown_run' });
+      if (TERMINAL_RUN_STATUSES.has(snap.run.status)) {
+        return jsonRes(res, 200, {
+          ok: true,
+          runId,
+          status: snap.run.status,
+          alreadyTerminal: true,
+          lastSeq: snap.lastSeq,
+        });
+      }
+      const owner = snap.chatBinding?.larkAppId;
+      if (!owner) {
+        return jsonRes(res, 409, { ok: false, error: 'workflow_owner_missing' });
+      }
+      const upstream = await proxyToDaemon(
+        owner,
+        `/api/workflows/runs/${encodeURIComponent(runId)}/cancel`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ reason }),
+        },
+      );
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
     }
 
     // ─── Groups (Phase B) ────────────────────────────────────────────────────

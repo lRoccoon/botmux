@@ -42,7 +42,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
 } from './core/worker-pool.js';
-import { setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
+import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -89,6 +89,13 @@ import {
   createDefaultHostExecutorRegistry,
   createDefaultProviderReconcilers,
 } from './workflows/hostExecutors/registry.js';
+import {
+  cancelWorkflowRun,
+  isTerminalRunStatus,
+} from './workflows/cancel-run.js';
+import { requestCancel } from './workflows/cancel.js';
+import { replay } from './workflows/events/replay.js';
+import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -358,6 +365,98 @@ function cleanupWorkflowRun(runId: string): void {
   }
 }
 
+async function cancelWorkflowRunFromDashboard(
+  runId: string,
+  reason: string,
+): Promise<{
+  ok: true;
+  runId: string;
+  status: string;
+  alreadyTerminal: boolean;
+  cancelEventId?: string;
+  loopReason?: string;
+  lastSeq: number;
+} | {
+  ok: false;
+  error: string;
+  status?: string;
+}> {
+  if (!isValidRunId(runId)) return { ok: false, error: 'bad_run_id' };
+
+  const entry = workflowRuns.get(runId);
+  if (entry?.running) {
+    const snapshot = replay(await entry.ctx.log.readAll());
+    if (isTerminalRunStatus(snapshot.run.status)) {
+      return {
+        ok: true,
+        runId,
+        status: snapshot.run.status,
+        alreadyTerminal: true,
+        lastSeq: snapshot.lastSeq,
+      };
+    }
+    let cancelEventId = snapshot.cancelledRunIntent?.cancelOriginEventId;
+    if (!cancelEventId) {
+      const cancel = await requestCancel(
+        entry.ctx.log,
+        {
+          target: { kind: 'run', runId },
+          reason,
+          by: 'dashboard',
+        },
+        'human',
+      );
+      cancelEventId = cancel.eventId;
+    }
+    const after = replay(await entry.ctx.log.readAll());
+    return {
+      ok: true,
+      runId,
+      status: after.run.status,
+      alreadyTerminal: false,
+      cancelEventId,
+      loopReason: 'already-running',
+      lastSeq: after.lastSeq,
+    };
+  }
+
+  const current = workflowRuns.get(runId);
+  if (!current) {
+    const snapshot = await readRunSnapshot(getRunsDir(), runId);
+    if (!snapshot) return { ok: false, error: 'unknown_run' };
+    if (isTerminalRunStatus(snapshot.run.status)) {
+      return {
+        ok: true,
+        runId,
+        status: snapshot.run.status,
+        alreadyTerminal: true,
+        lastSeq: snapshot.lastSeq,
+      };
+    }
+    return { ok: false, error: 'workflow_not_attached', status: snapshot.run.status };
+  }
+
+  const result = await cancelWorkflowRun({
+    ctx: current.ctx,
+    reason,
+    by: 'dashboard',
+    actor: 'human',
+    maxTicks: 200,
+  });
+  if (isTerminalRunStatus(result.snapshot.run.status)) {
+    cleanupWorkflowRun(runId);
+  }
+  return {
+    ok: true,
+    runId,
+    status: result.snapshot.run.status,
+    alreadyTerminal: result.alreadyTerminal,
+    cancelEventId: result.cancelEventId,
+    loopReason: result.loopResult?.reason,
+    lastSeq: result.snapshot.lastSeq,
+  };
+}
+
 async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
   const runsDir = getRunsDir();
   const runs = await scanColdWorkflowRuns({
@@ -554,6 +653,29 @@ const cardDeps: CardHandlerDeps = {
     });
   },
 };
+
+ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) => {
+  let body: { reason?: unknown };
+  try {
+    body = await readJsonBody<{ reason?: string }>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const reason =
+    typeof body.reason === 'string' && body.reason.trim()
+      ? body.reason.trim()
+      : 'cancelled via dashboard';
+  const result = await cancelWorkflowRunFromDashboard(params.runId, reason);
+  if (!result.ok) {
+    const status =
+      result.error === 'bad_run_id' ? 400 :
+        result.error === 'unknown_run' ? 404 :
+          result.error === 'workflow_not_attached' ? 409 :
+            500;
+    return jsonRes(res, status, result);
+  }
+  return jsonRes(res, 200, result);
+});
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 

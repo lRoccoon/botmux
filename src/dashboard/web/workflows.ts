@@ -1,4 +1,4 @@
-// Dashboard workflow Run List page (D0 — read-only).
+// Dashboard workflow Run List / Detail pages.
 //
 // Polls /api/workflows/runs every 5s while visible.  Each row links to
 // #/workflows/<runId> — the Run Detail page (B path) hooks into the
@@ -101,6 +101,14 @@ type EventWindow = {
   totalCount: number;
   hasOlder: boolean;
   hasNewer: boolean;
+};
+
+type CancelRunResponse = {
+  ok: boolean;
+  error?: string;
+  status?: string;
+  alreadyTerminal?: boolean;
+  lastSeq?: number;
 };
 
 const PAGE_HTML = `
@@ -307,6 +315,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
         <h2><code>${escapeHtml(runId)}</code></h2>
         <div id="wf-detail-subtitle" class="muted">Loading...</div>
       </div>
+      <button id="wf-cancel-run" type="button" class="contrast" hidden>Cancel</button>
       <span id="wf-detail-refresh" class="muted"></span>
     </div>
     <section id="wf-detail-error" class="hint-warn" hidden></section>
@@ -351,6 +360,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   const nodeTbody = root.querySelector<HTMLElement>('#wf-node-tbody')!;
   const eventTbody = root.querySelector<HTMLElement>('#wf-event-tbody')!;
   const eventMeta = root.querySelector<HTMLElement>('#wf-event-meta')!;
+  const cancelBtn = root.querySelector<HTMLButtonElement>('#wf-cancel-run')!;
   const loadOlder = root.querySelector<HTMLButtonElement>('#wf-load-older')!;
 
   let snapshot: RunSnapshot | null = null;
@@ -363,6 +373,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   let timer: number | null = null;
   let disposed = false;
   let inflight = false;
+  let canceling = false;
 
   function setError(message: string | null): void {
     if (!message) {
@@ -460,11 +471,46 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     }
   }
 
+  async function cancelRun(): Promise<void> {
+    if (!snapshot || TERMINAL.has(snapshot.run.status) || canceling) return;
+    if (!snapshot.chatBinding?.larkAppId) {
+      setError('cancel unavailable: this run has no chat-binding owner');
+      return;
+    }
+    if (!window.confirm(`Cancel workflow run ${runId}?`)) return;
+    canceling = true;
+    cancelBtn.disabled = true;
+    try {
+      const res = await fetch(`/api/workflows/runs/${encodeURIComponent(runId)}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ reason: 'cancelled via dashboard' }),
+      });
+      const body = (await res.json().catch(() => ({}))) as CancelRunResponse;
+      if (!res.ok || !body.ok) {
+        throw new Error(body.error ?? `cancel HTTP ${res.status}`);
+      }
+      setError(null);
+      await poll();
+    } catch (err: any) {
+      setError(err?.message ?? String(err));
+    } finally {
+      canceling = false;
+      cancelBtn.disabled = false;
+      rerender();
+    }
+  }
+
   function rerender(): void {
     if (!snapshot) return;
     const run = snapshot.run;
     subtitle.innerHTML = `${escapeHtml(run.workflowId ?? '?')} · ${statusBadge(run.status)} · lastSeq ${snapshot.lastSeq}`;
     refresh.textContent = `refreshed ${new Date().toLocaleTimeString()}`;
+    cancelBtn.hidden = TERMINAL.has(run.status);
+    cancelBtn.disabled = canceling || !snapshot.chatBinding?.larkAppId;
+    cancelBtn.title = snapshot.chatBinding?.larkAppId
+      ? 'Cancel this workflow run'
+      : 'Cancel unavailable: no chat-binding owner';
     renderSummary(summaryEl, snapshot);
     renderDangling(danglingEl, snapshot);
     renderNodeActivityRows(nodeTbody, snapshot);
@@ -493,6 +539,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   }
 
   loadOlder.addEventListener('click', () => void loadOlderEvents());
+  cancelBtn.addEventListener('click', () => void cancelRun());
   document.addEventListener('visibilitychange', onVisibility);
 
   void initialLoad()
