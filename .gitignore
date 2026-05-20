@@ -11,3 +11,7 @@ midscene_run/
 .codex
 .claude/
 
+
+# tmux debug/client logs (from `tmux -v` / verbose runs)
+tmux-client-*.log
+tmux-server-*.log
