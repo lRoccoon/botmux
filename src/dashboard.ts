@@ -9,7 +9,7 @@ import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import {
-  generateToken, parseCookie, buildSetCookie, verifyHmac,
+  generateToken, parseCookie, buildSetCookie, verifyHmac, decideDashboardAuth,
 } from './dashboard/auth.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -211,31 +211,25 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { url: fullUrl });
     }
 
-    // Workflow read-only paths + static SPA shell are public — the dashboard
-    // is meant to be linkable from Lark cards without forcing a `botmux
-    // dashboard` round-trip. Write actions (POST cancel etc.) still require
-    // the active token, matching the "get_write_link" pattern on session
-    // terminal cards.
-    const isWorkflowReadOnly =
-      req.method === 'GET' && url.pathname.startsWith('/api/workflows/');
-    const isStaticShell =
-      req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/assets/'));
+    const presentedToken = authedToken(req, url);
+    const decision = decideDashboardAuth({
+      method: req.method ?? 'GET',
+      pathname: url.pathname,
+      hasTokenParam: url.searchParams.has('t'),
+      presentedToken,
+      activeToken: activeToken ?? '',
+    });
 
-    // All other paths require an authenticated session.
-    const tok = authedToken(req, url);
-    const authed = !!tok && tok === activeToken;
-    if (!authed && !isWorkflowReadOnly && !isStaticShell) {
+    if (decision.kind === 'deny401') {
       res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');
       return;
     }
 
-    // First hit with `?t=<token>` sets the cookie + redirects to clean URL.
-    // Only reached when the token matched (authed=true && tok set above).
-    if (url.searchParams.has('t') && authed && tok) {
+    if (decision.kind === 'allow+set-cookie') {
       res.writeHead(302, {
-        'set-cookie': buildSetCookie(tok),
-        'location': url.pathname || '/',
+        'set-cookie': buildSetCookie(decision.token),
+        'location': decision.redirectTo,
       });
       res.end();
       return;
