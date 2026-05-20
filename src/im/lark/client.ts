@@ -409,8 +409,9 @@ export async function uploadFile(larkAppId: string, filePath: string): Promise<s
  * open_ids, AND return a `raw entry → resolved open_id` map. The map lets
  * `/revoke` delete the correct raw entry (email OR open_id) from bots.json so
  * the revocation survives a restart. open_id entries map to themselves;
- * resolved emails map via the API's `item.email`. Unresolvable emails are
- * dropped from both the list and the map.
+ * resolved emails are keyed by the EXACT raw email string from the config
+ * (matched case-insensitively against the API's returned email) so the map key
+ * always equals what's in `allowedUsers`. Unresolvable emails are dropped.
  */
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
@@ -439,13 +440,19 @@ export async function resolveAllowedUsersWithMap(
       return { resolved: openIds, map };
     }
     const userList: any[] = res.data?.user_list ?? [];
+    // 先按 normalized(email) → user_id 建查找表，再对原始请求的 raw email 逐个回填 map，
+    // 保证 map 的 key 与 allowedUsers 里的字面值完全一致（防 API 大小写/规范化错配）。
+    const byNorm = new Map<string, string>();
     for (const item of userList) {
-      if (item.user_id) {
-        openIds.push(item.user_id);
-        if (item.email) map.set(item.email, item.user_id);
-        logger.info(`Resolved ${item.email} → ${item.user_id}`);
-      } else {
-        logger.warn(`Could not resolve email: ${item.email}`);
+      if (item.user_id && item.email) byNorm.set(String(item.email).toLowerCase(), item.user_id);
+      else if (!item.user_id) logger.warn(`Could not resolve email: ${item.email}`);
+    }
+    for (const rawEmail of emails) {
+      const uid = byNorm.get(rawEmail.toLowerCase());
+      if (uid) {
+        openIds.push(uid);
+        map.set(rawEmail, uid);
+        logger.info(`Resolved ${rawEmail} → ${uid}`);
       }
     }
   } catch (err: any) {

@@ -6,6 +6,7 @@
  */
 import { getOwnerOpenId, getBotOpenId } from '../../bot-registry.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
+import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending } from './grant-pending.js';
 import { revokeGrant } from '../../services/grant-store.js';
@@ -23,7 +24,11 @@ export function parseGrantTarget(message: any, botOpenId: string | undefined): {
 export async function tryHandleGrantCommand(
   larkAppId: string, message: any, senderOpenId: string | undefined,
 ): Promise<boolean> {
-  const text = (extractMessageTextForRouting(message) ?? '').trim();
+  const rawText = extractMessageTextForRouting(message);
+  if (!rawText) return false;
+  // 先 strip 掉开头的 @<mention>（含本 bot），否则 `@bot /grant @x` 解析后是
+  // `@Claude /grant @x`，正则匹配不到。与 /introduce 同款处理。
+  const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
   const isGrant = /^\/grant(\s|$)/i.test(text);
   const isRevoke = /^\/revoke(\s|$)/i.test(text);
   if (!isGrant && !isRevoke) return false;

@@ -151,8 +151,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (cardMessageId) await updateMessage(larkAppId, cardMessageId, buildGrantResultCard('deny', loc));
       return;
     }
-    if (value.action === 'grant_chat') await addChatGrant(larkAppId, grantChatId, target);
-    else await addGlobalGrant(larkAppId, target);
+    const res = value.action === 'grant_chat'
+      ? await addChatGrant(larkAppId, grantChatId, target)
+      : await addGlobalGrant(larkAppId, target);
+    if (!res.ok) {
+      // 写失败：保留 pending（owner 可重试），卡片不渲染成成功，给 toast。
+      logger.warn(`Grant action "${value.action}" store failed: ${res.reason}`);
+      return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: res.reason }, loc) } };
+    }
     clearPending(larkAppId, grantChatId, target);
     if (cardMessageId) {
       await updateMessage(larkAppId, cardMessageId, buildGrantResultCard(value.action === 'grant_chat' ? 'chat' : 'global', loc));
@@ -181,8 +187,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : undefined;
     const effectiveAppId = larkAppId ?? ds?.larkAppId ?? closedForCtx?.larkAppId;
     const chatId = ds?.chatId ?? closedForCtx?.chatId;
+    // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo 起会话——
+    // 与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
+    const pendingRepoOwnerException =
+      value.action === 'skip_repo' && !!ds?.pendingRepo &&
+      !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
-      if (!canOperate(effectiveAppId, chatId, operatorOpenId)) {
+      if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
         logger.info(`Card action "${value.action}" blocked for non-operator user: ${operatorOpenId} (chat=${chatId})`);
         return;
       }
@@ -715,6 +726,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = activeSessions.get(sKey);
     if (!ds) return;
+
+    // /adopt 是管理动作：下拉入口同样要求 canOperate（命令路径已在 daemon 层 gate）。
+    if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+      logger.info(`adopt_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
+      return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(ds.larkAppId)) } };
+    }
 
     // Parse selected session info
     let selected: { tmuxTarget: string; cliPid: number };

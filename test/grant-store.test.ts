@@ -53,6 +53,13 @@ describe('grant-store', () => {
     expect(r).toEqual({ ok: false, reason: 'would_open_bot' });
   });
 
+  it('revokeGrant refuses to revoke the owner even when others remain (#2)', async () => {
+    writeConfig({ allowedUsers: ['ou_owner', 'ou_guest'] });
+    const { store } = await freshModules();
+    const r = await store.revokeGrant('a1', 'oc_1', 'ou_owner');
+    expect(r).toEqual({ ok: false, reason: 'would_open_bot' });
+  });
+
   it('revokeGrant atomically removes chat+global for a normal user', async () => {
     writeConfig({ allowedUsers: ['ou_owner', 'ou_guest'], chatGrants: { oc_1: ['ou_guest'] } });
     const { registry, store } = await freshModules();

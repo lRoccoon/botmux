@@ -57,7 +57,8 @@ export const messages: Record<string, string> = {
   'card.grant.note': '「授权本群」仅允许其在本群与我对话；管理命令（/cd、/oncall 等）仍仅限 owner。',
   'card.grant.toast_owner_only': '仅 owner 可操作',
   'card.grant.toast_expired': '该授权请求已失效',
-  'card.grant.toast_no_repo_perm': '无权限切换仓库',
+  'card.grant.toast_no_repo_perm': '无操作权限',
+  'card.grant.toast_failed': '授权失败：{reason}',
   'card.grant.result_chat': '✅ 已授权本群使用',
   'card.grant.result_global': '✅ 已全局授权',
   'card.grant.result_deny': '🚫 已拒绝该申请',
@@ -169,8 +170,8 @@ export const messages: Record<string, string> = {
   'help.oncall_unbind': '/oncall unbind       - 解绑当前群',
   'help.oncall_status': '/oncall status       - 查看当前群的 oncall 绑定',
   'help.heading_grant': '🔑 使用授权（owner 专用）：',
-  'help.grant': '/grant @某人   - 弹授权卡片，授权对方「本群使用」或「全局」',
-  'help.revoke': '/revoke @某人  - 撤销对方的本群 + 全局授权',
+  'help.grant': '@机器人 /grant @某人   - 弹授权卡片，授权对方「本群使用」或「全局」',
+  'help.revoke': '@机器人 /revoke @某人  - 撤销对方的本群 + 全局授权',
   'help.help': '/help       - 显示此帮助',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────

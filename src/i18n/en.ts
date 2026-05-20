@@ -54,7 +54,8 @@ export const messages: Record<string, string> = {
   'card.grant.note': '"Grant this chat" only lets them talk to me here; management commands (/cd, /oncall, …) remain owner-only.',
   'card.grant.toast_owner_only': 'Only the owner can do this',
   'card.grant.toast_expired': 'This request has expired',
-  'card.grant.toast_no_repo_perm': 'No permission to switch repo',
+  'card.grant.toast_no_repo_perm': 'No permission',
+  'card.grant.toast_failed': 'Grant failed: {reason}',
   'card.grant.result_chat': '✅ Granted for this chat',
   'card.grant.result_global': '✅ Granted globally',
   'card.grant.result_deny': '🚫 Request denied',
@@ -166,8 +167,8 @@ export const messages: Record<string, string> = {
   'help.oncall_unbind': '/oncall unbind       - Unbind this group',
   'help.oncall_status': '/oncall status       - Show oncall binding for this group',
   'help.heading_grant': '🔑 Access grants (owner only):',
-  'help.grant': '/grant @someone   - Pop an authorization card to grant "this chat" or "global" access',
-  'help.revoke': '/revoke @someone  - Revoke their this-chat + global access',
+  'help.grant': '@bot /grant @someone   - Pop an authorization card to grant "this chat" or "global" access',
+  'help.revoke': '@bot /revoke @someone  - Revoke their this-chat + global access',
   'help.help': '/help       - Show this help',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
