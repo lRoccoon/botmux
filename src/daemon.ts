@@ -81,6 +81,14 @@ import { runLoop } from './workflows/loop.js';
 import type { RunLoopResult } from './workflows/loop.js';
 import { createWorkflowDaemonSpawn } from './workflows/daemon-spawn.js';
 import { createDaemonSpawnFn } from './workflows/spawn-bot.js';
+import { scanColdWorkflowRuns } from './workflows/cold-scan.js';
+import { EventLog } from './workflows/events/append.js';
+import { getRunsDir } from './workflows/runs-dir.js';
+import { loadEffectInputSidecar } from './workflows/effect-input.js';
+import {
+  createDefaultHostExecutorRegistry,
+  createDefaultProviderReconcilers,
+} from './workflows/hostExecutors/registry.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -347,6 +355,51 @@ function cleanupWorkflowRun(runId: string): void {
   if (watcher) {
     watcher.close();
     workflowEventWatchers.delete(runId);
+  }
+}
+
+async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
+  const runsDir = getRunsDir();
+  const runs = await scanColdWorkflowRuns({
+    runsDir,
+    ownerLarkAppId,
+    onSkip: (runId, reason) => logger.debug(`[workflow:${runId}] cold-scan skipped: ${reason}`),
+  });
+  if (runs.length === 0) {
+    logger.info(`[workflow] cold-scan: no active runs for ${ownerLarkAppId}`);
+    return;
+  }
+
+  for (const run of runs) {
+    if (workflowRuns.has(run.runId)) continue;
+    const log = new EventLog(run.runId, runsDir);
+    const ctx: WorkflowRuntimeContext = {
+      log,
+      def: run.def,
+      spawnSubagent: workflowSpawnFn(),
+      hostExecutors: createDefaultHostExecutorRegistry(),
+      reconcilers: createDefaultProviderReconcilers(),
+      loadEffectInput: (activityId, attemptId) =>
+        loadEffectInputSidecar(log, activityId, attemptId),
+    };
+    const watcher = attachWorkflowEventWatcher(run.runId, ctx);
+    try {
+      await watcher.ready;
+    } catch {
+      continue;
+    }
+    logger.info(
+      `[workflow:${run.runId}] cold-attached status=${run.snapshot.run.status} ` +
+        `danglingEffects=${run.snapshot.danglingEffectAttempted.length} ` +
+        `danglingWaits=${run.snapshot.danglingWaits.length}`,
+    );
+    driveWorkflowRun(run.runId).catch((err) => {
+      logger.warn(
+        `[workflow:${run.runId}] cold-scan drive failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
   }
 }
 
@@ -1371,6 +1424,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   restoreActiveSessions(activeSessions);
+
+  await attachColdWorkflowRuns(cfg.larkAppId);
 
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
   // each filters to only execute tasks whose `larkAppId` matches its bot

@@ -74,19 +74,29 @@ export async function runLoop(
     // those out before any forward decision.  Without reconcilers we
     // CANNOT silently proceed — the dangling effect represents real
     // external state we'd be ignoring.
-    if (snapshot.danglingEffectAttempted.length > 0) {
-      if (!ctx.reconcilers || ctx.reconcilers.size === 0) {
+    const danglingRecoverableActivities = snapshot.danglingActivities.filter(
+      (activityId) => !snapshot.danglingWaits.includes(activityId),
+    );
+    if (
+      snapshot.danglingEffectAttempted.length > 0 ||
+      danglingRecoverableActivities.length > 0
+    ) {
+      if (
+        snapshot.danglingEffectAttempted.length > 0 &&
+        (!ctx.reconcilers || ctx.reconcilers.size === 0)
+      ) {
         logger.warn?.(
           `runLoop(${ctx.log.runId}): danglingEffectAttempted=${snapshot.danglingEffectAttempted.length} but ctx.reconcilers missing/empty — stopping with no-progress.`,
         );
         return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
       }
       const before = new Set(snapshot.danglingEffectAttempted);
+      const beforeRecoverable = new Set(danglingRecoverableActivities);
       await resume({
         log: ctx.log,
         runId: ctx.log.runId,
         daemonId: 'runloop',
-        reconcilers: ctx.reconcilers,
+        reconcilers: ctx.reconcilers ?? new Map(),
         loadEffectInput: ctx.loadEffectInput,
         now: ctx.now,
       });
@@ -95,11 +105,24 @@ export async function runLoop(
       // reconcilers concluded manual/transient.  Don't dispatch new work
       // — operator needs to look at the failed reconcile evidence.
       const stillDangling = snapshot.danglingEffectAttempted.filter((a) => before.has(a));
-      if (stillDangling.length === before.size) {
+      if (before.size > 0 && stillDangling.length === before.size) {
         logger.warn?.(
           `runLoop(${ctx.log.runId}): resume() made no progress on ${stillDangling.length} dangling effect(s) — stopping with no-progress.`,
         );
         return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
+      }
+      if (before.size === 0 && beforeRecoverable.size > 0) {
+        const stillRecoverable = snapshot.danglingActivities.filter(
+          (activityId) =>
+            beforeRecoverable.has(activityId) &&
+            !snapshot.danglingWaits.includes(activityId),
+        );
+        if (stillRecoverable.length === beforeRecoverable.size) {
+          logger.warn?.(
+            `runLoop(${ctx.log.runId}): resume() made no progress on ${stillRecoverable.length} dangling non-effect activity/activities — stopping with no-progress.`,
+          );
+          return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
+        }
       }
       // Progress made; re-enter loop with fresh snapshot before
       // computing actions.

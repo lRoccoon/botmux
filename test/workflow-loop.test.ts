@@ -10,7 +10,7 @@ import {
   type WorkflowDefinition,
 } from '../src/workflows/definition.js';
 import { createRun, type BotResolver } from '../src/workflows/run-init.js';
-import { gateActivityId } from '../src/workflows/orchestrator.js';
+import { gateActivityId, workActivityId } from '../src/workflows/orchestrator.js';
 import {
   type WorkflowRuntimeContext,
   type WorkerSpawnFn,
@@ -211,5 +211,47 @@ describe('runLoop — safety', () => {
     const result = await runLoop(ctx);
     expect(result.reason).toBe('terminal');
     expect(result.lastSnapshot.run.status).toBe('failed');
+  });
+
+  it('recovers a dangling non-effect activity as WorkerCrashed before deciding next actions', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'dangling-subagent',
+      version: 1,
+      nodes: { only: { type: 'subagent', bot: 'b', prompt: 'x' } },
+    });
+    const { log, ctx } = await bootstrap(def);
+    const activityId = workActivityId(RUN_ID, 'only');
+    const attemptId = `${activityId}::att-1`;
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'only',
+        activityId,
+        attemptId,
+        attemptNumber: 1,
+        inputRef: {
+          outputHash: 'sha256:' + '1'.repeat(64),
+          outputBytes: 1,
+          outputSchemaVersion: 1,
+        },
+      },
+    });
+
+    const result = await runLoop(ctx);
+
+    expect(result.reason).toBe('terminal');
+    expect(result.lastSnapshot.run.status).toBe('failed');
+    const events = await log.readAll();
+    const failed = events.find((e) => e.type === 'activityFailed');
+    expect(failed?.payload).toMatchObject({
+      activityId,
+      attemptId,
+      error: {
+        errorCode: 'WorkerCrashed',
+        errorClass: 'retryable',
+      },
+    });
   });
 });

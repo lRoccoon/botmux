@@ -411,10 +411,10 @@ describe('R1 — fresh subagent dispatch during cold resume is rejected, not cra
   });
 });
 
-// ─── Test 4: cold-start in-flight subagent → no-progress (R2 boundary) ──
+// ─── Test 4: cold-start in-flight subagent → WorkerCrashed recovery ─────
 
-describe('R1 — in-flight subagent activity on cold resume stays no-progress', () => {
-  it('attemptCreated without terminal and without effectAttempted is NOT touched by resume; runLoop returns no-progress (R2 will own the WorkerCrashed flip)', async () => {
+describe('R2 — in-flight subagent activity on cold resume is marked crashed', () => {
+  it('attemptCreated without terminal and without effectAttempted is recovered as WorkerCrashed without re-spawning', async () => {
     const def = parseWorkflowDefinition({
       workflowId: 'wf-r1-inflight',
       version: 1,
@@ -458,9 +458,6 @@ describe('R1 — in-flight subagent activity on cold resume stays no-progress', 
       },
     });
 
-    const eventsBefore = await log.readAll();
-    const seqBefore = eventsBefore[eventsBefore.length - 1]!.seq;
-
     const {
       createDefaultHostExecutorRegistry,
       createDefaultProviderReconcilers,
@@ -487,20 +484,22 @@ describe('R1 — in-flight subagent activity on cold resume stays no-progress', 
 
     const result = await runLoop(ctx, { maxTicks: 50 });
 
-    // Locked R1 behavior: in-flight subagent activity is invisible to
-    // R0 recovery and not re-dispatched by the orchestrator → no-progress.
-    expect(result.reason).toBe('no-progress');
-    expect(result.lastSnapshot.run.status).toBe('running');
+    // R2 cold-scan behavior: non-wait dangling activities are handed to
+    // resume(), which materializes WorkerCrashed.  Crucially, the daemon
+    // does not re-spawn the old subagent attempt.
+    expect(result.reason).toBe('terminal');
+    expect(result.lastSnapshot.run.status).toBe('failed');
     expect(spawnCalls).toBe(0);
 
-    // The activity is dangling at the activity level but NOT at the
-    // effect level — R2's cold-scan will be the one to decide whether
-    // to flip it to WorkerCrashed.
-    expect(result.lastSnapshot.danglingActivities).toContain(activityId);
-    expect(result.lastSnapshot.danglingEffectAttempted).not.toContain(activityId);
-
-    // No new events written during the no-progress detection.
     const eventsAfter = await log.readAll();
-    expect(eventsAfter[eventsAfter.length - 1]!.seq).toBe(seqBefore);
+    const failure = eventsAfter.find((e) => e.type === 'activityFailed');
+    expect(failure?.payload).toMatchObject({
+      activityId,
+      attemptId,
+      error: {
+        errorCode: 'WorkerCrashed',
+        errorClass: 'retryable',
+      },
+    });
   });
 });
