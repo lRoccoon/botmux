@@ -40,7 +40,10 @@ type TriggerResponse = {
   error?: string;
   hint?: string;
   message?: string;
-  issues?: Array<{ path?: string; code?: string; message: string }>;
+  // Matches the daemon contract from triggerWorkflowRun: `path` is the
+  // dotted-key trail (currently length 0 or 1), so we render `a.b.c` for
+  // potential future nesting and `(root)` when empty rather than blank.
+  issues?: Array<{ path: string[]; code?: string; message: string }>;
 };
 
 function escapeHtml(s: string): string {
@@ -304,7 +307,7 @@ function renderCatalogDetailPage(root: HTMLElement, workflowId: string): () => v
           issueEl.hidden = false;
           issueEl.innerHTML = `<strong>${escapeHtml(t('catalog.invalidParams'))}</strong><ul>${
             result.issues.map((issue) => `<li>${escapeHtml(t('catalog.issue', {
-              path: issue.path || '-',
+              path: issue.path.length ? issue.path.join('.') : '(root)',
               message: issue.message,
             }))}</li>`).join('')
           }</ul>`;
