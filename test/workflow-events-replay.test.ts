@@ -631,6 +631,77 @@ describe('replay — dangling sets', () => {
     );
     expect(s.danglingWaits).toEqual([]);
   });
+
+  it.each([
+    [
+      'activitySucceeded',
+      {
+        activityId: 'a1',
+        attemptId: 'at1',
+        outputRef: sampleOutputRef,
+      },
+    ],
+    [
+      'activityFailed',
+      {
+        activityId: 'a1',
+        attemptId: 'at1',
+        error: {
+          errorCode: 'WorkerCrashed',
+          errorClass: 'retryable',
+          errorMessage: 'worker lost',
+        },
+      },
+    ],
+    [
+      'activityTimedOut',
+      {
+        activityId: 'a1',
+        attemptId: 'at1',
+        runningMs: 1000,
+        reason: 'LeaseExpired',
+        errorClass: 'retryable',
+      },
+    ],
+    [
+      'activityCanceled',
+      {
+        activityId: 'a1',
+        attemptId: 'at1',
+        cancelOriginEventId: 'run-replay-test-01-3',
+      },
+    ],
+  ] as const)('waitCreated + %s terminal → not dangling', async (type, payload) => {
+    const s = await snapshotAfter(
+      runCreated,
+      {
+        runId: RUN_ID,
+        type: 'attemptCreated',
+        actor: 'scheduler',
+        payload: {
+          nodeId: 'n1',
+          activityId: 'a1',
+          attemptId: 'at1',
+          attemptNumber: 1,
+          inputRef: sampleOutputRef,
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: { activityId: 'a1', nodeId: 'n1', waitKind: 'human-gate' },
+      },
+      {
+        runId: RUN_ID,
+        type,
+        actor: 'scheduler',
+        payload,
+      },
+    );
+    expect(s.danglingWaits).toEqual([]);
+    expect(s.danglingActivities).toEqual([]);
+  });
 });
 
 describe('replay — retry: multiple attempts in same Activity', () => {

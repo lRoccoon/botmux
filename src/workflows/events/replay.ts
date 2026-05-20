@@ -571,6 +571,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
             at.externalRefs = p.externalRefs;
             a.status = 'succeeded';
             outputs.set(p.activityId, p.outputRef);
+            waitsOpen.delete(p.activityId);
           }
         }
         break;
@@ -584,6 +585,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
             at.status = 'failed';
             at.error = p.error;
             a.status = 'failed';
+            waitsOpen.delete(p.activityId);
           }
         }
         break;
@@ -597,6 +599,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
             at.status = 'timedOut';
             at.runningMs = p.runningMs;
             a.status = 'timedOut';
+            waitsOpen.delete(p.activityId);
           }
         }
         break;
@@ -644,6 +647,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
             at.status = 'cancelled';
             at.cancelOriginEventId = p.cancelOriginEventId;
             a.status = 'cancelled';
+            waitsOpen.delete(p.activityId);
           }
         }
         break;
