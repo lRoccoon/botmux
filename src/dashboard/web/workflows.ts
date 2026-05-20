@@ -14,6 +14,9 @@ type RunRow = {
   dWait: number;
   updatedAt: number;
   failedNodeId?: string;
+  errorCode?: string;
+  errorClass?: string;
+  errorMessage?: string;
   chatId?: string;
   larkAppId?: string;
 };
@@ -52,6 +55,7 @@ type AttemptState = {
   wait?: {
     waitKind: string;
     prompt?: string;
+    promptPreview?: string;
     deadlineAt?: number;
     resolution?: { kind: string; resolution?: string; by?: string; eventId: string };
   };
@@ -130,6 +134,21 @@ type CancelRunResponse = {
   alreadyTerminal?: boolean;
   pending?: boolean;
   lastSeq?: number;
+};
+
+type ResolveWaitResponse = {
+  ok: boolean;
+  error?: string;
+  hint?: string;
+  message?: string;
+  runId?: string;
+  resolution?: 'approved' | 'rejected';
+  activityId?: string;
+  attemptId?: string;
+  resolvedAt?: number;
+  lastSeq?: number;
+  alreadyTerminal?: boolean;
+  pending?: boolean;
 };
 
 const PAGE_HTML = `
@@ -234,12 +253,13 @@ function renderWorkflowListPage(root: HTMLElement): () => void {
         if (r.chatId) chatBits.push(escapeHtml(r.chatId));
         if (r.larkAppId) chatBits.push(`<span class="muted">${escapeHtml(r.larkAppId)}</span>`);
         const chatCell = chatBits.length > 0 ? chatBits.join('<br/>') : '—';
+        const errorSummary = renderRunErrorSummary(r);
         return `<tr data-runid="${escapeHtml(r.runId)}">
           <td><a href="#/workflows/${encodeURIComponent(r.runId)}"><code>${escapeHtml(r.runId)}</code></a></td>
           <td>${escapeHtml(r.workflowId)}</td>
           <td>${statusBadge(r.status)}${
             r.failedNodeId ? ` <span class="muted">(${escapeHtml(r.failedNodeId)})</span>` : ''
-          }</td>
+          }${errorSummary}</td>
           <td>${r.lastSeq}</td>
           <td class="${danglingCls}">${dangling}</td>
           <td title="${escapeHtml(new Date(r.updatedAt).toISOString())}">${fmtUpdated(r.updatedAt)}</td>
@@ -407,6 +427,9 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   let canceling = false;
   const openIOBlocks = new Set<string>();
   const ioScrollTops = new Map<string, number>();
+  const approvalComments = new Map<string, string>();
+  const approvalStatuses = new Map<string, { kind: 'ok' | 'error'; text: string }>();
+  const resolvingWaits = new Set<string>();
   let timelineScrollTop = 0;
 
   function setError(message: string | null): void {
@@ -553,6 +576,49 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     }
   }
 
+  async function resolveHumanGate(
+    attemptId: string,
+    action: 'approve' | 'reject',
+  ): Promise<void> {
+    if (resolvingWaits.has(attemptId)) return;
+    resolvingWaits.add(attemptId);
+    approvalStatuses.delete(attemptId);
+    rerender();
+    try {
+      const comment = approvalComments.get(attemptId)?.trim() || undefined;
+      const res = await fetch(`/api/workflows/runs/${encodeURIComponent(runId)}/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ comment }),
+      });
+      if (res.status === 401) {
+        throw new Error('write access required: run `botmux dashboard` in the terminal to get a one-time URL, open it once to set the cookie, then come back and approve/reject again.');
+      }
+      const body = (await res.json().catch(() => ({}))) as ResolveWaitResponse;
+      if (!res.ok || !body.ok) {
+        throw new Error(body.hint ?? body.message ?? body.error ?? `${action} HTTP ${res.status}`);
+      }
+      const label = action === 'approve' ? 'approved' : 'rejected';
+      approvalStatuses.set(attemptId, {
+        kind: 'ok',
+        text: body.alreadyTerminal
+          ? `Run already terminal; ${label} was not applied.`
+          : body.pending
+            ? `${label}; waiting for workflow to continue.`
+            : `${label}; refreshing workflow state.`,
+      });
+      setError(null);
+      await poll();
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      approvalStatuses.set(attemptId, { kind: 'error', text: message });
+      setError(message);
+    } finally {
+      resolvingWaits.delete(attemptId);
+      rerender();
+    }
+  }
+
   function rerender(): void {
     if (!snapshot) return;
     timelineScrollTop = timelineScroll.scrollTop;
@@ -569,7 +635,12 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     renderSummary(summaryEl, snapshot);
     renderDangling(danglingEl, snapshot);
     renderNodeActivityRows(nodeTbody, snapshot);
-    renderNodeIO(ioList, snapshot, openIOBlocks, ioScrollTops);
+    renderNodeIO(ioList, snapshot, openIOBlocks, ioScrollTops, {
+      comments: approvalComments,
+      statuses: approvalStatuses,
+      resolving: resolvingWaits,
+      onResolve: resolveHumanGate,
+    });
     renderEvents(eventTbody, events);
     timelineScroll.scrollTop = timelineScrollTop;
     loadOlder.hidden = !hasOlder;
@@ -635,6 +706,14 @@ function renderSummary(el: HTMLElement, snap: RunSnapshot): void {
   el.innerHTML = items
     .map(([label, value]) => `<div class="wf-summary-item"><span>${label}</span><strong>${value}</strong></div>`)
     .join('');
+}
+
+function renderRunErrorSummary(run: RunRow): string {
+  if (!run.errorCode) return '';
+  const message = run.errorMessage ? ` — ${shortText(run.errorMessage, 96)}` : '';
+  return `<div class="wf-run-error">
+    <span class="muted error">${escapeHtml(run.errorCode)}</span>${escapeHtml(message)}
+  </div>`;
 }
 
 function danglingSummary(snap: RunSnapshot): {
@@ -726,8 +805,10 @@ function renderNodeIO(
   snap: RunSnapshot,
   openBlocks: Set<string>,
   scrollTops: Map<string, number>,
+  approval: ApprovalRenderState,
 ): void {
   syncIOBlockState(el, openBlocks, scrollTops);
+  syncApprovalComments(el, approval.comments);
   const byId = new Map(snap.activities.map((a) => [a.activityId, a]));
   const used = new Set<string>();
   const cards: string[] = [];
@@ -737,7 +818,7 @@ function renderNodeIO(
       (node.activityId ? byId.get(node.activityId) : undefined) ??
       snap.activities.find((a) => a.ownerNodeId === node.nodeId);
     if (!activity) {
-      cards.push(renderIOCard(node, undefined, undefined, openBlocks));
+      cards.push(renderIOCard(node, undefined, undefined, openBlocks, approval));
       continue;
     }
     used.add(activity.activityId);
@@ -746,6 +827,7 @@ function renderNodeIO(
       activity,
       snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
       openBlocks,
+      approval,
     ));
   }
 
@@ -756,6 +838,7 @@ function renderNodeIO(
       activity,
       snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
       openBlocks,
+      approval,
     ));
   }
 
@@ -763,7 +846,15 @@ function renderNodeIO(
   restoreIOBlockScroll(el, scrollTops);
   attachIOBlockToggleTracking(el, openBlocks);
   attachIOBlockScrollTracking(el, scrollTops);
+  attachApprovalControls(el, approval);
 }
+
+type ApprovalRenderState = {
+  comments: Map<string, string>;
+  statuses: Map<string, { kind: 'ok' | 'error'; text: string }>;
+  resolving: Set<string>;
+  onResolve: (attemptId: string, action: 'approve' | 'reject') => Promise<void>;
+};
 
 function latestAttempt(activity?: ActivityState): AttemptState | undefined {
   return activity?.attempts[activity.attempts.length - 1];
@@ -774,10 +865,12 @@ function renderIOCard(
   activity: ActivityState | undefined,
   io: AttemptIO | undefined,
   openBlocks: Set<string>,
+  approval: ApprovalRenderState,
 ): string {
   const attempt = latestAttempt(activity);
   const title = node?.nodeId ?? activity?.ownerNodeId ?? activity?.activityId ?? 'unknown';
   const keyPrefix = attempt?.attemptId ?? activity?.activityId ?? node?.nodeId ?? 'unknown';
+  const controls = renderApprovalControls(attempt, approval);
   return `<article class="wf-io-card">
     <header>
       <div>
@@ -789,6 +882,7 @@ function renderIOCard(
     <div class="wf-io-meta">
       ${attempt ? `attempt <code>${escapeHtml(attempt.attemptId)}</code>` : 'No attempt yet'}
     </div>
+    ${controls}
     <div class="wf-io-grid">
       ${renderPreviewBlock(keyPrefix, 'Authored input', io?.input, openBlocks)}
       ${renderPreviewBlock(keyPrefix, 'Resolved input', io?.resolvedInput, openBlocks)}
@@ -797,6 +891,63 @@ function renderIOCard(
       ${io?.waitPrompt ? renderPreviewBlock(keyPrefix, 'Wait prompt', io.waitPrompt, openBlocks) : ''}
     </div>
   </article>`;
+}
+
+function renderApprovalControls(
+  attempt: AttemptState | undefined,
+  approval: ApprovalRenderState,
+): string {
+  if (!isOpenHumanGateAttempt(attempt)) return '';
+  const attemptId = attempt.attemptId;
+  const comment = approval.comments.get(attemptId) ?? '';
+  const resolving = approval.resolving.has(attemptId);
+  const status = approval.statuses.get(attemptId);
+  const statusClass = status?.kind === 'error' ? 'hint-warn' : 'hint-ok';
+  return `<div class="wf-approval-box" data-wf-approval="${escapeHtml(attemptId)}">
+    <label>
+      <span>Approval comment</span>
+      <textarea class="wf-approval-comment" data-wf-approval-comment="${escapeHtml(attemptId)}" rows="2" placeholder="Optional comment"${resolving ? ' disabled' : ''}>${escapeHtml(comment)}</textarea>
+    </label>
+    <div class="wf-approval-actions">
+      <button type="button" class="primary" data-wf-approval-action="approve" data-wf-attempt-id="${escapeHtml(attemptId)}"${resolving ? ' disabled' : ''}>Approve</button>
+      <button type="button" data-wf-approval-action="reject" data-wf-attempt-id="${escapeHtml(attemptId)}"${resolving ? ' disabled' : ''}>Reject</button>
+      ${resolving ? '<span class="muted">Submitting...</span>' : ''}
+    </div>
+    ${status ? `<div class="${statusClass} wf-approval-status">${escapeHtml(status.text)}</div>` : ''}
+  </div>`;
+}
+
+function isOpenHumanGateAttempt(attempt: AttemptState | undefined): attempt is AttemptState {
+  return !!attempt &&
+    attempt.status === 'waiting' &&
+    attempt.wait?.waitKind === 'human-gate' &&
+    !attempt.wait.resolution;
+}
+
+function syncApprovalComments(root: HTMLElement, comments: Map<string, string>): void {
+  root.querySelectorAll<HTMLTextAreaElement>('textarea[data-wf-approval-comment]').forEach((el) => {
+    const key = el.dataset.wfApprovalComment;
+    if (!key) return;
+    comments.set(key, el.value);
+  });
+}
+
+function attachApprovalControls(root: HTMLElement, approval: ApprovalRenderState): void {
+  root.querySelectorAll<HTMLTextAreaElement>('textarea[data-wf-approval-comment]').forEach((el) => {
+    const key = el.dataset.wfApprovalComment;
+    if (!key) return;
+    el.addEventListener('input', () => {
+      approval.comments.set(key, el.value);
+    });
+  });
+  root.querySelectorAll<HTMLButtonElement>('button[data-wf-approval-action][data-wf-attempt-id]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const attemptId = button.dataset.wfAttemptId;
+      const action = button.dataset.wfApprovalAction;
+      if (!attemptId || (action !== 'approve' && action !== 'reject')) return;
+      void approval.onResolve(attemptId, action);
+    });
+  });
 }
 
 function renderPreviewBlock(
@@ -954,6 +1105,10 @@ function extractEventContext(
 function short(value?: string): string {
   if (!value) return '-';
   return value.length > 18 ? value.slice(0, 10) + '...' + value.slice(-6) : value;
+}
+
+function shortText(value: string, max: number): string {
+  return value.length > max ? value.slice(0, max - 1) + '…' : value;
 }
 
 function formatClock(ms: number): string {

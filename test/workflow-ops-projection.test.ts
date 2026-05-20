@@ -176,6 +176,24 @@ describe('listRuns', () => {
     expect(row?.chatId).toBeUndefined();
     expect(row?.larkAppId).toBeUndefined();
   });
+
+  it('projects failed run error summary for dashboard run list', async () => {
+    const failingSpawn: WorkerSpawnFn = async () => ({
+      kind: 'failure',
+      errorCode: 'InputValidationFailed',
+      errorClass: 'userFault',
+      errorMessage: 'city must be provided before planning can start',
+    });
+    const log = await seedActive('r-failed-row');
+    await runLoop({ log, def: HELLO_DEF, spawnSubagent: failingSpawn });
+
+    const [row] = await listRuns(runsDir, { all: true });
+    expect(row?.runId).toBe('r-failed-row');
+    expect(row?.status).toBe('failed');
+    expect(row?.errorCode).toBe('InputValidationFailed');
+    expect(row?.errorClass).toBe('userFault');
+    expect(row?.errorMessage).toContain('city must be provided');
+  });
 });
 
 // ─── readRunSnapshot ────────────────────────────────────────────────────────

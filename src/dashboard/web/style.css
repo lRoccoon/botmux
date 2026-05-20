@@ -31,6 +31,7 @@ button { padding: 0.25rem 0.6rem; border: 1px solid var(--border); background: w
   -webkit-appearance: none; appearance: none; }
 button:disabled { opacity: 0.5; cursor: default; }
 button.contrast { background: #cf222e; color: white; border-color: #cf222e; }
+button.primary { background: #1f6feb; color: white; border-color: #1f6feb; }
 .btn-link { display: inline-block; padding: 0.25rem 0.6rem; border: 1px solid var(--border); border-radius: 4px; text-decoration: none; color: var(--fg); }
 .badge { padding: 0.05rem 0.4rem; border-radius: 999px; font-size: 11px; font-variant: small-caps; }
 .cli-claude-code { background: #d6e4ff; }
@@ -102,6 +103,7 @@ input.row-select { cursor: pointer; }
 .wf-status-cancelled     { background: #eee; color: var(--muted); }
 .wf-dangling.has  { color: #cf222e; font-weight: 600; }
 .wf-dangling.none { color: var(--muted); }
+.wf-run-error { margin-top: 0.25rem; max-width: 360px; white-space: normal; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }
 
 /* Workflow detail */
 .wf-detail-head { display: flex; align-items: flex-start; gap: 0.8rem; margin-bottom: 0.8rem; }
@@ -131,6 +133,11 @@ input.row-select { cursor: pointer; }
 .wf-io-card header code, .wf-io-meta code { overflow-wrap: anywhere; }
 .wf-io-card header .muted { display: block; margin-top: 0.1rem; overflow-wrap: anywhere; }
 .wf-io-meta { margin-top: 0.35rem; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.wf-approval-box { margin-top: 0.6rem; padding: 0.55rem; border: 1px solid #bf8700; border-radius: 4px; background: #fff8c5; }
+.wf-approval-box label span { display: block; margin-bottom: 0.25rem; color: var(--muted); font-size: 12px; }
+.wf-approval-comment { width: 100%; resize: vertical; min-height: 48px; padding: 0.35rem 0.45rem; border: 1px solid var(--border); border-radius: 4px; font: inherit; background: white; color: var(--fg); }
+.wf-approval-actions { display: flex; align-items: center; gap: 0.45rem; margin-top: 0.45rem; flex-wrap: wrap; }
+.wf-approval-status { margin: 0.5rem 0 0; }
 .wf-io-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.55rem; margin-top: 0.6rem; }
 .wf-io-block { border: 1px solid var(--border); border-radius: 4px; background: #f6f8fa; min-width: 0; }
 .wf-io-block summary { cursor: pointer; padding: 0.4rem 0.5rem; font-weight: 600; }
@@ -139,3 +146,29 @@ input.row-select { cursor: pointer; }
 .wf-io-empty { padding: 0.5rem; }
 .wf-error-msg { display: block; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 td code, .wf-summary-item code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+
+@media (max-width: 720px) {
+  .topbar { align-items: flex-start; flex-direction: column; gap: 0.45rem; }
+  .topbar nav { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+  .topbar nav a { margin-right: 0; }
+  .status { margin-left: 0; }
+  main { padding: 0.7rem; }
+  .filters input[type=search], .filters select { width: 100%; min-width: 0; }
+  th, td { padding: 0.35rem 0.45rem; }
+  .wf-detail-head { flex-wrap: wrap; align-items: center; }
+  .wf-detail-head > div { min-width: 0; flex: 1 1 220px; }
+  .wf-detail-head h2 code { overflow-wrap: anywhere; }
+  .wf-detail-head #wf-cancel-run { margin-left: 0; }
+  .wf-summary-grid { grid-template-columns: 1fr 1fr; }
+  .wf-panel { padding: 0.55rem; }
+  .wf-io-card header { flex-direction: column; }
+  .wf-io-grid { grid-template-columns: 1fr; }
+  .wf-approval-actions button { flex: 1 1 120px; }
+  .wf-timeline-scroll { max-height: 420px; }
+}
+
+@media (max-width: 460px) {
+  .wf-summary-grid { grid-template-columns: 1fr; }
+  .wf-approval-actions { flex-direction: column; align-items: stretch; }
+  .wf-approval-actions button { width: 100%; }
+}

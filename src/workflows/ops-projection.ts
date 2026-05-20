@@ -64,6 +64,9 @@ export type RunRow = {
   dWait: number;
   updatedAt: number;
   failedNodeId?: string;
+  errorCode?: string;
+  errorClass?: string;
+  errorMessage?: string;
   chatId?: string;
   larkAppId?: string;
 };
@@ -149,6 +152,9 @@ export function projectRunRow(
     (a) => !effectSet.has(a) && !waitSet.has(a),
   ).length;
 
+  const error = snap.run.status === 'failed' || snap.run.status === 'cancelled'
+    ? findRunError(snap)
+    : undefined;
   return {
     runId,
     workflowId: snap.run.workflowId ?? '?',
@@ -159,7 +165,28 @@ export function projectRunRow(
     dWait: snap.danglingWaits.length,
     updatedAt: events[events.length - 1]!.timestamp,
     failedNodeId: snap.run.failedNodeId,
+    errorCode: error?.errorCode,
+    errorClass: error?.errorClass,
+    errorMessage: error?.errorMessage,
   };
+}
+
+function findRunError(snap: Snapshot): {
+  errorCode: string;
+  errorClass: string;
+  errorMessage?: string;
+} | undefined {
+  const activities = [...snap.activities.values()];
+  const preferredActivities = snap.run.failedNodeId
+    ? activities.filter((activity) => activity.ownerNodeId === snap.run.failedNodeId)
+    : [];
+  const fallbackActivities = activities.filter((activity) => !preferredActivities.includes(activity));
+  for (const activity of [...preferredActivities, ...fallbackActivities]) {
+    for (const attempt of [...activity.attempts].reverse()) {
+      if (attempt.error) return attempt.error;
+    }
+  }
+  return undefined;
 }
 
 // ─── snapshot ──────────────────────────────────────────────────────────────
