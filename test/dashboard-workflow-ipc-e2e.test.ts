@@ -15,8 +15,10 @@ import {
   type WorkflowApiDeps,
 } from '../src/dashboard/workflow-api.js';
 import { cancelWorkflowRun } from '../src/workflows/cancel-run.js';
+import { requestCancel } from '../src/workflows/cancel.js';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { EventLog } from '../src/workflows/events/append.js';
+import type { WorkflowEvent } from '../src/workflows/events/schema.js';
 import { replay } from '../src/workflows/events/replay.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
@@ -38,13 +40,25 @@ const WAIT_DEF = parseWorkflowDefinition({
   },
 });
 
+const DONE_DEF = parseWorkflowDefinition({
+  workflowId: 'ipc-done',
+  version: 1,
+  nodes: {
+    done: {
+      type: 'subagent',
+      bot: 'bot-a',
+      prompt: 'finish',
+    },
+  },
+});
+
 let tempDir: string;
 let runsDir: string;
 let dashboardServer: Server | null;
 let daemonServer: Server | null;
 let dashboardBaseUrl: string;
 let daemonBaseUrl: string;
-let daemonContexts: Map<string, WorkflowRuntimeContext>;
+let daemonContexts: Map<string, { ctx: WorkflowRuntimeContext; running?: boolean }>;
 let daemonRequests: Array<{ path: string; body: unknown }>;
 
 beforeEach(async () => {
@@ -116,6 +130,74 @@ describe('dashboard workflow IPC e2e', () => {
     const snapshot = replay(events);
     expect(snapshot.run.status).toBe('cancelled');
     expect(snapshot.cancelledRunIntent).toBeUndefined();
+    expect(findEvent(events, 'cancelRequested')?.payload).toMatchObject({
+      reason: 'operator stop',
+      by: 'dashboard',
+    });
+  });
+
+  it('short-circuits terminal owned runs before daemon IPC', async () => {
+    const { log } = await seedOwnedSucceededRun('ipc-terminal-01', {
+      chatId: 'oc_owner',
+      larkAppId: 'cli_owner',
+    });
+    const before = await log.readAll();
+
+    const res = await fetch(`${dashboardBaseUrl}/api/workflows/runs/ipc-terminal-01/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'too late' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      runId: 'ipc-terminal-01',
+      status: 'succeeded',
+      alreadyTerminal: true,
+    });
+    expect(daemonRequests).toEqual([]);
+    expect(await log.readAll()).toEqual(before);
+  });
+
+  it('passes daemon pending cancel responses through without draining the run', async () => {
+    const { log } = await seedOwnedWaitingRun(
+      'ipc-running-01',
+      {
+        chatId: 'oc_owner',
+        larkAppId: 'cli_owner',
+      },
+      { running: true },
+    );
+
+    const res = await fetch(`${dashboardBaseUrl}/api/workflows/runs/ipc-running-01/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'wait for worker' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      runId: 'ipc-running-01',
+      status: 'running',
+      alreadyTerminal: false,
+      pending: true,
+      loopReason: 'already-running',
+    });
+
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'runStarted',
+      'attemptCreated',
+      'waitCreated',
+      'cancelRequested',
+    ]);
+    expect(findEvent(events, 'cancelRequested')?.payload).toMatchObject({
+      reason: 'wait for worker',
+      by: 'dashboard',
+    });
   });
 });
 
@@ -157,8 +239,8 @@ async function startDaemonIpcServer(): Promise<{
       daemonRequests.push({ path: url.pathname, body });
 
       const runId = decodeURIComponent(m[1]!);
-      const ctx = daemonContexts.get(runId);
-      if (!ctx) {
+      const entry = daemonContexts.get(runId);
+      if (!entry) {
         jsonRes(res, 409, { ok: false, error: 'workflow_not_attached' });
         return;
       }
@@ -166,8 +248,37 @@ async function startDaemonIpcServer(): Promise<{
         typeof body.reason === 'string' && body.reason.trim()
           ? body.reason.trim()
           : 'cancelled via dashboard';
+      if (entry.running) {
+        const snapshot = replay(await entry.ctx.log.readAll());
+        let cancelEventId = snapshot.cancelledRunIntent?.cancelOriginEventId;
+        if (!cancelEventId) {
+          const cancel = await requestCancel(
+            entry.ctx.log,
+            {
+              target: { kind: 'run', runId },
+              reason,
+              by: 'dashboard',
+            },
+            'human',
+          );
+          cancelEventId = cancel.eventId;
+        }
+        const after = replay(await entry.ctx.log.readAll());
+        jsonRes(res, 200, {
+          ok: true,
+          runId,
+          status: after.run.status,
+          alreadyTerminal: false,
+          cancelEventId,
+          loopReason: 'already-running',
+          pending: true,
+          lastSeq: after.lastSeq,
+        });
+        return;
+      }
+
       const result = await cancelWorkflowRun({
-        ctx,
+        ctx: entry.ctx,
         reason,
         by: 'dashboard',
         actor: 'human',
@@ -221,6 +332,7 @@ async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
 async function seedOwnedWaitingRun(
   runId: string,
   chatBinding: { chatId: string; larkAppId: string },
+  opts: { running?: boolean } = {},
 ): Promise<{ log: EventLog; ctx: WorkflowRuntimeContext }> {
   const log = new EventLog(runId, runsDir);
   await createRun(log, {
@@ -236,8 +348,36 @@ async function seedOwnedWaitingRun(
     spawnSubagent: unusedSpawn,
   };
   await runLoop(ctx);
-  daemonContexts.set(runId, ctx);
+  daemonContexts.set(runId, { ctx, running: opts.running });
   return { log, ctx };
+}
+
+async function seedOwnedSucceededRun(
+  runId: string,
+  chatBinding: { chatId: string; larkAppId: string },
+): Promise<{ log: EventLog; ctx: WorkflowRuntimeContext }> {
+  const log = new EventLog(runId, runsDir);
+  await createRun(log, {
+    def: DONE_DEF,
+    params: {},
+    initiator: 'test',
+    botResolver: () => ({}),
+    chatBinding,
+  });
+  const ctx: WorkflowRuntimeContext = {
+    log,
+    def: DONE_DEF,
+    spawnSubagent: async () => ({ kind: 'success', output: { ok: true } }),
+  };
+  await runLoop(ctx);
+  return { log, ctx };
+}
+
+function findEvent<T extends WorkflowEvent['type']>(
+  events: WorkflowEvent[],
+  type: T,
+): Extract<WorkflowEvent, { type: T }> | undefined {
+  return events.find((e): e is Extract<WorkflowEvent, { type: T }> => e.type === type);
 }
 
 const unusedSpawn: WorkerSpawnFn = async () => {
