@@ -52,7 +52,7 @@ banner() {
 RUN_ID="o1-canary-$(date +%s)"
 
 banner "1) workflow run — 启动一个会停在 humanGate 的 run"
-node "$CLI" workflow run o1-canary --run-id "$RUN_ID" || true
+node "$CLI" workflow run o1-canary --run-id "$RUN_ID"
 
 banner "2) workflow ls — 应该能看到 run 处于 running"
 node "$CLI" workflow ls
@@ -64,16 +64,16 @@ banner "4) workflow tail — 历史 4 条事件 (runCreated/runStarted/attemptCr
 node "$CLI" workflow tail "$RUN_ID"
 
 banner "5) workflow resume — CLI 没有审批入口，应继续 awaiting-wait，不写新事件"
-node "$CLI" workflow resume "$RUN_ID" || true
+node "$CLI" workflow resume "$RUN_ID"
 
 banner "6) workflow cancel — 写入 cancelRequested + 推动 cancel recovery 到 cancelled"
-node "$CLI" workflow cancel "$RUN_ID" --reason 'O1 dogfood' || true
+node "$CLI" workflow cancel "$RUN_ID" --reason 'O1 dogfood'
 
 banner "7) workflow ls --all — 现在能看到这个 run 已 cancelled"
 node "$CLI" workflow ls --all
 
 banner "8) workflow tail --from 5 — 看到 cancel 阶段写入的事件"
-node "$CLI" workflow tail "$RUN_ID" --from 5 || true
+node "$CLI" workflow tail "$RUN_ID" --from 5
 
 echo
 echo "✓ O1 dogfood 通过；run=$RUN_ID 已 cancelled。"

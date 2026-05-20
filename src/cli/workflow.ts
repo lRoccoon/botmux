@@ -697,6 +697,17 @@ async function cmdWorkflowLs(rest: string[]): Promise<void> {
       (a) => !effectSet.has(a) && !waitSet.has(a),
     ).length;
 
+    // Codex review (O1 medium #2): replay's `waitsOpen` does NOT clear
+    // when the wait's activity reaches a cancel/timeout/failure terminal,
+    // so danglingWaits over-counts on cancelled runs.  Operator surface
+    // filter here is a band-aid; root cause is in
+    // src/workflows/events/replay.ts and tracked as a follow-up.
+    const activityTerminal = new Set(['succeeded', 'failed', 'timedOut', 'cancelled']);
+    const dWait = snap.danglingWaits.filter((aid) => {
+      const a = snap.activities.get(aid);
+      return !a || !activityTerminal.has(a.status);
+    }).length;
+
     const row: Row = {
       runId,
       workflowId: snap.run.workflowId ?? '?',
@@ -704,7 +715,7 @@ async function cmdWorkflowLs(rest: string[]): Promise<void> {
       lastSeq: snap.lastSeq,
       dEf: snap.danglingEffectAttempted.length,
       dAct,
-      dWait: snap.danglingWaits.length,
+      dWait,
       updatedAt: events[events.length - 1]!.timestamp,
       failedNodeId: snap.run.failedNodeId,
     };
@@ -795,6 +806,24 @@ async function cmdWorkflowTail(rest: string[]): Promise<void> {
   const eventsPath = join(runsDir, runId, 'events.ndjson');
   const log = new EventLog(runId, runsDir);
 
+  // Capture the watch starting offset BEFORE readAll so that any event
+  // appended between readAll and the first stat is still picked up by
+  // the watch loop (lastSeq dedups any overlap).  Codex review (O1
+  // medium #1): if we stat AFTER readAll, a race-window event lands
+  // past readAll's view but inside the offset, and follow silently
+  // skips it forever.
+  let followOffset = 0;
+  if (follow) {
+    try {
+      followOffset = (await fs.stat(eventsPath)).size;
+    } catch {
+      // events.ndjson must exist if readAll below succeeds; defensive
+      // fallback keeps offset 0 so the watch re-reads the whole file
+      // and lastSeq still dedups.
+      followOffset = 0;
+    }
+  }
+
   let initial;
   try {
     initial = await log.readAll();
@@ -815,9 +844,9 @@ async function cmdWorkflowTail(rest: string[]): Promise<void> {
 
   if (!follow) return;
 
-  // Watch loop.  Cache file size so we only re-read new bytes; parse
+  // Watch loop.  Resume from `followOffset` (captured pre-readAll); parse
   // incrementally by line.  Stop on Ctrl-C; until then we never resolve.
-  let offset = (await fs.stat(eventsPath)).size;
+  let offset = followOffset;
   let lastSeq = eventSeqFromId(initial![initial!.length - 1]!.eventId);
   let buffer = '';
 

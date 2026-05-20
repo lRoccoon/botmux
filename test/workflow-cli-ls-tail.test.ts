@@ -157,6 +157,77 @@ describe('botmux workflow ls', () => {
     expect(typeof row.lastSeq).toBe('number');
     expect(typeof row.updatedAt).toBe('number');
   });
+
+  // Codex review (O1 medium #2): replay's `waitsOpen` doesn't clear on
+  // activityCanceled, so danglingWaits over-counts on cancelled runs.
+  // ls works around this by filtering by activity status — verify the
+  // workaround holds before we forget about the root cause in replay.ts.
+  it('dWait does NOT count waits whose activity is already terminal (cancelled-run regression)', async () => {
+    const log = await seedActiveRun('run-gate');
+    const gateActivityId = 'run-gate::gate::approve';
+    const gateAttemptId = `${gateActivityId}::att-1`;
+
+    // Hand-roll the gate state: attemptCreated + waitCreated +
+    // cancelRequested + activityCanceled.  This mirrors what
+    // cmdWorkflowCancel produces on an awaiting humanGate run; we drive
+    // it directly to keep the test independent of the cancel CLI.
+    await log.append({
+      runId: 'run-gate',
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'approve',
+        activityId: gateActivityId,
+        attemptId: gateAttemptId,
+        attemptNumber: 1,
+        inputRef: {
+          outputHash: 'sha256:' + 'a'.repeat(64),
+          outputBytes: 2,
+          outputSchemaVersion: 1,
+        },
+      },
+    });
+    await log.append({
+      runId: 'run-gate',
+      type: 'waitCreated',
+      actor: 'scheduler',
+      payload: {
+        activityId: gateActivityId,
+        nodeId: 'approve',
+        waitKind: 'human-gate',
+        prompt: 'ok?',
+      },
+    });
+    const cancelEv = await log.append({
+      runId: 'run-gate',
+      type: 'cancelRequested',
+      actor: 'human',
+      payload: {
+        target: { kind: 'run', runId: 'run-gate' },
+        reason: 'test',
+        by: 'test',
+      },
+    });
+    await log.append({
+      runId: 'run-gate',
+      type: 'activityCanceled',
+      actor: 'scheduler',
+      payload: {
+        activityId: gateActivityId,
+        attemptId: gateAttemptId,
+        cancelOriginEventId: cancelEv.eventId,
+      },
+    });
+
+    // Workflow is `ls-hello` with a single subagent node; humanGate
+    // isn't declared there.  We're injecting the gate activity directly
+    // because the test only cares about replay's waitsOpen behavior.
+
+    const out = runCli(['workflow', 'ls', '--all', '--json']);
+    expect(out.status).toBe(0);
+    const row = JSON.parse(out.stdout.trim().split('\n')[0]!);
+    expect(row.dWait).toBe(0);
+  });
 });
 
 // ─── tail ─────────────────────────────────────────────────────────────────
