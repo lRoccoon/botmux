@@ -93,6 +93,29 @@ async function bootstrapWait(
   });
 }
 
+async function bootstrapWaitWithPromptRef(promptPreview: string): Promise<WaitCreatedEvent> {
+  // Intentionally point outputPath at a non-existent file: cards MUST NOT
+  // read the blob, so test fails if anyone wires fs.readFile into the
+  // card-builder later.
+  await log.append(runCreated);
+  await log.append(attemptCreated);
+  return createWait(log, {
+    activityId: ACTIVITY_ID,
+    attemptId: ATTEMPT_ID,
+    nodeId: NODE_ID,
+    waitKind: 'human-gate',
+    deadlineAt: 2_000_000_000_000,
+    promptRef: {
+      outputHash: 'sha256:' + 'd'.repeat(64),
+      outputPath: '/tmp/__promptref_blob_should_not_be_read__',
+      outputBytes: 5000,
+      outputSchemaVersion: 1,
+      contentType: 'text/plain',
+    },
+    promptPreview,
+  });
+}
+
 function cardText(card: unknown): string {
   return JSON.stringify(card);
 }
@@ -147,6 +170,23 @@ describe('buildWorkflowApprovalCard', () => {
     expect(text).toContain('已截断');
     expect(text).toContain('Web 查看');
     expect(text).not.toContain('x'.repeat(620));
+  });
+
+  it('uses promptPreview (not the blob) when waitCreated carries promptRef', async () => {
+    const preview = '出行规划预览：D1 上海雨,D2 多云,D3 晴…(完整内容见 dashboard)';
+    const waitCreated = await bootstrapWaitWithPromptRef(preview);
+    const snapshot = replay(await log.readAll());
+
+    // Card must render successfully even though the blob file doesn't exist;
+    // any disk read attempt would surface as a thrown ENOENT.
+    const card = JSON.parse(buildWorkflowApprovalCard(waitCreated, snapshot));
+    const text = cardText(card);
+
+    expect(text).toContain('预览');                  // hasFullBehindRef hint
+    expect(text).toContain('Web 详情');               // ref → dashboard pointer
+    expect(text).toContain('出行规划预览');           // preview body landed
+    expect(text).toContain('dashboard');              // preview ellipsis tail
+    expect(text).not.toContain('__promptref_blob_should_not_be_read__'); // path never leaks
   });
 
   it('renders a Web detail button with multi_url', async () => {

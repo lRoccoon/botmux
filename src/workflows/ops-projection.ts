@@ -197,6 +197,10 @@ export type AttemptIODTO = {
   resolvedInput?: BlobPreviewDTO;
   output?: BlobPreviewDTO;
   log?: BlobPreviewDTO;
+  /** Full humanGate prompt when the producer spilled it to a blob via
+   *  `promptRef`.  Read on demand via the same 64 KiB preview ladder as
+   *  output / input blobs; cards never use this. */
+  waitPrompt?: BlobPreviewDTO;
 };
 
 const BLOB_PREVIEW_MAX_BYTES = 64 * 1024;
@@ -261,6 +265,9 @@ async function buildAttemptIO(
       io.log = await previewAttemptLog(runDir, activity.activityId, attempt.attemptId);
       if (io.input?.value !== undefined && def) {
         io.resolvedInput = await previewResolvedInput(runDir, snap, def, io.input.value, cache);
+      }
+      if (attempt.wait?.promptRef) {
+        io.waitPrompt = await previewRef(runDir, attempt.wait.promptRef, cache);
       }
       out[attempt.attemptId] = io;
     }

@@ -25,7 +25,14 @@ export type WorkflowApprovalCardContext = {
   activityId: string;
   attemptId: string;
   deadlineAt?: number;
+  /** Body text for the card.  Either the full inline prompt (small case)
+   *  or the inline promptPreview (large case).  Cards must NEVER read
+   *  promptRef blob files — see `hasFullBehindRef`. */
   prompt: string;
+  /** True when the upstream waitCreated event spilled its prompt to a
+   *  blob (promptRef set).  Card-builder uses this to render a hint
+   *  pointing the approver to the dashboard for the complete text. */
+  hasFullBehindRef: boolean;
   cardNonce: string;
   webDetailUrl: string;
 };
@@ -62,6 +69,12 @@ export function getWorkflowApprovalCardContext(
     );
   }
 
+  // Promptref / promptPreview split (v0.1.3): the card never reads the
+  // blob — promptPreview exists specifically so cards can render without
+  // touching disk and the dashboard owns the full-text path.
+  const hasFullBehindRef = event.payload.promptRef !== undefined;
+  const promptBody = event.payload.prompt ?? event.payload.promptPreview ?? '';
+
   return {
     runId: event.runId,
     workflowId: snapshot.run.workflowId,
@@ -70,7 +83,8 @@ export function getWorkflowApprovalCardContext(
     activityId: event.payload.activityId,
     attemptId,
     deadlineAt: event.payload.deadlineAt,
-    prompt: event.payload.prompt ?? '',
+    prompt: promptBody,
+    hasFullBehindRef,
     cardNonce: opts.cardNonce ?? workflowApprovalCardNonce(event.runId, event.payload.activityId, attemptId),
     webDetailUrl: opts.webDetailUrl ?? workflowRunDetailUrl(event.runId),
   };
@@ -110,7 +124,9 @@ export function buildWorkflowApprovalCard(
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**审批内容**\n${escapeMd(prompt)}`,
+          content: ctx.hasFullBehindRef
+            ? `**审批内容**（预览，完整内容见下方 Web 详情）\n${escapeMd(prompt)}`
+            : `**审批内容**\n${escapeMd(prompt)}`,
         },
       },
       {

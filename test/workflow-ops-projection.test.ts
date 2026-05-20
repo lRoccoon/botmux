@@ -266,6 +266,72 @@ describe('readRunSnapshot', () => {
     });
   });
 
+  it('surfaces waitPrompt BlobPreview when waitCreated has promptRef', async () => {
+    // v0.1.3: dispatchGate spills large humanGate prompts to a blob. The
+    // dashboard Node I/O view must surface the full text via the same
+    // BlobPreview 64KiB ladder used for input/output blobs.
+    const RUN = 'r-wait-prompt';
+    const blobDir = join(runsDir, RUN, 'blobs');
+    mkdirSync(blobDir, { recursive: true });
+    const fullPrompt = '出行规划完整 markdown\n' + 'x'.repeat(2000);
+    const { createHash } = await import('node:crypto');
+    const hash = createHash('sha256').update(fullPrompt, 'utf-8').digest('hex');
+    const blobPath = join(blobDir, hash);
+    writeFileSync(blobPath, fullPrompt, 'utf-8');
+
+    const log = new EventLog(RUN, runsDir);
+    await createRun(log, {
+      def: HELLO_DEF,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    // Hand-craft attemptCreated + waitCreated with promptRef
+    const activityId = workActivityId(RUN, 'only');
+    const attemptId = `${RUN}::gate::only::att-1`;
+    await log.append({
+      runId: RUN,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'only',
+        activityId,
+        attemptId,
+        attemptNumber: 1,
+        inputRef: {
+          outputHash: 'sha256:' + 'a'.repeat(64),
+          outputBytes: 8,
+          outputSchemaVersion: 1,
+        },
+      },
+    });
+    await log.append({
+      runId: RUN,
+      type: 'waitCreated',
+      actor: 'scheduler',
+      payload: {
+        activityId,
+        nodeId: 'only',
+        waitKind: 'human-gate',
+        promptRef: {
+          outputHash: `sha256:${hash}`,
+          outputPath: blobPath,
+          outputBytes: Buffer.byteLength(fullPrompt, 'utf-8'),
+          outputSchemaVersion: 1,
+          contentType: 'text/plain',
+        },
+        promptPreview: '出行规划完整 markdown…',
+      },
+    });
+
+    const snap = await readRunSnapshot(runsDir, RUN);
+    const waitPrompt = snap?.attemptIO[attemptId]?.waitPrompt;
+    expect(waitPrompt).toBeDefined();
+    expect(waitPrompt!.text ?? '').toContain('出行规划完整 markdown');
+    expect(waitPrompt!.outputBytes).toBe(Buffer.byteLength(fullPrompt, 'utf-8'));
+    expect(waitPrompt!.contentType).toBe('text/plain');
+  });
+
   it('returns the tail when terminal.log exceeds the 64KiB cap', async () => {
     await seedSucceeded('r-tail-log');
     const activityId = workActivityId('r-tail-log', 'only');

@@ -41,6 +41,7 @@ type AttemptIO = {
   resolvedInput?: BlobPreview;
   output?: BlobPreview;
   log?: BlobPreview;
+  waitPrompt?: BlobPreview;
 };
 
 type AttemptState = {
@@ -793,6 +794,7 @@ function renderIOCard(
       ${renderPreviewBlock(keyPrefix, 'Resolved input', io?.resolvedInput, openBlocks)}
       ${renderPreviewBlock(keyPrefix, 'Output', io?.output, openBlocks)}
       ${renderPreviewBlock(keyPrefix, 'Execution log', io?.log, openBlocks)}
+      ${io?.waitPrompt ? renderPreviewBlock(keyPrefix, 'Wait prompt', io.waitPrompt, openBlocks) : ''}
     </div>
   </article>`;
 }
