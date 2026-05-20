@@ -68,5 +68,14 @@ describe('built-in botmux-workflow-create skill', () => {
     expect(skill!.content).not.toContain('"bot": "claude-loopy"');
     // workflow file must live at $HOME/.botmux/workflows/, not in arbitrary cwd
     expect(skill!.content).toContain('$HOME/.botmux/workflows/');
+    // Params docs must track shared coerceWorkflowParams behavior across CLI + IM.
+    expect(skill!.content).toContain('--param-json');
+    expect(skill!.content).toContain('未知参数：');
+    expect(skill!.content).toContain('缺少必填参数：');
+    expect(skill!.content).toContain('必须是 number');
+    expect(skill!.content).toContain('必须是 boolean');
+    expect(skill!.content).toContain('暂不支持 object / array');
+    expect(skill!.content).toContain('object / array');
+    expect(skill!.content).toContain('default');
   });
 });
