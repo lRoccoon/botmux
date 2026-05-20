@@ -185,6 +185,35 @@ describe('EventLog.append — inline payload size cap (codex round 4: no auto-sp
   });
 });
 
+describe('EventLog.append — post-parse invariants run on write', () => {
+  it('rejects waitCreated drafts that violate the prompt/promptRef invariant', async () => {
+    // Producer 自己写出 prompt+promptRef 并存的 draft 也要被 invariant 在 append
+    // 时拦下，不能只靠 parseEvent 单元层。
+    const log = new EventLog(RUN_ID, baseDir);
+    await expect(
+      log.append({
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: {
+          activityId: 'a1',
+          nodeId: 'n',
+          waitKind: 'human-gate',
+          prompt: 'small',
+          promptRef: {
+            outputHash: SHA,
+            outputPath: join(baseDir, 'fake-blob'),
+            outputBytes: 5000,
+            outputSchemaVersion: 1,
+            contentType: 'text/plain',
+          },
+          promptPreview: 'preview',
+        },
+      } as EventDraft),
+    ).rejects.toThrow(/mutually exclusive/);
+  });
+});
+
 describe('EventLog.readAll', () => {
   it('returns [] for empty log', async () => {
     const log = new EventLog(RUN_ID, baseDir);

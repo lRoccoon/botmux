@@ -263,6 +263,29 @@ export function checkReconcileResultInvariant(event: WorkflowEvent): string | nu
 }
 
 /**
+ * `waitCreated` shape invariant: `prompt` (inline) and `promptRef` (blob
+ * spill) are mutually exclusive, and any spill MUST carry `promptPreview`
+ * so cards / dashboard can render without reading the blob file.
+ *
+ * Schema keeps `prompt` as `z.string().optional()` (no `.max()`) so that
+ * historical events with multi-KB inline prompts still parse / replay.
+ * The producer (runtime.dispatchGate) is responsible for the 1024-byte
+ * split policy.
+ */
+export function checkWaitCreatedPromptInvariant(event: WorkflowEvent): string | null {
+  if (event.type !== 'waitCreated') return null;
+  if (isPayloadRef(event.payload)) return null; // ref payloads opaque here
+  const p = event.payload as { prompt?: unknown; promptRef?: unknown; promptPreview?: unknown };
+  if (p.prompt !== undefined && p.promptRef !== undefined) {
+    return 'waitCreated: prompt and promptRef are mutually exclusive';
+  }
+  if (p.promptRef !== undefined && p.promptPreview === undefined) {
+    return 'waitCreated: promptRef requires promptPreview for card / dashboard display';
+  }
+  return null;
+}
+
+/**
  * Run every post-parse invariant against a WorkflowEvent.  Each entry is
  * a `(event) => string | null` checker; the first failure wins and gets
  * surfaced as a ZodIssue.  Adding new invariants here means they apply
@@ -274,6 +297,7 @@ const POST_PARSE_INVARIANTS: Array<{
 }> = [
   { path: ['payloadHash'], check: checkPayloadHashInvariant },
   { path: ['payload'], check: checkReconcileResultInvariant },
+  { path: ['payload'], check: checkWaitCreatedPromptInvariant },
 ];
 
 function applyInvariants(event: WorkflowEvent): z.ZodError | null {

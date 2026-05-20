@@ -179,6 +179,118 @@ describe('event schema — payloadHash invariant (v0.1.2 §1.1)', () => {
   });
 });
 
+describe('event schema — waitCreated prompt / promptRef invariant (v0.1.3)', () => {
+  const baseWait = {
+    ...baseEnvelope,
+    eventId: eventId(1),
+    type: 'waitCreated' as const,
+    actor: 'scheduler' as const,
+  };
+  const samplePromptRef = {
+    outputHash: SHA,
+    outputPath: '/tmp/runs/x/blobs/abc',
+    outputBytes: 5000,
+    outputSchemaVersion: 1,
+    contentType: 'text/plain',
+  };
+
+  it('inline-only prompt: ok', () => {
+    const e = {
+      ...baseWait,
+      payload: {
+        activityId: 'a1',
+        nodeId: 'n',
+        waitKind: 'human-gate',
+        prompt: 'review this',
+      },
+    };
+    expect(safeParseEvent(e).success).toBe(true);
+  });
+
+  it('promptRef + promptPreview only: ok', () => {
+    const e = {
+      ...baseWait,
+      payload: {
+        activityId: 'a1',
+        nodeId: 'n',
+        waitKind: 'human-gate',
+        promptRef: samplePromptRef,
+        promptPreview: 'review this big plan…',
+      },
+    };
+    expect(safeParseEvent(e).success).toBe(true);
+  });
+
+  it('no prompt and no promptRef: ok (caller never set one)', () => {
+    const e = {
+      ...baseWait,
+      payload: { activityId: 'a1', nodeId: 'n', waitKind: 'human-gate' },
+    };
+    expect(safeParseEvent(e).success).toBe(true);
+  });
+
+  it('prompt + promptRef both set: REJECTED', () => {
+    const e = {
+      ...baseWait,
+      payload: {
+        activityId: 'a1',
+        nodeId: 'n',
+        waitKind: 'human-gate',
+        prompt: 'small',
+        promptRef: samplePromptRef,
+        promptPreview: 'preview',
+      },
+    };
+    const r = safeParseEvent(e);
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      const msgs = r.error.issues.map((i) => i.message).join(';');
+      expect(msgs).toContain('mutually exclusive');
+    }
+  });
+
+  it('promptRef without promptPreview: REJECTED', () => {
+    const e = {
+      ...baseWait,
+      payload: {
+        activityId: 'a1',
+        nodeId: 'n',
+        waitKind: 'human-gate',
+        promptRef: samplePromptRef,
+      },
+    };
+    const r = safeParseEvent(e);
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      const msgs = r.error.issues.map((i) => i.message).join(';');
+      expect(msgs).toContain('requires promptPreview');
+    }
+  });
+
+  it('historical 3KB inline prompt still parses (no .max on schema)', () => {
+    // Pre-v0.1.3 events wrote arbitrarily long inline prompts up to the
+    // 4KB envelope cap. The schema must keep accepting them so the old
+    // run logs replay; the 1024B split is a producer policy, not a wire
+    // contract.
+    const bigPrompt = 'x'.repeat(3000);
+    const e = {
+      ...baseWait,
+      payload: {
+        activityId: 'a1',
+        nodeId: 'n',
+        waitKind: 'human-gate',
+        prompt: bigPrompt,
+      },
+    };
+    const r = safeParseEvent(e);
+    expect(r.success).toBe(true);
+    if (r.success) {
+      const p = r.data.payload as { prompt?: string };
+      expect(p.prompt?.length).toBe(3000);
+    }
+  });
+});
+
 describe('event schema — activityTimedOut payload v0.1.2', () => {
   it('requires reason=LeaseExpired and errorClass=retryable', () => {
     const e = {

@@ -269,7 +269,17 @@ export const WaitCreatedPayload = z.object({
   nodeId: z.string(),
   waitKind: WaitKindEnum,
   deadlineAt: z.number().int().positive().optional(),
+  // `prompt` is the inline form: small prompts (producer policy ≤1024B) live
+  // here directly. NO `.max()` on the schema — historical waitCreated events
+  // wrote 2-3KB inline prompts and must still replay/parse. The producer
+  // strategy split is enforced in `runtime.dispatchGate`, not the wire format.
   prompt: z.string().optional(),
+  // Blob-spill form: large prompts go to a content-addressed file via
+  // `writeBlob`, and the event carries the resulting `OutputRef` plus a short
+  // preview for cards / dashboard. Mutual exclusion with `prompt` is enforced
+  // by `checkWaitCreatedPromptInvariant`.
+  promptRef: OutputRefSchema.optional(),
+  promptPreview: z.string().max(500).optional(),
   approvers: z.array(z.string()).optional(),
   onTimeout: WaitOnTimeoutEnum.optional(),
 });
