@@ -30,6 +30,7 @@
  */
 
 import type { EventLog } from './events/append.js';
+import type { OutputRef } from './events/payloads.js';
 import type {
   ActivityFailedEvent,
   ActivitySucceededEvent,
@@ -51,8 +52,18 @@ export type CreateWaitInput = {
   waitKind: WaitKind;
   /** Wall-clock ms epoch.  Required for `time` kind, optional otherwise. */
   deadlineAt?: number;
-  /** Human-readable prompt (rendered to approvers / dashboards). */
+  /** Human-readable prompt (rendered to approvers / dashboards).  Small
+   *  prompts go here inline; large ones spill to `promptRef` per
+   *  `checkWaitCreatedPromptInvariant` (mutually exclusive). */
   prompt?: string;
+  /** Blob spill for prompts that don't fit in the inline envelope.
+   *  Consumers (card-builder / dashboard) read the blob on demand;
+   *  replay never touches it. */
+  promptRef?: OutputRef;
+  /** Required short preview when `promptRef` is set so cards / dashboards
+   *  can render without reading the blob.  Up to 500 chars (schema cap);
+   *  producer is responsible for keeping bytes reasonable for UTF-8. */
+  promptPreview?: string;
   /** Optional open_id allow list for human-gate card actions. */
   approvers?: string[];
   /** What to write as the activity terminal when the deadline fires
@@ -125,6 +136,8 @@ export async function createWait(
       waitKind: input.waitKind,
       deadlineAt: input.deadlineAt,
       prompt: input.prompt,
+      promptRef: input.promptRef,
+      promptPreview: input.promptPreview,
       approvers: input.approvers,
       onTimeout: input.onTimeout,
     },

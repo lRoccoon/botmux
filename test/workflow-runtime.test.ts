@@ -197,7 +197,11 @@ describe('dispatchGate', () => {
     expect(waitP.deadlineAt).toBe(1_700_000_000_000 + 60_000);
   });
 
-  it('fails humanGate with clear userFault when resolved prompt would exceed inline event cap', async () => {
+  it('spills large humanGate prompts to a blob and writes promptRef + promptPreview', async () => {
+    // v0.1.3: large prompts no longer fail; they spill to a content-addressed
+    // blob. The wait event carries promptRef + a short preview, the full text
+    // lives in <runDir>/blobs/<hash> and is readable on demand by the
+    // dashboard / Node I/O view.
     const longPrompt = 'x'.repeat(INLINE_PAYLOAD_MAX_BYTES + 200);
     const def = parseWorkflowDefinition({
       workflowId: 'gated-large-prompt',
@@ -221,21 +225,56 @@ describe('dispatchGate', () => {
 
     const result = await dispatchGate(ctx, gateAction);
 
-    expect(result.kind).toBe('failed');
-    const events = await log.readAll();
-    expect(events.map((e) => e.type)).toEqual([
-      'runCreated',
-      'runStarted',
-      'attemptCreated',
-      'activityFailed',
-    ]);
-    const failed = events.at(-1)!;
-    expect(failed.type).toBe('activityFailed');
-    const p = failed.payload as { error: { errorCode: string; errorClass: string; errorMessage: string } };
-    expect(p.error.errorCode).toBe('InputBindingFailed');
-    expect(p.error.errorClass).toBe('userFault');
-    expect(p.error.errorMessage).toContain('humanGate.prompt is too large');
-    expect(p.error.errorMessage).toContain('summary/preview');
+    expect(result.kind).toBe('wait');
+    if (result.kind !== 'wait') return;
+    const wp = result.waitCreated.payload as {
+      prompt?: string;
+      promptRef?: { outputHash: string; outputPath?: string; outputBytes: number; contentType?: string };
+      promptPreview?: string;
+    };
+    expect(wp.prompt).toBeUndefined();
+    expect(wp.promptRef).toBeDefined();
+    expect(wp.promptRef!.outputBytes).toBe(longPrompt.length);
+    expect(wp.promptRef!.contentType).toBe('text/plain');
+    expect(wp.promptPreview).toBeDefined();
+    expect(wp.promptPreview!.length).toBeLessThanOrEqual(500); // schema cap
+    expect(wp.promptPreview).toMatch(/dashboard/);
+
+    // Blob file actually written
+    const { promises: fsp } = await import('node:fs');
+    expect(wp.promptRef!.outputPath).toBeDefined();
+    const blobText = await fsp.readFile(wp.promptRef!.outputPath!, 'utf-8');
+    expect(blobText).toBe(longPrompt);
+  });
+
+  it('keeps small humanGate prompts inline (no spill below 1 KiB)', async () => {
+    const smallPrompt = 'approve?';
+    const def = parseWorkflowDefinition({
+      workflowId: 'gated-small-prompt',
+      version: 1,
+      nodes: {
+        gated: {
+          type: 'subagent',
+          bot: 'b2',
+          prompt: 'do gated thing',
+          humanGate: { stage: 'before', prompt: smallPrompt },
+        },
+      },
+    });
+    const { log, ctx } = await bootstrap(def, successSpawn);
+    const actions = decideNextActions(replay(await log.readAll()), def);
+    const gateAction = actions.find((a) => a.kind === 'dispatchGate');
+    if (!gateAction || gateAction.kind !== 'dispatchGate') throw new Error('no gate action');
+
+    const result = await dispatchGate(ctx, gateAction);
+    expect(result.kind).toBe('wait');
+    if (result.kind !== 'wait') return;
+    const wp = result.waitCreated.payload as {
+      prompt?: string; promptRef?: unknown; promptPreview?: string;
+    };
+    expect(wp.prompt).toBe(smallPrompt);
+    expect(wp.promptRef).toBeUndefined();
+    expect(wp.promptPreview).toBeUndefined();
   });
 
   it('orchestrator decides dispatchGate is no longer needed after gate raised', async () => {

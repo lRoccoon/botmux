@@ -594,6 +594,44 @@ describe('replay — dangling sets', () => {
     expect(s.danglingWaits).toEqual(['a1']);
   });
 
+  it('waitCreated with promptRef → wait.promptRef + promptPreview surface, no blob I/O', async () => {
+    // Replay must NOT read the blob file; the OutputRef and preview both
+    // flow through to AttemptState.wait so the dashboard / Node I/O can
+    // decide when (and whether) to read the full text.
+    const fakePromptRef = {
+      outputHash: 'sha256:' + 'c'.repeat(64),
+      outputPath: '/path/that/does/not/exist',  // proves replay doesn't read
+      outputBytes: 5000,
+      outputSchemaVersion: 1,
+      contentType: 'text/plain',
+    };
+    const s = await snapshotAfter(
+      runCreated,
+      {
+        runId: RUN_ID,
+        type: 'attemptCreated',
+        actor: 'scheduler',
+        payload: { nodeId: 'n1', activityId: 'a1', attemptId: 'at1', attemptNumber: 1, inputRef: sampleOutputRef },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: {
+          activityId: 'a1',
+          nodeId: 'n1',
+          waitKind: 'human-gate',
+          promptRef: fakePromptRef,
+          promptPreview: '出行规划预览：…(完整内容见 dashboard)',
+        },
+      },
+    );
+    const at = s.activities.get('a1')?.attempts[0];
+    expect(at?.wait?.prompt).toBeUndefined();
+    expect(at?.wait?.promptRef).toEqual(fakePromptRef);
+    expect(at?.wait?.promptPreview).toMatch(/dashboard/);
+  });
+
   it('waitCreated + waitResolved → not dangling', async () => {
     const s = await snapshotAfter(
       runCreated,

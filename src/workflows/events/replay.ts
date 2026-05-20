@@ -128,7 +128,17 @@ export type AttemptState = {
   wait?: {
     waitKind: 'human-gate' | 'time' | 'condition';
     deadlineAt?: number;
+    /** Inline prompt — only set for small prompts (≤1 KiB producer policy)
+     *  AND for historical pre-v0.1.3 events.  When the prompt was spilled
+     *  to a blob, `prompt` is undefined and consumers must use `promptRef`
+     *  (full text on demand) or `promptPreview` (cheap, card-safe). */
     prompt?: string;
+    /** Blob spill ref (v0.1.3+).  Replay never reads the blob; cards
+     *  must render `promptPreview` only and dashboard reads on demand. */
+    promptRef?: OutputRef;
+    /** Short preview carried inline on waitCreated when promptRef is set;
+     *  ≤500 chars by schema, byte-budgeted by the producer. */
+    promptPreview?: string;
     /** Default `fail` at the consumer.  Recorded only when waitCreated
      *  carries the field; absent means caller never specified. */
     onTimeout?: 'fail' | 'success';
@@ -665,6 +675,8 @@ export function replay(events: WorkflowEvent[]): Snapshot {
               waitKind: p.waitKind,
               deadlineAt: p.deadlineAt,
               prompt: p.prompt,
+              promptRef: p.promptRef,
+              promptPreview: p.promptPreview,
               onTimeout: p.onTimeout,
             };
           }

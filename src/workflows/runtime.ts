@@ -20,7 +20,7 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import { writeEffectInputSidecar } from './effect-input.js';
-import { writeJsonBlob } from './blob.js';
+import { writeBlob, writeJsonBlob } from './blob.js';
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
 import {
@@ -41,7 +41,6 @@ import type {
   RunSucceededEvent,
   WaitCreatedEvent,
 } from './events/types.js';
-import { INLINE_PAYLOAD_MAX_BYTES } from './events/schema.js';
 import type {
   CompleteNodeFailedAction,
   CompleteNodeSucceededAction,
@@ -353,24 +352,7 @@ export async function dispatchGate(
     ? nowMs(ctx) + action.humanGate.deadlineMs
     : undefined;
 
-  const oversizedPrompt = checkWaitCreatedPayloadSize({
-    activityId: action.activityId,
-    nodeId: action.nodeId,
-    waitKind: 'human-gate',
-    deadlineAt,
-    prompt: resolvedPrompt,
-    approvers: action.humanGate.approvers,
-    onTimeout: action.humanGate.onTimeout,
-  });
-  if (oversizedPrompt) {
-    const activityFailed = await writeBindingFailure(
-      ctx,
-      action.activityId,
-      attemptId,
-      oversizedPrompt,
-    );
-    return { kind: 'failed', attemptId, attemptCreated, activityFailed };
-  }
+  const promptField = await splitHumanGatePrompt(ctx, resolvedPrompt);
 
   const waitCreated = await createWait(ctx.log, {
     activityId: action.activityId,
@@ -378,7 +360,7 @@ export async function dispatchGate(
     nodeId: action.nodeId,
     waitKind: 'human-gate',
     deadlineAt,
-    prompt: resolvedPrompt,
+    ...promptField,
     approvers: action.humanGate.approvers,
     onTimeout: action.humanGate.onTimeout,
   });
@@ -386,24 +368,76 @@ export async function dispatchGate(
   return { kind: 'wait', attemptId, attemptCreated, waitCreated };
 }
 
-function checkWaitCreatedPayloadSize(payload: {
-  activityId: string;
-  nodeId: string;
-  waitKind: 'human-gate';
-  deadlineAt?: number;
-  prompt?: string;
-  approvers?: string[];
-  onTimeout?: string;
-}): string | undefined {
-  const bytes = Buffer.byteLength(JSON.stringify(payload), 'utf-8');
-  if (bytes <= INLINE_PAYLOAD_MAX_BYTES) return undefined;
-  return (
-    `humanGate.prompt is too large after binding (${bytes} bytes; max ` +
-    `${INLINE_PAYLOAD_MAX_BYTES}). Use a short summary/preview field for ` +
-    `humanGate.prompt and keep the full content in the node output for ` +
-    `downstream delivery. Future promptRef support may allow large approval ` +
-    `payloads.`
-  );
+/**
+ * Producer-side split for the humanGate prompt: small prompts stay inline
+ * on `waitCreated.payload.prompt`; anything over `PROMPT_INLINE_MAX_BYTES`
+ * spills to a content-addressed blob and the event carries `promptRef` +
+ * a short `promptPreview` for card / dashboard display.
+ *
+ * The schema accepts arbitrarily long inline prompts for historical
+ * compatibility, so this threshold is a runtime policy, not a wire
+ * contract.  Cards and dashboards MUST NOT read the blob — they render
+ * `promptPreview` only — so the preview is the contract for "what an
+ * approver sees" when prompts are large.
+ */
+async function splitHumanGatePrompt(
+  ctx: WorkflowRuntimeContext,
+  resolvedPrompt: string,
+): Promise<{ prompt: string } | { promptRef: OutputRef; promptPreview: string }> {
+  if (Buffer.byteLength(resolvedPrompt, 'utf-8') <= PROMPT_INLINE_MAX_BYTES) {
+    return { prompt: resolvedPrompt };
+  }
+  const buf = Buffer.from(resolvedPrompt, 'utf-8');
+  const promptRef = await writeBlob(ctx.log, buf, {
+    contentType: 'text/plain',
+    schemaVersion: 1,
+  });
+  return {
+    promptRef,
+    promptPreview: makePromptPreview(resolvedPrompt),
+  };
+}
+
+/**
+ * Producer policy: inline prompts <= 1 KiB; bigger spills to a blob.
+ * Chosen to leave headroom under the 4 KiB inline-event cap for
+ * activityId / nodeId / approvers / onTimeout and any future small
+ * fields.
+ */
+export const PROMPT_INLINE_MAX_BYTES = 1024;
+
+/**
+ * Build the preview string carried inline on `waitCreated` when the
+ * full prompt is in a blob.  Two simultaneous budgets (codex peg 2):
+ *   - chars ≤ 500: schema cap from WaitCreatedPayload.promptPreview
+ *   - bytes ≤ 800: UTF-8 budget so 500 CJK chars (~1.5 KiB) don't bloat
+ *     the envelope past the 4 KiB inline cap
+ * Whichever budget hits first wins; a trailing ellipsis flags truncation.
+ */
+const PROMPT_PREVIEW_MAX_CHARS = 480; // 500 - ellipsis chars, safety
+const PROMPT_PREVIEW_MAX_BYTES = 800;
+export function makePromptPreview(full: string): string {
+  const chars = [...full];
+  if (chars.length <= PROMPT_PREVIEW_MAX_CHARS && Buffer.byteLength(full, 'utf-8') <= PROMPT_PREVIEW_MAX_BYTES) {
+    return full;
+  }
+  const ELLIPSIS = '…(完整内容见 dashboard)';
+  const charBudget = PROMPT_PREVIEW_MAX_CHARS - [...ELLIPSIS].length;
+  const byteBudget = PROMPT_PREVIEW_MAX_BYTES - Buffer.byteLength(ELLIPSIS, 'utf-8');
+  let bytes = 0;
+  let cut = chars.length;
+  for (let i = 0; i < chars.length; i++) {
+    if (i >= charBudget) {
+      cut = i;
+      break;
+    }
+    bytes += Buffer.byteLength(chars[i]!, 'utf-8');
+    if (bytes > byteBudget) {
+      cut = i;
+      break;
+    }
+  }
+  return chars.slice(0, cut).join('') + ELLIPSIS;
 }
 
 async function writeBindingFailure(
