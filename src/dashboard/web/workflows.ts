@@ -481,6 +481,13 @@ function renderWorkflowDetailPage(
   const approvalComments = new Map<string, string>();
   const approvalStatuses = new Map<string, { kind: 'ok' | 'error'; text: string }>();
   const resolvingWaits = new Set<string>();
+  // Cache live iframe elements across snapshot polls so the 2s
+  // re-render of `renderNodeIO` (which `innerHTML=`'s the whole card
+  // list) doesn't tear down + reload the terminal iframe — the reload
+  // reconnects the WebSocket and the user sees a full-screen flicker.
+  // Key by URL: same worker port → same iframe instance; worker
+  // restart (port flips) gets a fresh iframe naturally.
+  const terminalIframes = new Map<string, HTMLIFrameElement>();
   let timelineScrollTop = 0;
   let focusAttemptId = opts.focusAttemptId;
 
@@ -695,7 +702,7 @@ function renderWorkflowDetailPage(
       statuses: approvalStatuses,
       resolving: resolvingWaits,
       onResolve: resolveHumanGate,
-    }, focusAttemptId);
+    }, focusAttemptId, terminalIframes);
     if (focusConsumed) focusAttemptId = undefined;
     renderEvents(eventTbody, events);
     timelineScroll.scrollTop = timelineScrollTop;
@@ -1022,12 +1029,25 @@ function renderNodeIO(
   scrollTops: Map<string, number>,
   approval: ApprovalRenderState,
   focusAttemptId?: string,
+  terminalIframes?: Map<string, HTMLIFrameElement>,
 ): boolean {
   syncIOBlockState(el, openBlocks, scrollTops);
   syncApprovalComments(el, approval.comments);
   const focusHasTerminal = !!(focusAttemptId && snap.attemptIO?.[focusAttemptId]?.terminal);
   if (focusHasTerminal && focusAttemptId) {
     openBlocks.add(ioBlockKey(focusAttemptId, t('workflow.detail.liveTerminal')));
+  }
+  // Pull every live terminal iframe currently mounted into the cache
+  // BEFORE we blow away the DOM with innerHTML.  After the rebuild we
+  // re-mount the same iframe instance into the new placeholder div so
+  // the iframe's document + WebSocket are never reloaded — without
+  // this, the 2s snapshot poll causes the terminal to flicker as the
+  // WebSocket reconnects.
+  if (terminalIframes) {
+    for (const iframe of el.querySelectorAll<HTMLIFrameElement>('iframe.wf-terminal-frame')) {
+      const url = iframe.dataset.wfTerminalUrl;
+      if (url) terminalIframes.set(url, iframe);
+    }
   }
   const byId = new Map(snap.activities.map((a) => [a.activityId, a]));
   const used = new Set<string>();
@@ -1067,6 +1087,34 @@ function renderNodeIO(
   el.innerHTML = cards.length > 0
     ? cards.join('')
     : `<div class="empty">${escapeHtml(t('workflow.detail.noNodeIO'))}</div>`;
+  // Restore preserved iframes into the just-rendered placeholders.
+  // A placeholder is `<div class="wf-terminal-host" data-wf-terminal-host="<url>">` —
+  // see renderTerminal.  For URLs we don't have cached yet (first
+  // render of a freshly-spawned worker), create a new iframe.  GC the
+  // cache after we've seen every placeholder so iframes for ended
+  // attempts release their WebSockets.
+  if (terminalIframes) {
+    const seenUrls = new Set<string>();
+    for (const host of el.querySelectorAll<HTMLDivElement>('.wf-terminal-host[data-wf-terminal-host]')) {
+      const url = host.dataset.wfTerminalHost;
+      if (!url) continue;
+      seenUrls.add(url);
+      let iframe = terminalIframes.get(url);
+      if (!iframe) {
+        iframe = document.createElement('iframe');
+        iframe.className = 'wf-terminal-frame';
+        iframe.src = url;
+        iframe.title = t('workflow.detail.liveTerminal');
+        iframe.loading = 'lazy';
+        iframe.dataset.wfTerminalUrl = url;
+        terminalIframes.set(url, iframe);
+      }
+      host.replaceWith(iframe);
+    }
+    for (const url of Array.from(terminalIframes.keys())) {
+      if (!seenUrls.has(url)) terminalIframes.delete(url);
+    }
+  }
   restoreIOBlockScroll(el, scrollTops);
   const focusVisible = scrollFocusedAttemptIntoView(el, focusAttemptId);
   attachIOBlockToggleTracking(el, openBlocks);
@@ -1160,10 +1208,12 @@ function renderTerminal(attempt: AttemptState | undefined, terminal: AttemptTerm
     return `<div class="muted wf-io-empty">${escapeHtml(t('workflow.detail.terminalClosed'))}</div>`;
   }
   const url = terminalReadOnlyUrl(terminal);
+  // Placeholder div: renderNodeIO swaps this for a cached iframe element
+  // post-innerHTML so the iframe instance survives the snapshot poll.
   return `<div class="wf-terminal-actions">
       <a class="btn-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(t('workflow.detail.openTerminalNewTab'))}</a>
     </div>
-    <iframe class="wf-terminal-frame" src="${escapeHtml(url)}" title="${escapeHtml(t('workflow.detail.liveTerminal'))}" loading="lazy"></iframe>`;
+    <div class="wf-terminal-host" data-wf-terminal-host="${escapeHtml(url)}"></div>`;
 }
 
 function isLiveTerminal(attempt: AttemptState | undefined, terminal: AttemptTerminal): boolean {
