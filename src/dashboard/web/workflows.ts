@@ -1439,6 +1439,8 @@ function syncIOBlockState(
 
 function attachIOBlockToggleTracking(root: HTMLElement, openBlocks: Set<string>): void {
   root.querySelectorAll<HTMLDetailsElement>('details.wf-io-block[data-io-key]').forEach((el) => {
+    if (el.dataset.ioToggleBound === '1') return;
+    el.dataset.ioToggleBound = '1';
     el.addEventListener('toggle', () => {
       const key = el.dataset.ioKey;
       if (!key) return;
@@ -1465,6 +1467,8 @@ function attachIOBlockScrollTracking(root: HTMLElement, scrollTops: Map<string, 
     if (!key) return;
     const pre = el.querySelector<HTMLElement>('.wf-io-pre');
     if (!pre) return;
+    if (pre.dataset.ioScrollBound === '1') return;
+    pre.dataset.ioScrollBound = '1';
     pre.addEventListener('scroll', () => {
       scrollTops.set(key, pre.scrollTop);
     });
