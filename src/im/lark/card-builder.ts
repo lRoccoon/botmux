@@ -12,6 +12,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'cursor': 'Cursor',
   'gemini': 'Gemini',
   'opencode': 'OpenCode',
+  'antigravity': 'Antigravity',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
