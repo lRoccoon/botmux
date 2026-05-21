@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { statSync } from 'node:fs';
-import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage } from './im/lark/client.js';
+import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -73,6 +73,12 @@ import {
   type WorkflowCommandResult,
 } from './im/lark/workflow-slash-command.js';
 import { workflowRunDetailUrl } from './im/lark/workflow-cards.js';
+import {
+  buildWorkflowStartingCard,
+  buildWorkflowProgressCard,
+} from './im/lark/workflow-progress-card.js';
+import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
+import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, type RoutingContext } from './im/lark/event-dispatcher.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { renderSenderTag } from './core/session-manager.js';
@@ -133,6 +139,15 @@ const workflowRuns = new Map<string, {
   running?: Promise<RunLoopResult>;
   aborters?: Map<string, AbortController>;
   cancelling?: Promise<CancelOnDaemonOk>;
+}>();
+// v0.1.5 slice 1: run-level progress card index.  daemon-internal only
+// (codex contract boundary 2: daemon restart drops the cardMessageId
+// and we accept losing card updates for that run — the dashboard link
+// inside any prior card still works).
+const workflowRunCards = new Map<string, {
+  cardMessageId: string;
+  larkAppId: string;
+  chatId: string;
 }>();
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
@@ -413,6 +428,10 @@ export function attachWorkflowEventWatcher(runId: string, ctx?: WorkflowRuntimeC
   const watcher = new WorkflowEventWatcher(
     runId,
     async (event) => {
+      // Progress card refresh is best-effort and runs first so a stale
+      // card never hangs around through approval / terminal events.
+      // Errors are swallowed inside updateWorkflowProgressCard.
+      await updateWorkflowProgressCard(runId);
       await handleWorkflowFanoutEvent(event);
     },
     {
@@ -460,10 +479,40 @@ async function driveWorkflowRun(runId: string): Promise<RunLoopResult> {
 
 function cleanupWorkflowRun(runId: string): void {
   workflowRuns.delete(runId);
+  workflowRunCards.delete(runId);
   const watcher = workflowEventWatchers.get(runId);
   if (watcher) {
     watcher.close();
     workflowEventWatchers.delete(runId);
+  }
+}
+
+/**
+ * v0.1.5 slice 1: progress card update path.
+ *
+ * Replay the run's EventLog → build a fresh card JSON → PATCH the
+ * previously-sent message.  Failure is logged at warn and swallowed —
+ * codex contract boundary 1: workflow runtime semantics must never
+ * depend on Feishu PATCH succeeding.
+ *
+ * Called after every event the fanout watcher sees, BEFORE handing the
+ * event off to handleWorkflowFanoutEvent (so an approval card landing
+ * doesn't race the progress card's "waiting" state).
+ */
+async function updateWorkflowProgressCard(runId: string): Promise<void> {
+  const card = workflowRunCards.get(runId);
+  if (!card) return;
+  try {
+    const log = new WorkflowEventLog(runId, getRunsDir());
+    const snapshot = replayWorkflow(await log.readAll());
+    const cardJson = buildWorkflowProgressCard(snapshot);
+    await updateMessage(card.larkAppId, card.cardMessageId, cardJson);
+  } catch (err) {
+    logger.warn(
+      `[workflow:${runId}] progress card update failed (continuing): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
   }
 }
 
@@ -944,15 +993,43 @@ async function handleWorkflowCommandIfAny(
       runLoopFn: (ctx) => driveWorkflowRun(ctx.log.runId),
       cancelWorkflowRunFn: (runId, reason, opts) => cancelWorkflowRunOnDaemon(runId, reason, opts),
       onRunCreated: async (info) => {
+        // v0.1.5 slice 1: send the run-level progress card so the user
+        // sees a single self-updating tile.  Best-effort: if the card
+        // send fails we still fall back to a plain-text "started"
+        // reply so they at least see the runId.
         try {
-          await sessionReply(
-            anchor,
-            `Workflow started: ${info.workflowId}\nrunId: ${info.runId}\nWeb: ${workflowRunDetailUrl(info.runId)}`,
-            'text',
-            larkAppId,
-          );
+          const cardJson = buildWorkflowStartingCard({
+            runId: info.runId,
+            workflowId: info.workflowId,
+          });
+          const cardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+          if (chatId) {
+            workflowRunCards.set(info.runId, {
+              cardMessageId,
+              larkAppId,
+              chatId,
+            });
+          }
         } catch (err) {
-          logger.warn(`[workflow:${info.runId}] failed to send start reply: ${err instanceof Error ? err.message : String(err)}`);
+          logger.warn(
+            `[workflow:${info.runId}] failed to send progress card (falling back to text): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          try {
+            await sessionReply(
+              anchor,
+              `Workflow started: ${info.workflowId}\nrunId: ${info.runId}\nWeb: ${workflowRunDetailUrl(info.runId)}`,
+              'text',
+              larkAppId,
+            );
+          } catch (fallbackErr) {
+            logger.warn(
+              `[workflow:${info.runId}] failed to send start reply: ${
+                fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)
+              }`,
+            );
+          }
         }
       },
     },
