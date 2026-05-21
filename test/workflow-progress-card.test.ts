@@ -264,6 +264,55 @@ describe('workflow-progress-card', () => {
       expect(parsed.header.title.content).toContain('🛑');
       expect(json).toContain('🛑 已取消');
     });
+
+    // codex round 1 blocker on slice 3: subagent runtime now writes
+    // `activityRunning` between attemptCreated and activitySucceeded
+    // (runtime.ts slice 3 round 1).  Replay this real event sequence and
+    // verify the enricher emits the "查看当前终端" link with the right
+    // attemptId — guards against the regression where the link never
+    // showed up because activity.status stayed `pending` for the whole
+    // attempt lifetime.
+    it('subagent runtime event sequence (attemptCreated + activityRunning) → enricher emits link', async () => {
+      const ACTIVITY_ID = `${RUN_ID}::work::n1`;
+      const ATTEMPT_ID = `${ACTIVITY_ID}::1`;
+      const INPUT_REF = { outputHash: 'sha256:' + 'e'.repeat(64), outputBytes: 32, outputSchemaVersion: 1 };
+
+      await log.append(runCreated);
+      await log.append({ runId: RUN_ID, type: 'runStarted', actor: 'scheduler', payload: {} });
+      await log.append({
+        runId: RUN_ID,
+        type: 'attemptCreated',
+        actor: 'scheduler',
+        payload: {
+          nodeId: 'n1',
+          activityId: ACTIVITY_ID,
+          attemptId: ATTEMPT_ID,
+          attemptNumber: 1,
+          inputRef: INPUT_REF,
+        },
+      });
+      await log.append({
+        runId: RUN_ID,
+        type: 'activityRunning',
+        actor: 'scheduler',
+        payload: {
+          activityId: ACTIVITY_ID,
+          attemptId: ATTEMPT_ID,
+          leaseId: `lease-${ATTEMPT_ID}`,
+        },
+      });
+      const snapshot = replay(await log.readAll());
+      // Sanity: replay projected both node and activity into 'running'.
+      expect(snapshot.activities.get(ACTIVITY_ID)?.status).toBe('running');
+      expect(snapshot.nodes.get('n1')?.status).toBe('running');
+
+      const json = buildWorkflowProgressCard(snapshot, {
+        enrichWithTerminalLink: buildAttemptDeeplinkEnricher(RUN_ID, snapshot),
+      });
+      // Link present with the running attempt's URL-encoded attemptId.
+      expect(json).toContain('查看当前终端');
+      expect(json).toContain(encodeURIComponent(ATTEMPT_ID));
+    });
   });
 
   it('inline rows cap at maxInlineRows with "+N more" trailer', () => {
@@ -318,13 +367,16 @@ describe('workflow-progress-card', () => {
       expect(link?.url).toBe(`${workflowRunDetailUrl(RUN_ID)}?attempt=${encodeURIComponent('run-x::work::n1::1')}`);
     });
 
-    it('returns live-terminal link when activity is effectAttempting', () => {
-      const hook = buildAttemptDeeplinkEnricher(RUN_ID, snapWithActivity('effectAttempting'));
-      const link = hook('run-x::work::n1', 'run-x::work::n1::1');
-      expect(link?.kind).toBe('live-terminal');
-    });
-
-    it.each(['pending', 'acquired', 'waiting', 'succeeded', 'failed', 'cancelled', 'timedOut'] as const)(
+    it.each([
+      'pending',
+      'acquired',
+      'waiting',
+      'effectAttempting',
+      'succeeded',
+      'failed',
+      'cancelled',
+      'timedOut',
+    ] as const)(
       'returns undefined when activity status is %s (no live web port)',
       (status) => {
         const hook = buildAttemptDeeplinkEnricher(RUN_ID, snapWithActivity(status));

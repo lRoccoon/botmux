@@ -327,8 +327,12 @@ describe('dispatchWork — subagent', () => {
       'runCreated',
       'runStarted',
       'attemptCreated',
+      'activityRunning',
       'activitySucceeded',
     ]);
+    const running = events.find((e) => e.type === 'activityRunning');
+    const payload = (running?.payload ?? {}) as { activityId: string; attemptId: string; leaseId: string };
+    expect(payload.leaseId).toBe(`lease-${payload.attemptId}`);
 
     // session sidecar
     if (result.kind !== 'succeeded') return;

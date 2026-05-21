@@ -312,9 +312,12 @@ export function buildAttemptDeeplinkEnricher(
   return (activityId, attemptId) => {
     const activity = snapshot.activities.get(activityId);
     if (!activity) return undefined;
-    const inFlight =
-      activity.status === 'running' || activity.status === 'effectAttempting';
-    if (!inFlight) return undefined;
+    // Only subagent activities own a worker + web-terminal sidecar.
+    // `effectAttempting` is a hostExecutor-side state (no worker, no
+    // sidecar) — handing the user a live-terminal link there would land
+    // them on an attempt with no terminal block.  `acquired` / `pending`
+    // / `waiting` skip for the same "no sidecar yet" reason.
+    if (activity.status !== 'running') return undefined;
     return {
       url: `${workflowRunDetailUrl(runId)}?attempt=${encodeURIComponent(attemptId)}`,
       kind: 'live-terminal',

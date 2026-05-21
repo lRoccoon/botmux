@@ -687,15 +687,33 @@ export async function dispatchWork(
     throw err;
   }
 
-  // NB: skipping `leaseSigned` + `activityRunning` in v0 — those are
-  // tied to the lease-timeout enforcement path (Step 6) which we
-  // don't engage when the spawn callback runs inline and synchronously
-  // settles into success/failure.  Re-introduce when leases are wired
+  // NB: still skipping `leaseSigned` in v0 — that's tied to the lease-
+  // timeout enforcement path (Step 6) which we don't engage when the
+  // spawn callback runs inline.  Re-introduce when leases are wired
   // (Slice D / runtime-loop slice).
-
+  //
+  // BUT we DO write `activityRunning` here (v0.1.5 slice 3 round 1):
+  // replay projects it into `activity.status = 'running'` AND
+  // `node.status = 'running'`, which the run-level Feishu progress card's
+  // `collectRunningRows()` + `buildAttemptDeeplinkEnricher()` both gate
+  // on to render the "查看当前终端" deeplink.  Without this write the
+  // activity stays `pending` for the entire lifetime of a long-running
+  // subagent and the card never shows the link.  `leaseId` is a stable
+  // inline token so cold-attach replay is deterministic; real leases
+  // arrive with Slice D.
   const botSnapshot = await resolveBotSnapshot(ctx, node.bot, options.snapshot);
   const sidecarDir = await attemptSidecarDir(ctx.log, action.activityId, attemptId);
   const attemptLogPath = join(sidecarDir, 'terminal.log');
+  await ctx.log.append({
+    runId: ctx.log.runId,
+    type: 'activityRunning',
+    actor: 'scheduler',
+    payload: {
+      activityId: action.activityId,
+      attemptId,
+      leaseId: `lease-${attemptId}`,
+    },
+  });
   const spawnResult = await ctx.spawnSubagent({
     botName: node.bot,
     botSnapshot,
