@@ -20,6 +20,7 @@
  */
 
 import { fork, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -589,13 +590,33 @@ function truncateLogLine(line: string): string {
   return line.length > 2000 ? `${line.slice(0, 2000)}…[truncated]` : line;
 }
 
+/**
+ * Deterministically map any string id to a UUID-v4-shaped hex token.
+ *
+ * Why: Claude Code CLI ≥ 2.1.146 rejects `--session-id` values that
+ * aren't valid UUIDs ("Invalid session ID. Must be a valid UUID."). The
+ * workflow runtime mints synthetic ids by concatenating runId /
+ * activityId / attemptId (which embed `::` separators), so the raw form
+ * fails validation. We keep determinism (same input → same uuid, so the
+ * jsonl bridge path & resume both work) by hashing through SHA-256 and
+ * rewriting the version + variant nibbles to satisfy the v4 shape.
+ */
+export function syntheticSessionUuid(rawId: string): string {
+  const h = createHash('sha256').update(rawId).digest('hex');
+  const version = `4${h.slice(13, 16)}`;
+  const variantNibble = ((parseInt(h[16]!, 16) & 0x3) | 0x8).toString(16);
+  const variant = `${variantNibble}${h.slice(17, 20)}`;
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${version}-${variant}-${h.slice(20, 32)}`;
+}
+
 function syntheticIds(input: DaemonRunOneShotInput): {
   sessionId: string;
   chatId: string;
   rootMessageId: string;
 } {
+  const rawSessionId = `wf-${input.runId}-${input.activityId}-${input.attemptId}`;
   return {
-    sessionId: `wf-${input.runId}-${input.activityId}-${input.attemptId}`,
+    sessionId: syntheticSessionUuid(rawSessionId),
     chatId: `wf-chat-${input.runId}`,
     rootMessageId: `wf-root-${input.activityId}`,
   };

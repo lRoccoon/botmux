@@ -7,6 +7,7 @@ import { join } from 'node:path';
 
 import {
   createWorkflowDaemonSpawn,
+  syntheticSessionUuid,
   type WorkerHandle,
   type WorkerProcessFactory,
 } from '../src/workflows/daemon-spawn.js';
@@ -193,7 +194,17 @@ describe('createWorkflowDaemonSpawn', () => {
     expect(init!.cliId).toBe('claude-code');
     expect(init!.larkAppId).toBe('cli_x');
     expect(init!.larkAppSecret).toBe('secret');
-    expect(init!.sessionId).toContain('run-x');
+    // sessionId is now UUID-v4-shaped (Claude CLI 2.1.146 requires it).
+    // Deterministically derived from runId/activityId/attemptId, so it
+    // must equal syntheticSessionUuid of the same raw concatenation.
+    const UUID_V4_RE =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    expect(init!.sessionId).toMatch(UUID_V4_RE);
+    expect(init!.sessionId).toBe(
+      syntheticSessionUuid(
+        `wf-${baseInput.runId}-${baseInput.activityId}-${baseInput.attemptId}`,
+      ),
+    );
     expect(init!.chatId).toContain('wf-chat');
   });
 
@@ -286,5 +297,36 @@ describe('createWorkflowDaemonSpawn', () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+describe('syntheticSessionUuid', () => {
+  const UUID_V4_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+  it('produces a valid UUID v4 shape (Claude CLI session-id validator accepts it)', () => {
+    const id = syntheticSessionUuid(
+      'wf-run-2026-05-21T07-06-16-028Z-e072e865-run::work::root-run::work::root::att-1',
+    );
+    expect(id).toMatch(UUID_V4_RE);
+  });
+
+  it('is deterministic — same raw id maps to the same uuid (jsonl bridge path + resume both rely on this)', () => {
+    const raw = 'wf-some-run-some::activity-some::attempt';
+    expect(syntheticSessionUuid(raw)).toBe(syntheticSessionUuid(raw));
+  });
+
+  it('different inputs map to different uuids (no collisions across attempts)', () => {
+    const a = syntheticSessionUuid('wf-run-act-att-1');
+    const b = syntheticSessionUuid('wf-run-act-att-2');
+    expect(a).not.toBe(b);
+    expect(a).toMatch(UUID_V4_RE);
+    expect(b).toMatch(UUID_V4_RE);
+  });
+
+  it('accepts ids with `::` separators that broke the raw string form', () => {
+    const id = syntheticSessionUuid('wf-r::a::b');
+    expect(id).toMatch(UUID_V4_RE);
+    expect(id).not.toContain('::');
   });
 });
