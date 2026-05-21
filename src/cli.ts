@@ -235,9 +235,10 @@ function ecosystemConfig(): string {
     env: {
       SESSION_DATA_DIR: DATA_DIR,
       BOTMUX_BOT_INDEX: String(i),
-      // Short-term native-memory diagnostics for the workflow OOM investigation.
-      // Keep it scoped to daemon-0 unless the operator explicitly overrides it.
-      BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? (i === 0 ? '5000' : '0'),
+      // Native-memory diagnostics. Default off; operator can flip it on
+      // ad-hoc (e.g. `BOTMUX_MEMORY_DIAG_INTERVAL_MS=5000`) when chasing an
+      // RSS regression — turned off in master so logs stay quiet.
+      BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0',
     },
   }));
 

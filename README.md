@@ -156,7 +156,11 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 - 一键定位回飞书话题 / 跳 Web 终端 / 多选批量关闭会话
 - 拉新群、自动转让群主、@ 提醒
 - 解散群聊、bot 退群（关联会话自动清理）
-- **Workflows 运维面**（read-only）：Run List 5s 轮询，点进 Run Detail 看 summary / dangling 红区 / node-activity 表 / timeline；2s 轮询且 run 到 terminal 后自动停。mutation（run/resume/cancel）仍走 [Workflow CLI 子命令](#workflow-子命令实验性运维) 或 IM 卡片，UI 第一版只读
+- **Workflows 管控面**：
+  - Run List 5s 轮询；Run Detail 看 summary / dangling 红区 / node-activity 表 / event timeline / **并发执行 timeline**（attempt 级时序），到 terminal 自动停轮询
+  - **Dashboard 内可直接 cancel run**、批准/拒绝 humanGate（approve/reject + 评论）
+  - **Workflow Catalog**：列所有 `~/.botmux/workflows/` 下的 workflow，点进去看 schema / 依赖图，直接在 UI 触发 run（带 params 输入）
+  - IM 卡片（cancel / approve / reject）仍可用；CLI 子命令也保留
 
 <img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
 

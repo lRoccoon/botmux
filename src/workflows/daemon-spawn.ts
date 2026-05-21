@@ -512,7 +512,19 @@ async function runOneShotImpl(
   });
 }
 
+// Per-spawn memory diagnostics. Gated by the same env flag the periodic
+// daemon-level diag uses (`BOTMUX_MEMORY_DIAG_INTERVAL_MS` > 0). Default off
+// in master so workflow spawn doesn't spam ~10 lines per attempt; flip the env
+// on when chasing a real RSS regression and both layers light up together.
+function spawnMemDiagEnabled(): boolean {
+  const raw = process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS;
+  if (!raw) return false;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0;
+}
+
 function logOneShotMemory(input: DaemonRunOneShotInput, phase: string): void {
+  if (!spawnMemDiagEnabled()) return;
   const usage = process.memoryUsage();
   const external = usage.external ?? 0;
   const nativeOther = Math.max(0, usage.rss - usage.heapTotal - external);
