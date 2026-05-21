@@ -237,7 +237,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (result?.ok && !result.duplicate && runId) {
       await deps.workflowApprovalResolved?.(runId);
     }
-    return result;
+    // Non-approver: surface a toast so the clicker knows nothing happened
+    // (instead of silently leaving the buttons active).
+    if (result && !result.ok && result.error === 'not_approver') {
+      return { toast: { type: 'warning', content: '你不在该审批人名单里，无法操作' } };
+    }
+    // Successful resolve / reject / cancel: replace the clicked card with a
+    // frozen "已通过/已拒绝/已取消" body so the buttons can't be re-submitted
+    // from this surface. Duplicate clicks just no-op (the first PATCH already
+    // landed).
+    if (result?.ok && !result.duplicate && result.resolvedCardJson) {
+      try {
+        return JSON.parse(result.resolvedCardJson);
+      } catch {
+        // fall through to undefined
+      }
+    }
+    return;
   }
 
   // Handle session card button actions (restart/close)

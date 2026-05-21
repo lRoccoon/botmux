@@ -124,7 +124,8 @@ export function buildWorkflowProgressCard(
         { is_short: true, text: { tag: 'lark_md', content: `**runId**\n${escapeMd(short(snapshot.run.runId, 28))}` } },
         { is_short: true, text: { tag: 'lark_md', content: `**状态**\n${statusBadge(status)}` } },
         { is_short: true, text: { tag: 'lark_md', content: `**进度**\n${counts.succeeded} / ${denominator} 节点完成` } },
-        { is_short: true, text: { tag: 'lark_md', content: `**failed**\n${counts.failed}  ·  **cancelled**\n${counts.cancelled}` } },
+        { is_short: true, text: { tag: 'lark_md', content: `**失败**\n${counts.failed}` } },
+        { is_short: true, text: { tag: 'lark_md', content: `**已取消**\n${counts.cancelled}` } },
       ],
     },
   ];

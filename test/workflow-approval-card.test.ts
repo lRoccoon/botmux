@@ -202,13 +202,82 @@ describe('buildWorkflowApprovalCard', () => {
     expect(text).toContain('multi_url');
     expect(text).toContain('http://example.com/detail');
   });
+
+  it('lays out approve and reject side-by-side via column_set so they do not stack vertically', async () => {
+    const waitCreated = await bootstrapWait();
+    const snapshot = replay(await log.readAll());
+
+    const card = JSON.parse(buildWorkflowApprovalCard(waitCreated, snapshot));
+    const form = card.elements.find((e: any) => e.tag === 'form');
+    expect(form).toBeDefined();
+    const columnSet = form.elements.find((e: any) => e.tag === 'column_set');
+    expect(columnSet).toBeDefined();
+    expect(columnSet.columns).toHaveLength(2);
+    const buttons = columnSet.columns.map((c: any) => c.elements[0]);
+    expect(buttons[0].name).toBe('workflow_approve');
+    expect(buttons[1].name).toBe('workflow_reject');
+    // Cancel stays below the row at full width — visual grouping separates
+    // gate decision from run cancel.
+    const cancelButton = form.elements.find(
+      (e: any) => e.tag === 'button' && e.name === 'workflow_cancel',
+    );
+    expect(cancelButton).toBeDefined();
+  });
+
+  it('renders frozen card with no form/buttons when resolution is set (approve)', async () => {
+    const waitCreated = await bootstrapWait();
+    const snapshot = replay(await log.readAll());
+
+    const card = JSON.parse(
+      buildWorkflowApprovalCard(waitCreated, snapshot, {
+        resolution: { kind: 'approved', by: 'ou_approver', comment: 'looks good' },
+      }),
+    );
+    expect(card.header.template).toBe('green');
+    expect(card.header.title.content).toContain('已通过');
+    // No form / approve / reject button — buttons must be unclickable
+    expect(card.elements.find((e: any) => e.tag === 'form')).toBeUndefined();
+    const text = cardText(card);
+    expect(text).not.toContain(WORKFLOW_APPROVE_ACTION);
+    expect(text).not.toContain(WORKFLOW_REJECT_ACTION);
+    expect(text).not.toContain(WORKFLOW_CANCEL_ACTION);
+    // But the resolution banner + operator + comment all surface (open_id
+    // underscores are markdown-escaped, so check the prefix instead of the
+    // raw id).
+    expect(text).toContain('已通过');
+    expect(text).toContain('ou\\\\_approver');
+    expect(text).toContain('looks good');
+    // Web detail button still rendered so the operator can hop to dashboard
+    expect(text).toContain('Web 详情');
+  });
+
+  it('uses red template for rejected and grey template for cancelled', async () => {
+    const waitCreated = await bootstrapWait();
+    const snapshot = replay(await log.readAll());
+
+    const rejected = JSON.parse(
+      buildWorkflowApprovalCard(waitCreated, snapshot, {
+        resolution: { kind: 'rejected', by: 'ou_reviewer' },
+      }),
+    );
+    expect(rejected.header.template).toBe('red');
+    expect(rejected.header.title.content).toContain('已拒绝');
+
+    const cancelled = JSON.parse(
+      buildWorkflowApprovalCard(waitCreated, snapshot, {
+        resolution: { kind: 'cancelled', by: 'ou_owner' },
+      }),
+    );
+    expect(cancelled.header.template).toBe('grey');
+    expect(cancelled.header.title.content).toContain('已取消');
+  });
 });
 
 describe('handleWorkflowApprovalAction', () => {
   it('approve click writes waitResolved=approved and activitySucceeded', async () => {
     await bootstrapWait();
 
-    await handleWorkflowApprovalAction(cardActionData(WORKFLOW_APPROVE_ACTION), {
+    const result = await handleWorkflowApprovalAction(cardActionData(WORKFLOW_APPROVE_ACTION), {
       runsDir: baseDir,
       loadFrozenCardsFn: () => new Map(),
       saveFrozenCardsFn: () => undefined,
@@ -226,6 +295,16 @@ describe('handleWorkflowApprovalAction', () => {
       activityId: ACTIVITY_ID,
       attemptId: ATTEMPT_ID,
     });
+
+    // The handler now returns a frozen (no-form) card body so the dispatcher
+    // can in-place-patch the clicked card.
+    expect(result).toMatchObject({ ok: true, duplicate: false });
+    if (result && result.ok && !result.duplicate) {
+      expect(result.resolvedCardJson).toBeDefined();
+      const frozen = JSON.parse(result.resolvedCardJson!);
+      expect(frozen.header.template).toBe('green');
+      expect(frozen.elements.find((e: any) => e.tag === 'form')).toBeUndefined();
+    }
   });
 
   it('reject click preserves comment and writes activityFailed', async () => {

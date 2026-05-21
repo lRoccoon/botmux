@@ -1,7 +1,9 @@
 import { logger } from '../../utils/logger.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { EventLog } from '../../workflows/events/append.js';
+import { replay } from '../../workflows/events/replay.js';
 import type { WorkflowEvent } from '../../workflows/events/schema.js';
+import type { WaitCreatedEvent } from '../../workflows/events/types.js';
 import { getRunsDir } from '../../workflows/runs-dir.js';
 import {
   resolveWait,
@@ -15,10 +17,12 @@ import {
 import type { CancelRequestedEvent } from '../../workflows/events/types.js';
 import type { FrozenCard } from '../../core/types.js';
 import {
+  buildWorkflowApprovalCard,
   WORKFLOW_APPROVE_ACTION,
   WORKFLOW_CANCEL_ACTION,
   WORKFLOW_COMMENT_FIELD,
   WORKFLOW_REJECT_ACTION,
+  type WorkflowApprovalResolutionKind,
 } from './workflow-cards.js';
 
 export type WorkflowCardActionData = {
@@ -51,6 +55,11 @@ export type WorkflowApprovalHandlerResult =
       duplicate: false;
       cardNonce: string;
       result: ResolveWaitResult | CancelRequestedEvent;
+      /** Frozen card body (no buttons) for the dispatcher to in-place patch the
+       *  clicked card.  Undefined if rebuild failed — caller falls back to no
+       *  patch and the card stays interactive (handler is idempotent via
+       *  frozenCards). */
+      resolvedCardJson?: string;
     }
   | { ok: false; error: 'not_approver'; cardNonce: string };
 
@@ -98,7 +107,8 @@ export async function handleWorkflowApprovalAction(
   const runsDir = deps.runsDir ?? workflowRunsDir();
   const makeEventLog = deps.makeEventLog ?? ((rid, base) => new EventLog(rid, base));
   const log = makeEventLog(runId, runsDir);
-  if (!(await canApprove(log, activityId, by))) {
+  const eventsBefore = await log.readAll();
+  if (!canApproveFromEvents(eventsBefore, activityId, by)) {
     logger.info(`[workflow:${runId}] approval card action blocked for non-approver ${by}`);
     return { ok: false, error: 'not_approver', cardNonce };
   }
@@ -121,6 +131,13 @@ export async function handleWorkflowApprovalAction(
           comment,
         });
 
+  const resolutionKind: WorkflowApprovalResolutionKind =
+    action === WORKFLOW_APPROVE_ACTION
+      ? 'approved'
+      : action === WORKFLOW_REJECT_ACTION
+        ? 'rejected'
+        : 'cancelled';
+
   frozenCards.set(cardNonce, {
     messageId: data.context?.open_message_id ?? data.open_message_id ?? '',
     title: `workflow approval ${runId}/${activityId}`,
@@ -128,12 +145,7 @@ export async function handleWorkflowApprovalAction(
       runId,
       activityId,
       attemptId,
-      resolution:
-        action === WORKFLOW_APPROVE_ACTION
-          ? 'approved'
-          : action === WORKFLOW_REJECT_ACTION
-            ? 'rejected'
-            : 'cancelled',
+      resolution: resolutionKind,
       by,
       ...(comment ? { comment } : {}),
     }),
@@ -145,7 +157,42 @@ export async function handleWorkflowApprovalAction(
     logger.info(`[workflow:${runId}] wait ${activityId}/${attemptId} resolved by ${by}`);
   }
 
-  return { ok: true, duplicate: false, cardNonce, result };
+  const resolvedCardJson = buildResolvedCardJson(eventsBefore, activityId, {
+    kind: resolutionKind,
+    by,
+    comment,
+  });
+
+  return { ok: true, duplicate: false, cardNonce, result, resolvedCardJson };
+}
+
+function buildResolvedCardJson(
+  events: WorkflowEvent[],
+  activityId: string,
+  resolution: { kind: WorkflowApprovalResolutionKind; by: string; comment?: string },
+): string | undefined {
+  try {
+    const waitEvent = findLatestWaitCreated(events, activityId);
+    if (!waitEvent) return undefined;
+    const snapshot = replay(events);
+    return buildWorkflowApprovalCard(waitEvent, snapshot, { resolution });
+  } catch (err) {
+    logger.warn(`failed to build resolved approval card: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
+function findLatestWaitCreated(
+  events: WorkflowEvent[],
+  activityId: string,
+): WaitCreatedEvent | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const evt = events[i];
+    if (evt.type !== 'waitCreated') continue;
+    if (waitCreatedActivityId(evt) !== activityId) continue;
+    return evt as WaitCreatedEvent;
+  }
+  return undefined;
 }
 
 function requiredValue(value: Record<string, string> | undefined, key: string): string {
@@ -163,12 +210,8 @@ function cancelReason(comment: string | undefined): string {
   return comment ? `cancelled from approval card: ${comment}` : 'cancelled from approval card';
 }
 
-async function canApprove(log: EventLog, activityId: string, by: string): Promise<boolean> {
-  const events = await log.readAll();
-  const wait = [...events].reverse().find((event) =>
-    event.type === 'waitCreated' &&
-    waitCreatedActivityId(event) === activityId
-  );
+function canApproveFromEvents(events: WorkflowEvent[], activityId: string, by: string): boolean {
+  const wait = findLatestWaitCreated(events, activityId);
   const approvers = waitCreatedApprovers(wait);
   if (!approvers || approvers.length === 0) return true;
   return approvers.includes(by);
