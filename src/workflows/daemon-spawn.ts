@@ -30,6 +30,8 @@ import type {
   DaemonRunOneShotResult,
   DaemonSpawnDeps,
 } from './spawn-bot.js';
+import { WorkflowSpawnCancelledError } from './spawn-bot.js';
+import type { AbortCancelReason } from './runtime.js';
 import { logger } from '../utils/logger.js';
 
 // ─── IPC payloads (subset of WorkerToDaemon we care about) ────────────────
@@ -130,6 +132,14 @@ export type WorkflowDaemonSpawnDeps = {
    * Tests can shrink this.  Default 800 ms.
    */
   quiesceMs?: number;
+  /**
+   * Grace period after cancel SIGINT before escalating to SIGKILL.
+   * Default 5000 ms — long enough for a CLI to flush its current chunk
+   * and exit cleanly, short enough that a stuck worker doesn't keep
+   * `cancelWorkflowRunOnDaemon` blocked.  Per-CLI tuning lives in
+   * v0.1.4-b's `cancelPolicy` schema; we keep a single constant here.
+   */
+  cancelGraceMs?: number;
 };
 
 export function createWorkflowDaemonSpawn(
@@ -139,6 +149,7 @@ export function createWorkflowDaemonSpawn(
   const workerPath = deps.workerPath ?? defaultWorkerPath();
   const defaultTimeoutMs = deps.defaultTimeoutMs ?? 5 * 60 * 1000;
   const quiesceMs = deps.quiesceMs ?? 800;
+  const cancelGraceMs = deps.cancelGraceMs ?? 5000;
 
   return {
     runOneShot: (input) =>
@@ -147,6 +158,7 @@ export function createWorkflowDaemonSpawn(
         workerPath,
         defaultTimeoutMs,
         quiesceMs,
+        cancelGraceMs,
         resolveLarkCredentials: deps.resolveLarkCredentials,
       }),
   };
@@ -172,6 +184,7 @@ type RunOneShotInternalDeps = {
   workerPath: string;
   defaultTimeoutMs: number;
   quiesceMs: number;
+  cancelGraceMs: number;
   resolveLarkCredentials: WorkflowDaemonSpawnDeps['resolveLarkCredentials'];
 };
 
@@ -229,6 +242,7 @@ async function runOneShotImpl(
 
   return new Promise<DaemonRunOneShotResult>((resolve, reject) => {
     let settled = false;
+    let sigkillTimer: NodeJS.Timeout | undefined;
     const timeoutMs = input.timeoutMs ?? deps.defaultTimeoutMs;
     const hardDeadline = setTimeout(() => {
       fail(new Error(`workflow worker timeout after ${timeoutMs} ms`));
@@ -237,6 +251,12 @@ async function runOneShotImpl(
     const cleanup = (): void => {
       clearTimeout(hardDeadline);
       if (quiesceTimer) clearTimeout(quiesceTimer);
+      // NOTE: do NOT clear `sigkillTimer` here.  cleanup() is called from
+      // `fail()` which is what cancel itself triggers — clearing the
+      // grace timer would cancel our own SIGKILL escalation and a stuck
+      // CLI worker would keep eating CPU.  The sigkillTimer is cleared
+      // only on the worker's `exit` event below.
+      input.cancelSignal?.removeEventListener('abort', onCancelAbort);
       try {
         worker.send({ type: 'close' });
       } catch {
@@ -245,6 +265,68 @@ async function runOneShotImpl(
       // Give close a moment to land before SIGTERM.
       setTimeout(() => worker.kill('SIGTERM'), 250);
     };
+
+    /**
+     * Cancel responsiveness (v0.1.4-a slice 2):
+     *   1. Tell the worker via the existing IPC `close` channel so the CLI
+     *      can flush its current chunk and exit cleanly.
+     *   2. SIGINT for an unambiguous interrupt signal that CLI shells
+     *      conventionally honor (Ctrl-C semantics).
+     *   3. Arm a SIGKILL fallback after `cancelGraceMs` in case the CLI
+     *      is stuck (rare but real — e.g. mid-network call).
+     *   4. Reject the outer Promise with `WorkflowSpawnCancelledError`;
+     *      `createDaemonSpawnFn` maps it to `kind: 'cancelled'` so
+     *      `dispatchWork` writes `activityCanceled` with the right
+     *      `cancelOriginEventId`.
+     *
+     * If the worker had already produced final_output and we're inside
+     * the quiesce window, success-wins: we DON'T cancel. The `settled`
+     * guard in `fail` enforces that.
+     */
+    function onCancelAbort(): void {
+      if (settled) return;
+      const reason = input.cancelSignal!.reason as AbortCancelReason | undefined;
+      const cancelOriginEventId = typeof reason?.cancelOriginEventId === 'string'
+        ? reason.cancelOriginEventId
+        : '';
+      appendAttemptLog(
+        input,
+        'system',
+        `cancel signal received origin=${cancelOriginEventId || '<missing>'}, sending close+SIGINT (grace ${deps.cancelGraceMs}ms)`,
+      );
+      try { worker.send({ type: 'close' }); } catch { /* already gone */ }
+      try { worker.kill('SIGINT'); } catch { /* already gone */ }
+      sigkillTimer = setTimeout(() => {
+        appendAttemptLog(input, 'system', `cancel grace expired; escalating to SIGKILL`);
+        try { worker.kill('SIGKILL'); } catch { /* already gone */ }
+      }, deps.cancelGraceMs);
+      // Snapshot session info so the cancel result still tells the
+      // dashboard who/what was cancelled.
+      const sessionSnapshot = {
+        sessionId: synthetic.sessionId,
+        larkAppId: creds.larkAppId,
+        botName: input.botName,
+        cliId,
+        workingDir: cwd,
+        webPort,
+        logPath: input.attemptLogPath,
+        startedAt,
+        endedAt: Date.now(),
+      };
+      // Reject via the sentinel error.  cleanup() will fire from `fail`
+      // and stop further worker output from racing.
+      fail(new WorkflowSpawnCancelledError(cancelOriginEventId, sessionSnapshot));
+    }
+    if (input.cancelSignal) {
+      if (input.cancelSignal.aborted) {
+        // Signal already aborted before we got here — fire on next tick
+        // so the spawn at least gets a chance to register handlers and
+        // appendAttemptLog is meaningful.
+        setImmediate(onCancelAbort);
+      } else {
+        input.cancelSignal.addEventListener('abort', onCancelAbort);
+      }
+    }
 
     const fail = (err: Error): void => {
       if (settled) return;
@@ -347,6 +429,11 @@ async function runOneShotImpl(
 
     worker.on('exit', (code) => {
       appendAttemptLog(input, 'system', `worker process exit code=${code ?? 'null'}`);
+      // Worker is gone — we don't need to SIGKILL it anymore.
+      if (sigkillTimer) {
+        clearTimeout(sigkillTimer);
+        sigkillTimer = undefined;
+      }
       // If we already resolved, the cleanup() already killed the worker;
       // ignore the exit.  If we're still waiting for output, treat as fail.
       if (!settled && collectedOutputs.length === 0) {

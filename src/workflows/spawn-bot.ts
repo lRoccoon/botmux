@@ -173,7 +173,33 @@ export type DaemonRunOneShotInput = {
   attemptId: string;
   /** Conventional per-attempt execution log path. */
   attemptLogPath?: string;
+  /**
+   * Cooperative cancel handle (v0.1.4-a slice 2).  When `aborted` fires,
+   * the daemon-backed runOneShot sends the worker a close message + SIGINT
+   * for a graceful shutdown, then escalates to SIGKILL after `cancelGraceMs`.
+   * Resolves the outer Promise via `WorkflowSpawnCancelledError` so
+   * `createDaemonSpawnFn` can map it to `{ kind: 'cancelled', cancelOriginEventId }`.
+   */
+  cancelSignal?: AbortSignal;
 };
+
+/**
+ * Sentinel error class used by `runOneShot` to signal cancel — caught by
+ * `createDaemonSpawnFn` and translated into a `WorkerSpawnResult` of
+ * `kind: 'cancelled'`.  Keeping it a distinct class (instead of e.g. a
+ * `result.cancelled?` field) lets test stubs reject with it without
+ * needing to know the `DaemonRunOneShotResult` shape.
+ */
+export class WorkflowSpawnCancelledError extends Error {
+  readonly cancelOriginEventId: string;
+  readonly session?: WorkerSessionInfo;
+  constructor(cancelOriginEventId: string, session?: WorkerSessionInfo) {
+    super('workflow spawn cancelled');
+    this.name = 'WorkflowSpawnCancelledError';
+    this.cancelOriginEventId = cancelOriginEventId;
+    this.session = session;
+  }
+}
 
 export type DaemonRunOneShotResult = {
   finalTranscript: string;
@@ -222,8 +248,17 @@ export function createDaemonSpawnFn(deps: DaemonSpawnDeps): WorkerSpawnFn {
         activityId: input.activityId,
         attemptId: input.attemptId,
         attemptLogPath: input.attemptLogPath,
+        cancelSignal: input.cancelSignal,
       });
     } catch (err) {
+      // Translate the sentinel cancel error into a cancelled spawn result.
+      if (err instanceof WorkflowSpawnCancelledError) {
+        return {
+          kind: 'cancelled',
+          cancelOriginEventId: err.cancelOriginEventId,
+          session: err.session,
+        };
+      }
       return {
         kind: 'failure',
         errorCode: 'WorkerCrashed',
