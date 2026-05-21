@@ -18,8 +18,16 @@ let pageDispose: (() => void) | null = null;
 function route() {
   if (pageDispose) { pageDispose(); pageDispose = null; }
   const hash = location.hash || '#/';
-  if (hash.startsWith('#/workflows-catalog')) pageDispose = renderWorkflowCatalogPage(root);
-  else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
+  // Catalog is a sub-route under Workflows now (`#/workflows/catalog[/<id>]`)
+  // so the top nav has a single "Workflows (beta)" entry.  Legacy
+  // `#/workflows-catalog[*]` URLs are kept working for any external links
+  // that may have been pasted before the move.
+  if (
+    hash.startsWith('#/workflows/catalog') ||
+    hash.startsWith('#/workflows-catalog')
+  ) {
+    pageDispose = renderWorkflowCatalogPage(root);
+  } else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);

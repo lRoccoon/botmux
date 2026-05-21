@@ -164,6 +164,10 @@ function pageHtml(): string {
     ['cancelled', statusLabel('cancelled')],
   ];
   return `
+<nav class="wf-subnav">
+  <a href="#/workflows" class="active" data-i18n="workflow.subnav.runs">${escapeHtml(t('workflow.subnav.runs'))}</a>
+  <a href="#/workflows/catalog" data-i18n="workflow.subnav.catalog">${escapeHtml(t('workflow.subnav.catalog'))}</a>
+</nav>
 <form id="wf-filters" class="filters">
   <input type="search" name="q" placeholder="${escapeHtml(t('workflow.searchPlaceholder'))}" />
   <select name="status">

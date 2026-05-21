@@ -58,7 +58,12 @@ function short(value?: string): string {
 }
 
 export function renderWorkflowCatalogPage(root: HTMLElement): () => void {
-  const detailMatch = location.hash.match(/^#\/workflows-catalog\/([^/?#]+)$/);
+  // Catalog lives at `#/workflows/catalog[/<workflowId>]` since the nav
+  // refactor.  Legacy `#/workflows-catalog[/<workflowId>]` is honored so
+  // pasted URLs keep working.
+  const detailMatch = location.hash.match(
+    /^#\/(?:workflows\/catalog|workflows-catalog)\/([^/?#]+)$/,
+  );
   if (detailMatch) {
     return renderCatalogDetailPage(root, decodeURIComponent(detailMatch[1]!));
   }
@@ -67,6 +72,10 @@ export function renderWorkflowCatalogPage(root: HTMLElement): () => void {
 
 function renderCatalogListPage(root: HTMLElement): () => void {
   root.innerHTML = `
+    <nav class="wf-subnav">
+      <a href="#/workflows" data-i18n="workflow.subnav.runs">${escapeHtml(t('workflow.subnav.runs'))}</a>
+      <a href="#/workflows/catalog" class="active" data-i18n="workflow.subnav.catalog">${escapeHtml(t('workflow.subnav.catalog'))}</a>
+    </nav>
     <section class="catalog-head">
       <div>
         <h2>${escapeHtml(t('catalog.title'))}</h2>
@@ -130,7 +139,7 @@ function renderCatalogListPage(root: HTMLElement): () => void {
     }
     tbody.innerHTML = rows.map((entry) => `
       <tr>
-        <td><a href="#/workflows-catalog/${encodeURIComponent(entry.workflowId)}"><code>${escapeHtml(entry.workflowId)}</code></a></td>
+        <td><a href="#/workflows/catalog/${encodeURIComponent(entry.workflowId)}"><code>${escapeHtml(entry.workflowId)}</code></a></td>
         <td>${entry.version}</td>
         <td>${escapeHtml(t('catalog.paramSummary', {
           required: entry.requiredParamCount,
@@ -173,7 +182,7 @@ function renderCatalogListPage(root: HTMLElement): () => void {
 function renderCatalogDetailPage(root: HTMLElement, workflowId: string): () => void {
   root.innerHTML = `
     <div class="catalog-detail-head">
-      <a class="btn-link" href="#/workflows-catalog">${escapeHtml(t('catalog.back'))}</a>
+      <a class="btn-link" href="#/workflows/catalog">${escapeHtml(t('catalog.back'))}</a>
       <div>
         <h2><code>${escapeHtml(workflowId)}</code></h2>
         <div id="catalog-detail-subtitle" class="muted">${escapeHtml(t('workflow.detail.loading'))}</div>

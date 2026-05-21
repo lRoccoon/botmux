@@ -6,8 +6,10 @@ const messages = {
   en: {
     'nav.sessions': 'Sessions',
     'nav.schedules': 'Schedules',
-    'nav.workflows': 'Workflows',
+    'nav.workflows': 'Workflows (beta)',
     'nav.workflowCatalog': 'Catalog',
+    'workflow.subnav.runs': 'Runs',
+    'workflow.subnav.catalog': 'Catalog',
     'nav.groups': 'Groups & Bots',
     'nav.botDefaults': 'Bot Defaults',
     'status.live': '● live',
@@ -177,8 +179,10 @@ const messages = {
   zh: {
     'nav.sessions': '会话',
     'nav.schedules': '定时',
-    'nav.workflows': '工作流',
+    'nav.workflows': '工作流(beta)',
     'nav.workflowCatalog': '目录',
+    'workflow.subnav.runs': '运行',
+    'workflow.subnav.catalog': '目录',
     'nav.groups': '群组与机器人',
     'nav.botDefaults': '机器人默认值',
     'status.live': '● 在线',
