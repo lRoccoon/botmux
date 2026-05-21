@@ -259,7 +259,11 @@ function resolutionBanner(r: WorkflowApprovalCardResolution): string {
       : r.kind === 'rejected'
         ? '❌ 已拒绝'
         : '🛑 已取消';
-  const lines = [`**${label}**`, `操作人 \`${escapeMd(short(r.by, 28))}\``];
+  // Open_id contains underscores that are markdown-significant; wrapping in
+  // backticks would force the escape backslashes to render literally in
+  // some Lark clients (codex review nit). Plain text with escapeMd keeps
+  // it portable — Lark renders escaped `_` as `_` outside code spans.
+  const lines = [`**${label}**`, `操作人：${escapeMd(short(r.by, 28))}`];
   if (r.comment) lines.push(`备注：${escapeMd(r.comment)}`);
   return lines.join('\n');
 }
