@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { statSync } from 'node:fs';
-import { getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from './im/lark/client.js';
+import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -19,6 +19,7 @@ import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
+import { resolveAllowedChatGroups } from './services/allowed-chat-groups.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
@@ -2234,23 +2235,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
     forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }
-}
-
-async function resolveAllowedChatGroups(bot: BotState): Promise<void> {
-  const chatIds = bot.config.allowedChatGroups ?? [];
-  if (chatIds.length === 0) return;
-
-  const resolved = new Set<string>();
-  for (const chatId of chatIds) {
-    try {
-      const members = await listChatMemberOpenIds(bot.config.larkAppId, chatId);
-      for (const openId of members) resolved.add(openId);
-      logger.info(`[${bot.config.larkAppId}] Resolved allowedChatGroups ${chatId}: ${members.length} member(s)`);
-    } catch (err: any) {
-      logger.warn(`[${bot.config.larkAppId}] Failed to resolve allowedChatGroups ${chatId}: ${err?.message ?? err}`);
-    }
-  }
-  bot.resolvedAllowedChatGroupUsers = [...resolved];
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
