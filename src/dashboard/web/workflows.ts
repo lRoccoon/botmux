@@ -1472,16 +1472,20 @@ function renderResumeButtonHtml(
   const dataAttrs =
     `data-wf-resume-attempt="${escapeHtml(attempt.attemptId)}" ` +
     `data-wf-resume-activity="${escapeHtml(activity.activityId)}"`;
+  // data-wf-resume-button is the stable marker used by refreshResumeActions
+  // to locate any prior resume button in-place — including disabled variants
+  // that don't carry attempt/activity ids — so re-renders replace instead of
+  // appending and creating duplicates each poll.
   if (active) {
-    return `<button type="button" class="btn-link" data-wf-resume-action="end" ${dataAttrs}${pending ? ' disabled' : ''}>${escapeHtml(pending ? t('workflow.detail.resumeEnding') : t('workflow.detail.endResumeSession'))}</button>`;
+    return `<button type="button" class="btn-link" data-wf-resume-button="1" data-wf-resume-action="end" ${dataAttrs}${pending ? ' disabled' : ''}>${escapeHtml(pending ? t('workflow.detail.resumeEnding') : t('workflow.detail.endResumeSession'))}</button>`;
   }
   if (!isResumeCapableCli(terminal.cliId)) {
-    return `<button type="button" class="btn-link" disabled title="${escapeHtml(t('workflow.detail.resumeUnsupportedCli', { cliId: terminal.cliId ?? '?' }))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
+    return `<button type="button" class="btn-link" data-wf-resume-button="1" disabled title="${escapeHtml(t('workflow.detail.resumeUnsupportedCli', { cliId: terminal.cliId ?? '?' }))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
   }
   if (!terminal.cliSessionId) {
-    return `<button type="button" class="btn-link" disabled title="${escapeHtml(t('workflow.detail.resumeMissingCliSession'))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
+    return `<button type="button" class="btn-link" data-wf-resume-button="1" disabled title="${escapeHtml(t('workflow.detail.resumeMissingCliSession'))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
   }
-  return `<button type="button" class="btn-link" data-wf-resume-action="start" ${dataAttrs}${pending ? ' disabled' : ''}>${escapeHtml(pending ? t('workflow.detail.resumeStarting') : t('workflow.detail.resumeSession'))}</button>`;
+  return `<button type="button" class="btn-link" data-wf-resume-button="1" data-wf-resume-action="start" ${dataAttrs}${pending ? ' disabled' : ''}>${escapeHtml(pending ? t('workflow.detail.resumeStarting') : t('workflow.detail.resumeSession'))}</button>`;
 }
 
 function renderResumeStatusHtml(
@@ -1700,7 +1704,7 @@ function refreshResumeActions(
   // anchors (open-in-tab + download) stay stable.  We tag-select the
   // existing button (if any) and replace its outerHTML so the new
   // listener pickup goes through the same data-wf-resume-bound gate.
-  const existingButton = actions.querySelector<HTMLButtonElement>('button[data-wf-resume-attempt]');
+  const existingButton = actions.querySelector<HTMLButtonElement>('button[data-wf-resume-button="1"]');
   const html = renderResumeButtonHtml(attempt, activity, terminal, surface, resume);
   if (existingButton) {
     existingButton.outerHTML = html;
