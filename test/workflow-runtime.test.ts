@@ -475,6 +475,9 @@ describe('dispatchWork — subagent', () => {
           type: 'hostExecutor',
           executor: 'feishu-send',
           input: { msg: 'hi' },
+          // Test exercises dispatchWork's unknown-executor branch; gate
+          // semantics are not under test — opt in so parse succeeds.
+          unsafeAllowUngated: true,
         },
       },
     });

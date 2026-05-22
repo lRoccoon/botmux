@@ -9,7 +9,8 @@
   "nodes": {
     "draft": {
       "type": "subagent",
-      "bot": "claude-loopy",
+      "bot": "cli_canary_PLACEHOLDER",
+      "description": "subagent.bot is a larkAppId placeholder (cli_*); replace with the real bot id from `botmux bots list` before running.",
       "prompt": "Create a short canary message. Return JSON: {\"preview\": string, \"text\": string}.",
       "outputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -23,7 +24,7 @@
     },
     "confirm": {
       "type": "subagent",
-      "bot": "claude-loopy",
+      "bot": "cli_canary_PLACEHOLDER",
       "depends": ["draft"],
       "humanGate": {
         "stage": "before",
@@ -45,6 +46,8 @@
       "type": "hostExecutor",
       "executor": "feishu-send",
       "depends": ["confirm"],
+      "description": "Canary deliberately opts out of a per-send gate because `confirm` already gates the chain; the human reviewed the exact text being sent (`approvedText`) one node ago. New workflows should usually put the gate directly on the side-effect node (see feishu-send-demo) — `unsafeAllowUngated: true` is the explicit audit trail when that's not appropriate.",
+      "unsafeAllowUngated": true,
       "input": {
         "larkAppId": "cli_canary_PLACEHOLDER",
         "chatId": "oc_canary_PLACEHOLDER",

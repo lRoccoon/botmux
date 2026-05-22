@@ -148,6 +148,9 @@ describe('R0 — schedule readOnlyLookup recovery', () => {
             workingDir: '/wd',
             chatId: 'oc_x',
           },
+          // R0 reconciler tests focus on idempotentSubmit + readOnlyLookup
+          // recovery, not gate flow — opt in to bypass the side-effect rule.
+          unsafeAllowUngated: true,
         },
       },
     });
@@ -241,6 +244,8 @@ describe('R0 — feishu-send idempotentSubmit recovery via sidecar', () => {
             chatId: 'oc_y',
             content: 'hello R0',
           },
+          // R0 reconciler test; opt out of the side-effect gate so parse succeeds.
+          unsafeAllowUngated: true,
         },
       },
     });
@@ -315,6 +320,8 @@ describe('R0 — explicit no-progress without reconcilers', () => {
           type: 'hostExecutor',
           executor: 'botmux-schedule',
           input: { ignored: true },
+          // R0 no-reconciler test; opt out of gate so parse succeeds.
+          unsafeAllowUngated: true,
         },
       },
     });
@@ -353,6 +360,8 @@ describe('R0 — no-progress when reconciler stays unresolved', () => {
           type: 'hostExecutor',
           executor: 'botmux-schedule',
           input: { ignored: true },
+          // R0 stuck-reconciler test; opt out of gate so parse succeeds.
+          unsafeAllowUngated: true,
         },
       },
     });

@@ -166,6 +166,9 @@ describe('R1 — feishu-send cold resume from runDir', () => {
             chatId: 'oc_y',
             content: 'hello R1 resume',
           },
+          // R1 cold-resume test focuses on reconciler idempotency, not gate
+          // flow — opt in to bypass the side-effect gate rule.
+          unsafeAllowUngated: true,
         },
       },
     });

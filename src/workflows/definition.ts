@@ -101,6 +101,18 @@ const NodeBaseShape = {
   timeoutMs: z.number().int().positive().optional(),
   maxOutputBytes: z.number().int().positive().optional(),
   outputSchema: OutputSchemaSchema.optional(),
+  /**
+   * Opt-in escape hatch for a side-effect hostExecutor node that *must* run
+   * without a humanGate (e.g. a system-internal cron tick, an explicitly
+   * batched send-all script).  Default is unset / false → validator rejects
+   * ungated side-effect executors at parse time (`SIDE_EFFECT_EXECUTORS`).
+   *
+   * Setting this to `true` is the workflow author's audit-trail: "I know
+   * this node sends a message / writes to repo / schedules a cron with no
+   * human approval — accept the risk."  Prefer `humanGate` whenever the
+   * intent is "let an operator confirm before this fires."
+   */
+  unsafeAllowUngated: z.boolean().optional(),
 };
 
 export const SubagentNodeSchema = z.object({
@@ -131,6 +143,27 @@ export const HostExecutorNodeSchema = z.object({
   input: BoundJsonValueSchema,
 });
 export type HostExecutorNode = z.infer<typeof HostExecutorNodeSchema>;
+
+/**
+ * Executors that produce externally-visible side effects: sending a Feishu
+ * message, scheduling a botmux cron task, etc.  Validator requires a
+ * `humanGate.stage='before'` on any node using one of these executors, or
+ * an explicit `unsafeAllowUngated: true` opt-in (see NodeBaseShape).
+ *
+ * Add new executors here as they're registered with the dispatch table —
+ * keep this list in lockstep with `runtime.ts`'s side-effect executor
+ * registrations.  Read-only / pure-computation executors do NOT belong
+ * here; only ones whose execution is observable outside the workflow.
+ */
+export const SIDE_EFFECT_EXECUTORS: ReadonlySet<string> = new Set([
+  'feishu-send',
+  'feishu-reply',
+  'botmux-schedule',
+]);
+
+export function isSideEffectExecutor(executor: string): boolean {
+  return SIDE_EFFECT_EXECUTORS.has(executor);
+}
 
 export const WorkflowNodeSchema = z.discriminatedUnion('type', [
   SubagentNodeSchema,
@@ -255,6 +288,22 @@ function validateGraph(def: WorkflowDefinition): void {
       if (dep === nodeId) {
         throw new Error(`Node '${nodeId}' depends on itself`);
       }
+    }
+    // Safe-by-default: a hostExecutor node that runs a side-effect executor
+    // must either declare `humanGate.stage='before'` or opt into the audit
+    // trail via `unsafeAllowUngated: true`.  Catches ungated `feishu-send`
+    // and friends at parse time instead of relying on author discipline.
+    if (
+      node.type === 'hostExecutor' &&
+      isSideEffectExecutor(node.executor) &&
+      !node.humanGate &&
+      !node.unsafeAllowUngated
+    ) {
+      throw new Error(
+        `Node '${nodeId}' runs side-effect executor '${node.executor}' without ` +
+        `a humanGate. Add humanGate.stage='before' for human approval, or set ` +
+        `unsafeAllowUngated: true to acknowledge the risk explicitly.`,
+      );
     }
   }
   detectCycle(def);

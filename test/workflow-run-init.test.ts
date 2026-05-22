@@ -121,6 +121,9 @@ describe('createRun', () => {
           executor: 'feishu-send',
           input: { msg: 'hi' },
           depends: ['sub'],
+          // run-init test focuses on bot snapshot scoping, not gate
+          // semantics — opt in so parse succeeds under the side-effect rule.
+          unsafeAllowUngated: true,
         },
       },
     });

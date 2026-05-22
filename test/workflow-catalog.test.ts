@@ -93,6 +93,10 @@ describe('catalog helpers', () => {
             executor: 'feishu-send',
             depends: ['draft'],
             input: { content: 'x' },
+            // Catalog test only cares about summary metadata, not gate
+            // semantics — opt in so the fixture parses under the side-effect
+            // gate rule.
+            unsafeAllowUngated: true,
           },
         },
       }),

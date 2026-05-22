@@ -204,6 +204,9 @@ describe('runLoop — safety', () => {
           type: 'hostExecutor',
           executor: 'feishu-send',
           input: { msg: 'hi' },
+          // Test is exercising the loop's hostExecutor-failure path, not the
+          // side-effect gate semantics.  Opt in so parse succeeds.
+          unsafeAllowUngated: true,
         },
       },
     });

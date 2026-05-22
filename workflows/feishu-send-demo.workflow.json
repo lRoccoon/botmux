@@ -10,6 +10,8 @@
     "send-text": {
       "type": "hostExecutor",
       "executor": "feishu-send",
+      "description": "Demo of the bare feishu-send executor mechanics (idempotent submit + sidecar persistence). Production workflows should gate this with humanGate.stage='before' so an operator approves the content; see canary-multistep.workflow.json for the canonical draft→confirm→send pattern. `unsafeAllowUngated` is the explicit opt-out — never an oversight.",
+      "unsafeAllowUngated": true,
       "input": {
         "larkAppId": "cli_demo_PLACEHOLDER",
         "chatId": "oc_demo_PLACEHOLDER",

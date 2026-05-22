@@ -9,7 +9,8 @@
   "nodes": {
     "greet": {
       "type": "subagent",
-      "bot": "claude-loopy",
+      "bot": "cli_canary_PLACEHOLDER",
+      "description": "subagent.bot is a larkAppId placeholder (cli_*); replace with the real bot id from `botmux bots list` before running.",
       "prompt": "Write a short, friendly greeting message. Return JSON with two fields: `preview` (the greeting text shown to the human approver) and `finalPrompt` (a string instructing the next node to echo the greeting back verbatim as the final signed-off message). Schema: {\"preview\": string, \"finalPrompt\": string}.",
       "outputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -23,7 +24,7 @@
     },
     "confirm": {
       "type": "subagent",
-      "bot": "claude-loopy",
+      "bot": "cli_canary_PLACEHOLDER",
       "depends": ["greet"],
       "humanGate": {
         "stage": "before",

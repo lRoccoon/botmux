@@ -187,6 +187,9 @@ describe('parseWorkflowDefinition', () => {
           depends: ['draft'],
           input: { content: { $ref: 'draft.output.text' } },
           description: 'Send the approved draft to Feishu.',
+          // This test only checks descriptions, not gate semantics — the
+          // explicit opt-in keeps it passing under the safe-by-default rule.
+          unsafeAllowUngated: true,
         },
       },
     });
@@ -217,6 +220,9 @@ describe('parseWorkflowDefinition', () => {
             chatId: { $ref: 'params.chatId' },
             content: { $ref: 'greet.output.text' },
           },
+          // Same as above — focus is on params ref resolution; opt out of
+          // the side-effect gate so the test passes for the intended reason.
+          unsafeAllowUngated: true,
         },
       },
     });
@@ -247,6 +253,70 @@ describe('parseWorkflowDefinition', () => {
       },
     };
     expect(() => parseWorkflowDefinition(raw)).toThrow();
+  });
+
+  describe('side-effect executor gate', () => {
+    function withSend(extra: Record<string, unknown> = {}): unknown {
+      return {
+        workflowId: 'wf-gate',
+        version: 1,
+        nodes: {
+          draft: { type: 'subagent', bot: 'b', prompt: 'x' },
+          send: {
+            type: 'hostExecutor',
+            executor: 'feishu-send',
+            depends: ['draft'],
+            input: { content: { $ref: 'draft.output.text' } },
+            ...extra,
+          },
+        },
+      };
+    }
+
+    it('rejects feishu-send without humanGate or unsafeAllowUngated', () => {
+      expect(() => parseWorkflowDefinition(withSend())).toThrow(
+        /side-effect executor 'feishu-send'.*humanGate/,
+      );
+    });
+
+    it('rejects feishu-reply without humanGate or unsafeAllowUngated', () => {
+      const raw = withSend();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (raw as any).nodes.send.executor = 'feishu-reply';
+      expect(() => parseWorkflowDefinition(raw)).toThrow(/feishu-reply/);
+    });
+
+    it('rejects botmux-schedule without humanGate or unsafeAllowUngated', () => {
+      const raw = withSend();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (raw as any).nodes.send.executor = 'botmux-schedule';
+      expect(() => parseWorkflowDefinition(raw)).toThrow(/botmux-schedule/);
+    });
+
+    it('accepts feishu-send when humanGate.stage="before" is declared', () => {
+      const def = parseWorkflowDefinition(withSend({
+        humanGate: { stage: 'before', prompt: 'Approve send?' },
+      }));
+      expect(def.nodes.send!.humanGate?.stage).toBe('before');
+    });
+
+    it('accepts feishu-send when unsafeAllowUngated: true', () => {
+      const def = parseWorkflowDefinition(withSend({ unsafeAllowUngated: true }));
+      // Cast: the discriminated union doesn't expose unsafeAllowUngated as a
+      // type-narrowed member because it sits on NodeBaseShape, not the
+      // hostExecutor variant.  Round-tripping through parse preserves it.
+      expect((def.nodes.send as { unsafeAllowUngated?: boolean }).unsafeAllowUngated).toBe(true);
+    });
+
+    it('does not gate non-side-effect executors', () => {
+      // A hypothetical pure-compute executor (e.g. `format-json`) should
+      // parse without gate or opt-in — only the named side-effect set is
+      // governed.
+      const raw = withSend();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (raw as any).nodes.send.executor = 'format-json';
+      expect(() => parseWorkflowDefinition(raw)).not.toThrow();
+    });
   });
 });
 
