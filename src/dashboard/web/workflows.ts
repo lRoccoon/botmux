@@ -3,7 +3,7 @@
 // Polls /api/workflows/runs every 5s while visible.  Each row links to
 // #/workflows/<runId> — the Run Detail page (B path) hooks into the
 // same hash route.
-import { t, type MessageKey } from './i18n.js';
+import { t } from './ui.js';
 
 type RunRow = {
   runId: string;
@@ -228,7 +228,7 @@ function statusBadge(status: string): string {
 }
 
 function statusLabel(status: string): string {
-  const key = `workflow.status.${status}` as MessageKey;
+  const key = `workflow.status.${status}`;
   const label = t(key);
   return label === key ? status : label;
 }

@@ -1,3 +1,5 @@
+import type { StreamStatus } from '../types.js';
+
 export interface ImMessage {
   id: string;
   threadId: string;
@@ -51,7 +53,7 @@ export interface ImCardBuilder {
     terminalUrl: string;
     title: string;
     content: string;
-    status: 'starting' | 'working' | 'idle';
+    status: StreamStatus;
   }): ImCard;
 
   buildRepoSelectCard(opts: {

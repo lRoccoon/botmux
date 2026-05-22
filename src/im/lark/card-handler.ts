@@ -20,8 +20,8 @@ import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard } from '../../core/worker-pool.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession } from '../../core/session-manager.js';
+import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -136,7 +136,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-
   // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny）─────────────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
   if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {
@@ -188,7 +187,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return JSON.parse(buildGrantResultCard(kind, loc));
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -365,6 +364,62 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       logger.info(`[${tag(ds)}] Legacy takeover action ignored (bridge era; historical card)`);
     }
 
+    if (actionType === 'retry_last_task' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const cliInput = ds.lastCliInput;
+      if (!cliInput) {
+        await sessionReply(rootId, t('card.action.retry_last_task_missing', undefined, locDs));
+        return;
+      }
+      if (!ds.usageLimit) {
+        await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
+        return;
+      }
+      if (!ds.usageLimit.retryReady && ds.usageLimit.retryAtMs > Date.now()) {
+        await sessionReply(rootId, t('card.action.retry_last_task_not_ready', { retryLabel: ds.usageLimit.retryLabel }, locDs));
+        return;
+      }
+
+      clearUsageLimitState(ds);
+      ds.lastScreenStatus = 'working';
+      ds.streamCardPending = true;
+      ds.currentTurnTitle = (ds.lastUserPrompt || ds.currentTurnTitle || ds.session.title || getCliDisplayName(sessionCliId(ds))).substring(0, 50);
+      ds.currentImageKey = undefined;
+      persistStreamCardState(ds);
+
+      let cardJson: string | undefined;
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          sessionAnchorId(ds),
+          readUrl,
+          ds.currentTurnTitle,
+          '',
+          'working',
+          sessionCliId(ds),
+          ds.displayMode ?? 'hidden',
+          ds.streamCardNonce,
+          ds.currentImageKey,
+          !!ds.adoptedFrom,
+          false,
+          locDs,
+        );
+        scheduleCardPatch(ds, cardJson);
+      }
+
+      if (ds.worker && !ds.worker.killed) {
+        ds.worker.send({ type: 'message', content: cliInput } as DaemonToWorker);
+      } else {
+        forkWorker(ds, cliInput, ds.hasHistory);
+      }
+      logger.info(`[${tag(ds)}] Retrying last task after usage limit`);
+      if (cardJson) {
+        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+      }
+      return;
+    }
+
     if (actionType === 'tui_keys' && ds) {
       let keys: string[] = [];
       try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
@@ -534,6 +589,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               ds.currentImageKey,
               !!ds.adoptedFrom,
               false,
+              localeForBot(ds.larkAppId),
+              cardUsageLimit(ds),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -574,6 +631,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           localeForBot(ds.larkAppId),
+          cardUsageLimit(ds),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -612,6 +670,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           localeForBot(ds.larkAppId),
+          cardUsageLimit(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -656,7 +715,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // Return the current card JSON so Feishu doesn't revert the displayed
       // image to the originally-POSTed initial frame while waiting for the
       // fresh screenshot PATCH (~1s).
-      if (ds.streamCardId && ds.streamCardId !== '__posting__' && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
         const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
@@ -675,6 +734,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           localeForBot(ds.larkAppId),
+          cardUsageLimit(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -694,7 +754,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.worker.send({ type: 'term_action', key } as DaemonToWorker);
         logger.info(`[${tag(ds)}] term_action: ${key}`);
       }
-      if (ds.streamCardId && ds.streamCardId !== '__posting__' && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
         const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
@@ -713,6 +773,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           localeForBot(ds.larkAppId),
+          cardUsageLimit(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
@@ -727,8 +788,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const effectiveCliId = sessionCliId(ds);
         // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
+        const pendingPrompt = ds.pendingPrompt ?? '';
         const prompt = buildNewTopicPrompt(
-          ds.pendingPrompt ?? '',
+          pendingPrompt,
           ds.session.sessionId,
           effectiveCliId,
           botCfg.cliPathOverride,
@@ -740,6 +802,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           locDs,
           ds.pendingSender,
         );
+        rememberLastCliInput(ds, pendingPrompt, prompt);
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
@@ -844,8 +907,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const effectiveCliId = sessionCliId(targetDs);
     // First-time repo selection — now spawn CLI with the original prompt
     targetDs.pendingRepo = false;
+    const pendingPrompt = targetDs.pendingPrompt ?? '';
     const prompt = buildNewTopicPrompt(
-      targetDs.pendingPrompt ?? '',
+      pendingPrompt,
       targetDs.session.sessionId,
       effectiveCliId,
       botCfg.cliPathOverride,
@@ -857,6 +921,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       locTarget,
       targetDs.pendingSender,
     );
+    rememberLastCliInput(targetDs, pendingPrompt, prompt);
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
     targetDs.pendingMentions = undefined;
@@ -878,6 +943,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     sessionStore.closeSession(targetDs.session.sessionId);
     const session = sessionStore.createSession(targetDs.chatId, rootId, displayName, targetDs.chatType);
     targetDs.session = session;
+    targetDs.lastUserPrompt = undefined;
+    targetDs.lastCliInput = undefined;
     // Pin workingDir + larkAppId onto the new session before forkWorker.
     // Without this, a daemon restart restores the session with an empty
     // workingDir and the worker spawns in the bot's default cwd, so

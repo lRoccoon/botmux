@@ -34,6 +34,12 @@ conventional_commits = false
 filter_unconventional = false
 split_commits = false
 filter_commits = false
+# 跳过 merge commit：用'Merge pull request'方式合 PR 时,git 历史里 PR 标题会同时挂在
+# 分支 commit 和 merge commit 上,不过滤会导致一个 PR 在'本次合并'里出现两次。
+# 兼容自定义 merge message:'Merge branch …'、'Merge: …'、'Merge fix/… '等。
+commit_parsers = [
+  { message = "^Merge[ :]", skip = true },
+]
 tag_pattern = "v[0-9].*"
 sort_commits = "oldest"
 

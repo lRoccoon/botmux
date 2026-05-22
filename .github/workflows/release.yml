@@ -88,8 +88,10 @@ jobs:
             PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
           fi
           TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
-          # cliff.toml 渲染'本次合并' + '新贡献者'两段，GitHub PR 元数据由 GITHUB_TOKEN 拉取
-          CLIFF=$(npx --yes git-cliff --current)
+          # cliff.toml 渲染'本次合并' + '新贡献者'两段，GitHub PR 元数据由 GITHUB_TOKEN 拉取。
+          # 用显式区间 PREV_TAG..本 tag，别用 --current：--current 在 HEAD 落在 tag 上时
+          # 会把范围撑到好几个历史 release，导致'本次合并'重复堆叠多段。PREV_TAG 上面已算好。
+          CLIFF=$(npx --yes git-cliff "${PREV_TAG}..${GITHUB_REF_NAME}")
           {
             echo 'body<<CHANGELOG_EOF'
             [ -n "$TAG_MSG" ] && echo "$TAG_MSG"

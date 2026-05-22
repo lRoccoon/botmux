@@ -17,12 +17,15 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_up': '⇞ Page ½ Up',
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
+  'card.btn.retry_last_task': '🔁 Retry Last Task',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
   'card.status.working': 'Working',
   'card.status.idle': 'Awaiting input',
   'card.status.analyzing': 'Analyzing…',
+  'card.status.limited': 'Limit reached',
+  'card.status.retry_ready': 'Ready to retry',
   'card.status.executing': 'Executing…',
   'card.status.session_closed': '🛑 Session Closed',
   'card.status.selected': 'Selected',
@@ -36,6 +39,8 @@ export const messages: Record<string, string> = {
   'card.body.cli_no_cli_resume': '_{cliName} cannot resume a specific session from the CLI; you can resume here in Lark._',
   'card.body.working_dir': '📁 Working dir:',
   'card.body.choose_label': 'Choice:',
+  'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
+  'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -129,6 +134,13 @@ export const messages: Record<string, string> = {
   'cmd.oncall.unbind_not_bound': 'This group is not bound to oncall. (Unbind intent recorded — default-oncall won\'t auto-bind this group again.)',
   'cmd.oncall.unbind_success': '✅ Oncall binding released. The next new topic will fall back to the default repo-selection flow.',
   'cmd.oncall.unknown_sub': 'Unknown subcommand: {sub}\nSupported: /oncall bind <path> | /oncall unbind | /oncall status',
+  'cmd.group.empty_fallback': 'New session {ts}',
+  'cmd.group.no_bot': '⚠️ Cannot identify the responding bot — /group aborted.',
+  'cmd.group.no_sender': '⚠️ Cannot get sender open_id — /group aborted.',
+  'cmd.group.created': '✅ Created group "{name}"\n👉 {link}\n\nJust start chatting in the new group — the whole group is one CLI session.{hints}',
+  'cmd.group.failed': '⚠️ Failed to create group: {error}',
+  'cmd.group.warn_invite_rejected': '⚠️ Feishu rejected the auto-invite (your open_id may not be in this bot\'s app scope). Please join the group manually.',
+  'cmd.group.warn_transfer_failed': '⚠️ Owner transfer failed ({reason}); the bot is still the group owner. You can transfer it manually inside the new group.',
 
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': 'No scheduled tasks yet.\n\nExamples:\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report',
@@ -172,6 +184,8 @@ export const messages: Record<string, string> = {
   'help.heading_grant': '🔑 Access grants (owner only):',
   'help.grant': '@bot /grant @someone   - Pop an authorization card to grant "this chat" or "global" access',
   'help.revoke': '@bot /revoke @someone  - Revoke their this-chat + global access',
+  'help.heading_group': '🆕 One-shot session group:',
+  'help.group': '/group <name>  (alias /g)  - Auto-create a group and invite you (the whole group = one CLI session)',
   'help.help': '/help       - Show this help',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
@@ -237,6 +251,9 @@ export const messages: Record<string, string> = {
   'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
   'card.action.continue_using_current_repo': 'Keeping current repo: {cwd}',
+  'card.action.retry_last_task_missing': '⚠️ Cannot find the last task to retry. Send a new message instead.',
+  'card.action.retry_last_task_unavailable': '⚠️ This retry state is no longer active. Send a new message instead.',
+  'card.action.retry_last_task_not_ready': '⚠️ The limit is still active. Try again after {retryLabel}.',
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ Adopted CLI session has exited.',

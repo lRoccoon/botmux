@@ -24,6 +24,7 @@ import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { markSessionActivity } from './session-activity.js';
+import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 
@@ -33,6 +34,12 @@ function sessionCreatedAtMs(session: { createdAt?: string }): number {
 
 function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: string }): number {
   return session.lastMessageAt ? (Date.parse(session.lastMessageAt) || sessionCreatedAtMs(session)) : sessionCreatedAtMs(session);
+}
+
+function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageLimit']): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady;
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -50,15 +57,21 @@ export function getSessionWorkingDir(ds?: DaemonSession): string {
 }
 
 export function getProjectScanDir(ds?: DaemonSession): string {
-  // 总是落到 workingDir 的父目录. 之前 PROJECT_SCAN_DIR / projectScanDir
-  // 字段允许显式覆盖, 但在交互配置里从未暴露过, 也基本没人用; workingDir
-  // 逗号语法 (workingDirs) 已经覆盖 "扫多棵树" 的需求, 故整个字段在
-  // PR feature/setup-bot-management 收尾时一并下线.
-  const cwd = getSessionWorkingDir(ds);
-  return resolve(cwd, '..');
+  // 从 workingDir 自身开始向下扫描 git 仓库 (scanProjects 会向下递归).
+  // 早期版本扫的是 workingDir 的父目录, 会把无关的同级兄弟仓库一起列出来,
+  // 语义反直觉; 现在把扫描根钉在 workingDir 本身: 指向仓库集合根目录
+  // (如 ~/projects) 就列出其下所有仓库, 指向单个仓库就只列该仓库及其嵌套.
+  // (PROJECT_SCAN_DIR / projectScanDir 显式覆盖字段早已在
+  // PR feature/setup-bot-management 收尾时下线, 此处不再涉及.)
+  return getSessionWorkingDir(ds);
 }
 
-/** Return all directories to scan for projects (supports multi-dir WORKING_DIR). */
+/**
+ * Return all directories to scan for projects (supports multi-dir WORKING_DIR).
+ * Each configured workingDir is used as the scan root AS-IS — scanProjects
+ * recurses downward from it. See getProjectScanDir for why we no longer climb
+ * to the parent directory.
+ */
 export function getProjectScanDirs(ds?: DaemonSession): string[] {
   if (ds?.larkAppId) {
     const bot = getBot(ds.larkAppId);
@@ -67,20 +80,20 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
       ? bot.config.workingDirs
       : parseWorkingDirList(bot.config.workingDir ?? '~');
     for (const wd of workingDirs) {
-      dirs.add(resolve(expandHome(wd), '..'));
+      dirs.add(expandHome(wd));
     }
     if (ds.workingDir) {
-      dirs.add(resolve(expandHome(ds.workingDir), '..'));
+      dirs.add(expandHome(ds.workingDir));
     }
     return [...dirs];
   }
   // Fallback to global config
   const dirs = new Set<string>();
   for (const wd of config.daemon.workingDirs) {
-    dirs.add(resolve(expandHome(wd), '..'));
+    dirs.add(expandHome(wd));
   }
   if (ds?.workingDir) {
-    dirs.add(resolve(expandHome(ds.workingDir), '..'));
+    dirs.add(expandHome(ds.workingDir));
   }
   return [...dirs];
 }
@@ -455,16 +468,30 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.streamCardNonce === ds.streamCardNonce &&
     s.displayMode === ds.displayMode &&
     s.currentImageKey === ds.currentImageKey &&
-    s.currentTurnTitle === ds.currentTurnTitle
+    s.currentTurnTitle === ds.currentTurnTitle &&
+    sameUsageLimit(s.usageLimit, ds.usageLimit) &&
+    s.lastUserPrompt === ds.lastUserPrompt &&
+    s.lastCliInput === ds.lastCliInput
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
   s.displayMode = ds.displayMode;
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
+  s.usageLimit = ds.usageLimit;
+  s.lastUserPrompt = ds.lastUserPrompt;
+  s.lastCliInput = ds.lastCliInput;
   // Clear legacy field so it doesn't drift
   s.streamExpanded = undefined;
   sessionStore.updateSession(s);
+}
+
+export function rememberLastCliInput(ds: DaemonSession, userPrompt: string, cliInput: string): void {
+  ds.lastUserPrompt = userPrompt;
+  ds.lastCliInput = cliInput;
+  ds.session.lastUserPrompt = userPrompt;
+  ds.session.lastCliInput = cliInput;
+  sessionStore.updateSession(ds.session);
 }
 
 // ─── Session restore ─────────────────────────────────────────────────────────
@@ -520,6 +547,9 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
           : (session.streamExpanded ? 'screenshot' : 'hidden'),
         currentImageKey: session.currentImageKey,
         currentTurnTitle: session.currentTurnTitle,
+        usageLimit: session.usageLimit,
+        lastUserPrompt: session.lastUserPrompt,
+        lastCliInput: session.lastCliInput,
       };
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
@@ -560,6 +590,9 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
+      usageLimit: session.usageLimit,
+      lastUserPrompt: session.lastUserPrompt,
+      lastCliInput: session.lastCliInput,
     };
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
@@ -692,6 +725,9 @@ export function resumeSession(
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,
+    usageLimit: session.usageLimit,
+    lastUserPrompt: session.lastUserPrompt,
+    lastCliInput: session.lastCliInput,
   };
 
   messageQueue.ensureQueue(anchor);
@@ -830,6 +866,7 @@ export async function executeScheduledTask(
   if (isContinuation && existing?.worker && !existing.worker.killed) {
     markSessionActivity(existing);
     try {
+      rememberLastCliInput(existing, task.prompt, task.prompt);
       existing.worker.send({ type: 'message', content: task.prompt });
       logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}`);
       return;
@@ -870,6 +907,7 @@ export async function executeScheduledTask(
     workingDir: task.workingDir,
   };
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
+  rememberLastCliInput(ds, task.prompt, prompt);
   forkWorker(ds, prompt);
 
   logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${scope}, anchor: ${anchor}, continuation: ${isContinuation})`);

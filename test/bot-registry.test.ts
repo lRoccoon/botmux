@@ -413,6 +413,27 @@ describe('loadBotConfigs', () => {
     expect(configs.map(c => c.cliId)).toEqual(['claude-code', 'aiden', 'coco']);
   });
 
+  it('should parse defaultWorkingDir as an optional string', () => {
+    process.env.BOTS_CONFIG = '/tmp/defwd.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      { larkAppId: 'a1', larkAppSecret: 's1', defaultWorkingDir: '~/projects/foo' },
+      { larkAppId: 'a2', larkAppSecret: 's2' },                      // unset → undefined
+      { larkAppId: 'a3', larkAppSecret: 's3', defaultWorkingDir: '' },  // empty → undefined
+      { larkAppId: 'a4', larkAppSecret: 's4', defaultWorkingDir: '   ' }, // whitespace → undefined
+      { larkAppId: 'a5', larkAppSecret: 's5', defaultWorkingDir: 42 }, // non-string → undefined
+      { larkAppId: 'a6', larkAppSecret: 's6', defaultWorkingDir: '  /repos/bar  ' }, // trimmed
+    ]));
+
+    const configs = mod.loadBotConfigs();
+    expect(configs[0].defaultWorkingDir).toBe('~/projects/foo');
+    expect(configs[1].defaultWorkingDir).toBeUndefined();
+    expect(configs[2].defaultWorkingDir).toBeUndefined();
+    expect(configs[3].defaultWorkingDir).toBeUndefined();
+    expect(configs[4].defaultWorkingDir).toBeUndefined();
+    expect(configs[5].defaultWorkingDir).toBe('/repos/bar');
+  });
+
   it('should handle empty workingDir string gracefully', () => {
     process.env.BOTS_CONFIG = '/tmp/empty_wd.json';
     fsMock.existsSync.mockReturnValue(true);

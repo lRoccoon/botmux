@@ -6,7 +6,7 @@
 // module so worker-pool can import the composer without pulling in the IPC
 // server (which itself imports worker-pool — that would be a cycle).
 import type { DaemonSession } from './types.js';
-import type { Session } from '../types.js';
+import type { Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
 
 export interface SessionRow {
@@ -14,7 +14,7 @@ export interface SessionRow {
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
-  status: 'starting' | 'working' | 'idle' | 'analyzing' | 'closed';
+  status: StreamStatus | 'closed';
   adopt: boolean;
   spawnedAt: number;
   lastMessageAt: number;

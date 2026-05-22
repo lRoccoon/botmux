@@ -33,7 +33,7 @@ import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from './types.js';
+import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey, ScreenStatus } from './types.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import {
   DEFAULT_RENDER_COLS,
@@ -58,6 +58,7 @@ import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText } from './utils/transient-snapshot.js';
+import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
@@ -91,6 +92,63 @@ let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
 const pendingMessages: string[] = [];
+
+type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
+
+// Per-turn usage-limit state machine. Owns the turn counter plus the
+// "did this turn hit a limit" / "suppress a stale retry-ready banner" flags, so
+// classify()'s state writes are explicit method calls rather than hidden
+// mutations of module globals from a function that otherwise reads as a pure
+// mapper.
+function createUsageLimitTracker() {
+  let turnSeq = 0;
+  let detectedTurn: number | undefined;
+  let suppressedRetryReadyKey: string | undefined;
+
+  return {
+    currentTurn(): number {
+      return turnSeq;
+    },
+    // Open a new turn; remember any stale retry-ready banner still on screen so
+    // classify() doesn't re-flag it as a fresh limit this turn.
+    beginTurn(snapshot: string): number {
+      turnSeq++;
+      detectedTurn = undefined;
+      const current = detectCliUsageLimit(snapshot);
+      suppressedRetryReadyKey = current.limited && current.retryReady
+        ? usageLimitStateKey(current)
+        : undefined;
+      return turnSeq;
+    },
+    // Map a runtime status to a usage-limit-aware status, recording whether this
+    // turn hit a limit (read back via detectedThisTurn).
+    classify(
+      content: string,
+      status: RuntimeScreenStatus,
+    ): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+      const detected = detectCliUsageLimit(content);
+      if (!detected.limited) return { status };
+
+      const key = usageLimitStateKey(detected);
+      if (detected.retryReady && key === suppressedRetryReadyKey) {
+        return { status };
+      }
+
+      suppressedRetryReadyKey = undefined;
+      detectedTurn = turnSeq;
+      return { status: 'limited', usageLimit: detected };
+    },
+    detectedThisTurn(seq: number): boolean {
+      return detectedTurn === seq;
+    },
+  };
+}
+
+const usageLimitTracker = createUsageLimitTracker();
+
+function currentUsageLimitSnapshot(): string {
+  return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+}
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
 //
@@ -1749,6 +1807,7 @@ async function captureAndUpload(): Promise<void> {
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
 
   let png: Buffer;
+  let usageLimitContent = '';
   try {
     // Preferred path: pipe-pane backends ask tmux for a fresh viewport
     // snapshot and render it through a transient xterm-headless. This
@@ -1759,6 +1818,7 @@ async function captureAndUpload(): Promise<void> {
       if (pipeResult.ansi === lastShotHash) return;
       lastShotHash = pipeResult.ansi;
       png = pipeResult.png;
+      usageLimitContent = pipeResult.content;
     } else {
       // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
       // still drive the long-lived renderer.
@@ -1769,6 +1829,7 @@ async function captureAndUpload(): Promise<void> {
       const hash = createHash('md5').update(snap).digest('hex');
       if (hash === lastShotHash) return;
       lastShotHash = hash;
+      usageLimitContent = snap;
       const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
       const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
       png = captureToPng(term, { cols: shotCols, rows: shotRows, startY });
@@ -1786,9 +1847,9 @@ async function captureAndUpload(): Promise<void> {
     return;
   }
 
-  let status: 'working' | 'idle' | 'analyzing' = isPromptReady ? 'idle' : 'working';
+  let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
   if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
-  send({ type: 'screenshot_uploaded', imageKey, status });
+  send({ type: 'screenshot_uploaded', imageKey, ...usageLimitTracker.classify(usageLimitContent, status) });
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
@@ -2047,7 +2108,7 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   if (renderer && pendingMessages.length === 0 && !isFlushing) {
     const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, status: 'idle' });
+    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle') });
   }
   flushPending();
 }
@@ -2091,6 +2152,7 @@ function scheduleSubmitFailureNotify(
   transcriptLabel: string,
   bridgeTurnId?: string,
   failureReason?: string,
+  turnSeq = usageLimitTracker.currentTurn(),
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
   const dropBridgeMark = (): void => {
@@ -2121,6 +2183,11 @@ function scheduleSubmitFailureNotify(
       } catch (err: any) {
         log(`Deferred recheck threw (${err?.message ?? err}); falling through to warning.`);
       }
+    }
+    if (usageLimitTracker.detectedThisTurn(turnSeq)) {
+      dropBridgeMark();
+      log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
+      return;
     }
     dropBridgeMark();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
@@ -2164,6 +2231,7 @@ async function flushPending(): Promise<void> {
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const msg = pendingMessages.shift()!;
+      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Bridge fallback: mark immediately before writeInput. Doing it here
       // (instead of at enqueue time) means markTimeMs anchors to the
       // moment the message actually starts hitting the PTY — so any
@@ -2198,7 +2266,7 @@ async function flushPending(): Promise<void> {
         // nulled `backend` and told the user the CLI exited) — nothing more to
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
-        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId);
+        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, turnSeq);
         break;
       }
       // Persist any sessionId the adapter observed via authoritative sources
@@ -2216,7 +2284,7 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
-        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason);
+        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, turnSeq);
       }
       // Codex bridge: stop after one writeInput per idle cycle. Codex's
       // bridge queue doesn't yet attribute queued_command-equivalents, so
@@ -2277,7 +2345,7 @@ function startScreenUpdates(): void {
   let lastTextSnapshotHash = '';
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) return;
-    let status: 'working' | 'idle' | 'analyzing' = isPromptReady ? 'idle' : 'working';
+    let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
     if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
 
     void (async () => {
@@ -2307,9 +2375,10 @@ function startScreenUpdates(): void {
         return;
       }
 
-      if (changed || status !== lastSentStatus) {
-        lastSentStatus = status;
-        send({ type: 'screen_update', content, status });
+      const usageAware = usageLimitTracker.classify(content, status);
+      if (changed || usageAware.status !== lastSentStatus) {
+        lastSentStatus = usageAware.status;
+        send({ type: 'screen_update', content, ...usageAware });
       }
     })();
   }, SCREEN_UPDATE_INTERVAL_MS);
@@ -2508,6 +2577,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const args = cliAdapter.buildArgs({
     sessionId: cfg.sessionId,
     resume: cfg.resume ?? false,
+    workingDir: cfg.workingDir,
     resumeSessionId: cfg.cliSessionId,
     initialPrompt: cfg.prompt || undefined,
     botName: cfg.botName,
@@ -3145,6 +3215,7 @@ process.on('message', async (raw: unknown) => {
     case 'message': {
       // Mark new turn baseline so the streaming card only shows this turn's content
       renderer?.markNewTurn();
+      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
@@ -3188,7 +3259,7 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason);
+                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, turnSeq);
               }
             } catch (err: any) {
               log(`Codex adopt writeInput error: ${err.message}`);
@@ -3229,6 +3300,7 @@ process.on('message', async (raw: unknown) => {
       // fires. Also skip adapter.writeInput() / pendingMessages queueing so
       // the prompt wrapping (Session ID, mention hints) is not prepended.
       renderer?.markNewTurn();
+      usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       if (backend) {
         if ('sendText' in backend && 'sendSpecialKeys' in backend) {

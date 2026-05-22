@@ -27,6 +27,7 @@ import { composeRowFromActive } from './dashboard-rows.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
+import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -94,6 +95,89 @@ function tag(ds: DaemonSession): string {
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
+}
+
+export function clearUsageLimitState(ds: DaemonSession): void {
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  ds.usageLimit = undefined;
+  persistStreamCardState(ds);
+}
+
+export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefined {
+  return ds.lastScreenStatus === 'limited' ? ds.usageLimit : undefined;
+}
+
+function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
+  if (ds.lastScreenStatus !== 'limited') return;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) return;
+
+  const bot = getBot(ds.larkAppId);
+  const effectiveCliId = sessionCliId(ds, bot.config);
+  const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+  const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readUrl,
+    turnTitle,
+    ds.lastScreenContent ?? '',
+    'limited',
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    ds.usageLimit,
+  );
+  scheduleCardPatch(ds, cardJson);
+}
+
+function armUsageLimitRetryTimer(ds: DaemonSession, previous?: CliUsageLimitState): void {
+  if (!ds.usageLimit) return;
+
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+
+  if (ds.usageLimit.retryReady || ds.usageLimit.retryAtMs <= Date.now()) {
+    const wasReady = !!previous?.retryReady;
+    ds.usageLimit = { ...ds.usageLimit, retryReady: true };
+    persistStreamCardState(ds);
+    if (!wasReady) scheduleUsageLimitCardPatch(ds);
+    return;
+  }
+
+  const key = usageLimitStateKey(ds.usageLimit);
+  const delayMs = Math.max(0, ds.usageLimit.retryAtMs - Date.now());
+  ds.usageLimitRetryTimer = setTimeout(() => {
+    if (!ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+    ds.usageLimit = { ...ds.usageLimit, retryReady: true };
+    persistStreamCardState(ds);
+    scheduleUsageLimitCardPatch(ds);
+  }, delayMs);
+}
+
+function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitState): void {
+  if (!usageLimit) return;
+
+  const previous = ds.usageLimit;
+  // Screen updates repeat the same limit every tick while a session sits
+  // blocked. Skip the persist + timer re-arm churn unless the limit changed.
+  if (
+    previous &&
+    usageLimitStateKey(previous) === usageLimitStateKey(usageLimit) &&
+    previous.retryReady === usageLimit.retryReady
+  ) return;
+
+  ds.usageLimit = usageLimit;
+  persistStreamCardState(ds);
+  armUsageLimitRetryTimer(ds, previous);
 }
 
 const WORKER_ERROR_MARKER = '[botmux-worker-error]';
@@ -370,6 +454,7 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
 export function killWorker(ds: DaemonSession): void {
+  clearUsageLimitState(ds);
   if (!ds.worker || ds.worker.killed) return;
   try {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
@@ -571,6 +656,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         const readOnlyUrl = `http://${config.web.externalHost}:${msg.port}`;
         const writeUrl = `${readOnlyUrl}?token=${msg.token}`;
         logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
+        if (ds.usageLimit) {
+          ds.lastScreenStatus = 'limited';
+          armUsageLimitRetryTimer(ds);
+        }
         // Dashboard: surface the new xterm port so the live terminal link works.
         dashboardEventBus.publish({
           type: 'session.update',
@@ -593,13 +682,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             // Reuse persisted nonce so existing card buttons (toggle/etc) keep working.
             if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
+            const initStatus = ds.usageLimit ? 'limited' : 'starting';
             const streamCardJson = buildStreamingCard(
               ds.session.sessionId,
               sessionAnchorId(ds),
               readOnlyUrl,
               initTitle,
               ds.lastScreenContent ?? '',
-              'starting',
+              initStatus,
               effectiveCliId,
               ds.displayMode ?? 'hidden',
               ds.streamCardNonce,
@@ -607,6 +697,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               isAdopt,
               showTakeover,
               loc,
+              initStatus === 'limited' ? ds.usageLimit : undefined,
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             persistStreamCardState(ds);
@@ -635,13 +726,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
           const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+          const initStatus = ds.usageLimit ? 'limited' : 'starting';
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
             readOnlyUrl,
             initTitle,
             '',
-            'starting',
+            initStatus,
             effectiveCliId,
             ds.displayMode ?? 'hidden',
             ds.streamCardNonce,
@@ -649,6 +741,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             isAdopt,
             showTakeover,
             loc,
+            initStatus === 'limited' ? ds.usageLimit : undefined,
           );
           ds.streamCardId = await cb.sessionReply(sessionAnchorId(ds), streamCardJson, 'interactive', ds.larkAppId);
           persistStreamCardState(ds);
@@ -702,15 +795,16 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       case 'screen_update': {
         if (!ds.workerPort) break;
         const prevStatus = ds.lastScreenStatus;
+        updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = msg.status;
+        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
 
         // Dashboard: publish a patch only when status truly transitioned, so
         // SSE clients reflect real state changes (starting → working → idle)
         // without flooding on every PTY tick. The screen analyzer is the
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
-        if (prevStatus !== msg.status) {
+        if (prevStatus !== ds.lastScreenStatus) {
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
@@ -744,7 +838,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             readUrl,
             turnTitle,
             isNewTurn ? '' : msg.content,
-            msg.status,
+            ds.lastScreenStatus,
             effectiveCliId,
             mode,
             ds.streamCardNonce,
@@ -752,6 +846,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             isAdopt,
             showTakeover,
             loc,
+            cardUsageLimit(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -782,7 +877,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         } else {
           // Same turn — PATCH only on status change. Image PATCHes go through
           // the screenshot_uploaded path; text is no longer a card body mode.
-          const statusChanged = prevStatus !== msg.status;
+          const statusChanged = prevStatus !== ds.lastScreenStatus;
           if (!statusChanged) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
@@ -790,7 +885,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             readUrl,
             turnTitle,
             msg.content,
-            msg.status,
+            ds.lastScreenStatus,
             effectiveCliId,
             mode,
             ds.streamCardNonce,
@@ -798,6 +893,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             isAdopt,
             showTakeover,
             loc,
+            cardUsageLimit(ds),
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -809,7 +905,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
         ds.currentImageKey = msg.imageKey;
-        ds.lastScreenStatus = msg.status;
+        updateUsageLimitState(ds, msg.usageLimit);
+        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
@@ -821,7 +918,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           readUrl,
           turnTitle,
           ds.lastScreenContent ?? '',
-          msg.status,
+          ds.lastScreenStatus,
           effectiveCliId,
           'screenshot',
           ds.streamCardNonce,
@@ -829,6 +926,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           isAdopt,
           showTakeover,
           loc,
+          cardUsageLimit(ds),
         );
         scheduleCardPatch(ds, cardJson);
         break;

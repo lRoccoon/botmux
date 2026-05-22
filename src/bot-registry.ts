@@ -45,6 +45,16 @@ export interface BotConfig {
   oncallChats?: OncallChat[];
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
   lang?: Locale;
+  /**
+   * Per-bot default working directory. When set, new topics that have no
+   * oncall binding and no sibling-session inheritance skip the repo-select
+   * card and spawn the CLI directly in this directory. `/cd <path>` still
+   * works to switch mid-session; the next new topic falls back to this default.
+   *
+   * Pure runtime fallback — does NOT write any state to bots.json and does
+   * NOT change the canTalk / canOperate permission model (unlike defaultOncall).
+   */
+  defaultWorkingDir?: string;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
   /**
@@ -326,6 +336,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       oncallChats,
       defaultOncall,
       defaultOncallAutoboundChats,
+      defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
+        ? entry.defaultWorkingDir.trim()
+        : undefined,
       chatGrants,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
     });

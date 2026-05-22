@@ -358,6 +358,12 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 | `@bot /grant @someone` | Pop an authorization card to add the user to the "this chat" or "global" allowlist; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
 | `@bot /revoke @someone` | Revoke the user's this-chat + global access |
 
+**🆕 One-shot session group**
+
+| Command | Description |
+|---------|-------------|
+| `/group <name>` (alias `/g`) | Auto-create a new Lark group, invite you, transfer ownership; the whole group acts as one chat-scope CLI session. Empty name falls back to a timestamp. |
+
 **👥 Multi-bot collaboration**
 
 | Command | Description |
@@ -439,7 +445,8 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
 | `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `cursor`, `gemini`, `opencode`, `antigravity`) |
 | `cliPathOverride` | No | Absolute path to the CLI entry, for wrappers / routers; typical use: `ccr`, `claude-w`, `aiden-x-claude`, etc. |
 | `backendType` | No | Session backend: `pty` or `tmux` (auto-detected by default) |
-| `workingDir` | No | Default working directory, supports comma-separated |
+| `workingDir` | No | Default working directory, supports comma-separated. The new-topic repo-select card scans for git repos **from this directory downward** (recursive, up to 3 levels), no longer climbing to the parent: point it at a repos root (e.g. `~/projects`) to list every repo beneath it, or at a single repo to list just that repo (and its linked worktrees) |
+| `defaultWorkingDir` | No | Single-repo default: new topics with no oncall binding and no peer-session inheritance spawn directly here, skipping the repo-select card. `/cd <path>` still switches mid-session; the next new topic falls back to this default. **Difference from `defaultOncall`:** does NOT write `oncallChats` and does NOT change the `canTalk` / `canOperate` permission model |
 | `allowedUsers` | No | Allowed users (email prefixes or open_ids) |
 | `oncallChats` | No | Oncall bindings (written by `/oncall bind`), e.g. `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`; any group member can @ the bot |
 

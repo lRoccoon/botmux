@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { getLang, setLang, t } from '../src/dashboard/web/i18n.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('dashboard i18n helpers', () => {
   it('renders English workflow labels with interpolation', () => {
-    setLang('en');
-    expect(getLang()).toBe('en');
+    const t = createDashboardTranslator('en');
     expect(t('nav.workflowCatalog')).toBe('Catalog');
     expect(t('workflow.detail.approve')).toBe('Approve');
     expect(t('catalog.run')).toBe('Run');
@@ -13,8 +12,7 @@ describe('dashboard i18n helpers', () => {
   });
 
   it('renders Chinese workflow labels with interpolation', () => {
-    setLang('zh');
-    expect(getLang()).toBe('zh');
+    const t = createDashboardTranslator('zh');
     expect(t('nav.workflowCatalog')).toBe('目录');
     expect(t('workflow.detail.approve')).toBe('通过');
     expect(t('catalog.run')).toBe('运行');
