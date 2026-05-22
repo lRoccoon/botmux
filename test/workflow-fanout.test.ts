@@ -123,6 +123,64 @@ describe('WorkflowEventWatcher', () => {
     expect(seen.map((e) => e.type)).toEqual(['attemptCreated', 'waitCreated']);
     expect(new Set(seen.map((e) => e.eventId)).size).toBe(2);
   });
+
+  it('does not advance cursor when event delivery fails, then retries the same event', async () => {
+    await appendAttempt('gate-activity', 'gate-attempt');
+    const seen: string[] = [];
+    let fail = true;
+    const errors: unknown[] = [];
+    const watcher = new WorkflowEventWatcher(
+      RUN_ID,
+      (event) => {
+        seen.push(event.eventId);
+        if (fail) {
+          fail = false;
+          throw new Error('temporary delivery failure');
+        }
+      },
+      { runsDir: baseDir, onError: (err) => errors.push(err), pollIntervalMs: 60_000 },
+    );
+    await watcher.ready;
+
+    const waitEvent = await createWait(log, {
+      activityId: 'gate-activity',
+      attemptId: 'gate-attempt',
+      nodeId: 'gate',
+      waitKind: 'human-gate',
+      prompt: 'approve?',
+    });
+
+    await waitFor(() => errors.length === 1);
+    await watcher.drain();
+    watcher.close();
+
+    expect(seen).toEqual([waitEvent.eventId, waitEvent.eventId]);
+  });
+
+  it('polling fallback dispatches events even without another fs.watch edge', async () => {
+    await appendAttempt('gate-activity', 'gate-attempt');
+    const seen: WorkflowEvent[] = [];
+    const watcher = new WorkflowEventWatcher(
+      RUN_ID,
+      (event) => {
+        seen.push(event);
+      },
+      { runsDir: baseDir, pollIntervalMs: 20, useFsWatch: false },
+    );
+    await watcher.ready;
+
+    await createWait(log, {
+      activityId: 'gate-activity',
+      attemptId: 'gate-attempt',
+      nodeId: 'gate',
+      waitKind: 'human-gate',
+      prompt: 'approve?',
+    });
+
+    await waitFor(() => seen.some((event) => event.type === 'waitCreated'));
+    watcher.close();
+    expect(seen.filter((event) => event.type === 'waitCreated')).toHaveLength(1);
+  });
 });
 
 describe('handleWorkflowFanoutEvent', () => {

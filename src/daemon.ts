@@ -965,39 +965,47 @@ async function resolveDashboardWait(
 
 async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
   const runsDir = getRunsDir();
-  const result = await attachColdWorkflowRunsForDaemon({
-    runsDir,
-    ownerLarkAppId,
-    isAttached: (runId) => workflowRuns.has(runId),
-    makeContext: (run, log) => ({
-      log,
-      def: run.def,
-      spawnSubagent: workflowSpawnFn(),
-      hostExecutors: createDefaultHostExecutorRegistry(),
-      reconcilers: createDefaultProviderReconcilers(),
-      loadEffectInput: (activityId, attemptId) =>
-        loadEffectInputSidecar(log, activityId, attemptId),
-    }),
-    attachWatcher: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
-    driveRun: (runId) => driveWorkflowRun(runId),
-    onSkip: (runId, reason) => logger.debug(`[workflow:${runId}] cold-scan skipped: ${reason}`),
-    onAttached: (run) => {
-      logger.info(
-        `[workflow:${run.runId}] cold-attached status=${run.snapshot.run.status} ` +
-          `danglingEffects=${run.snapshot.danglingEffectAttempted.length} ` +
-          `danglingWaits=${run.snapshot.danglingWaits.length}`,
-      );
-    },
-    onDriveError: (runId, err) => {
-      logger.warn(
-        `[workflow:${runId}] cold-scan drive failed: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    },
-  });
-  if (result.discovered === 0) {
-    logger.info(`[workflow] cold-scan: no active runs for ${ownerLarkAppId}`);
+  try {
+    const result = await attachColdWorkflowRunsForDaemon({
+      runsDir,
+      ownerLarkAppId,
+      isAttached: (runId) => workflowRuns.has(runId),
+      makeContext: (run, log) => ({
+        log,
+        def: run.def,
+        spawnSubagent: workflowSpawnFn(),
+        hostExecutors: createDefaultHostExecutorRegistry(),
+        reconcilers: createDefaultProviderReconcilers(),
+        loadEffectInput: (activityId, attemptId) =>
+          loadEffectInputSidecar(log, activityId, attemptId),
+      }),
+      attachWatcher: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
+      driveRun: (runId) => driveWorkflowRun(runId),
+      onSkip: (runId, reason) => logger.debug(`[workflow:${runId}] cold-scan skipped: ${reason}`),
+      onAttached: (run) => {
+        logger.info(
+          `[workflow:${run.runId}] cold-attached status=${run.snapshot.run.status} ` +
+            `danglingEffects=${run.snapshot.danglingEffectAttempted.length} ` +
+            `danglingWaits=${run.snapshot.danglingWaits.length}`,
+        );
+      },
+      onDriveError: (runId, err) => {
+        logger.warn(
+          `[workflow:${runId}] cold-scan drive failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      },
+    });
+    if (result.discovered === 0) {
+      logger.info(`[workflow] cold-scan: no active runs for ${ownerLarkAppId}`);
+    }
+  } catch (err) {
+    logger.warn(
+      `[workflow] cold-scan failed for ${ownerLarkAppId}; continuing daemon startup: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
   }
 }
 

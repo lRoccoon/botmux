@@ -18,6 +18,8 @@ export type WorkflowEventCallback = (event: WorkflowEvent) => void | Promise<voi
 export type WorkflowEventWatcherOptions = {
   runsDir?: string;
   onError?: (err: unknown) => void;
+  pollIntervalMs?: number;
+  useFsWatch?: boolean;
 };
 
 export class WorkflowEventWatcher {
@@ -26,6 +28,7 @@ export class WorkflowEventWatcher {
   readonly ready: Promise<void>;
 
   private watcher?: FSWatcher;
+  private pollTimer?: NodeJS.Timeout;
   private lastSeq = 0;
   private draining = false;
   private pendingDrain = false;
@@ -45,6 +48,8 @@ export class WorkflowEventWatcher {
     this.closed = true;
     this.watcher?.close();
     this.watcher = undefined;
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.pollTimer = undefined;
   }
 
   async drain(): Promise<void> {
@@ -65,9 +70,12 @@ export class WorkflowEventWatcher {
             await this.onNewEvent(event);
           } catch (err) {
             this.opts.onError?.(err);
-          } finally {
-            this.lastSeq = seq;
+            // At-least-once delivery: do not advance the cursor when a
+            // downstream card/send/update fails.  A later fs.watch event or
+            // polling tick will retry the same event before newer events.
+            return;
           }
+          this.lastSeq = seq;
         }
       } while (this.pendingDrain && !this.closed);
     } finally {
@@ -81,9 +89,15 @@ export class WorkflowEventWatcher {
       await writeFile(this.log.eventsFile, '', { flag: 'a' });
     }
     this.lastSeq = await this.log.currentSeq();
-    this.watcher = watch(this.log.eventsFile, { persistent: false }, () => {
+    if (this.opts.useFsWatch !== false) {
+      this.watcher = watch(this.log.eventsFile, { persistent: false }, () => {
+        void this.drain();
+      });
+    }
+    this.pollTimer = setInterval(() => {
       void this.drain();
-    });
+    }, this.opts.pollIntervalMs ?? 5_000);
+    this.pollTimer.unref?.();
   }
 }
 

@@ -2701,8 +2701,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the file Claude creates on first submit isn't absorbed as history,
   // and baseline-existing on resume so prior-run turns ARE absorbed (we
   // don't want to re-emit yesterday's conversation as fresh turns).
-  if (cfg.cliId === 'claude-code' && cfg.sessionId) {
-    const claudeJsonl = claudeJsonlPathForSession(cfg.sessionId, cfg.workingDir);
+  if (cfg.cliId === 'claude-code' && adapterSessionId) {
+    const claudeBridgeSessionId = cfg.cliSessionId ?? adapterSessionId;
+    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir);
     startBridgeWatcher(claudeJsonl, {
       cliPid: cliPid ?? undefined,
       cliCwd: cfg.workingDir,
