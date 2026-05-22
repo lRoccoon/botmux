@@ -1445,16 +1445,22 @@ function terminalOpenInTabLabel(kind: TerminalSurface['kind']): string {
 }
 
 /**
- * CLI ids whose adapters expose a working `--resume <sessionId>` flow
- * (`buildArgs({ resume:true, resumeSessionId })`).  Opencode explicitly
- * documents resume as unsupported, and gemini's `--resume` only takes
- * "latest" so we can't deterministically target an attempt's session.
+ * CLI capability split — mirrors `src/workflows/attempt-resume.ts`:
+ *  - REQUIRES native cliSessionId: adapter has no botmux-sessionId fallback,
+ *    so resume can't proceed unless `cli_session_id` IPC was captured.
+ *  - USES botmux sessionId: adapter resumes by the original attempt sessionId
+ *    (now passed through as `originalSessionId` in worker init by codex's
+ *    server-side fix).  cliSessionId is consumed when present but optional.
+ *  - Anything else (opencode / gemini / ...) is `resume_unsupported_cli`
+ *    server-side.
  */
-const RESUME_CAPABLE_CLI_IDS = new Set<string>([
-  'claude-code', 'coco', 'codex', 'aiden', 'antigravity', 'cursor',
-]);
+const RESUME_REQUIRES_CLI_SESSION_ID = new Set<string>(['antigravity', 'cursor']);
+const RESUME_USES_SESSION_ID = new Set<string>(['aiden', 'coco', 'claude-code', 'codex']);
 function isResumeCapableCli(cliId: string | undefined): boolean {
-  return !!cliId && RESUME_CAPABLE_CLI_IDS.has(cliId);
+  return !!cliId && (RESUME_USES_SESSION_ID.has(cliId) || RESUME_REQUIRES_CLI_SESSION_ID.has(cliId));
+}
+function cliRequiresNativeSessionId(cliId: string | undefined): boolean {
+  return !!cliId && RESUME_REQUIRES_CLI_SESSION_ID.has(cliId);
 }
 
 function renderResumeButtonHtml(
@@ -1482,7 +1488,10 @@ function renderResumeButtonHtml(
   if (!isResumeCapableCli(terminal.cliId)) {
     return `<button type="button" class="btn-link" data-wf-resume-button="1" disabled title="${escapeHtml(t('workflow.detail.resumeUnsupportedCli', { cliId: terminal.cliId ?? '?' }))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
   }
-  if (!terminal.cliSessionId) {
+  // Only CLIs that have NO botmux-sessionId fallback (antigravity, cursor)
+  // hard-require cliSessionId — aiden / coco / claude-code / codex resume
+  // through the original attempt sessionId on the server side now.
+  if (cliRequiresNativeSessionId(terminal.cliId) && !terminal.cliSessionId) {
     return `<button type="button" class="btn-link" data-wf-resume-button="1" disabled title="${escapeHtml(t('workflow.detail.resumeMissingCliSession'))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
   }
   return `<button type="button" class="btn-link" data-wf-resume-button="1" data-wf-resume-action="start" ${dataAttrs}${pending ? ' disabled' : ''}>${escapeHtml(pending ? t('workflow.detail.resumeStarting') : t('workflow.detail.resumeSession'))}</button>`;
