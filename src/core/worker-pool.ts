@@ -645,6 +645,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           );
           ds.streamCardId = await cb.sessionReply(sessionAnchorId(ds), streamCardJson, 'interactive', ds.larkAppId);
           persistStreamCardState(ds);
+          // Re-sync worker's display mode (it starts fresh in 'hidden')
+          if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
+            ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
+          }
           // New card is live — recall any cards frozen by previous turns.
           // Done after `streamCardId` is committed so we never delete the old
           // card without a successor visible to the user.
