@@ -547,6 +547,19 @@ export async function dispatchWork(
     options.snapshot ?? replay(await ctx.log.readAll()),
   );
 
+  if (node.type === 'loop' || node.type === 'decision') {
+    // v0.2 schema introduced these node types but their dispatch is
+    // owned by the loop runtime executor (Step 3 of
+    // feat/workflow-loop-v02; see /tmp/wf-loop-v02.md §13).  The
+    // orchestrator (`decideNextActions`) skips them so we should never
+    // get here in Step 1; throw fail-loud rather than silently no-op so
+    // any regression is caught immediately in tests.
+    throw new Error(
+      `dispatchWork received unexpected node type '${node.type}' for node '${action.nodeId}' ` +
+      `(loop runtime not yet wired in Step 1; orchestrator should intercept upstream)`,
+    );
+  }
+
   if (node.type === 'hostExecutor') {
     // attemptCreated carries the RAW (pre-binding) input.  Operator-side
     // debug can see the literal `$ref` the author wrote, while the

@@ -21,6 +21,16 @@
  *
  * One node may own at most one gate (before-gate) and one work
  * activity in v0.  After-gates and re-runs are deferred.
+ *
+ * v0.2 loop body activities are scoped by a `loop::<loopId>.<N>` segment:
+ *
+ *   loop work activity: `<runId>::loop::<loopId>.<N>::work::<bodyNodeId>`
+ *   loop gate activity: `<runId>::loop::<loopId>.<N>::gate::<bodyNodeId>`
+ *
+ * `<N>` is the 1-indexed iteration; `<loopId>` is the loop block's
+ * nodeId.  All segments stay within `SEGMENT_RE` (allows
+ * `[A-Za-z0-9._:-]`), so existing `isValidPathSegment` / attempt-
+ * sidecar path guards continue to apply without modification.
  * ────────────────────────────────────────────────────────────────────
  */
 
@@ -41,6 +51,99 @@ export function gateActivityId(runId: string, nodeId: string): string {
 
 export function workActivityId(runId: string, nodeId: string): string {
   return `${runId}::work::${nodeId}`;
+}
+
+// ─── Loop iteration activity IDs (v0.2) ───────────────────────────────────
+//
+// See /tmp/wf-loop-v02.md §4.2 and the top-of-file ASCII spec.
+//
+// Iteration `N` is 1-indexed.  We refuse to encode `N < 1` so callers
+// never accidentally emit `loop::foo.0` ids (the iteration counter is a
+// real loop-state position, not a placeholder).
+
+export function loopWorkActivityId(
+  runId: string,
+  loopId: string,
+  iteration: number,
+  bodyNodeId: string,
+): string {
+  if (!Number.isInteger(iteration) || iteration < 1) {
+    throw new Error(
+      `loopWorkActivityId: iteration must be a positive integer (got ${iteration})`,
+    );
+  }
+  return `${runId}::loop::${loopId}.${iteration}::work::${bodyNodeId}`;
+}
+
+export function loopGateActivityId(
+  runId: string,
+  loopId: string,
+  iteration: number,
+  bodyNodeId: string,
+): string {
+  if (!Number.isInteger(iteration) || iteration < 1) {
+    throw new Error(
+      `loopGateActivityId: iteration must be a positive integer (got ${iteration})`,
+    );
+  }
+  return `${runId}::loop::${loopId}.${iteration}::gate::${bodyNodeId}`;
+}
+
+/**
+ * Parsed activity id.  `kind: 'plain'` corresponds to the v0.1 forms
+ * (`<runId>::work::<nodeId>` / `<runId>::gate::<nodeId>`).  `kind:
+ * 'loop'` corresponds to v0.2 loop-iteration forms.  Returns `undefined`
+ * if `s` doesn't match any known shape — callers can treat that as
+ * "not a workflow activity id" without throwing.
+ */
+export type ParsedActivityId =
+  | {
+      kind: 'plain';
+      runId: string;
+      activityKind: 'work' | 'gate';
+      nodeId: string;
+    }
+  | {
+      kind: 'loop';
+      runId: string;
+      loopId: string;
+      iteration: number;
+      activityKind: 'work' | 'gate';
+      nodeId: string;
+    };
+
+const PLAIN_RE = /^([^:]+(?:::?[^:]+)*?)::(work|gate)::([A-Za-z0-9_.-]+)$/;
+const LOOP_RE = /^(.+)::loop::([A-Za-z0-9_.-]+)\.(\d+)::(work|gate)::([A-Za-z0-9_.-]+)$/;
+
+export function parseActivityId(s: string): ParsedActivityId | undefined {
+  // Loop form first — the `::loop::` segment is unambiguous and would
+  // also accidentally satisfy a greedy plain match if we tried plain
+  // first (`runId` would absorb `::loop::<id>.<N>::work`).
+  const loopMatch = LOOP_RE.exec(s);
+  if (loopMatch) {
+    const [, runId, loopId, iterStr, activityKind, nodeId] = loopMatch;
+    const iteration = Number(iterStr);
+    if (!Number.isFinite(iteration) || iteration < 1) return undefined;
+    return {
+      kind: 'loop',
+      runId,
+      loopId,
+      iteration,
+      activityKind: activityKind as 'work' | 'gate',
+      nodeId,
+    };
+  }
+  const plainMatch = PLAIN_RE.exec(s);
+  if (plainMatch) {
+    const [, runId, activityKind, nodeId] = plainMatch;
+    return {
+      kind: 'plain',
+      runId,
+      activityKind: activityKind as 'work' | 'gate',
+      nodeId,
+    };
+  }
+  return undefined;
 }
 
 // ─── Actions ──────────────────────────────────────────────────────────────
@@ -169,6 +272,17 @@ export function decideNextActions(
   for (const nodeId of order) {
     const node = def.nodes[nodeId]!;
     const nstatus = snapshot.nodes.get(nodeId)?.status ?? 'idle';
+
+    // v0.2 loop / decision dispatch is owned by the loop runtime executor
+    // (Step 3 of feat/workflow-loop-v02; see /tmp/wf-loop-v02.md §13).
+    // Schema has landed but runtime is not yet wired — keep these out of
+    // the legacy scheduler so a workflow that mistakenly invokes one in
+    // Step 1 stays `pending` rather than silently failing.  Step 3 will
+    // intercept these node types upstream and never reach this branch.
+    if (node.type === 'loop' || node.type === 'decision') {
+      pendingCount++;
+      continue;
+    }
 
     // Already settled at the node level — nothing for us to advance.
     if (nstatus === 'succeeded' || nstatus === 'skipped' || nstatus === 'cancelled') {
