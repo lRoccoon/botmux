@@ -45,6 +45,11 @@ export const ErrorCodeEnum = z.enum([
   'InputUnrecoverable',
   'CorruptLog',
   'LoopMaxIterationsExceeded',
+  // Non-terminator failure inside a loop body (subagent crash /
+  // hostExecutor error / non-terminator humanGate reject = fail-run).
+  // Carried on `loopFinished` when resolution='body-failed'.  Loop v0.2
+  // Step 3 review Medium — see /tmp/wf-loop-v02.md §10.8.
+  'LoopBodyFailed',
 ]);
 export type ErrorCode = z.infer<typeof ErrorCodeEnum>;
 
@@ -209,7 +214,19 @@ export const LoopIterationFinishedPayload = z.object({
 export const LoopFinishedPayload = z.object({
   loopId: z.string(),
   finalIteration: z.number().int().positive(),
-  resolution: z.enum(['approved', 'max-iterations-exceeded', 'cancelled', 'timeout']),
+  // - approved: terminator decision approved (success)
+  // - max-iterations-exceeded: ran out of iterations on rejection
+  // - body-failed: non-terminator body node failed (subagent crash /
+  //   hostExecutor error / non-terminator humanGate reject = fail-run)
+  // - cancelled: user-initiated cancel reached the loop
+  // - timeout: terminator humanGate deadline expired
+  resolution: z.enum([
+    'approved',
+    'max-iterations-exceeded',
+    'body-failed',
+    'cancelled',
+    'timeout',
+  ]),
   outputRef: OutputRefSchema.optional(),
   errorCode: ErrorCodeEnum.optional(),
   errorClass: ErrorClassEnum.optional(),

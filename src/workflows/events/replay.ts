@@ -568,12 +568,23 @@ export function replay(events: WorkflowEvent[]): Snapshot {
               ? 'succeeded'
               : p.resolution === 'cancelled'
                 ? 'cancelled'
-                : 'failed';
+                : 'failed'; // body-failed / timeout / max-iterations-exceeded
           loop.output = p.outputRef;
           loop.errorCode = p.errorCode;
           loop.errorClass = p.errorClass;
           if (p.outputRef) {
             outputs.set(workActivityId(runId, p.loopId), p.outputRef);
+          }
+          // Close any still-running iteration so the dashboard / ops
+          // surface doesn't display the loop as "failed but iteration
+          // X is somehow still running" (codex Step 3 review Medium —
+          // /tmp/wf-loop-v02.md §10.8 design compromise resolved).
+          if (loop.status !== 'succeeded') {
+            const inflight = loop.iterations.find((it) => it.status === 'running');
+            if (inflight) {
+              inflight.status =
+                p.resolution === 'cancelled' ? 'cancelled' : 'failed';
+            }
           }
         }
         break;

@@ -343,20 +343,134 @@ describe('runLoop — non-terminator humanGate.reject in loop body (§10.8)', ()
 
     const finalSnap = replay(await log.readAll());
     const loop = finalSnap.loops.get('review-loop');
-    // Non-terminator body failure uses `cancelled` resolution as the
-    // abnormal-termination bucket (LoopFinishedPayload doesn't yet have
-    // a `'body-failed'` resolution; `max-iterations-exceeded` is locked
-    // to errorCode='LoopMaxIterationsExceeded' by codex Step 2 invariant
-    // — so we route through `cancelled` and rely on the run-level
-    // failedNodeId propagation to surface the run as failed).
-    expect(loop?.status).toBe('cancelled');
+    // Codex Step 3 review Medium: dedicated `body-failed` resolution
+    // distinguishes "loop died because a body node failed" from
+    // user-initiated cancel.  Replay maps body-failed → loop.status =
+    // 'failed' and closes the in-flight iteration as 'failed'.
+    expect(loop?.status).toBe('failed');
+    expect(loop?.errorCode).toBe('LoopBodyFailed');
+    expect(loop?.errorClass).toBe('fatal');
     expect(loop?.iteration).toBe(1);
-    // Iteration stays `running` because `loopFinished` (codex Step 2)
-    // doesn't retroactively close the in-flight iteration entry — the
-    // loop-level `cancelled` status already conveys "this iteration
-    // never reached a decision".  A follow-up could have loopFinished
-    // null-out the in-flight iteration status; not needed for v0.2.
-    expect(loop?.iterations[0]?.status).toBe('running');
+    expect(loop?.iterations[0]?.status).toBe('failed');
+  });
+});
+
+// ─── runFailed.rootCauseEventId points to loopFinished (Blocker 2) ────────
+
+describe('runLoop — runFailed.rootCauseEventId for loop failure', () => {
+  it('max-iterations-exceeded: rootCauseEventId points to loopFinished', async () => {
+    const def = reviewLoopDef(2);
+    const { log, ctx } = await bootstrap(def);
+
+    await runLoop(ctx);
+    await resolveDecision(log, def, 'review-loop', 1, 'reviewDecision', 'rejected');
+    await runLoop(ctx);
+    await resolveDecision(log, def, 'review-loop', 2, 'reviewDecision', 'rejected');
+    await runLoop(ctx);
+
+    const events = await log.readAll();
+    const runFailed = events.find((e) => e.type === 'runFailed');
+    const loopFinished = events.find((e) => e.type === 'loopFinished');
+    expect(runFailed).toBeDefined();
+    expect(loopFinished).toBeDefined();
+    // Plain falsy check + identity — runFailed must NOT fallback to
+    // events[0] (runCreated) which is the diagnostic black-hole this
+    // Blocker 2 fix is preventing.
+    const payload = runFailed!.payload as { rootCauseEventId?: string };
+    expect(payload.rootCauseEventId).toBe(loopFinished!.eventId);
+    // Sanity: definitely not runCreated.
+    expect(payload.rootCauseEventId).not.toBe(events[0]!.eventId);
+  });
+
+  it('body-failed: rootCauseEventId points to the (terminal) loopFinished', async () => {
+    // Same shape as the non-terminator humanGate.reject test but
+    // assert on rootCauseEventId.  This covers the body-fail path
+    // separately from max-iterations.
+    const def = parseWorkflowDefinition({
+      workflowId: 'review-loop-body-gate-rc',
+      version: 1,
+      nodes: {
+        implement: {
+          type: 'subagent',
+          bot: 'cli_a',
+          prompt: 'implement',
+          humanGate: { stage: 'before', prompt: 'ok?' },
+        },
+        reviewDecision: {
+          type: 'decision',
+          depends: ['implement'],
+          humanGate: { stage: 'before', prompt: 'approve?' },
+        },
+        'review-loop': {
+          type: 'loop',
+          maxIterations: 3,
+          body: ['implement', 'reviewDecision'],
+          terminate: { node: 'reviewDecision', via: 'humanGate' },
+        },
+      },
+    });
+    const { log, ctx } = await bootstrap(def);
+    await runLoop(ctx);
+
+    const implementGateId = loopGateActivityId(RUN_ID, 'review-loop', 1, 'implement');
+    const snap = replay(await log.readAll());
+    const gateAct = snap.activities.get(implementGateId);
+    await resolveWait(log, {
+      activityId: implementGateId,
+      attemptId: gateAct!.currentAttemptId!,
+      resolution: 'rejected',
+      by: 'ou_user',
+    });
+    await runLoop(ctx);
+
+    const events = await log.readAll();
+    const runFailed = events.find((e) => e.type === 'runFailed');
+    const loopFinished = events.find((e) => e.type === 'loopFinished');
+    expect(runFailed).toBeDefined();
+    expect(loopFinished).toBeDefined();
+    const payload = runFailed!.payload as { rootCauseEventId?: string };
+    expect(payload.rootCauseEventId).toBe(loopFinished!.eventId);
+  });
+});
+
+// ─── decision outputRef has outputPath so `previous` binding can read ─────
+
+describe('runLoop — decision attempt outputRef carries outputPath (Blocker 1)', () => {
+  it('approve writes an OutputRef with outputPath set so binding can read', async () => {
+    const def = reviewLoopDef(2);
+    const { log, ctx } = await bootstrap(def);
+    await runLoop(ctx);
+    await resolveDecision(log, def, 'review-loop', 1, 'reviewDecision', 'approved');
+
+    const snap = replay(await log.readAll());
+    const decisionActId = loopGateActivityId(RUN_ID, 'review-loop', 1, 'reviewDecision');
+    const outputRef = snap.outputs.get(decisionActId);
+    expect(outputRef).toBeDefined();
+    expect(outputRef?.outputPath).toBeDefined();
+    expect(outputRef?.outputPath).toMatch(/\.blob$|blobs\//);
+    expect(outputRef?.outputHash).toMatch(/^sha256:/);
+  });
+
+  it('reject writes an OutputRef with outputPath set (same blob path)', async () => {
+    const def = reviewLoopDef(2);
+    const { log, ctx } = await bootstrap(def);
+    await runLoop(ctx);
+    await resolveDecision(
+      log,
+      def,
+      'review-loop',
+      1,
+      'reviewDecision',
+      'rejected',
+      'ou_r',
+      'try again',
+    );
+
+    const snap = replay(await log.readAll());
+    const decisionActId = loopGateActivityId(RUN_ID, 'review-loop', 1, 'reviewDecision');
+    const outputRef = snap.outputs.get(decisionActId);
+    expect(outputRef).toBeDefined();
+    expect(outputRef?.outputPath).toBeDefined();
   });
 });
 

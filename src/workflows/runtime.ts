@@ -34,6 +34,7 @@ import { replay, type Snapshot } from './events/replay.js';
 import type {
   ActivityFailedEvent,
   AttemptCreatedEvent,
+  LoopFinishedEvent,
   NodeFailedEvent,
   NodeSucceededEvent,
   RunCanceledEvent,
@@ -885,8 +886,12 @@ async function findRootCauseEventId(
   const events = await ctx.log.readAll();
   // Prefer the activityFailed under the failed node's last activity.
   // Fall back to the nodeFailed event itself (always exists by now).
+  // For loop block failures (v0.2): loop blocks have no own attempts /
+  // nodeFailed; the `loopFinished` event is the authoritative root
+  // cause of a loop-level failure (codex Step 3 review Blocker 2).
   let nodeFailedEventId: string | undefined;
   let activityFailedEventId: string | undefined;
+  let loopFinishedEventId: string | undefined;
   const nodeActivities = new Set<string>();
   for (const e of events) {
     if (e.type === 'attemptCreated') {
@@ -902,9 +907,19 @@ async function findRootCauseEventId(
       if (!('ref' in p) && p.nodeId === nodeId) {
         nodeFailedEventId = e.eventId;
       }
+    } else if (e.type === 'loopFinished') {
+      const p = (e as LoopFinishedEvent).payload;
+      if (!('ref' in p) && p.loopId === nodeId && p.resolution !== 'approved') {
+        loopFinishedEventId = e.eventId;
+      }
     }
   }
-  return activityFailedEventId ?? nodeFailedEventId ?? events[0]!.eventId;
+  return (
+    activityFailedEventId ??
+    nodeFailedEventId ??
+    loopFinishedEventId ??
+    events[0]!.eventId
+  );
 }
 
 export async function completeRunFailed(

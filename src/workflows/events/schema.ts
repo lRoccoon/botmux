@@ -318,6 +318,19 @@ export function checkLoopFinishedInvariant(event: WorkflowEvent): string | null 
       return "loopFinished: max-iterations-exceeded requires errorCode='LoopMaxIterationsExceeded' and errorClass='userFault'";
     }
   }
+  if (p.resolution === 'body-failed') {
+    if (p.errorCode !== 'LoopBodyFailed') {
+      return "loopFinished: body-failed requires errorCode='LoopBodyFailed'";
+    }
+    if (!p.errorClass) {
+      return "loopFinished: body-failed requires errorClass (derived from underlying body failure)";
+    }
+  }
+  if (p.resolution === 'timeout') {
+    if (p.errorCode !== 'WaitDeadlineExceeded' || p.errorClass !== 'userFault') {
+      return "loopFinished: timeout requires errorCode='WaitDeadlineExceeded' and errorClass='userFault'";
+    }
+  }
   return null;
 }
 

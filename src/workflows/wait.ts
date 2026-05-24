@@ -40,6 +40,7 @@ import type {
 } from './events/types.js';
 import type { WorkflowDefinition } from './definition.js';
 import { parseActivityId } from './orchestrator.js';
+import { writeJsonBlob } from './blob.js';
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -304,8 +305,14 @@ async function writeWaitTerminal(
 ): Promise<ActivitySucceededEvent | ActivityFailedEvent> {
   if (spec.kind.tag === 'succeeded') {
     const externalRefs = spec.kind.externalRefs;
-    const outputBuf = Buffer.from(JSON.stringify(externalRefs), 'utf-8');
-    const outputHash = await sha256Hex(outputBuf);
+    // Persist externalRefs as a real blob so `${node.output.x}` /
+    // `${node.previous.x}` binding can read the resolution payload.
+    // Plain wait approve also benefits — downstream nodes can now read
+    // `${gate.output.resolution}` without falling back to externalRefs.
+    // (Previously we hand-rolled an OutputRef without `outputPath`,
+    // which made the binding layer fail-loud on decision `previous`
+    // references — codex Step 3 review Blocker 1.)
+    const outputRef = await writeJsonBlob(log, externalRefs);
     return (await log.append({
       runId: log.runId,
       type: 'activitySucceeded',
@@ -313,12 +320,7 @@ async function writeWaitTerminal(
       payload: {
         activityId: spec.activityId,
         attemptId: spec.attemptId,
-        outputRef: {
-          outputHash: `sha256:${outputHash}`,
-          outputBytes: outputBuf.length,
-          outputSchemaVersion: 1,
-          contentType: 'application/json',
-        },
+        outputRef,
         externalRefs,
       },
     })) as ActivitySucceededEvent;
@@ -337,9 +339,4 @@ async function writeWaitTerminal(
       },
     },
   })) as ActivityFailedEvent;
-}
-
-async function sha256Hex(buf: Buffer): Promise<string> {
-  const { createHash } = await import('node:crypto');
-  return createHash('sha256').update(buf).digest('hex');
 }

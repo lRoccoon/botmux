@@ -256,7 +256,12 @@ export type FinishLoopAction = {
   kind: 'finishLoop';
   loopId: string;
   finalIteration: number;
-  resolution: 'approved' | 'max-iterations-exceeded' | 'cancelled' | 'timeout';
+  resolution:
+    | 'approved'
+    | 'max-iterations-exceeded'
+    | 'body-failed'
+    | 'cancelled'
+    | 'timeout';
   errorCode?: string;
   errorClass?: ErrorClass;
   outputRef?: OutputRef;
@@ -413,18 +418,17 @@ export function decideNextActions(
     }
     if (iterState.status === 'failed' || iterState.status === 'cancelled') {
       // Non-terminator failure already finalized this iteration; close
-      // the loop block with `cancelled` resolution.  This is the closest
-      // bucket the LoopFinishedPayload supports for "loop terminated
-      // abnormally without reaching maxIterations"; the underlying
-      // failed body attempt carries the root cause.  A dedicated
-      // `'body-failed'` resolution / errorCode is a clean follow-up but
-      // not required for v0.2 to be useful.
+      // the loop block with `body-failed` resolution (codex Step 3
+      // review Medium).  `cancelled` is reserved for user-initiated
+      // cancel; `body-failed` distinguishes "this loop died because a
+      // body node failed" from "user clicked cancel".
       return [
         {
           kind: 'finishLoop',
           loopId,
           finalIteration: currentIter,
-          resolution: 'cancelled',
+          resolution: 'body-failed',
+          errorCode: 'LoopBodyFailed',
           errorClass: 'fatal',
         },
       ];
@@ -515,27 +519,26 @@ export function decideNextActions(
       if (advance.isFailed) {
         if (isTerminator) {
           // Terminator humanGate timed out / failed → finish the loop
-          // with `timeout`.  `errorCode` is left unset until the enum
-          // grows a dedicated value (the underlying activityFailed event
-          // carries the WaitDeadlineExceeded code).
+          // with `timeout` + WaitDeadlineExceeded (codex Step 3 review
+          // Medium — schema invariant requires this errorCode pairing).
           bodyFailureFinish = {
             kind: 'finishLoop',
             loopId,
             finalIteration: currentIter,
             resolution: 'timeout',
+            errorCode: 'WaitDeadlineExceeded',
             errorClass: 'userFault',
           };
         } else {
           // Non-terminator body node failed (subagent crash / hostExecutor
           // error / non-terminator humanGate.reject = fail-run per
-          // /tmp/wf-loop-v02.md §10.8) → fail the loop block.  Uses
-          // `cancelled` resolution as the abnormal-termination bucket;
-          // see the iterState branch above for the same rationale.
+          // /tmp/wf-loop-v02.md §10.8) → close as `body-failed`.
           bodyFailureFinish = {
             kind: 'finishLoop',
             loopId,
             finalIteration: currentIter,
-            resolution: 'cancelled',
+            resolution: 'body-failed',
+            errorCode: 'LoopBodyFailed',
             errorClass: 'fatal',
           };
         }
