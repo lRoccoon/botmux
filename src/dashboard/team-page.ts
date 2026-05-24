@@ -29,6 +29,12 @@ export const TEAM_PAGE_HTML = `<!doctype html>
   .ok { color: #00b42a; } .err { color: #f53f3f; }
   .hide { display: none; }
   .hint { color: #86909c; font-size: 13px; margin-top: 8px; }
+  input.capedit { font: inherit; width: 92%; padding: 4px 8px; border: 1px solid #e5e6eb; border-radius: 6px; }
+  input.capedit:focus { border-color: #3370ff; outline: none; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; }
+  .modal { background: #fff; border-radius: 10px; padding: 18px 20px; width: min(560px, 92vw); }
+  .modal textarea { width: 100%; min-height: 200px; font: 13px/1.5 ui-monospace, Menlo, monospace; padding: 10px; border: 1px solid #e5e6eb; border-radius: 8px; box-sizing: border-box; }
+  .modal .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -66,12 +72,21 @@ export const TEAM_PAGE_HTML = `<!doctype html>
         <tbody id="logs"></tbody></table>
     </section>
   </section>
+
+  <!-- Team-role edit modal -->
+  <div id="modal" class="overlay hide"><div class="modal">
+    <h2 id="modal-title">团队角色</h2>
+    <p class="hint">团队级角色（该机器人跨群的默认人设）。留空并保存即删除。本群 /role 仍可覆盖。</p>
+    <textarea id="modal-text" placeholder="# 角色\n用 Markdown 描述这个机器人的职责/风格…"></textarea>
+    <div class="row"><button id="modal-cancel">取消</button><button class="primary" id="modal-save">保存</button></div>
+  </div></div>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 async function jget(u){ const r = await fetch(u); return { status:r.status, body: await r.json().catch(()=>({})) }; }
 async function jpost(u, b){ const r = await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:b?JSON.stringify(b):undefined}); return { status:r.status, body: await r.json().catch(()=>({})) }; }
+async function jput(u, b){ const r = await fetch(u,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(b||{})}); return { status:r.status, body: await r.json().catch(()=>({})) }; }
 
 let pollTimer = null;
 
@@ -85,9 +100,18 @@ async function showApp(){
   const r = await jget('/api/team/roster');
   const t = r.body || {};
   $('team-meta').textContent = (t.team?.name || '') + ' · ' + (t.team?.memberCount ?? 0) + ' 名成员';
-  $('roster').innerHTML = (t.bots||[]).map(b =>
-    '<tr><td>'+esc(b.name)+'</td><td class="muted">'+esc(b.cliId)+'</td><td>'+(b.capability?esc(b.capability):'<span class=muted>—</span>')+'</td><td>'+(b.hasTeamRole?'<span class=tag>已设</span>':'<span class=muted>—</span>')+'</td></tr>'
-  ).join('') || '<tr><td colspan=4 class=muted>暂无机器人</td></tr>';
+  $('roster').innerHTML = (t.bots||[]).map(b => {
+    const app = esc(b.larkAppId || '');
+    return '<tr><td>'+esc(b.name)+'</td><td class="muted">'+esc(b.cliId)+'</td>'
+      + '<td><input class="capedit" data-app="'+app+'" value="'+esc(b.capability||'')+'" placeholder="能力标签…"></td>'
+      + '<td><button class="roleedit" data-app="'+app+'" data-name="'+esc(b.name)+'">'+(b.hasTeamRole?'已设·改':'设置')+'</button></td></tr>';
+  }).join('') || '<tr><td colspan=4 class=muted>暂无机器人</td></tr>';
+  document.querySelectorAll('.capedit').forEach(inp => {
+    inp.onchange = async () => { await jput('/api/team/bots/'+encodeURIComponent(inp.dataset.app)+'/capability', { capability: inp.value }); };
+  });
+  document.querySelectorAll('.roleedit').forEach(btn => {
+    btn.onclick = () => openRoleModal(btn.dataset.app, btn.dataset.name);
+  });
 
   const c = await jget('/api/team/connectors');
   $('connectors').innerHTML = (c.body?.connectors||[]).map(x =>
@@ -101,6 +125,22 @@ async function showApp(){
 }
 
 function showLogin(){ $('app').classList.add('hide'); $('login').classList.remove('hide'); }
+
+async function openRoleModal(app, name){
+  if (!app) { alert('该机器人无 app id，无法设置团队角色'); return; }
+  const r = await jget('/api/team/bots/' + encodeURIComponent(app) + '/role');
+  $('modal-title').textContent = '团队角色 · ' + name;
+  $('modal-text').value = r.body?.role || '';
+  $('modal').dataset.app = app;
+  $('modal').classList.remove('hide');
+}
+$('modal-cancel').onclick = () => $('modal').classList.add('hide');
+$('modal-save').onclick = async () => {
+  const app = $('modal').dataset.app;
+  await jput('/api/team/bots/' + encodeURIComponent(app) + '/role', { role: $('modal-text').value });
+  $('modal').classList.add('hide');
+  showApp();
+};
 
 $('btn-start').onclick = async () => {
   $('login-err').textContent = '';

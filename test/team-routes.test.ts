@@ -90,6 +90,50 @@ describe('handleTeamRoute', () => {
     expect(res.statusCode).toBe(401);
   });
 
+  async function login(): Promise<string> {
+    writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_a', botOpenId: 'ou_a', botName: '后端Bot', cliId: 'codex' },
+    ]));
+    let res = makeRes();
+    await call(makeReq('POST', '/api/pairing/start'), res, '/api/pairing/start');
+    const { pairingId, code } = json(res);
+    const browserToken = cookieValue(res, 'bmx_pair');
+    claimPairing(dataDir, code, { openId: 'ou_1', unionId: 'on_1', name: '张三' });
+    res = makeRes();
+    await call(makeReq('POST', '/api/pairing/consume', { cookie: 'bmx_pair=' + browserToken, body: { pairingId } }), res, '/api/pairing/consume');
+    return cookieValue(res, 'bmx_session');
+  }
+
+  it('PUT capability is reflected in the roster', async () => {
+    const session = await login();
+    const c = 'bmx_session=' + session;
+    let res = makeRes();
+    await call(makeReq('PUT', '/api/team/bots/cli_a/capability', { cookie: c, body: { capability: '服务端排查' } }), res, '/api/team/bots/cli_a/capability');
+    expect(res.statusCode).toBe(200);
+    res = makeRes();
+    await call(makeReq('GET', '/api/team/roster', { cookie: c }), res, '/api/team/roster');
+    expect(json(res).bots.find((b: any) => b.larkAppId === 'cli_a').capability).toBe('服务端排查');
+  });
+
+  it('PUT then GET team role round-trips', async () => {
+    const session = await login();
+    const c = 'bmx_session=' + session;
+    await call(makeReq('PUT', '/api/team/bots/cli_a/role', { cookie: c, body: { role: '# 后端\n严谨' } }), makeRes(), '/api/team/bots/cli_a/role');
+    const res = makeRes();
+    await call(makeReq('GET', '/api/team/bots/cli_a/role', { cookie: c }), res, '/api/team/bots/cli_a/role');
+    expect(json(res).role).toContain('后端');
+    // roster shows hasTeamRole now
+    const rres = makeRes();
+    await call(makeReq('GET', '/api/team/roster', { cookie: c }), rres, '/api/team/roster');
+    expect(json(rres).bots.find((b: any) => b.larkAppId === 'cli_a').hasTeamRole).toBe(true);
+  });
+
+  it('editing requires a session (401)', async () => {
+    const res = makeRes();
+    await call(makeReq('PUT', '/api/team/bots/cli_a/capability', { body: { capability: 'x' } }), res, '/api/team/bots/cli_a/capability');
+    expect(res.statusCode).toBe(401);
+  });
+
   it('logout clears the session cookie', async () => {
     const res = makeRes();
     await call(makeReq('POST', '/api/team/logout'), res, '/api/team/logout');

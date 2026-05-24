@@ -9,14 +9,32 @@
  * Returns true if it handled the request, false to let the dashboard continue.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { config } from '../config.js';
 import { jsonRes } from './workflow-api.js';
 import { pairingStart, pairingStatusView, pairingConsume, PAIR_COOKIE, SESSION_COOKIE } from './pairing-api.js';
 import { getWebSession, revokeWebSession, type WebSession } from '../services/web-session-store.js';
 import { buildTeamRoster } from '../services/team-roster.js';
+import { setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
 import { listConnectors } from '../services/connector-store.js';
 import { listTriggerLogs, summarizeTriggerLogs, type TriggerLogListOptions } from '../services/trigger-log-store.js';
 import { TEAM_PAGE_HTML } from './team-page.js';
+
+const MAX_ROLE_BYTES = 4 * 1024;
+/** Write/delete a bot's team-level role file directly under dataDir (matches
+ *  role-resolver's `{dataDir}/team-roles/{larkAppId}.md`; kept dataDir-based so
+ *  the dashboard process and tests don't depend on role-resolver's config read). */
+function setTeamRoleFile(dataDir: string, larkAppId: string, content: string): void {
+  const fp = join(dataDir, 'team-roles', `${larkAppId}.md`);
+  mkdirSync(dirname(fp), { recursive: true });
+  let out = content.trim();
+  while (Buffer.byteLength(out, 'utf-8') > MAX_ROLE_BYTES) out = out.slice(0, -1);
+  writeFileSync(fp, out, 'utf-8');
+}
+function deleteTeamRoleFile(dataDir: string, larkAppId: string): void {
+  try { unlinkSync(join(dataDir, 'team-roles', `${larkAppId}.md`)); } catch { /* already gone */ }
+}
 
 export interface TeamRouteDeps {
   dataDir?: string;
@@ -115,6 +133,32 @@ export async function handleTeamRoute(
   }
   if (path === '/api/team/roster' && method === 'GET') {
     jsonRes(res, 200, { ok: true, ...buildTeamRoster(dataDir, session.teamId) });
+    return true;
+  }
+  // Edit a bot's capability label or team-level role from the web (team内互信).
+  const botEdit = path.match(/^\/api\/team\/bots\/([^/]+)\/(capability|role)$/);
+  if (botEdit && method === 'PUT') {
+    const [, larkAppId, field] = botEdit;
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    if (field === 'capability') {
+      const cap = String(body?.capability ?? '').trim();
+      if (cap) setBotCapability(dataDir, larkAppId, cap, session.identity.openId);
+      else clearBotCapability(dataDir, larkAppId);
+    } else {
+      const role = String(body?.role ?? '').trim();
+      if (role) setTeamRoleFile(dataDir, larkAppId, role);
+      else deleteTeamRoleFile(dataDir, larkAppId);
+    }
+    jsonRes(res, 200, { ok: true });
+    return true;
+  }
+  // Read a bot's full team role (for the edit form to prefill).
+  const roleGet = path.match(/^\/api\/team\/bots\/([^/]+)\/role$/);
+  if (roleGet && method === 'GET') {
+    const fp = join(dataDir, 'team-roles', `${roleGet[1]}.md`);
+    const content = existsSync(fp) ? readFileSync(fp, 'utf-8') : '';
+    jsonRes(res, 200, { ok: true, role: content });
     return true;
   }
   if (path === '/api/team/connectors' && method === 'GET') {
