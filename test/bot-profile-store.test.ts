@@ -19,10 +19,10 @@ describe('bot-profile-store', () => {
     expect(getBotCapability(dataDir, 'app1')).toBeNull();
   });
 
-  it('sets and reads back a capability label', () => {
+  it('sets and reads back a capability label (one file per bot)', () => {
     setBotCapability(dataDir, 'app1', '后端 bot，擅长服务端排查');
     expect(getBotCapability(dataDir, 'app1')).toBe('后端 bot，擅长服务端排查');
-    expect(existsSync(join(dataDir, 'bot-profiles.json'))).toBe(true);
+    expect(existsSync(join(dataDir, 'bot-profiles', 'app1.json'))).toBe(true);
   });
 
   it('trims and caps the label length', () => {
@@ -53,10 +53,20 @@ describe('bot-profile-store', () => {
     expect(all.app1.capability).toBe('A');
   });
 
-  it('persists as a flat JSON object', () => {
-    setBotCapability(dataDir, 'app1', 'hi');
-    const raw = JSON.parse(readFileSync(join(dataDir, 'bot-profiles.json'), 'utf-8'));
-    expect(raw.app1.capability).toBe('hi');
-    expect(typeof raw.app1.updatedAt).toBe('number');
+  it('persists one JSON file per bot', () => {
+    setBotCapability(dataDir, 'app1', 'hi', 'ou_caller');
+    const raw = JSON.parse(readFileSync(join(dataDir, 'bot-profiles', 'app1.json'), 'utf-8'));
+    expect(raw.capability).toBe('hi');
+    expect(typeof raw.updatedAt).toBe('number');
+    expect(raw.updatedBy).toBe('ou_caller');
+  });
+
+  it('concurrent writes to different bots do not lose updates', () => {
+    // Each bot owns its own file → no shared read-modify-write window.
+    setBotCapability(dataDir, 'app1', 'A');
+    setBotCapability(dataDir, 'app2', 'B');
+    setBotCapability(dataDir, 'app3', 'C');
+    const all = listBotProfiles(dataDir);
+    expect(Object.keys(all).sort()).toEqual(['app1', 'app2', 'app3']);
   });
 });

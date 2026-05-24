@@ -187,6 +187,7 @@ async function handleRoleCommand(
   rootId: string,
   chatId: string,
   larkAppId: string,
+  senderId: string | undefined,
   deps: CommandHandlerDeps,
 ): Promise<void> {
   const sessionReply = (rid: string, content: string, msgType?: string) =>
@@ -228,7 +229,7 @@ async function handleRoleCommand(
     if (capSet) {
       const label = capSet[1].trim();
       if (!label) { await sessionReply(rootId, t('role.cap_set_empty', undefined, loc)); return; }
-      setBotCapability(dataDir, larkAppId, label);
+      setBotCapability(dataDir, larkAppId, label, senderId);
       await sessionReply(rootId, t('role.cap_saved', { cap: getBotCapability(dataDir, larkAppId) ?? label }, loc));
       return;
     }
@@ -687,7 +688,7 @@ export async function handleCommand(
           break;
         }
         const roleArgs = message.content.replace(/^\/role\s*/, '');
-        await handleRoleCommand(roleArgs, rootId, chatId, larkAppId, deps);
+        await handleRoleCommand(roleArgs, rootId, chatId, larkAppId, message.senderId, deps);
         logger.info(`[${logTag}] Role command handled`);
         break;
       }

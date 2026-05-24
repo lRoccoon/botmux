@@ -140,12 +140,15 @@ export async function getAvailableBots(
   chatId: string,
 ): Promise<Array<{ name: string; displayName: string; openId: string }>> {
   try {
-    const currentBot = getBot(currentAppId);
-    const myCliId = currentBot.config.cliId;
     const chatBots = await listChatBotMembers(currentAppId, chatId);
 
     return chatBots
-      .filter(b => b.name !== myCliId)
+      // Exclude self by larkAppId — NOT by cliId, since two bots can share a
+      // cliId (e.g. both run "codex") and a name-based check would wrongly drop
+      // a same-cliId peer. Only surface bots we can RELIABLY @-mention from
+      // here: an unreliable open_id (peer self-view / appId fallback) would make
+      // the model's `botmux send --mention <open_id>` miss its target.
+      .filter(b => b.larkAppId !== currentAppId && b.mentionable)
       .map(b => ({
         name: b.name,
         displayName: b.displayName,

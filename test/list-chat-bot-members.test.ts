@@ -99,6 +99,33 @@ describe('listChatBotMembers', () => {
     expect(peer.mentionSource).toBe('self');
   });
 
+  it('upgrades a configured peer (no cross-ref) in place using an observed same-name handle', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf', cliId: 'codex' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_self_view', botName: 'BotPeer', cliId: 'codex' },
+    ]));
+    // cli_self cross-ref knows only itself → peer would be 'self' (unreliable)
+    writeFileSync(join(state.dataDir, 'bot-openids-cli_self.json'), JSON.stringify({ 'BotSelf': 'ou_self' }));
+    // But /introduce recorded BotPeer's open_id from cli_self's perspective
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      'ou_peer_seen_by_self': { name: 'BotPeer', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    const peers = bots.filter(b => b.displayName === 'BotPeer');
+    expect(peers).toHaveLength(1);                       // upgraded in place, NOT duplicated
+    expect(peers[0].larkAppId).toBe('cli_peer');         // kept managed identity
+    expect(peers[0].openId).toBe('ou_peer_seen_by_self'); // adopted the reliable handle
+    expect(peers[0].mentionable).toBe(true);
+    expect(peers[0].mentionSource).toBe('observed');
+    // no external duplicate row for the same handle
+    expect(bots.filter(b => b.openId === 'ou_peer_seen_by_self' && b.larkAppId === '')).toHaveLength(0);
+  });
+
   it('includes observed bots from observed-bots-<larkAppId>-<chatId>.json with source="introduce"', async () => {
     state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
     writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
