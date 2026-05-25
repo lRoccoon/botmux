@@ -444,6 +444,32 @@ export function validateLoopBlocks(def: WorkflowDefinition): Set<string> {
         `Loop '${nodeId}' terminate.node '${termId}' must be a decision node (got '${termNode?.type ?? 'undefined'}')`,
       );
     }
+    // Each loop body must contain exactly one decision node, and (by
+    // construction since terminate.node is verified to be a decision in
+    // the body above) it must equal terminate.node.
+    //
+    // Why: `wait.ts` decision-mode treats *any* decision-typed node's
+    // reject as a structured `activitySucceeded { resolution: 'rejected' }`
+    // blob, regardless of terminator status (the dispatcher has no
+    // terminator-vs-non-terminator distinction at resolve time).  So if
+    // a body has two decisions, the non-terminator one's reject would
+    // silently "succeed" and the body would continue past a rejection
+    // the author intended to terminate the loop.  Force authors to use
+    // a regular `subagent + humanGate` for intermediate approvals — only
+    // the terminator slot is allowed to be a decision.
+    const decisionsInBody = node.body.filter(
+      (id) => def.nodes[id]?.type === 'decision',
+    );
+    if (decisionsInBody.length !== 1) {
+      throw new Error(
+        `Loop '${nodeId}' body must contain exactly one decision node ` +
+        `(got ${decisionsInBody.length}: [${decisionsInBody.join(', ')}]) — ` +
+        `decision nodes are the loop terminator slot; a non-terminator ` +
+        `decision's reject would be silently treated as success by ` +
+        `wait.ts decision-mode, letting the body continue past the rejection. ` +
+        `Use a regular subagent + humanGate for intermediate approvals.`,
+      );
+    }
     // output.from (if declared) must be a body node and not the terminator.
     if (node.output) {
       if (!node.body.includes(node.output.from)) {

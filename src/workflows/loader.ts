@@ -6,6 +6,7 @@ import {
   type WorkflowDefinition,
 } from './definition.js';
 import { ensureRunDir } from './runs-dir.js';
+import { logger } from '../utils/logger.js';
 
 export type RunChatBinding = {
   chatId: string;
@@ -64,16 +65,26 @@ export async function snapshotWorkflowDefinition(
  *
  * Returns null when the snapshot is missing or unreadable — callers can
  * still operate (e.g. resolveWait without ctx.def degrades to v0.1
- * approve/reject semantics).  Logged failures are intentional silent here;
- * callers can choose to surface or fall back.
+ * approve/reject semantics).  The fallback is the *intended* design, but
+ * we log non-ENOENT failures so an unexpected parse/IO error doesn't go
+ * silently null and confuse debugging (ENOENT stays silent — missing
+ * snapshot is a normal state for legacy v0.1 runs that predate this file).
  */
 export async function readWorkflowDefinitionFromRunDir(
   runDir: string,
 ): Promise<WorkflowDefinition | null> {
+  const path = join(runDir, 'workflow.json');
   try {
-    const raw = await fs.readFile(join(runDir, 'workflow.json'), 'utf-8');
+    const raw = await fs.readFile(path, 'utf-8');
     return parseWorkflowDefinition(JSON.parse(raw));
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      logger.warn?.(
+        `readWorkflowDefinitionFromRunDir: ${path} unreadable — caller falls back to v0.1 wait semantics: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     return null;
   }
 }

@@ -760,6 +760,48 @@ describe('loop sink + decision-timeout validation (PR #47 round 2)', () => {
   });
 });
 
+// External-reviewer PR #47 round-3 finding: non-terminator decisions in
+// the body would be schema-legal but `wait.ts` decision-mode treats *any*
+// decision-typed node's reject as `activitySucceeded`, so the body would
+// silently continue past a "reject" the author intended to terminate the
+// loop.  validateLoopBlocks now enforces "exactly one decision per body,
+// which must equal terminate.node".
+describe('loop body single-decision enforcement (PR #47 round 3)', () => {
+  it('rejects body with two decision nodes (non-terminator silently swallows reject)', () => {
+    const raw = loopFixture();
+    // Inject a second decision node BEFORE the terminator.
+    raw.nodes.preDecision = {
+      type: 'decision',
+      depends: ['implement'],
+      humanGate: { stage: 'before', prompt: 'gate before review?' },
+    };
+    raw.nodes.review.depends = ['preDecision'];
+    raw.nodes['review-loop'].body = ['implement', 'preDecision', 'review', 'reviewDecision'];
+    expect(() => parseWorkflowDefinition(raw)).toThrow(
+      /Loop 'review-loop' body must contain exactly one decision node.*preDecision.*reviewDecision/s,
+    );
+  });
+
+  it('accepts body with exactly one decision == terminate.node (baseline)', () => {
+    const raw = loopFixture();
+    expect(() => parseWorkflowDefinition(raw)).not.toThrow();
+  });
+
+  it('error message points authors at subagent + humanGate for intermediate approvals', () => {
+    const raw = loopFixture();
+    raw.nodes.preDecision = {
+      type: 'decision',
+      depends: ['implement'],
+      humanGate: { stage: 'before', prompt: 'gate?' },
+    };
+    raw.nodes.review.depends = ['preDecision'];
+    raw.nodes['review-loop'].body = ['implement', 'preDecision', 'review', 'reviewDecision'];
+    expect(() => parseWorkflowDefinition(raw)).toThrow(
+      /subagent \+ humanGate for intermediate approvals/,
+    );
+  });
+});
+
 describe('validateLoopBlocks direct (returns body set)', () => {
   it('returns body-node set for downstream use', () => {
     const def = parseWorkflowDefinition(loopFixture());
