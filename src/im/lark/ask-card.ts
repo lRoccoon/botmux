@@ -8,12 +8,20 @@ import { tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
 
+/** 旧单选即答动作（保留兼容旧卡片回调；Task 5 新增 ask_submit 路径）。 */
 export const ASK_SELECT_ACTION = 'ask_select';
+
+/** 新多问 Submit 动作（form 内提交按钮携带此 action）。 */
+export const ASK_SUBMIT_ACTION = 'ask_submit';
+
+/** form 名称常量，与 workflow-cards.ts 形式对齐。 */
+const ASK_FORM_NAME = 'ask_form';
 
 export interface AskCardActionData {
   operator?: { open_id?: string };
   action?: {
     value?: Record<string, unknown>;
+    form_value?: Record<string, unknown>;
   };
 }
 
@@ -54,79 +62,115 @@ export function createLarkAskCardDispatcher(
 }
 
 export function isAskCardAction(action?: string): boolean {
-  return action === ASK_SELECT_ACTION;
+  return action === ASK_SELECT_ACTION || action === ASK_SUBMIT_ACTION;
 }
 
 export function handleAskCardAction(data: AskCardActionData): { toast: { type: string; content: string } } | undefined {
   const value = data.action?.value;
-  if (!isAskCardAction(asString(value?.action))) return undefined;
+  const action = asString(value?.action);
+  if (!isAskCardAction(action)) return undefined;
 
   const askId = asString(value?.ask_id);
   const nonce = asString(value?.nonce);
-  const selected = asString(value?.key);
   const by = data.operator?.open_id;
-  if (!askId || !nonce || !selected || !by) {
+  if (!askId || !nonce || !by) {
     return staleToast();
   }
 
-  return toastForOutcome(tryResolveAsk({ askId, nonce, selected, by }));
+  // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）
+  if (action === ASK_SELECT_ACTION) {
+    const selected = asString(value?.key);
+    if (!selected) return staleToast();
+    return toastForOutcome(tryResolveAsk({ askId, nonce, selected, by }));
+  }
+
+  // 新 Submit 路径（Task 5 会完整实现）：暂返回 stale，避免未处理静默忽略
+  return staleToast();
 }
 
+/**
+ * 构建 ask 卡片 JSON 字符串。
+ *
+ * 未 settle 时：将所有问题包在一个 form 内，每问渲染标题 div + 下拉选择组件，
+ * 最后附一个 `action_type:'form_submit'` 的提交按钮。
+ * 单选问题用 `select_static`，多选问题用 `multi_select_static`。
+ *
+ * 已 settle 时：渲染状态摘要，展示每问的选中标签（answered），或超时/失效信息。
+ */
 export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
-  const prompt = truncate(ask.prompt, 512);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask) : undefined;
-  const elements: Array<Record<string, unknown>> = [
-    {
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: `**问题**\n${escapeMd(prompt)}`,
-      },
-    },
-    {
-      tag: 'div',
-      fields: [
-        { is_short: true, text: { tag: 'lark_md', content: `**截止**\n${escapeMd(deadline)}` } },
-        { is_short: true, text: { tag: 'lark_md', content: `**可答复**\n${escapeMd(approverSummary(ask))}` } },
-      ],
-    },
-  ];
+
+  // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示）
+  const metaDiv = {
+    tag: 'div',
+    fields: [
+      { is_short: true, text: { tag: 'lark_md', content: `**截止**\n${escapeMd(deadline)}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**可答复**\n${escapeMd(approverSummary(ask))}` } },
+    ],
+  };
+
+  const elements: Array<Record<string, unknown>> = [metaDiv];
 
   if (status) {
+    // 已 settle：展示状态摘要，无可交互组件
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
       text: { tag: 'lark_md', content: status },
     });
   } else {
+    // 未 settle：多问 form，每问一个标题 div + 选择组件，最后一个 Submit 按钮
     elements.push({ tag: 'hr' });
-    for (const row of chunk(ask.options, 4)) {
-      elements.push({
-        tag: 'column_set',
-        flex_mode: 'none',
-        horizontal_spacing: 'default',
-        columns: row.map((option) => ({
-          tag: 'column',
-          width: 'weighted',
-          weight: 1,
-          vertical_align: 'center',
-          elements: [
-            {
-              tag: 'button',
-              text: { tag: 'plain_text', content: option.label },
-              type: 'primary',
-              value: {
-                action: ASK_SELECT_ACTION,
-                ask_id: ask.askId,
-                nonce: ask.nonce,
-                key: option.key,
-              },
-            },
-          ],
+
+    // form 内的元素列表
+    const formElements: Array<Record<string, unknown>> = [];
+
+    for (let i = 0; i < ask.questions.length; i++) {
+      const q = ask.questions[i]!;
+
+      // 问题标题
+      formElements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `**问题 ${i + 1}**\n${escapeMd(truncate(q.prompt, 512))}`,
+        },
+      });
+
+      // 选项组件：单选 select_static / 多选 multi_select_static
+      const selectTag = q.multiSelect ? 'multi_select_static' : 'select_static';
+      const placeholder = q.multiSelect ? '可多选' : '请选择';
+      formElements.push({
+        tag: selectTag,
+        name: `q${i}`,
+        placeholder: { tag: 'plain_text', content: placeholder },
+        options: q.options.map((opt) => ({
+          text: { tag: 'plain_text', content: opt.label },
+          // value 编码 questionIndex::key，供 handler 解析
+          value: `${i}::${opt.key}`,
         })),
       });
     }
+
+    // Submit 按钮，放在 form 内，`action_type:'form_submit'` 与 workflow-cards.ts 完全一致
+    formElements.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '提交' },
+      type: 'primary',
+      action_type: 'form_submit',
+      value: {
+        action: ASK_SUBMIT_ACTION,
+        ask_id: ask.askId,
+        nonce: ask.nonce,
+      },
+    });
+
+    elements.push({
+      tag: 'form',
+      name: ASK_FORM_NAME,
+      elements: formElements,
+    });
   }
 
   return JSON.stringify({
@@ -149,6 +193,9 @@ function toastForOutcome(outcome: AskClickOutcome): { toast: { type: string; con
       return { toast: { type: 'info', content: '这个 ask 已经被回答或结束' } };
     case 'stale':
       return staleToast();
+    case 'toggled':
+      // 累积勾选，不弹 toast
+      return undefined;
   }
 }
 
@@ -156,10 +203,23 @@ function staleToast(): { toast: { type: string; content: string } } {
   return { toast: { type: 'warning', content: '⚠️ 此 ask 已失效' } };
 }
 
+/**
+ * 生成已结束状态的摘要文本。
+ *
+ * answered：遍历每个问题，把选中的 key 映射为 label 并渲染。
+ * timedOut / invalidated：展示对应说明。
+ */
 function settleStatus(result: AskResult, ask: PendingAsk): string {
   if (result.kind === 'answered') {
-    const label = ask.options.find((o) => o.key === result.selected)?.label ?? result.selected;
-    return `**已选择：${escapeMd(label)}**\n操作人：${escapeMd(short(result.by, 28))}`;
+    // 每问一行：问题N：<选中标签>
+    const lines = result.answers.map((keys, i) => {
+      const q = ask.questions[i];
+      if (!q) return `问题${i + 1}：（无法解析）`;
+      const labels = keys.map((key) => q.options.find((o) => o.key === key)?.label ?? key);
+      return `问题${i + 1}：${labels.join(', ')}`;
+    });
+    const summary = lines.join('\n');
+    return `**已选择**\n${escapeMd(summary)}\n操作人：${escapeMd(short(result.by, 28))}`;
   }
   if (result.kind === 'timedOut') {
     return '**超时未答**';
@@ -180,12 +240,6 @@ function approverSummary(ask: PendingAsk): string {
   const values = [...ask.approvers].map((id) => short(id, 18));
   if (values.length <= 3) return values.join(', ');
   return `${values.slice(0, 3).join(', ')} +${values.length - 3}`;
-}
-
-function chunk<T>(values: ReadonlyArray<T>, size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < values.length; i += size) out.push(values.slice(i, i + size));
-  return out;
 }
 
 function asString(value: unknown): string | undefined {
