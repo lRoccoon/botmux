@@ -233,7 +233,11 @@ export async function handleWorkflowApi(
   }
 
   // ─── Attempt raw terminal.log ──────────────────────────────────────────────
-  // Public-read (under decideDashboardAuth's `GET /api/workflows/*` allowlist).
+  // Cookie-auth only (carved OUT of `decideDashboardAuth`'s
+  // `GET /api/workflows/*` public-read allowlist by `b5d23a6` — raw PTY +
+  // diagnostic streams can leak API keys / env / tokens; `/snapshot`'s
+  // log preview is scrubbed under the same posture via
+  // `scrubSnapshotForUnauthed`).
   // Streams `runs/<runId>/attempts/<activityId>/<attemptId>/terminal.log` for
   // the dashboard replay viewer.  Default behavior tails the last 10 MB; pass
   // `?tailBytes=N` to widen the window (capped at MAX_TAIL_BYTES) or
