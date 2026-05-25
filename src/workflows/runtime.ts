@@ -42,13 +42,14 @@ import type {
   RunSucceededEvent,
   WaitCreatedEvent,
 } from './events/types.js';
-import type {
-  CompleteNodeFailedAction,
-  CompleteNodeSucceededAction,
-  CompleteRunFailedAction,
-  CompleteRunSucceededAction,
-  DispatchGateAction,
-  DispatchWorkAction,
+import {
+  parseActivityId,
+  type CompleteNodeFailedAction,
+  type CompleteNodeSucceededAction,
+  type CompleteRunFailedAction,
+  type CompleteRunSucceededAction,
+  type DispatchGateAction,
+  type DispatchWorkAction,
 } from './orchestrator.js';
 import { createWait } from './wait.js';
 import { executeSideEffect } from './hostExecutors/protocol.js';
@@ -254,8 +255,19 @@ async function resolveWorkflowIdentity(
 function bindingContext(
   ctx: WorkflowRuntimeContext,
   snapshot: Snapshot,
+  activityId?: string,
 ): BindingContext {
   let paramsPromise: Promise<Record<string, unknown>> | undefined;
+  // Loop body nodes need their iteration coordinates surfaced to the
+  // binder so `${node.previous.x}` resolves against the prior iteration.
+  // Caller dispatch sites (dispatchWork / dispatchHumanGate / hostExecutor
+  // path) pass `action.activityId`; parseActivityId picks loop kind and
+  // we forward { loopId, iteration }.  Plain activityIds leave
+  // loopContext undefined and `.previous.` still fails-loud as designed.
+  const parsed = activityId ? parseActivityId(activityId) : undefined;
+  const loopContext = parsed?.kind === 'loop'
+    ? { loopId: parsed.loopId, iteration: parsed.iteration }
+    : undefined;
   return {
     snapshot,
     def: ctx.def,
@@ -264,6 +276,7 @@ function bindingContext(
       paramsPromise ??= loadRunParamsFromSnapshot(snapshot);
       return paramsPromise;
     },
+    loopContext,
   };
 }
 
@@ -372,7 +385,7 @@ export async function dispatchGate(
   try {
     resolvedPrompt = await resolveBoundString(
       action.humanGate.prompt,
-      bindingContext(ctx, options.snapshot ?? replay(await ctx.log.readAll())),
+      bindingContext(ctx, options.snapshot ?? replay(await ctx.log.readAll()), action.activityId),
     );
   } catch (err) {
     if (err instanceof BindingError) {
@@ -546,6 +559,7 @@ export async function dispatchWork(
   const bindingCtx = bindingContext(
     ctx,
     options.snapshot ?? replay(await ctx.log.readAll()),
+    action.activityId,
   );
 
   if (node.type === 'loop' || node.type === 'decision') {

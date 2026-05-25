@@ -502,3 +502,95 @@ describe('runLoop — output projection (N4)', () => {
     expect(projectedOutput?.outputHash).toBe(implementOut?.outputHash);
   });
 });
+
+// ─── body-node prompt resolves ${decision.previous.x} per iteration ───────
+//
+// Regression for bindingContext.loopContext omission discovered during
+// the first dogfood run on feat/workflow-loop-v02: dispatchWork built
+// BindingContext without loopContext, so any loop body node referencing
+// `${decisionNode.previous.x}` (string template) fail-bound with
+// "outside a loop iteration context" — even on iteration 1 where the
+// designed behaviour is "missing previous → empty string".
+//
+// This test pins dispatchWork's binding to actually receive
+// { loopId, iteration } from action.activityId.
+
+describe('runLoop — body node binding sees iteration context', () => {
+  it('implement prompt resolves ${reviewDecision.previous.comment} per iteration', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'code-review-loop-binding',
+      version: 1,
+      nodes: {
+        implement: {
+          type: 'subagent',
+          bot: 'cli_a',
+          // Iteration 1: empty replacement (no previous).
+          // Iteration 2+: prior reviewDecision.comment substituted.
+          prompt: 'do task | feedback=${reviewDecision.previous.comment}',
+        },
+        review: {
+          type: 'subagent',
+          bot: 'cli_b',
+          depends: ['implement'],
+          prompt: 'review',
+        },
+        reviewDecision: {
+          type: 'decision',
+          depends: ['review'],
+          humanGate: { stage: 'before', prompt: 'approve?' },
+        },
+        'review-loop': {
+          type: 'loop',
+          maxIterations: 3,
+          body: ['implement', 'review', 'reviewDecision'],
+          terminate: { node: 'reviewDecision', via: 'humanGate' },
+          output: { from: 'implement' },
+        },
+      },
+    });
+
+    const capturedPrompts: Array<{ activityId: string; prompt: string }> = [];
+    const captureSpawn: WorkerSpawnFn = async (input) => {
+      capturedPrompts.push({ activityId: input.activityId, prompt: input.prompt });
+      return {
+        kind: 'success',
+        output: { ok: true },
+        session: {
+          sessionId: `s-${input.activityId}`,
+          botName: input.botName,
+          startedAt: 0,
+        },
+      };
+    };
+
+    const { log, ctx } = await bootstrap(def, captureSpawn);
+    await runLoop(ctx);
+
+    // Iteration 1 implement: previous lookup yields "" (first iteration grace).
+    const iter1Impl = capturedPrompts.find((p) =>
+      p.activityId === loopWorkActivityId(RUN_ID, 'review-loop', 1, 'implement'),
+    );
+    expect(iter1Impl).toBeDefined();
+    expect(iter1Impl?.prompt).toBe('do task | feedback=');
+
+    // Reject iter 1 with a specific comment.
+    await resolveDecision(
+      log,
+      def,
+      'review-loop',
+      1,
+      'reviewDecision',
+      'rejected',
+      'ou_reviewer',
+      'add error handling',
+    );
+    await runLoop(ctx);
+
+    // Iteration 2 implement: prompt must carry the prior reject comment.
+    const iter2Impl = capturedPrompts.find((p) =>
+      p.activityId === loopWorkActivityId(RUN_ID, 'review-loop', 2, 'implement'),
+    );
+    expect(iter2Impl).toBeDefined();
+    expect(iter2Impl?.prompt).toBe('do task | feedback=add error handling');
+  });
+});
