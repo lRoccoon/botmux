@@ -3217,6 +3217,67 @@ botmux create-group — 用一组机器人新建飞书群
 // process unblocks with the selected key (or exit 124 on timeout, exit 3 if
 // the daemon dies). See /tmp/botmux-ask.md (or design memory).
 
+/**
+ * postAsk: 找到 daemon → POST /api/asks → 返回 AskResult。
+ * 连接失败 / HTTP 错误时抛出带 exitCode 属性的 Error：
+ *   - exitCode=3：daemon 不可达或 HTTP 非 400
+ *   - exitCode=2：400 + no_approvers
+ */
+async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
+  type AskResult = import('./core/ask-types.js').AskResult;
+
+  const larkAppId = body.larkAppId as string;
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) {
+    const err = new Error(
+      `botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`,
+    ) as Error & { exitCode: number };
+    err.exitCode = 3;
+    throw err;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      // No client-side timeout — broker enforces `timeoutMs` and will respond
+      // with `kind:'timedOut'` so this fetch always settles.
+    });
+  } catch (fetchErr) {
+    const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+    const err = new Error(
+      `botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`,
+    ) as Error & { exitCode: number };
+    err.exitCode = 3;
+    throw err;
+  }
+
+  if (!res.ok) {
+    let errBody = '';
+    try { errBody = (await res.text()).slice(0, 200); } catch { /* */ }
+    if (res.status === 400 && /no_approvers/.test(errBody)) {
+      const err = new Error(
+        'botmux ask: 当前会话没有可批准者（session.owner 不在 bot.allowedUsers 里，且 --approver 未指定）',
+      ) as Error & { exitCode: number };
+      err.exitCode = 2;
+      throw err;
+    }
+    const err = new Error(`botmux ask: daemon HTTP ${res.status}: ${errBody}`) as Error & { exitCode: number };
+    err.exitCode = 3;
+    throw err;
+  }
+
+  try {
+    return (await res.json()) as AskResult;
+  } catch (jsonErr) {
+    const err = new Error(`botmux ask: daemon 返回非 JSON: ${jsonErr}`) as Error & { exitCode: number };
+    err.exitCode = 3;
+    throw err;
+  }
+}
+
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
   // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
@@ -3246,8 +3307,8 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 
   const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
     await import('./core/ask-args.js');
-  type AskResult = import('./core/ask-types.js').AskResult;
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
+  const { toLegacySelected } = await import('./core/ask-types.js');
 
   const missing = findMissingAskEnv(process.env);
   if (missing) {
@@ -3286,14 +3347,6 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   }
 
   const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
-  const daemon = findDaemon(larkAppId);
-  if (!daemon) {
-    console.error(
-      `botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`,
-    );
-    process.exit(3);
-  }
-
   const body = {
     sessionId: process.env.BOTMUX_SESSION_ID!,
     chatId: process.env.BOTMUX_CHAT_ID!,
@@ -3305,52 +3358,30 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     approvers: approverArgs,
   };
 
-  let res: Response;
+  let result;
   try {
-    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      // No client-side timeout — broker enforces `timeoutMs` and will respond
-      // with `kind:'timedOut'` so this fetch always settles.
-    });
+    result = await postAsk(body);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`);
-    process.exit(3);
+    const code = (err as any).exitCode ?? 3;
+    console.error((err as Error).message);
+    process.exit(code);
   }
 
-  if (!res.ok) {
-    let errBody = '';
-    try { errBody = (await res.text()).slice(0, 200); } catch { /* */ }
-    if (res.status === 400 && /no_approvers/.test(errBody)) {
-      console.error(
-        'botmux ask: 当前会话没有可批准者（session.owner 不在 bot.allowedUsers 里，且 --approver 未指定）',
-      );
-      process.exit(2);
-    }
-    console.error(`botmux ask: daemon HTTP ${res.status}: ${errBody}`);
-    process.exit(3);
-  }
-
-  let result: AskResult;
-  try {
-    result = (await res.json()) as AskResult;
-  } catch (err) {
-    console.error(`botmux ask: daemon 返回非 JSON: ${err}`);
-    process.exit(3);
-  }
+  // result.kind==='answered' 时用 toLegacySelected 取回旧的 string（单问单选）
+  const selected = toLegacySelected(result);
 
   if (useJson) {
     const out: AskJsonOutput = {
-      selected: result.kind === 'answered' ? result.selected : null,
+      selected,
+      answers: result.kind === 'answered' ? (result.answers as string[][]) : null,
       by: result.kind === 'answered' ? result.by : null,
       comment: null,
       timedOut: result.kind === 'timedOut',
     };
     process.stdout.write(JSON.stringify(out) + '\n');
   } else if (result.kind === 'answered') {
-    process.stdout.write(result.selected + '\n');
+    // 非 JSON 模式：输出 selected key（单问单选），多选/多问输出空字符串
+    process.stdout.write((selected ?? '') + '\n');
   }
 
   switch (result.kind) {
@@ -3363,6 +3394,134 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       console.error(`botmux ask: 已失效 (${result.reason})`);
       process.exit(3);
   }
+}
+
+// ─── botmux hook <cliId> ──────────────────────────────────────────────────────
+//
+// hook 模式：各 CLI hook 配置调用 `botmux hook <cliId>`，stdin 注入 hook payload，
+// 本命令解析问题 → POST /api/asks → 等结果 → 写 directive 到 stdout。
+// 任何失败（daemon 不可达、env 缺失、解析错误）均输出 passthrough directive 并 exit 0，
+// 绝不挂死，保证 CLI 可以继续原生终端提问。
+
+/**
+ * runHook: hook 命令的纯业务逻辑，接受已解析的 payload/env/postAskFn，
+ * 返回应写到 stdout 的字符串。通过依赖注入使单元测试无需真实 daemon/env。
+ *
+ * @param payload   已经 JSON.parse 的 hook payload 对象
+ * @param env       包含 BOTMUX_* 环境变量的字典
+ * @param postAskFn 替代真实 postAsk 的可注入函数（测试用）
+ * @returns         { stdout: string } 应写到 stdout 的内容
+ */
+export async function runHook(
+  payload: unknown,
+  env: Record<string, string | undefined>,
+  postAskFn: (body: Record<string, unknown>) => Promise<import('./core/ask-types.js').AskResult>,
+  cliId: string,
+): Promise<{ stdout: string }> {
+  const { getHookAdapter } = await import('./core/ask-hook/registry.js');
+
+  // 未知 cliId → 无 adapter，输出空字符串静默放行
+  const adapter = getHookAdapter(cliId);
+  if (!adapter) {
+    return { stdout: '' };
+  }
+
+  // Workflow-subagent 安全门：workflow 子 agent 内直接 passthrough
+  if (env.BOTMUX_WORKFLOW === '1') {
+    return { stdout: adapter.passthrough(payload) };
+  }
+
+  // 解析问题：非 askUserQuestion 类事件 → passthrough 放行
+  const parsed = adapter.parseQuestions(payload);
+  if (!parsed) {
+    return { stdout: adapter.passthrough(payload) };
+  }
+
+  // 检查必需的 BOTMUX_* env
+  const sessionId = env.BOTMUX_SESSION_ID;
+  const chatId = env.BOTMUX_CHAT_ID;
+  const larkAppId = env.BOTMUX_LARK_APP_ID;
+  if (!sessionId || !chatId || !larkAppId) {
+    // 非 botmux 会话（env 缺失），passthrough 放行
+    return { stdout: adapter.passthrough(payload) };
+  }
+
+  // 解析 timeoutMs：默认 1 小时，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖
+  const DEFAULT_TIMEOUT_MS = 3_600_000;
+  let timeoutMs = DEFAULT_TIMEOUT_MS;
+  const timeoutEnv = env.BOTMUX_ASK_TIMEOUT_MS;
+  if (timeoutEnv) {
+    const parsed_timeout = parseInt(timeoutEnv, 10);
+    if (Number.isInteger(parsed_timeout) && parsed_timeout > 0) {
+      timeoutMs = parsed_timeout;
+    }
+  }
+
+  const body: Record<string, unknown> = {
+    sessionId,
+    chatId,
+    larkAppId,
+    rootMessageId: env.BOTMUX_ROOT_MESSAGE_ID || null,
+    questions: parsed.questions,
+    timeoutMs,
+    approvers: [],
+  };
+
+  let result: import('./core/ask-types.js').AskResult;
+  try {
+    result = await postAskFn(body);
+  } catch {
+    // 任何失败（daemon 不可达、HTTP 错误等）→ passthrough 放行
+    return { stdout: adapter.passthrough(payload) };
+  }
+
+  if (result.kind === 'answered') {
+    return { stdout: adapter.formatAnswer(result.answers, parsed) };
+  }
+
+  // timedOut / invalidated → passthrough 放行
+  return { stdout: adapter.passthrough(payload) };
+}
+
+/**
+ * cmdHook: `botmux hook <cliId>` 入口。
+ * 读取 stdin 全文 → JSON.parse → runHook → 写 stdout，exit 0。
+ */
+async function cmdHook(cliId: string): Promise<void> {
+  // 读取 stdin 全文
+  let stdinText = '';
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    stdinText = Buffer.concat(chunks).toString('utf-8');
+  } catch {
+    // stdin 读取失败 → 无法处理，静默退出
+    process.exit(0);
+  }
+
+  // JSON.parse 失败 → 输出空并退出（不挂死）
+  let payload: unknown;
+  try {
+    payload = JSON.parse(stdinText);
+  } catch {
+    process.exit(0);
+  }
+
+  const { getHookAdapter } = await import('./core/ask-hook/registry.js');
+  const adapter = getHookAdapter(cliId);
+  // 未知 cliId → 静默放行
+  if (!adapter) {
+    process.exit(0);
+  }
+
+  const env = process.env as Record<string, string | undefined>;
+  const result = await runHook(payload, env, postAsk, cliId);
+  if (result.stdout) {
+    console.log(result.stdout);
+  }
+  process.exit(0);
 }
 
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
@@ -3575,6 +3734,12 @@ switch (command) {
     const { normalizeAskDispatch } = await import('./core/ask-args.js');
     const { sub, rest } = normalizeAskDispatch(process.argv.slice(3));
     await cmdAsk(sub, rest);
+    break;
+  }
+  case 'hook': {
+    // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
+    const cliId = process.argv[3] ?? '';
+    await cmdHook(cliId);
     break;
   }
   case 'workflow': {
