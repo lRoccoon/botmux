@@ -41,8 +41,14 @@ export function createLarkAskCardDispatcher(
   return {
     async send(ask) {
       const cardJson = buildAskCard(ask);
-      const messageId = ask.rootMessageId
-        ? await reply(ask.larkAppId, ask.rootMessageId, cardJson, 'interactive', true)
+      // botmux 把 chat-scope session 的 routing anchor 也叫 rootMessageId,
+      // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
+      // 飞书 /messages/{id}/reply 只接受 om_ — 用 oc_ 会 400 invalid message_id.
+      // 所以这里要按前缀判断是否真的能 reply.
+      const canReplyToRoot =
+        typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_');
+      const messageId = canReplyToRoot
+        ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true)
         : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive');
       return { messageId };
     },
