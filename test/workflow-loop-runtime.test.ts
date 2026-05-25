@@ -593,4 +593,76 @@ describe('runLoop — body node binding sees iteration context', () => {
     expect(iter2Impl).toBeDefined();
     expect(iter2Impl?.prompt).toBe('do task | feedback=add error handling');
   });
+
+  // Regression for codex PR #47 review medium: when reviewer rejects without
+  // filling a comment, wait.ts succeeded output must still materialize the
+  // `comment` field (as '') so iter N+1's ${reviewDecision.previous.comment}
+  // doesn't BindingError on own-property check.
+  it('decision reject without comment → previous.comment renders as ""', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'code-review-loop-empty-comment',
+      version: 1,
+      nodes: {
+        implement: {
+          type: 'subagent',
+          bot: 'cli_a',
+          prompt: 'do task | feedback=${reviewDecision.previous.comment}',
+        },
+        review: {
+          type: 'subagent',
+          bot: 'cli_b',
+          depends: ['implement'],
+          prompt: 'review',
+        },
+        reviewDecision: {
+          type: 'decision',
+          depends: ['review'],
+          humanGate: { stage: 'before', prompt: 'approve?' },
+        },
+        'review-loop': {
+          type: 'loop',
+          maxIterations: 3,
+          body: ['implement', 'review', 'reviewDecision'],
+          terminate: { node: 'reviewDecision', via: 'humanGate' },
+          output: { from: 'implement' },
+        },
+      },
+    });
+
+    const capturedPrompts: Array<{ activityId: string; prompt: string }> = [];
+    const captureSpawn: WorkerSpawnFn = async (input) => {
+      capturedPrompts.push({ activityId: input.activityId, prompt: input.prompt });
+      return {
+        kind: 'success',
+        output: { ok: true },
+        session: {
+          sessionId: `s-${input.activityId}`,
+          botName: input.botName,
+          startedAt: 0,
+        },
+      };
+    };
+
+    const { log, ctx } = await bootstrap(def, captureSpawn);
+    await runLoop(ctx);
+
+    // Reject iter 1 WITHOUT a comment.
+    await resolveDecision(
+      log,
+      def,
+      'review-loop',
+      1,
+      'reviewDecision',
+      'rejected',
+      'ou_reviewer',
+      undefined,
+    );
+    await runLoop(ctx);
+
+    const iter2Impl = capturedPrompts.find((p) =>
+      p.activityId === loopWorkActivityId(RUN_ID, 'review-loop', 2, 'implement'),
+    );
+    expect(iter2Impl).toBeDefined();
+    expect(iter2Impl?.prompt).toBe('do task | feedback=');
+  });
 });

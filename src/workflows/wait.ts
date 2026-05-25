@@ -221,7 +221,11 @@ export async function resolveWait(
             externalRefs: {
               resolution: input.resolution,
               by: input.by,
-              ...(input.comment ? { comment: input.comment } : {}),
+              // Always materialize `comment` (empty string when missing) so
+              // downstream `${node.output.comment}` / `${node.previous.comment}`
+              // bindings don't hit BindingError on the natural "approve/reject
+              // without note" interaction. input.output may override.
+              comment: input.comment ?? '',
               ...(input.output ?? {}),
             },
           },
