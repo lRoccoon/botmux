@@ -56,6 +56,28 @@ export async function snapshotWorkflowDefinition(
   return path;
 }
 
+/**
+ * Load the workflow definition snapshot from a run's directory.  Each run
+ * persists `workflow.json` next to `events.ndjson` so consumers that come
+ * in via run id alone (Lark card callbacks, dashboard resolve) can recover
+ * the definition without needing the catalog (which may drift).
+ *
+ * Returns null when the snapshot is missing or unreadable — callers can
+ * still operate (e.g. resolveWait without ctx.def degrades to v0.1
+ * approve/reject semantics).  Logged failures are intentional silent here;
+ * callers can choose to surface or fall back.
+ */
+export async function readWorkflowDefinitionFromRunDir(
+  runDir: string,
+): Promise<WorkflowDefinition | null> {
+  try {
+    const raw = await fs.readFile(join(runDir, 'workflow.json'), 'utf-8');
+    return parseWorkflowDefinition(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
 export async function writeRunChatBinding(
   runId: string,
   binding: RunChatBinding,
