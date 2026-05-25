@@ -3121,6 +3121,22 @@ botmux create-group — 用一组机器人新建飞书群
 // the daemon dies). See /tmp/botmux-ask.md (or design memory).
 
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
+  // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
+  // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
+  // approvals belong in humanGate / decision nodes so the choice is part of
+  // the run's event log; an ad-hoc `botmux ask` would bypass that audit
+  // trail entirely.
+  if (process.env.BOTMUX_WORKFLOW === '1') {
+    const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
+    const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
+    console.error(
+      `botmux ask refused inside workflow subagent (run=${runId} node=${nodeId}).\n` +
+        `Workflow subagents must surface approvals via humanGate / decision nodes\n` +
+        `so the resolution is recorded in the run's event log; ask would bypass it.`,
+    );
+    process.exit(2);
+  }
+
   // Only `buttons` shipped in v0.1.7. The bare alias (`botmux ask --options`)
   // routes here with sub='' — accept it and behave identically. `ask text` /
   // `ask confirm` are reserved for later versions.
