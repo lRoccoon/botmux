@@ -2657,6 +2657,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     env: {
       ...process.env,
       CLAUDECODE: undefined,
+      // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find
+      // the daemon socket, route the card back to this thread, and resolve
+      // the approver allowlist against session.owner. Missing env → exit 2.
+      BOTMUX_SESSION_ID: cfg.sessionId,
+      BOTMUX_CHAT_ID: cfg.chatId,
+      BOTMUX_LARK_APP_ID: cfg.larkAppId,
+      BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId,
       ...(injectClaudeSandbox ? { IS_SANDBOX: '1' } : {}),
     } as unknown as Record<string, string>,
   });
