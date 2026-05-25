@@ -20,6 +20,7 @@ import {
   listRuns,
   readEventWindow,
   readRunSnapshot,
+  scrubSnapshotForUnauthed,
 } from '../src/workflows/ops-projection.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
@@ -463,6 +464,95 @@ describe('readRunSnapshot', () => {
     expect(log!.outputBytes).toBeGreaterThan(64 * 1024);
     expect(log!.text).toContain(TAIL);
     expect(log!.text).not.toContain(HEAD);
+  });
+
+  it('scrubSnapshotForUnauthed strips io.log.text + io.terminal.logPath; keeps metadata', async () => {
+    // Same seeding as the input/output preview test — gives us a snapshot
+    // with both a non-empty `io.log` and a populated `io.terminal.logPath`.
+    await seedSucceeded('r-scrub');
+    const activityId = workActivityId('r-scrub', 'only');
+    const attemptId = 'r-scrub::work::only::att-1';
+    const attemptDir = join(runsDir, 'r-scrub', 'attempts', activityId, attemptId);
+    mkdirSync(attemptDir, { recursive: true });
+    const SECRET_LINE = 'AWS_SECRET=AKIAFAKE_should_not_leak';
+    writeFileSync(
+      join(attemptDir, 'terminal.log'),
+      `[2026-05-25T00:00:00.000Z] stderr ${SECRET_LINE}\n`,
+      'utf-8',
+    );
+    writeFileSync(
+      join(attemptDir, 'terminal.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        sessionId: 'wf-r-scrub-only',
+        webPort: 32200,
+        status: 'closed',
+        cliId: 'claude-code',
+        logPath: join(attemptDir, 'terminal.log'),
+        startedAt: 100,
+        updatedAt: 200,
+      }),
+      'utf-8',
+    );
+
+    const full = await readRunSnapshot(runsDir, 'r-scrub');
+    expect(full).not.toBeNull();
+    // Authed view still gets the full log + logPath — the function only
+    // changes the view served to unauth'd public-read callers.
+    expect(full!.attemptIO[attemptId]?.log?.text).toContain(SECRET_LINE);
+    expect(full!.attemptIO[attemptId]?.terminal?.logPath).toBe(
+      join(attemptDir, 'terminal.log'),
+    );
+
+    const scrubbed = scrubSnapshotForUnauthed(full!);
+    const scrubbedLog = scrubbed.attemptIO[attemptId]?.log;
+    expect(scrubbedLog).toBeDefined();
+    expect(scrubbedLog!.text).toBeUndefined();
+    expect(scrubbedLog!.value).toBeUndefined();
+    expect(scrubbedLog!.redacted).toBe(true);
+    // Metadata stays so the dashboard can render a "log available after
+    // login (N bytes)" placeholder rather than pretending the blob doesn't
+    // exist.
+    expect(scrubbedLog!.outputBytes).toBeGreaterThan(0);
+
+    // Sibling blobs (input/output/resolvedInput/waitPrompt) are workflow
+    // products, not raw process bytes — they stay public, same as before.
+    expect(scrubbed.attemptIO[attemptId]?.input?.value).toBeDefined();
+    expect(scrubbed.attemptIO[attemptId]?.output?.value).toBeDefined();
+
+    const scrubbedTerm = scrubbed.attemptIO[attemptId]?.terminal;
+    expect(scrubbedTerm).toBeDefined();
+    expect(scrubbedTerm!.logPath).toBeUndefined();
+    // Sidecar status / port / sessionId stay — they're needed for the
+    // dashboard to know whether the live terminal stream exists.  The raw
+    // bytes themselves are already cookie-gated at /terminal-log/raw.
+    expect(scrubbedTerm!.sessionId).toBe('wf-r-scrub-only');
+    expect(scrubbedTerm!.status).toBe('closed');
+    expect(scrubbedTerm!.webPort).toBe(32200);
+
+    // Input snapshot must not have been mutated.
+    expect(full!.attemptIO[attemptId]?.log?.text).toContain(SECRET_LINE);
+    expect(full!.attemptIO[attemptId]?.terminal?.logPath).toBe(
+      join(attemptDir, 'terminal.log'),
+    );
+  });
+
+  it('scrubSnapshotForUnauthed is a no-op when attemptIO carries no log/terminal', async () => {
+    await seedSucceeded('r-scrub-empty');
+    const snap = await readRunSnapshot(runsDir, 'r-scrub-empty');
+    expect(snap).not.toBeNull();
+    const scrubbed = scrubSnapshotForUnauthed(snap!);
+    // Same top-level shape; attemptIO keys identical.
+    expect(Object.keys(scrubbed.attemptIO).sort()).toEqual(
+      Object.keys(snap!.attemptIO).sort(),
+    );
+    for (const [aid, io] of Object.entries(scrubbed.attemptIO)) {
+      // No log seeded → no log key after scrub either (we don't synthesize).
+      expect(io.log).toBeUndefined();
+      // input/output stay byte-equal with the source.
+      expect(io.input?.value).toEqual(snap!.attemptIO[aid]?.input?.value);
+      expect(io.output?.value).toEqual(snap!.attemptIO[aid]?.output?.value);
+    }
   });
 
   it('preserves activityFailed errorMessage in attempt error', async () => {

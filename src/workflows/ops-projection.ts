@@ -302,6 +302,11 @@ export type BlobPreviewDTO = {
   value?: unknown;
   text?: string;
   error?: string;
+  /** Set by `scrubSnapshotForUnauthed`: text/value were stripped because
+   *  the caller wasn't authenticated.  Metadata (bytes, truncated) stays
+   *  so the dashboard can render a "log available after login" placeholder
+   *  instead of pretending the blob doesn't exist. */
+  redacted?: boolean;
 };
 
 export type AttemptIODTO = {
@@ -339,9 +344,50 @@ export type AttemptTerminalDTO = {
 const BLOB_PREVIEW_MAX_BYTES = 64 * 1024;
 
 /**
+ * Scrub fields that leak raw CLI process bytes from a snapshot DTO before
+ * exposing it to an unauthenticated reader.  Companion of the
+ * `…/terminal-log/raw` cookie-auth carve-out: that carve-out hid the full
+ * pty/terminal stream download, but the same data still leaked via
+ * `attemptIO[*].log.text` (last 64 KiB tail of `terminal.log`) on the
+ * public `/snapshot` endpoint.
+ *
+ * What stays public: run/node/activity status, output blob previews
+ * (workflow author's intended product), terminal sidecar metadata.
+ * What gets scrubbed: `io.log.text/value` (the raw stdout/stderr tail
+ * — may contain env-var dumps, API key error messages, secret-bearing
+ * curl responses) and `io.terminal.logPath` (absolute on-disk path
+ * leaks filesystem layout).
+ *
+ * Idempotent + pure: caller is the route handler that already knows
+ * `authed === false`.  Returns a new DTO; input is not mutated.
+ */
+export function scrubSnapshotForUnauthed(snap: RunSnapshotDTO): RunSnapshotDTO {
+  const attemptIO: Record<string, AttemptIODTO> = {};
+  for (const [attemptId, io] of Object.entries(snap.attemptIO)) {
+    const scrubbed: AttemptIODTO = { ...io };
+    if (io.log) {
+      const { text: _text, value: _value, ...logRest } = io.log;
+      scrubbed.log = { ...logRest, redacted: true } as BlobPreviewDTO;
+    }
+    if (io.terminal && io.terminal.logPath !== undefined) {
+      const { logPath: _logPath, ...termRest } = io.terminal;
+      scrubbed.terminal = termRest;
+    }
+    attemptIO[attemptId] = scrubbed;
+  }
+  return { ...snap, attemptIO };
+}
+
+/**
  * Build a JSON-serializable snapshot for a single run.  Returns null when
  * the run is missing / has no events / has a corrupt log.  Callers
  * (dashboard `/snapshot` endpoint) should map null → 404.
+ *
+ * Always returns the full DTO including sensitive log bytes.  Callers
+ * serving unauth'd HTTP requests MUST apply `scrubSnapshotForUnauthed`
+ * before responding — kept as a separate step so internal callers
+ * (cancel-run, daemon-side hooks) keep the full view without
+ * round-tripping through scrub.
  */
 export async function readRunSnapshot(
   runsDir: string,
