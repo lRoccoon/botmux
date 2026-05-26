@@ -7,7 +7,7 @@ import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
-import { sendUserMessage, updateMessage, deleteMessage, replyMessage } from './client.js';
+import { sendUserMessage, updateMessage, deleteMessage, replyMessage, sendMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { addChatGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied } from './grant-pending.js';
@@ -189,6 +189,62 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  // ─── /relay picker pickup button ────────────────────────────────────────
+  // Custom owner check — operator must equal the *source* session's owner,
+  // which is a different session from the current chat's ds. Handle this
+  // before the isSensitive gate (which checks canOperate against the
+  // current session, irrelevant here).
+  if (value?.action === 'relay_pickup' && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    const sourceSessionId = value.session_id;
+    const targetChatId = value.target_chat_id;
+    const targetRootId = value.root_id;
+    if (!sourceSessionId || !targetChatId || !targetRootId) {
+      return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
+    }
+    // Locate the source session in the in-process registry. Since picker only
+    // lists sessions of THIS bot in OTHER chats, the source must live in our
+    // activeSessions — if it's gone, treat as not found rather than reaching
+    // across daemons (cross-daemon pull is out of v1 scope).
+    let sourceDs: DaemonSession | undefined;
+    for (const cand of activeSessions.values()) {
+      if (cand.larkAppId === larkAppId && cand.session.sessionId === sourceSessionId) {
+        sourceDs = cand;
+        break;
+      }
+    }
+    if (!sourceDs) {
+      return { toast: { type: 'error', content: t('card.relay.toast_not_found', undefined, loc) } };
+    }
+    if (sourceDs.session.ownerOpenId && sourceDs.session.ownerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.relay.toast_not_owner', undefined, loc) } };
+    }
+    if (sourceDs.chatId === targetChatId) {
+      return { toast: { type: 'error', content: t('card.relay.toast_same_chat', undefined, loc) } };
+    }
+    // Send the M1 announcement first — its message_id becomes the new
+    // rootMessageId after the transfer (mirrors /relay --create's flow).
+    let m1MessageId: string;
+    try {
+      const m1Body = JSON.stringify({
+        text: t('cmd.relay.m1_announce', { sourceChat: sourceDs.chatId, groupName: targetChatId }, loc),
+      });
+      m1MessageId = await sendMessage(larkAppId, targetChatId, m1Body, 'text');
+    } catch (err: any) {
+      return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: err?.message ?? 'send_m1_failed' }, loc) } };
+    }
+    const { transferSession } = await import('../../core/worker-pool.js');
+    const r = await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId);
+    if (!r.ok) {
+      return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: r.error }, loc) } };
+    }
+    // Best-effort: remove the picker card now that the click resolved.
+    if (cardMessageId && larkAppId) {
+      deleteMessage(larkAppId, cardMessageId).catch(() => { /* leave it */ });
+    }
+    return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
   const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);

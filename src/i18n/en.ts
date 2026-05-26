@@ -89,6 +89,16 @@ export const messages: Record<string, string> = {
   'card.adopt.placeholder_select': 'Pick a CLI session',
   'card.adopt.uptime_unknown': 'unknown',
 
+  // ─── /relay picker card (pull mode) ─────────────────────────────────────
+  'card.relay.title': '📋 Pick a session to relay into this chat',
+  'card.relay.empty': 'No relayable sessions.\n(Picker only lists sessions you own, on this bot, in other chats.)',
+  'card.relay.btn_pull': 'Pull into this chat',
+  'card.relay.toast_not_found': 'Session not found or already closed.',
+  'card.relay.toast_not_owner': 'Only the session owner can relay it.',
+  'card.relay.toast_same_chat': 'That session is already in this chat — nothing to relay.',
+  'card.relay.toast_failed': 'Relay failed: {error}',
+  'card.relay.toast_success': '✅ Relayed into this chat',
+
   // ─── TUI prompt card ─────────────────────────────────────────────────────
   'card.tui.input_placeholder': 'Type a custom reply…',
 
@@ -153,8 +163,7 @@ export const messages: Record<string, string> = {
 
   // ─── /relay --create ────────────────────────────────────────────────────
   'cmd.relay.empty_group_name': 'Session Relay {ts}',
-  'cmd.relay.picker_not_impl': '⚠️ Relay picker (no-flag mode) not yet implemented. Use /relay --create <name> @bot to create a new group and relay the session.',
-  'cmd.relay.no_session': '⚠️ /relay --create must be invoked from a thread with an active session.',
+  'cmd.relay.no_session': '⚠️ /relay must be invoked from a thread with an active session.',
   'cmd.relay.no_sender': '⚠️ Could not resolve sender open_id; /relay cancelled.',
   'cmd.relay.no_mentions': '⚠️ /relay --create requires at least one @-mentioned bot as a collaborator in the new group.',
   'cmd.relay.not_owner': '⚠️ Only the original session owner can /relay --create this session to a new group.',

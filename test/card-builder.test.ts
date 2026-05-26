@@ -12,8 +12,10 @@ import {
   buildStreamingCard,
   buildRepoSelectCard,
   buildSessionClosedCard,
+  buildRelayPickerCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
+import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -718,5 +720,59 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn.value.session_id).toBe('sess-4');
     expect(resumeBtn.value.root_id).toBe('om_root_X');
     expect(resumeBtn.type).toBe('primary');
+  });
+});
+
+describe('buildRelayPickerCard', () => {
+  it('renders an "empty" notice when no sessions are pickable', () => {
+    const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root'));
+    const divs = card.elements.filter((e: any) => e.tag === 'div');
+    expect(divs.length).toBeGreaterThan(0);
+    const emptyText = divs.map((d: any) => d.text?.content ?? '').join('\n');
+    expect(emptyText).toMatch(/没有可接力|No relayable/);
+    // No action buttons in empty state.
+    expect(card.elements.filter((e: any) => e.tag === 'action').length).toBe(0);
+  });
+
+  it('renders one row per session with a relay_pickup button', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-a', chatLabel: 'oc_src_1', title: 'PR review', cliId: 'claude-code', workingDir: '/work/proj', lastMessageAt: Date.now() - 60_000 },
+      { sessionId: 'sess-b', chatLabel: 'oc_src_2', title: 'docs sync',                                                  lastMessageAt: Date.now() - 600_000 },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_target_root'));
+    const actions = card.elements.filter((e: any) => e.tag === 'action');
+    expect(actions).toHaveLength(2);
+
+    actions.forEach((a: any, i: number) => {
+      const btn = a.actions[0];
+      expect(btn.value.action).toBe('relay_pickup');
+      expect(btn.value.session_id).toBe(entries[i].sessionId);
+      expect(btn.value.target_chat_id).toBe('oc_target');
+      expect(btn.value.root_id).toBe('om_target_root');
+    });
+  });
+
+  it('omits the cwd line when entry has no workingDir', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-a', chatLabel: 'oc_x', title: 'no cwd' },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_root'));
+    const md = card.elements
+      .filter((e: any) => e.tag === 'div')
+      .map((d: any) => d.text?.content ?? '')
+      .join('\n');
+    expect(md).toContain('no cwd');
+    expect(md).not.toContain('📂');
+  });
+
+  it('inserts an hr between consecutive sessions', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 's1', chatLabel: 'oc_a', title: 't1' },
+      { sessionId: 's2', chatLabel: 'oc_b', title: 't2' },
+      { sessionId: 's3', chatLabel: 'oc_c', title: 't3' },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_root'));
+    // 3 entries → 2 hrs between them.
+    expect(card.elements.filter((e: any) => e.tag === 'hr').length).toBe(2);
   });
 });

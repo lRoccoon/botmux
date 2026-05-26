@@ -92,6 +92,16 @@ export const messages: Record<string, string> = {
   'card.adopt.placeholder_select': '选择 CLI 会话',
   'card.adopt.uptime_unknown': '未知',
 
+  // ─── /relay picker card (pull mode) ─────────────────────────────────────
+  'card.relay.title': '📋 选择要接力到本群的会话',
+  'card.relay.empty': '当前没有可接力的会话。\n（picker 只列你作为 owner、同一机器人在其他群里的活跃会话。）',
+  'card.relay.btn_pull': '接力到本群',
+  'card.relay.toast_not_found': '会话已不存在或已关闭。',
+  'card.relay.toast_not_owner': '只有会话发起人能接力它。',
+  'card.relay.toast_same_chat': '该会话已在本群里，无需接力。',
+  'card.relay.toast_failed': '接力失败：{error}',
+  'card.relay.toast_success': '✅ 已接力到本群',
+
   // ─── TUI prompt card ─────────────────────────────────────────────────────
   'card.tui.input_placeholder': '输入自定义回复…',
 
@@ -156,8 +166,7 @@ export const messages: Record<string, string> = {
 
   // ─── /relay --create ────────────────────────────────────────────────────
   'cmd.relay.empty_group_name': '会话接力 {ts}',
-  'cmd.relay.picker_not_impl': '⚠️ 接力 picker（无参数模式）尚未实现。请用 /relay --create <群名> @机器人 创建新群并接力。',
-  'cmd.relay.no_session': '⚠️ /relay --create 必须在已有会话的话题里发起。',
+  'cmd.relay.no_session': '⚠️ /relay 必须在已有会话的话题里发起。',
   'cmd.relay.no_sender': '⚠️ 无法获取发起人 open_id，/relay 取消。',
   'cmd.relay.no_mentions': '⚠️ /relay --create 必须 @ 至少一个机器人作为新群的协作伙伴。',
   'cmd.relay.not_owner': '⚠️ 只有会话发起人能用 /relay --create 把会话搬到新群。',

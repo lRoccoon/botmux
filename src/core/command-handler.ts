@@ -989,9 +989,51 @@ export async function handleCommand(
       case '/relay': {
         const argsLine = message.content.replace(/^\/relay\s*/i, '').trim();
         if (!/^--create\b/i.test(argsLine)) {
-          // PR3 territory — picker mode pulls a session from another chat
-          // into the current chat. Not implemented yet in PR2.
-          await sessionReply(rootId, t('cmd.relay.picker_not_impl', undefined, loc));
+          // ── Pull picker ───────────────────────────────────────────────────
+          // /relay (no flag) lives in the *target* chat — list the operator's
+          // own active sessions in OTHER chats so they can pull one in.
+          //
+          // Filter:
+          //   • same bot (this larkAppId)
+          //   • session is active (has a worker / appears in activeSessions)
+          //   • session NOT in the current chat (can't relay to yourself)
+          //   • operator IS the session owner (owner-only access)
+          //
+          // The button's `target_chat_id` / `target_root_id` are the chat we're
+          // pulling INTO (the chat hosting this command). card-handler uses
+          // them to invoke transferSession after sending the M1 announcement.
+          const operatorOpenId = message.senderId;
+          if (!operatorOpenId) {
+            await sessionReply(rootId, t('cmd.relay.no_sender', undefined, loc));
+            break;
+          }
+          const myAppId = larkAppId ?? ds?.larkAppId;
+          if (!myAppId) {
+            await sessionReply(rootId, t('cmd.group.no_bot', undefined, loc));
+            break;
+          }
+          const targetChatId = ds?.chatId;
+          if (!targetChatId) {
+            await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
+            break;
+          }
+          const entries: import('../im/lark/card-builder.js').RelayPickerEntry[] = [];
+          for (const candidate of activeSessions.values()) {
+            if (candidate.larkAppId !== myAppId) continue;
+            if (candidate.chatId === targetChatId) continue;
+            if (candidate.session.ownerOpenId !== operatorOpenId) continue;
+            entries.push({
+              sessionId: candidate.session.sessionId,
+              chatLabel: candidate.chatId,
+              title: candidate.session.title || candidate.currentTurnTitle || '(no title)',
+              workingDir: candidate.session.workingDir,
+              cliId: candidate.session.cliId,
+              lastMessageAt: candidate.lastMessageAt,
+            });
+          }
+          const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
+          const card = buildRelayPickerCard(entries, targetChatId, rootId, loc);
+          await sessionReply(rootId, card, 'interactive');
           break;
         }
         const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();

@@ -655,6 +655,91 @@ function formatDuration(ms: number): string {
   return `${d}d${h % 24}h`;
 }
 
+// ─── /relay picker (pull mode) ──────────────────────────────────────────────
+
+export interface RelayPickerEntry {
+  sessionId: string;
+  /** Short human label for the source chat — chat name if resolvable, else chatId. */
+  chatLabel: string;
+  /** First-turn title or current-turn topic — already truncated by the caller. */
+  title: string;
+  /** Absolute working dir, displayed verbatim. */
+  workingDir?: string;
+  /** CLI identifier, used to render a friendly name. */
+  cliId?: CliId;
+  /** Last activity timestamp, used to render a relative duration. */
+  lastMessageAt?: number;
+}
+
+/**
+ * Card listing the operator's relayable sessions across other chats — each
+ * entry has a "Pull here" button whose action `relay_pickup` carries the
+ * source sessionId. Card-handler verifies owner-match before invoking
+ * transferSession to move the session into the current chat.
+ *
+ * Empty list and "all-current-chat" lists produce a card with a single
+ * "no relayable sessions" notice — keeps the UX consistent (always returns
+ * a card, never an empty message).
+ *
+ * The button's `value.root_id` is the rootMessageId of the current chat's
+ * thread where the user invoked /relay, so card-handler can route follow-up
+ * card patches back to the same anchor.
+ */
+export function buildRelayPickerCard(
+  entries: RelayPickerEntry[],
+  targetChatId: string,
+  targetRootMessageId: string,
+  locale?: Locale,
+): string {
+  const elements: any[] = [];
+
+  if (entries.length === 0) {
+    elements.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: t('card.relay.empty', undefined, locale) },
+    });
+  } else {
+    entries.forEach((e, i) => {
+      const cliName = e.cliId ? getCliDisplayName(e.cliId) : '';
+      const cwdLine = e.workingDir ? `\n📂 \`${escapeMd(e.workingDir)}\`` : '';
+      const ageLine = e.lastMessageAt ? `\n⏱ ${formatDuration(Date.now() - e.lastMessageAt)}` : '';
+      const header = cliName ? `**${escapeMd(e.chatLabel)}** · ${cliName}` : `**${escapeMd(e.chatLabel)}**`;
+      const body = `${header}\n💬 ${escapeMd(e.title)}${cwdLine}${ageLine}`;
+      elements.push({
+        tag: 'div',
+        text: { tag: 'lark_md', content: body },
+      });
+      elements.push({
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.relay.btn_pull', undefined, locale) },
+            type: 'primary',
+            value: {
+              action: 'relay_pickup',
+              session_id: e.sessionId,
+              target_chat_id: targetChatId,
+              root_id: targetRootMessageId,
+            },
+          },
+        ],
+      });
+      if (i < entries.length - 1) elements.push({ tag: 'hr' });
+    });
+  }
+
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: t('card.relay.title', undefined, locale) },
+    },
+    elements,
+  };
+  return JSON.stringify(card);
+}
+
 export function buildAdoptSelectCard(sessions: AdoptableSession[], rootMessageId?: string, locale?: Locale): string {
   const unknownUptime = t('card.adopt.uptime_unknown', undefined, locale);
   const options = sessions.map((s) => {

@@ -113,6 +113,22 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     (sid: string) =>
       `{"header":{"title":{"content":"🛑 会话已关闭"}},"action":"resume","cmd":"botmux resume ${sid.substring(0, 12)}"}`,
   ),
+  buildRelayPickerCard: vi.fn(
+    (entries: any[], targetChatId: string, rootMessageId: string) => JSON.stringify({
+      elements: [
+        ...entries.flatMap((e: any) => [
+          { tag: 'div', text: { content: e.title } },
+          {
+            tag: 'action',
+            actions: [{
+              tag: 'button',
+              value: { action: 'relay_pickup', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId },
+            }],
+          },
+        ]),
+      ],
+    }),
+  ),
   getCliDisplayName: vi.fn((id: string) => {
     const names: Record<string, string> = {
       'claude-code': 'Claude',
@@ -1362,15 +1378,62 @@ describe('handleCommand', () => {
       vi.mocked(dd.findOnlineDaemon).mockReturnValue(null);
     });
 
-    it('falls back to picker_not_impl when invoked without --create', async () => {
-      const ds = makeDaemonSession();
+    it('renders the relay picker card when invoked without --create', async () => {
+      // Existing session in the current chat (ds) — picker should NOT list it
+      // (self-targeting is rejected by the cant_relay_same_chat filter).
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+
+      // Other-chat session, same bot, same owner → should appear in picker.
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other',
+          chatId: 'oc_other',
+          rootMessageId: 'om_other_root',
+          title: 'other-thread task',
+          ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
       const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(reply).toContain('picker');
+      // Reply was an interactive card (msgType='interactive').
+      const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const actions = card.elements.filter((e: any) => e.tag === 'action');
+      expect(actions).toHaveLength(1);
+      const btn = actions[0].actions[0];
+      expect(btn.value.action).toBe('relay_pickup');
+      expect(btn.value.session_id).toBe('sess-other');
+      expect(btn.value.target_chat_id).toBe(CHAT_ID);
       expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    it('picker excludes sessions whose owner is not the operator', async () => {
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const otherUserDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other-user',
+          chatId: 'oc_other',
+          rootMessageId: 'om_other_root',
+          ownerOpenId: 'ou_someone_else',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherUserDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const [, replyContent] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      const card = JSON.parse(replyContent as string);
+      // No pickup actions — empty picker (otherUser's session filtered out).
+      expect(card.elements.filter((e: any) => e.tag === 'action')).toHaveLength(0);
     });
 
     it('rejects --create when not invoked inside an active session', async () => {
