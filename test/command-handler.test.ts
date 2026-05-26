@@ -104,6 +104,7 @@ vi.mock('../src/core/scheduler.js', () => ({
 vi.mock('../src/services/project-scanner.js', () => ({
   scanProjects: vi.fn(() => []),
   scanMultipleProjects: vi.fn(() => []),
+  describeProjectDir: vi.fn(() => null),
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
@@ -778,6 +779,46 @@ describe('handleCommand', () => {
         'interactive',
         LARK_APP_ID,
       );
+    });
+
+    it('should resolve a first-level project name and switch repo (mid-session)', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(scanMultipleProjects).mockReturnValue([
+        { name: 'payments', path: '/home/testuser/payments', branch: 'main' },
+      ]);
+      const ds = makeDaemonSession({ pendingRepo: false, repoCardMessageId: 'om_card' });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo payments'), deps, LARK_APP_ID);
+
+      expect(ds.workingDir).toBe('/home/testuser/payments');
+      expect(sessionStore.createSession).toHaveBeenCalledWith(
+        CHAT_ID, ROOT_ID, 'payments (main)', 'group',
+      );
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      // the pending repo-selection card must be withdrawn after resolving
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_card');
+      expect(ds.repoCardMessageId).toBeUndefined();
+    });
+
+    it('should reply path_not_found when the arg resolves to nothing', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(scanMultipleProjects).mockReturnValue([]);
+      vi.mocked(statSync).mockImplementation(() => { throw new Error('ENOENT'); });
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+
+      try {
+        await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo ./nope'), deps, LARK_APP_ID);
+      } finally {
+        // restore the shared statSync mock for subsequent tests
+        vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
+      }
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('找不到目录或项目');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
     });
   });
 
