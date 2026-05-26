@@ -3,7 +3,6 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { hookCommandFor } from '../hook-command.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { t } from '../../i18n/index.js';
 
@@ -390,16 +389,12 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       }
       args.push('--dangerously-skip-permissions');
       // 内联 --settings JSON 作用域仅限本次 spawn，不会写入用户全局 ~/.claude/settings.json。
-      // 同时注入 PreToolUse hook（matcher='*'），使 AskUserQuestion 事件自动转发到
-      // `botmux hook claude-code`——进程级注入，不污染非 botmux 的 Claude 会话。
+      // 注意：askUserQuestion hook 不在这里注入——它要写全局 settings.json（见下方
+      // hookInstall），这样 adopt 模式（botmux 接管的是别处已启动、拿不到本 --settings
+      // 的 claude 会话）才能让那条会话读到 hook。
       args.push('--settings', JSON.stringify({
         skipDangerousModePermissionPrompt: true,
         permissions: { defaultMode: 'bypassPermissions' },
-        hooks: {
-          PreToolUse: [
-            { matcher: '*', hooks: [{ type: 'command', command: hookCommandFor('claude-code'), timeout: 86400 }] },
-          ],
-        },
       }));
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
       const unknown = t('ai.identity.unknown', undefined, locale);
@@ -714,8 +709,15 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     systemHints: [],
     altScreen: false,
     skillsDir: '~/.claude/skills',
-    // hook 通过 buildArgs 的 --settings 内联 JSON 注入（进程级），不写全局 settings.json，
-    // 不污染非 botmux 的 Claude 会话。
+    // askUserQuestion hook 写全局 ~/.claude/settings.json（matcher='*' 的 PreToolUse），
+    // 把 AskUserQuestion 事件转发到 `botmux hook claude-code`。
+    // 选全局而非进程级 --settings：adopt 模式接管的是 botmux 没启动、拿不到 --settings
+    // 的已有 claude 会话，只有全局配置那条会话才读得到。代价是会作用于非 botmux 的
+    // claude 会话，但 hook 客户端在缺 BOTMUX_* env 时直接 passthrough 放行，不破坏它们。
+    hookInstall: {
+      configPath: '~/.claude/settings.json',
+      format: 'claude-settings',
+    },
     asksViaHook: true,
   };
 }
