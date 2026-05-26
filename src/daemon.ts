@@ -1484,6 +1484,31 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   return jsonRes(res, 200, result);
 });
 
+// ─── adopt-session 查询端点 ───────────────────────────────────────────────────
+// CLI side（botmux hook）通过祖先 PID 匹配 adopt 会话，路由 askUserQuestion。
+// GET /api/adopt-session/:pid — 返回该 pid 对应的 adopt 会话路由信息。
+// 仅匹配**当前活跃**的 adopt 会话（按 originalCliPid）。残留风险：OS 的 PID 复用——
+// 若原 adopt 的 Claude 已退出、同号 PID 被别的进程复用，理论上可能误命中；但 hook
+// 进程是该 Claude 的子孙，只有 Claude 仍在跑时其祖先链里才会出现这个 PID，且 session
+// 必须仍在 activeSessions 里，复用窗口极小，可接受（不为此引入进程级鉴权）。
+ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
+  const pid = Number(params.pid);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_pid' });
+  }
+  for (const ds of activeSessions.values()) {
+    if (ds.adoptedFrom?.originalCliPid === pid) {
+      return jsonRes(res, 200, {
+        sessionId: ds.session.sessionId,
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        rootMessageId: sessionAnchorId(ds),
+      });
+    }
+  }
+  return jsonRes(res, 404, { ok: false, error: 'no_adopt_session' });
+});
+
 function parseTriggerChatBinding(
   raw: unknown,
 ): { chatId: string; larkAppId: string } | undefined {

@@ -101,10 +101,15 @@ describe('runHook', () => {
   });
 
   describe('env 缺失 → passthrough 放行', () => {
+    // 注：runHook 第 5 参数是可选的 resolveAdoptRouteFn。
+    // 这里传 null-returning stub，确保测试不依赖真实 daemon 环境，
+    // 并且仍然覆盖 "adopt 也找不到 → passthrough" 的分支。
+    const nullAdoptResolver = async () => null;
+
     it('BOTMUX_SESSION_ID 缺失 → passthrough', async () => {
       const stub = makeAnsweredStub([['继续']]);
       const env = { ...FULL_ENV, BOTMUX_SESSION_ID: undefined };
-      const result = await runHook(claudeAskPayload, env, stub, 'claude-code');
+      const result = await runHook(claudeAskPayload, env, stub, 'claude-code', nullAdoptResolver);
       // 回归（Codex P1.1）：放行 = 空 stdout，绝不输出 directive。直接断言空串，
       // 不与实现的 passthrough() 比较，避免实现回退时测试跟着移动。
       expect(result.stdout).toBe('');
@@ -113,9 +118,63 @@ describe('runHook', () => {
     it('BOTMUX_CHAT_ID 缺失 → passthrough', async () => {
       const stub = makeAnsweredStub([['继续']]);
       const env = { ...FULL_ENV, BOTMUX_CHAT_ID: undefined };
-      const result = await runHook(claudeAskPayload, env, stub, 'claude-code');
+      const result = await runHook(claudeAskPayload, env, stub, 'claude-code', nullAdoptResolver);
       // 回归（Codex P1.1）：放行 = 空 stdout，绝不输出 directive。直接断言空串，
       // 不与实现的 passthrough() 比较，避免实现回退时测试跟着移动。
+      expect(result.stdout).toBe('');
+    });
+  });
+
+  describe('env 缺失 + adopt 路由命中 → 路由到 adopt 会话', () => {
+    const adoptRoute = {
+      sessionId: 's-adopt',
+      chatId: 'c-adopt',
+      larkAppId: 'a-adopt',
+      rootMessageId: 'om_x',
+    };
+
+    it('adopt 命中 → postAskFn 收到 adopt 会话的 body', async () => {
+      let capturedBody: Record<string, unknown> | undefined;
+      const captureStub = async (body: Record<string, unknown>) => {
+        capturedBody = body;
+        return { kind: 'answered' as const, answers: [['yes']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const adoptResolver = async () => adoptRoute;
+      // env 全缺失
+      const env: Record<string, string | undefined> = {};
+      const result = await runHook(claudeAskPayload, env, captureStub, 'claude-code', adoptResolver);
+      // body 应使用 adopt 路由信息
+      expect(capturedBody?.sessionId).toBe('s-adopt');
+      expect(capturedBody?.larkAppId).toBe('a-adopt');
+      expect(capturedBody?.chatId).toBe('c-adopt');
+      expect(capturedBody?.rootMessageId).toBe('om_x');
+      // 应输出答案 directive（非空）
+      expect(result.stdout).toBeTruthy();
+      const directive = JSON.parse(result.stdout);
+      expect(JSON.stringify(directive)).toContain('yes');
+    });
+
+    it('adopt 命中 → stdout 含 answer directive', async () => {
+      const captureStub = async (body: Record<string, unknown>) => {
+        void body;
+        return { kind: 'answered' as const, answers: [['yes']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const adoptResolver = async () => adoptRoute;
+      const env: Record<string, string | undefined> = {};
+      const result = await runHook(claudeAskPayload, env, captureStub, 'claude-code', adoptResolver);
+      expect(result.stdout).toBeTruthy();
+    });
+  });
+
+  describe('env 缺失 + adopt 路由返回 null → passthrough', () => {
+    // Codex 钉桩：祖先里有非 adopt PID、daemon 全 404（resolver 返回 null）时，
+    // 必须既不调用 postAsk、stdout 又为空——确保"真·非 botmux 会话"完全不受影响。
+    it('adopt 未命中 → postAsk 不被调用 且 stdout === ""', async () => {
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const nullAdoptResolver = async () => null;
+      const env: Record<string, string | undefined> = {};
+      const result = await runHook(claudeAskPayload, env, postAsk, 'claude-code', nullAdoptResolver);
+      expect(postAsk).not.toHaveBeenCalled();
       expect(result.stdout).toBe('');
     });
   });

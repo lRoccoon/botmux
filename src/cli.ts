@@ -3407,16 +3407,20 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
  * runHook: hook 命令的纯业务逻辑，接受已解析的 payload/env/postAskFn，
  * 返回应写到 stdout 的字符串。通过依赖注入使单元测试无需真实 daemon/env。
  *
- * @param payload   已经 JSON.parse 的 hook payload 对象
- * @param env       包含 BOTMUX_* 环境变量的字典
- * @param postAskFn 替代真实 postAsk 的可注入函数（测试用）
- * @returns         { stdout: string } 应写到 stdout 的内容
+ * @param payload              已经 JSON.parse 的 hook payload 对象
+ * @param env                  包含 BOTMUX_* 环境变量的字典
+ * @param postAskFn            替代真实 postAsk 的可注入函数（测试用）
+ * @param cliId                CLI 适配器 ID
+ * @param resolveAdoptRouteFn  可选：替代真实 adopt 路由解析的注入函数（测试用）；
+ *                             缺省时使用真实 resolveAdoptRoute（查祖先 PID → daemon）
+ * @returns                    { stdout: string } 应写到 stdout 的内容
  */
 export async function runHook(
   payload: unknown,
   env: Record<string, string | undefined>,
   postAskFn: (body: Record<string, unknown>) => Promise<import('./core/ask-types.js').AskResult>,
   cliId: string,
+  resolveAdoptRouteFn?: () => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
 
@@ -3441,9 +3445,40 @@ export async function runHook(
   const sessionId = env.BOTMUX_SESSION_ID;
   const chatId = env.BOTMUX_CHAT_ID;
   const larkAppId = env.BOTMUX_LARK_APP_ID;
+
+  // 路由变量：优先用 env，env 缺失时尝试 adopt 路由
+  let routeSessionId = sessionId;
+  let routeChatId = chatId;
+  let routeLarkAppId = larkAppId;
+  let routeRoot: string | null = env.BOTMUX_ROOT_MESSAGE_ID || null;
+
   if (!sessionId || !chatId || !larkAppId) {
-    // 非 botmux 会话（env 缺失），passthrough 放行
-    return { stdout: adapter.passthrough(payload) };
+    // env 缺失 → 尝试通过祖先 PID 匹配在线 adopt 会话
+    const resolver = resolveAdoptRouteFn ?? (() => {
+      // 延迟 import 避免冷启动开销
+      return import('./adapters/adopt-route.js').then(({ resolveAdoptRoute, queryAdoptSession }) =>
+        resolveAdoptRoute({
+          startPid: process.pid,
+          listDaemons: listOnlineDaemons,
+          queryDaemon: queryAdoptSession,
+        }),
+      );
+    });
+    let adopt: import('./adapters/adopt-route.js').AdoptRoute | null = null;
+    try {
+      adopt = await resolver();
+    } catch {
+      // 解析失败 → 视作真非 botmux 会话，passthrough 放行
+    }
+    if (!adopt) {
+      // 真非 botmux 会话 → passthrough 放行
+      return { stdout: adapter.passthrough(payload) };
+    }
+    // adopt 命中 → 使用 adopt 路由信息
+    routeSessionId = adopt.sessionId;
+    routeChatId = adopt.chatId;
+    routeLarkAppId = adopt.larkAppId;
+    routeRoot = adopt.rootMessageId;
   }
 
   // 解析 timeoutMs：默认 1 小时，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖
@@ -3458,10 +3493,10 @@ export async function runHook(
   }
 
   const body: Record<string, unknown> = {
-    sessionId,
-    chatId,
-    larkAppId,
-    rootMessageId: env.BOTMUX_ROOT_MESSAGE_ID || null,
+    sessionId: routeSessionId,
+    chatId: routeChatId,
+    larkAppId: routeLarkAppId,
+    rootMessageId: routeRoot,
     questions: parsed.questions,
     timeoutMs,
     approvers: [],
