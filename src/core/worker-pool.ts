@@ -368,6 +368,12 @@ export async function postFreshStreamingCard(
   // rather than duplicates it.
   parkStreamCard(ds);
 
+  // Snapshot prior identity for rollback on POST failure (restore all three
+  // together so a failed /card leaves no orphaned nonce/pending state).
+  const prevCardId = ds.streamCardId;
+  const prevNonce = ds.streamCardNonce;
+  const prevPending = ds.streamCardPending;
+
   ds.streamCardNonce = randomBytes(4).toString('hex');
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
@@ -386,16 +392,22 @@ export async function postFreshStreamingCard(
     cardUsageLimit(ds),
     writableTerminalLinkFor(ds),
   );
-  const prevCardId = ds.streamCardId;
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
     ds.streamCardId = await sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
+    // This card is now the live one for the current turn. Clear the new-turn
+    // pending flag so the next screen_update PATCHes it instead of POSTing a
+    // duplicate (the gate above only suppresses cards when disabled+unforced;
+    // /card forces them on, so a stale pending flag would otherwise re-POST).
+    ds.streamCardPending = false;
     persistStreamCardState(ds);
     recallFrozenCards(ds);
     logger.info(`[${tag(ds)}] Posted streaming card via /card`);
     return true;
   } catch (err) {
     ds.streamCardId = prevCardId;
+    ds.streamCardNonce = prevNonce;
+    ds.streamCardPending = prevPending;
     logger.warn(`[${tag(ds)}] /card POST failed: ${err}`);
     return false;
   }
@@ -1244,7 +1256,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
-              isAdopt, showTakeover,
+              isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -1281,7 +1293,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
-              isAdopt, showTakeover, loc,
+              isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }

@@ -44,6 +44,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
   ensureCliEnv,
+  writableTerminalLinkFor,
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
@@ -1206,6 +1207,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       ds.lastScreenContent ?? '', previousStatus, dsBotCfg.cliId,
       prevMode, ds.streamCardNonce, ds.currentImageKey,
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
+      writableTerminalLinkFor(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 
