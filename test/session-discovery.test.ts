@@ -329,6 +329,36 @@ describe('discoverAdoptableSessions', () => {
     expect(results[0]!.cwd).toBe('/workspace/mtr');
   });
 
+  it('should treat OpenCode comm as MTR when the MTR bot filters adopt sessions', () => {
+    setupMocks({
+      paneLines: 'mtrsession:0.0 1000\n',
+      commMap: { 1000: 'opencode' },
+      cwdMap: { 1000: '/workspace/mtr' },
+      dimsMap: { 'mtrsession:0.0': '120 40' },
+    });
+
+    const results = discoverAdoptableSessions('mtr');
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('mtr');
+    expect(results[0]!.cwd).toBe('/workspace/mtr');
+  });
+
+  it('should keep OpenCode comm as OpenCode when the OpenCode bot filters adopt sessions', () => {
+    setupMocks({
+      paneLines: 'opencode:0.0 1000\n',
+      commMap: { 1000: 'opencode' },
+      cwdMap: { 1000: '/workspace/opencode' },
+      dimsMap: { 'opencode:0.0': '120 40' },
+    });
+
+    const results = discoverAdoptableSessions('opencode');
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('opencode');
+    expect(results[0]!.cwd).toBe('/workspace/opencode');
+  });
+
   it('should not include sessionId for non-claude CLI types', () => {
     setupMocks({
       paneLines: 'mysession:0.0 1000\n',

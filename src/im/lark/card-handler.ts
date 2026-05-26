@@ -848,7 +848,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // Re-discover to get full session info and validate
     const { discoverAdoptableSessions } = await import('../../core/session-discovery.js');
-    const sessions = discoverAdoptableSessions();
+    const botCliId = getBot(ds.larkAppId).config.cliId;
+    const sessions = discoverAdoptableSessions(botCliId);
     const target = sessions.find(s => s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
     if (!target) {
       await sessionReply(rootId, t('cmd.adopt.target_exited', undefined, localeForBot(ds.larkAppId)));
