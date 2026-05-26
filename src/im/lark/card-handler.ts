@@ -228,7 +228,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     } else {
       const bots = getAllBots();
       const allowedUsers = bots.flatMap(b => b.resolvedAllowedUsers);
-      const hasAllowlist = allowedUsers.length > 0 || bots.some(b => (b.config.allowedChatGroups?.length ?? 0) > 0);
+      // globalGrants 与 allowedChatGroups 同理计入 hasAllowlist：只配 globalGrants（talk-only）
+      // 也算限制态，否则这条手写 fallback 会算成 false → 敏感动作 fall through 成全开放。
+      // 注意只进 hasAllowlist 判定，命中仍只认 allowedUsers（与 canOperate 一致，不授 operate）。
+      const hasAllowlist = allowedUsers.length > 0
+        || bots.some(b => (b.config.allowedChatGroups?.length ?? 0) > 0)
+        || bots.some(b => (b.config.globalGrants?.length ?? 0) > 0);
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
         return;
