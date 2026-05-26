@@ -308,6 +308,7 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 |---------|-------------|
 | `/repo` | Show project selector card (interactive dropdown + text list) |
 | `/repo <N>` | Switch to Nth project from last scan |
+| `/repo <path\|name>` | Skip the selector card; pass a path (relative/absolute) or a first-level project name under workingDir |
 | `/skip` | Skip the repo selector card, start the session in the default dir |
 | `/cd <path>` | Change working directory and restart the CLI process |
 | `/status` | Show session info (uptime, terminal URL, etc.) |

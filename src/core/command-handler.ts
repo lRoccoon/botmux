@@ -2,14 +2,14 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
-import { scanProjects, scanMultipleProjects } from '../services/project-scanner.js';
+import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage, sendMessage, listChatBotMembers } from '../im/lark/client.js';
@@ -59,6 +59,69 @@ const MULTILINE_COMMANDS = new Set(['/schedule', '/role']);
 // `validateWorkingDir` now lives in ./working-dir.js (leaf module the CLI can
 // import without the daemon graph); re-exported here for existing callers.
 export { validateWorkingDir };
+
+/**
+ * Resolve a non-numeric `/repo <arg>` into a concrete repo path + display name.
+ * `arg` is either a path (absolute or relative) or a first-level project name
+ * under one of the bot's scan dirs — letting the user skip the selection card.
+ *
+ * Resolution:
+ *   1. Build candidate absolute paths — absolute / `~` taken as-is; relative or
+ *      bare names resolved against each scan dir, then the daemon cwd (mirrors
+ *      how the card's project list is rooted).
+ *   2. Prefer a candidate matching a scanned git project (carries a branch label).
+ *   3. For a bare name, also match a scanned project by basename (covers projects
+ *      nested deeper than the scan-dir top level).
+ *   4. Fall back to any existing directory — lenient like `/cd`, whose trust model
+ *      is "owner explicitly chose a dir"; the CLI already runs with full FS access.
+ * Returns null when nothing resolves to an existing directory.
+ */
+export function resolveRepoSelection(
+  repoArg: string,
+  scanDirs: string[],
+): { path: string; displayName: string } | null {
+  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
+  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
+
+  const isExplicitPath =
+    repoArg.startsWith('/') ||
+    repoArg.startsWith('~') ||
+    repoArg.startsWith('.') ||
+    repoArg.includes('/');
+
+  const candidates: string[] = [];
+  if (repoArg.startsWith('/') || repoArg.startsWith('~')) {
+    candidates.push(resolve(expandHome(repoArg)));
+  } else {
+    for (const d of scanDirs) candidates.push(resolve(d, repoArg));
+    candidates.push(resolve(expandHome(repoArg))); // daemon-cwd fallback (matches /cd)
+  }
+
+  // 1) Exact scanned-project match — preferred, gives the "name (branch)" label.
+  for (const cand of candidates) {
+    const proj = projects.find((p) => resolve(p.path) === cand);
+    if (proj) return { path: proj.path, displayName: `${proj.name} (${proj.branch})` };
+  }
+  // 2) Bare name → match a scanned project by basename.
+  if (!isExplicitPath) {
+    const byName = projects.find((p) => p.name === repoArg);
+    if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
+  }
+  // 3) Lenient fallback: any existing directory. Label it with a git ref when
+  //    it's a repo (covers explicit paths outside the scan roots), else basename.
+  for (const cand of candidates) {
+    try {
+      if (!statSync(cand).isDirectory()) continue;
+    } catch {
+      continue; // missing / not a dir — try next candidate
+    }
+    const desc = describeProjectDir(cand);
+    return desc
+      ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
+      : { path: cand, displayName: basename(cand) };
+  }
+  return null;
+}
 
 /**
  * Parse a force-topic invocation: `/t [prompt]` or `/topic [prompt]`.
@@ -457,9 +520,68 @@ export async function handleCommand(
 
       case '/repo': {
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
-        const repoIndex = repoArg ? parseInt(repoArg, 10) : NaN;
 
-        if (!isNaN(repoIndex) && ds) {
+        // Shared commit path for an already-resolved repo: update the session's
+        // working dir, then either fork into the pending CLI (first spawn) or
+        // close + recreate the session (mid-session switch). Used by both the
+        // numeric `/repo <N>` form and the `/repo <path|name>` form.
+        const commitRepoSelection = async (selectedPath: string, displayName: string, how: string) => {
+          ds!.workingDir = selectedPath;
+          ds!.session.workingDir = selectedPath;
+          sessionStore.updateSession(ds!.session);
+
+          if (ds!.pendingRepo) {
+            const selfBot = getBot(ds!.larkAppId);
+            const botCfg = selfBot.config;
+            ds!.pendingRepo = false;
+            const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+            const pendingPrompt = ds!.pendingPrompt ?? '';
+            const prompt = buildNewTopicPrompt(
+              pendingPrompt,
+              ds!.session.sessionId,
+              botCfg.cliId,
+              botCfg.cliPathOverride,
+              ds!.pendingAttachments,
+              ds!.pendingMentions,
+              await getAvailableBots(ds!.larkAppId, ds!.chatId),
+              ds!.pendingFollowUps,
+              { name: selfBot.botName, openId: selfBot.botOpenId },
+              loc,
+              ds!.pendingSender,
+              { larkAppId, chatId: ds!.chatId },
+            );
+            rememberLastCliInput(ds!, pendingPrompt, prompt);
+            ds!.pendingPrompt = undefined;
+            ds!.pendingAttachments = undefined;
+            ds!.pendingMentions = undefined;
+            ds!.pendingSender = undefined;
+            ds!.pendingFollowUps = undefined;
+            forkWorker(ds!, prompt);
+            await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, loc));
+          } else {
+            killWorker(ds!);
+            sessionStore.closeSession(ds!.session.sessionId);
+            const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
+            ds!.session = session;
+            ds!.lastUserPrompt = undefined;
+            ds!.lastCliInput = undefined;
+            ds!.session.workingDir = selectedPath;
+            ds!.session.larkAppId = ds!.larkAppId;
+            sessionStore.updateSession(ds!.session);
+            ds!.hasHistory = false;
+            forkWorker(ds!, '', false);
+            await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
+          }
+          if (ds!.repoCardMessageId) {
+            deleteMessage(ds!.larkAppId, ds!.repoCardMessageId);
+            ds!.repoCardMessageId = undefined;
+          }
+          logger.info(`[${logTag}] Repo selected via ${how}: ${selectedPath}`);
+        };
+
+        // Numeric arg → pick by 1-based index from the last scan.
+        if (repoArg && ds && /^\d+$/.test(repoArg)) {
+          const repoIndex = parseInt(repoArg, 10);
           const cached = lastRepoScan.get(ds.chatId);
           if (!cached || cached.length === 0) {
             await sessionReply(rootId, t('cmd.repo.no_prior_scan', undefined, loc));
@@ -470,59 +592,19 @@ export async function handleCommand(
             break;
           }
           const project = cached[repoIndex - 1];
-          const selectedPath = project.path;
-          const displayName = `${project.name} (${project.branch})`;
-          ds.workingDir = selectedPath;
-          ds.session.workingDir = selectedPath;
-          sessionStore.updateSession(ds.session);
+          await commitRepoSelection(project.path, `${project.name} (${project.branch})`, `/repo ${repoIndex}`);
+          break;
+        }
 
-          if (ds.pendingRepo) {
-            const selfBot = getBot(ds.larkAppId);
-            const botCfg = selfBot.config;
-            ds.pendingRepo = false;
-            const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
-            const pendingPrompt = ds.pendingPrompt ?? '';
-            const prompt = buildNewTopicPrompt(
-              pendingPrompt,
-              ds.session.sessionId,
-              botCfg.cliId,
-              botCfg.cliPathOverride,
-              ds.pendingAttachments,
-              ds.pendingMentions,
-              await getAvailableBots(ds.larkAppId, ds.chatId),
-              ds.pendingFollowUps,
-              { name: selfBot.botName, openId: selfBot.botOpenId },
-              loc,
-              ds.pendingSender,
-              { larkAppId, chatId: ds.chatId },
-            );
-            rememberLastCliInput(ds, pendingPrompt, prompt);
-            ds.pendingPrompt = undefined;
-            ds.pendingAttachments = undefined;
-            ds.pendingMentions = undefined;
-            ds.pendingSender = undefined;
-            ds.pendingFollowUps = undefined;
-            forkWorker(ds, prompt);
-            await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, loc));
-          } else {
-            killWorker(ds);
-            sessionStore.closeSession(ds.session.sessionId);
-            const session = sessionStore.createSession(ds.chatId, rootId, displayName, ds.chatType);
-            ds.session = session;
-            ds.lastUserPrompt = undefined;
-            ds.lastCliInput = undefined;
-            ds.session.workingDir = selectedPath;
-            ds.session.larkAppId = ds.larkAppId;
-            sessionStore.updateSession(ds.session);
-            ds.hasHistory = false;
-            forkWorker(ds, '', false);
-            await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
+        // Non-numeric arg → a path (relative/absolute) or first-level project
+        // name under workingDir; resolve it directly and skip the card.
+        if (repoArg && ds) {
+          const resolved = resolveRepoSelection(repoArg, getProjectScanDirs(ds));
+          if (!resolved) {
+            await sessionReply(rootId, t('cmd.repo.path_not_found', { arg: repoArg }, loc));
+            break;
           }
-          if (ds.repoCardMessageId) {
-            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
-            ds.repoCardMessageId = undefined;
-          }
-          logger.info(`[${logTag}] Repo selected via /repo ${repoIndex}: ${selectedPath}`);
+          await commitRepoSelection(resolved.path, resolved.displayName, `/repo ${repoArg}`);
           break;
         }
 
@@ -967,6 +1049,7 @@ export async function handleCommand(
           t('help.cd', { cliName }, loc),
           t('help.repo_list', undefined, loc),
           t('help.repo_n', undefined, loc),
+          t('help.repo_path', undefined, loc),
           t('help.status', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
