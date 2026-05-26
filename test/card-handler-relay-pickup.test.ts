@@ -1,10 +1,10 @@
 /**
- * Tests for the `relay_pickup` card action: target-chat picker per-session button.
+ * Tests for the `relay_pick_select` card action: target-chat picker
+ * select_static dropdown selection.
  *
- * Each session in the picker card has its own button whose value carries
- * `{ action: 'relay_pickup', session_id, target_chat_id, root_id }`.
- * card-handler resolves the source session, owner-checks, sends M1, then
- * transferSession.
+ * action.value carries the per-card context (target chat + root). action.option
+ * carries the picked sessionId. card-handler resolves the source session,
+ * owner-checks, sends M1, then transferSession.
  *
  * We test:
  *   - operator must match the source session's ownerOpenId
@@ -90,17 +90,17 @@ function makeDs(overrides: Partial<Session> & { chatId?: string } = {}): DaemonS
   } as DaemonSession;
 }
 
-// Per-session button action shape: value carries the full pickup context.
+// Dropdown selection shape: value carries per-card context; option = sessionId.
 function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id?: string; operator?: string } = {}) {
   return {
     operator: { open_id: opts.operator ?? OWNER },
     action: {
       value: {
-        action: 'relay_pickup',
-        session_id: opts.sessionId ?? 'sess-source-1',
+        key: 'relay_pick_select',
         target_chat_id: opts.target_chat_id ?? 'oc_target',
         root_id: opts.root_id ?? 'om_target_root',
       },
+      option: opts.sessionId ?? 'sess-source-1',
     },
   };
 }
@@ -122,14 +122,16 @@ beforeEach(() => {
   transferSessionMock.mockResolvedValue({ ok: true });
 });
 
-describe('relay_pickup per-session button action', () => {
-  it('rejects when required value fields are missing', async () => {
+describe('relay_pick_select dropdown action', () => {
+  it('falls through (no transfer) when action.option is missing', async () => {
+    // No selection → handler key check requires option; nothing fires.
     const r = await handleCardAction({
       operator: { open_id: OWNER },
-      action: { value: { action: 'relay_pickup' /* missing everything */ } },
+      action: { value: { key: 'relay_pick_select', target_chat_id: 'oc_target', root_id: 'om_root' } },
     } as any, deps(new Map()), LARK_APP_ID);
-    expect(r?.toast?.type).toBe('error');
     expect(transferSessionMock).not.toHaveBeenCalled();
+    // The handler returns undefined / something non-relay; we just assert no transfer.
+    if (r?.toast) expect(r.toast.content).not.toMatch(/接力|relay/i);
   });
 
   it('returns not_found when the picked sessionId is not in active registry', async () => {
@@ -170,7 +172,8 @@ describe('relay_pickup per-session button action', () => {
     const r = await handleCardAction({
       operator: { open_id: OWNER },
       action: {
-        value: { action: 'relay_pickup', session_id: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_target_root' },
+        value: { key: 'relay_pick_select', target_chat_id: 'oc_target', root_id: 'om_target_root' },
+        option: 'sess-source-1',
       },
       context: { open_message_id: 'om_picker_card' },
     } as any, deps(map), LARK_APP_ID);

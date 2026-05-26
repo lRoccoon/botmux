@@ -684,18 +684,19 @@ function relayPickerTypeTag(mode: 'group' | 'topic' | 'p2p' | undefined, locale?
 }
 
 /**
- * Card listing the operator's relayable sessions. Each session renders as a
- * structured block:
+ * Card listing the operator's relayable sessions in a single dropdown.
+ * Each option label is a multi-line plain_text block with four fields
+ * (matching the spec from review):
  *
- *   **Session title**
- *   `[类型 tag]` · Chat name
- *   📂 /work/dir · CLI · ⏱ 10m ago
- *   [接力到本群]
+ *   Session title
+ *   [type tag]
+ *   [chat location — chat name or "单聊" for p2p]
+ *   [relative active time]
  *
- * Per-session buttons rather than a single dropdown: dropdown labels are
- * plain_text only and the multi-field info got cramped on one line
- * (caught in review). The button's value carries the source sessionId so
- * card-handler can resolve it independently of any selection state.
+ * Selecting an option fires `relay_pick_select` immediately — Lark's
+ * select_static dispatches the callback on choice, no separate confirm
+ * button needed. The option's `value` is the sessionId; the select's own
+ * `value` carries target chat context for the card-handler routing.
  *
  * Empty list produces a card with a single "no relayable sessions" notice —
  * keeps the UX consistent (always returns a card, never an empty message).
@@ -714,36 +715,35 @@ export function buildRelayPickerCard(
       text: { tag: 'lark_md', content: t('card.relay.empty', undefined, locale) },
     });
   } else {
-    entries.forEach((e, i) => {
+    const p2pLocationLabel = t('card.relay.type_p2p', undefined, locale);
+    const options = entries.map((e) => {
       const typeTag = relayPickerTypeTag(e.chatMode, locale);
-      const cliName = e.cliId ? getCliDisplayName(e.cliId) : '';
-      const cwdLine = e.workingDir ? `📂 \`${escapeMd(e.workingDir)}\`` : '';
-      const ageLine = e.lastMessageAt ? `⏱ ${formatDuration(Date.now() - e.lastMessageAt)}` : '';
-      const meta = [cwdLine, cliName, ageLine].filter(Boolean).join(' · ');
-      const titleLine = `**${escapeMd(e.title)}**`;
-      const tagLine = `\`${typeTag}\` · ${escapeMd(e.chatLabel)}`;
-      const body = meta ? `${titleLine}\n${tagLine}\n${meta}` : `${titleLine}\n${tagLine}`;
-      elements.push({
-        tag: 'div',
-        text: { tag: 'lark_md', content: body },
-      });
-      elements.push({
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.relay.btn_pull', undefined, locale) },
-            type: 'primary',
-            value: {
-              action: 'relay_pickup',
-              session_id: e.sessionId,
-              target_chat_id: targetChatId,
-              root_id: targetRootMessageId,
-            },
+      // For p2p chats the "location" is conceptually the same as the type
+      // (it's a direct message — no group name). Per spec ("含单聊，单聊
+      // 就写单聊") we render the literal "单聊" / "direct message" string.
+      const locationLine = e.chatMode === 'p2p' ? p2pLocationLabel : e.chatLabel;
+      const ageLine = e.lastMessageAt ? formatDuration(Date.now() - e.lastMessageAt) : '';
+      const lines = [e.title, typeTag, locationLine];
+      if (ageLine) lines.push(ageLine);
+      return {
+        text: { tag: 'plain_text' as const, content: lines.join('\n') },
+        value: e.sessionId,
+      };
+    });
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'select_static',
+          placeholder: { tag: 'plain_text', content: t('card.relay.placeholder_select', undefined, locale) },
+          options,
+          value: {
+            key: 'relay_pick_select',
+            target_chat_id: targetChatId,
+            root_id: targetRootMessageId,
           },
-        ],
-      });
-      if (i < entries.length - 1) elements.push({ tag: 'hr' });
+        },
+      ],
     });
   }
 
