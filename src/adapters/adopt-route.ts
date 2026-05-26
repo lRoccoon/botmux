@@ -149,44 +149,72 @@ export async function queryAdoptSession(
 /**
  * 通过祖先 PID 匹配在线 adopt 会话。
  *
- * 遍历每个 daemon × 每个祖先 pid，首个命中即返回；都不中返回 null。
+ * **并发 + 全局 budget 封顶**：候选 = daemon 列表序 × 祖先链序（由近及远）逐个编号；
+ * 全部并发查询（每请求各自带 2s 超时），整体不超过 `budgetMs`。命中按候选 index 取
+ * 最小，保持确定性。
+ *
+ * 为何要全局 budget：runHook 在缺 BOTMUX_* 时同步 await 本函数，而全局 hook 会覆盖
+ * 非 botmux 的 Claude 会话；若某 daemon still-online 但 IPC 不响应，顺序 await 会
+ * `祖先数 × 2s × daemon 数` 线性叠加（可达几十秒），把真·非 botmux 的 ask 卡死。
+ * 并发让总耗时收敛到单请求量级，budget 再封顶，保证快速 passthrough。
  *
  * @param deps.startPid      hook 进程自身的 PID
  * @param deps.listDaemons   列出在线 daemon（ipcPort）
  * @param deps.queryDaemon   查询某 daemon 是否有该 pid 的活跃 adopt 会话
  * @param deps.getAncestors  取祖先 PID（默认使用 getAncestorPids）
+ * @param deps.budgetMs      整体耗时上限（默认 1500ms；可注入便于测试）
  */
 export async function resolveAdoptRoute(deps: {
   startPid: number;
   listDaemons: () => Array<{ ipcPort: number }>;
   queryDaemon: (ipcPort: number, pid: number) => Promise<AdoptRoute | null>;
   getAncestors?: (startPid: number) => number[];
+  budgetMs?: number;
 }): Promise<AdoptRoute | null> {
   const { startPid, listDaemons, queryDaemon } = deps;
   const getAncestors = deps.getAncestors ?? ((pid) => getAncestorPids(pid));
+  const budgetMs = deps.budgetMs ?? 1500;
   const ancestors = getAncestors(startPid);
   if (ancestors.length === 0) return null;
 
   const daemons = listDaemons();
   if (daemons.length === 0) return null;
 
-  // 外层遍历 daemon，内层遍历祖先（减少对同一 daemon 的重复连接）。
-  // 命中顺序确定：daemon 列表序 × 祖先链序（由近及远），首个 active match 即返回。
-  // 同一个外部 Claude 理论上不会被多个 bot 同时 adopt，故首个命中即正解。
+  // 候选编号：daemon 列表序 × 祖先链序（由近及远），index 决定确定性优先级。
+  const candidates: Array<{ index: number; ipcPort: number; pid: number }> = [];
+  let idx = 0;
   for (const daemon of daemons) {
     for (const pid of ancestors) {
-      const route = await queryDaemon(daemon.ipcPort, pid);
-      if (route) {
-        // 排障用：默认静默，置 BOTMUX_HOOK_DEBUG=1 时打到 stderr（不污染 hook stdout）。
-        if (process.env.BOTMUX_HOOK_DEBUG === '1') {
-          process.stderr.write(
-            `[adopt-route] matched pid=${pid} daemon=${daemon.ipcPort} session=${route.sessionId}\n`,
-          );
-        }
-        return route;
-      }
+      candidates.push({ index: idx++, ipcPort: daemon.ipcPort, pid });
     }
   }
 
-  return null;
+  // 并发发起全部查询，命中按 index 记入 hits；整体被 budget 封顶。
+  const hits = new Map<number, AdoptRoute>();
+  const queries = candidates.map(async (c) => {
+    const route = await queryDaemon(c.ipcPort, c.pid);
+    if (route) hits.set(c.index, route);
+  });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, budgetMs);
+    timer.unref?.();
+  });
+  try {
+    await Promise.race([Promise.allSettled(queries), budget]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  // 在「budget 内已 settle 的命中」里按候选 index 升序取最早的一个（确定性）。
+  let best: AdoptRoute | null = null;
+  let bestIdx = Infinity;
+  for (const [i, route] of hits) {
+    if (i < bestIdx) { bestIdx = i; best = route; }
+  }
+  if (best && process.env.BOTMUX_HOOK_DEBUG === '1') {
+    process.stderr.write(`[adopt-route] matched candidate#${bestIdx} session=${best.sessionId}\n`);
+  }
+  return best;
 }

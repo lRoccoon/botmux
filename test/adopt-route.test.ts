@@ -102,27 +102,38 @@ describe('resolveAdoptRoute', () => {
     expect(result).toEqual(MOCK_ROUTE);
   });
 
-  it('首个命中后停止（不再查询后续 daemon/pid）', async () => {
+  it('并发查询，多命中时按候选 index 取最小（确定性）', async () => {
+    // 候选编号：daemon 列表序 × 祖先链序 →
+    //   #0 (port1,100) #1 (port1,200) #2 (port2,100) #3 (port2,200)
     const getAncestors = () => [100, 200];
     const listDaemons = () => [{ ipcPort: 1 }, { ipcPort: 2 }];
-    const calls: Array<{ port: number; pid: number }> = [];
 
-    // (port=1, pid=100) 命中
+    // 让 #1(port1,200) 和 #3(port2,200) 都命中，但 #1 故意慢、#3 快返回；
+    // 并发下 #3 先 settle，但结果必须取 index 更小的 #1（确定性）。
+    const route1: AdoptRoute = { ...MOCK_ROUTE, sessionId: 's-idx1' };
+    const route3: AdoptRoute = { ...MOCK_ROUTE, sessionId: 's-idx3' };
     const queryDaemon = async (port: number, pid: number): Promise<AdoptRoute | null> => {
-      calls.push({ port, pid });
-      if (port === 1 && pid === 100) return MOCK_ROUTE;
+      if (port === 1 && pid === 200) { await new Promise((r) => setTimeout(r, 20)); return route1; }
+      if (port === 2 && pid === 200) return route3;
       return null;
     };
 
-    const result = await resolveAdoptRoute({
-      startPid: 999,
-      listDaemons,
-      queryDaemon,
-      getAncestors,
-    });
-    expect(result).toEqual(MOCK_ROUTE);
-    // 命中后不应再查询
-    expect(calls).toEqual([{ port: 1, pid: 100 }]);
+    const result = await resolveAdoptRoute({ startPid: 999, listDaemons, queryDaemon, getAncestors, budgetMs: 1000 });
+    expect(result?.sessionId).toBe('s-idx1');
+  });
+
+  it('全局 budget：所有 query 都挂起 → budget 内返回 null（不被无响应 daemon 卡住）', async () => {
+    const getAncestors = () => [100, 200, 300];
+    const listDaemons = () => [{ ipcPort: 1 }, { ipcPort: 2 }];
+    // 永不 resolve，模拟 still-online 但 IPC 不响应的 daemon
+    const queryDaemon = (): Promise<AdoptRoute | null> => new Promise<AdoptRoute | null>(() => {});
+
+    const t0 = Date.now();
+    const result = await resolveAdoptRoute({ startPid: 999, listDaemons, queryDaemon, getAncestors, budgetMs: 60 });
+    const elapsed = Date.now() - t0;
+    expect(result).toBeNull();
+    // 应在 budget 量级返回（给足余量），绝不线性叠加到 祖先×daemon×2s
+    expect(elapsed).toBeLessThan(1000);
   });
 
   it('全部 daemon × 祖先都未命中 → 返回 null', async () => {
