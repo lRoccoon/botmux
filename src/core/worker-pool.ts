@@ -645,6 +645,129 @@ export async function closeSession(
   return { ok: true, alreadyClosed };
 }
 
+// ─── Session transfer (cross-chat relay) ────────────────────────────────────
+
+/**
+ * Transfer an active session from its current chat to a new chat. The CLI
+ * process keeps running inside its tmux session — only the routing fields
+ * (chatId, rootMessageId, scope) and activeSessions key are rewritten. After
+ * the rewrite, forkWorker spawns a new worker that re-attaches to the same
+ * `bmx-<sessionId>` tmux, so the AI's transcript continues without break.
+ *
+ * Visible side effects:
+ *   - Lark messages in the *source* chat remain where they were — we have no
+ *     API to move them. Only the worker's *routing* moves; the AI's memory
+ *     follows via the CLI's persistent jsonl on disk.
+ *   - Cards posted by the prior worker stay in the source chat. We clear
+ *     streamCardId/Nonce/imageKey so the new worker posts fresh cards in the
+ *     target chat instead of trying to PATCH unreachable old ones.
+ *
+ * Pre-conditions:
+ *   - Session must be currently active (live worker + activeSessions entry)
+ *   - Worker must reach `idle` or `limited` within `waitForIdleMs` (default
+ *     60s) — transferring mid-turn would tear the in-progress jsonl write.
+ *
+ * Idempotent for `same_chat`: returns error without side effects when the
+ * source chat equals the target chat.
+ */
+export async function transferSession(
+  sessionId: string,
+  targetChatId: string,
+  targetRootMessageId: string,
+  opts?: {
+    waitForIdleMs?: number;
+    /** @internal Override for tests — the real implementation forks a child
+     *  process and tries to attach to tmux, neither of which is appropriate
+     *  in a unit test environment. Defaults to module-level forkWorker. */
+    forkWorkerImpl?: typeof forkWorker;
+    /** @internal Override for tests — mirror of forkWorkerImpl for killWorker. */
+    killWorkerImpl?: typeof killWorker;
+  },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const ds = findActiveBySessionId(sessionId);
+  if (!ds) return { ok: false, error: 'session_not_active' };
+  if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
+
+  const fkw = opts?.forkWorkerImpl ?? forkWorker;
+  const kw = opts?.killWorkerImpl ?? killWorker;
+
+  // Wait for the worker to leave a mid-turn state so the CLI's jsonl reaches
+  // a consistent line boundary before we kill. We treat `limited` as a stable
+  // resting state too — the CLI is parked on a usage-limit prompt, not
+  // streaming output.
+  const timeoutMs = opts?.waitForIdleMs ?? 60_000;
+  const idleStart = Date.now();
+  while (Date.now() - idleStart < timeoutMs) {
+    if (!ds.worker || ds.worker.killed) break;
+    const st = ds.lastScreenStatus;
+    if (st === 'idle' || st === 'limited') break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  const stillBusy = ds.worker && !ds.worker.killed
+    && ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited';
+  if (stillBusy) return { ok: false, error: 'worker_busy_timeout' };
+
+  const tagPrefix = sessionId.substring(0, 8);
+  const oldAnchor = sessionAnchorId(ds);
+  const oldChatId = ds.chatId;
+
+  // Detach worker — TmuxBackend.kill() does NOT destroy the tmux session, so
+  // the CLI process and its rolling jsonl continue running.
+  kw(ds);
+  activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
+
+  // Rewrite routing fields. Target chat is always chat-scope: leader posts a
+  // notification message (M1) used as `targetRootMessageId` for trace, but
+  // chat-scope routes by chatId anyway, so M1 is purely audit/UX.
+  ds.session.chatId = targetChatId;
+  ds.session.rootMessageId = targetRootMessageId;
+  ds.session.scope = 'chat';
+  ds.session.chatType = 'group';
+  ds.session.lastMessageAt = new Date().toISOString();
+  // Card state was pinned to the source chat — clear so the new worker posts
+  // a fresh card in the target chat instead of trying to PATCH a message that
+  // lives in another chat entirely.
+  ds.session.streamCardId = undefined;
+  ds.session.streamCardNonce = undefined;
+  ds.session.currentImageKey = undefined;
+
+  // Mirror onto runtime DaemonSession.
+  ds.chatId = targetChatId;
+  ds.chatType = 'group';
+  ds.scope = 'chat';
+  ds.streamCardId = undefined;
+  ds.streamCardNonce = undefined;
+  ds.currentImageKey = undefined;
+
+  sessionStore.updateSession(ds.session);
+
+  const newAnchor = sessionAnchorId(ds);
+  activeSessionsRegistry?.set(sessionKey(newAnchor, ds.larkAppId), ds);
+
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId,
+      patch: {
+        chatId: targetChatId,
+        rootMessageId: targetRootMessageId,
+        scope: 'chat',
+        chatType: 'group',
+      },
+    },
+  });
+
+  // forkWorker with resume=true — TmuxBackend.spawn detects the surviving
+  // `bmx-<sessionId>` session and re-attaches instead of creating a new one.
+  fkw(ds, '', /*resume*/true);
+
+  logger.info(
+    `[${tagPrefix}] transferred ${oldChatId} → ${targetChatId} ` +
+    `(anchor ${oldAnchor.substring(0, 8)} → ${newAnchor.substring(0, 8)})`,
+  );
+  return { ok: true };
+}
+
 // ─── Fork worker ────────────────────────────────────────────────────────────
 
 export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
