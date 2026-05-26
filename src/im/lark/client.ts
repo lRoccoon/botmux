@@ -223,6 +223,38 @@ export async function getChatName(larkAppId: string, chatId: string): Promise<st
   }
 }
 
+/**
+ * One-shot fetch of both the chat's display name AND its mode (普通群 /
+ * 话题群 / p2p) — saves a duplicate API call when the caller wants both
+ * (the /relay picker needs name for display and mode for the type tag).
+ * Falls back to `{ name: null, mode: 'group' }` on any error, mirroring
+ * getChatMode's safer-default behaviour. */
+export async function getChatNameAndMode(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ name: string | null; mode: ChatMode }> {
+  let name: string | null = null;
+  let mode: ChatMode = 'group';
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code === 0) {
+      const raw = String(res.data?.name ?? '').trim();
+      name = raw.length > 0 ? raw : null;
+      const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+      const rawType = String(res.data?.chat_type ?? '').toLowerCase();
+      const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
+      // Same classification as getChatMode — keep in sync.
+      if (rawType === 'p2p') mode = 'p2p';
+      else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
+      else mode = 'group';
+    }
+  } catch {
+    /* keep safe defaults */
+  }
+  return { name, mode };
+}
+
 /** Lark chat-mode classification used by botmux to decide session scope:
  *   - 'topic'  → 话题群: every top-level message becomes a new thread, so
  *                botmux always uses thread-scope sessions. Two underlying

@@ -117,19 +117,16 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     (entries: any[], targetChatId: string, rootMessageId: string) => JSON.stringify({
       elements: entries.length === 0 ? [
         { tag: 'div', text: { content: 'empty' } },
-      ] : [
+      ] : entries.flatMap((e: any) => [
+        { tag: 'div', text: { content: `**${e.title}** · ${e.chatMode ?? 'group'} · ${e.chatLabel}` } },
         {
           tag: 'action',
           actions: [{
-            tag: 'select_static',
-            options: entries.map((e: any) => ({
-              text: { tag: 'plain_text', content: `${e.chatLabel} · ${e.title}` },
-              value: e.sessionId,
-            })),
-            value: { key: 'relay_pick_select', target_chat_id: targetChatId, root_id: rootMessageId },
+            tag: 'button',
+            value: { action: 'relay_pickup', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId },
           }],
         },
-      ],
+      ]),
     }),
   ),
   getCliDisplayName: vi.fn((id: string) => {
@@ -148,6 +145,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   // Tests can override per-scenario via vi.mocked(getChatName).mockResolvedValue(...).
   // Default returns null so picker entries fall back to raw chatId.
   getChatName: vi.fn(async () => null),
+  getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
@@ -1412,13 +1410,38 @@ describe('handleCommand', () => {
       const card = JSON.parse(replyContent as string);
       const actions = card.elements.filter((e: any) => e.tag === 'action');
       expect(actions).toHaveLength(1);
-      const select = actions[0].actions[0];
-      expect(select.tag).toBe('select_static');
-      expect(select.value.key).toBe('relay_pick_select');
-      expect(select.value.target_chat_id).toBe(CHAT_ID);
-      expect(select.options).toHaveLength(1);
-      expect(select.options[0].value).toBe('sess-other');
+      const btn = actions[0].actions[0];
+      expect(btn.tag).toBe('button');
+      expect(btn.value.action).toBe('relay_pickup');
+      expect(btn.value.session_id).toBe('sess-other');
+      expect(btn.value.target_chat_id).toBe(CHAT_ID);
       expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    it('picker excludes adopt sessions (those wrapping a user-attached tmux)', async () => {
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      // Adopt session in another chat — should NOT appear in the picker.
+      const adoptDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-adopt',
+          chatId: 'oc_other',
+          rootMessageId: 'om_other_root',
+          title: 'adopted',
+          ownerOpenId: 'ou_sender',
+          adoptedFrom: { tmuxTarget: '0:2.0', originalCliPid: 12345, cwd: '/tmp' },
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), adoptDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const [, replyContent] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      const card = JSON.parse(replyContent as string);
+      // No buttons rendered — picker is empty after filtering out the adopt session.
+      expect(card.elements.filter((e: any) => e.tag === 'action')).toHaveLength(0);
     });
 
     it('picker refuses upfront when this chat already has an active session for the bot', async () => {
@@ -1440,7 +1463,7 @@ describe('handleCommand', () => {
       expect(reply).toContain('PR review chat');
       expect(reply).toContain('已经有一个活跃会话');
       // Picker card should NOT have been rendered.
-      expect(reply).not.toContain('relay_pick_select');
+      expect(reply).not.toContain('relay_pickup');
     });
 
     it('picker excludes sessions whose owner is not the operator', async () => {

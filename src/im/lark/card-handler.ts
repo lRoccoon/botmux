@@ -191,16 +191,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
-  // ─── /relay picker select_static dropdown selection ────────────────────
-  // The dropdown fires on selection (no separate confirm button — Lark
-  // semantics for select_static). action.value carries target context;
-  // action.option is the selected sessionId. Custom owner check — operator
-  // must equal the *source* session's owner, which is a different session
-  // from the current chat's ds. Handle this before the isSensitive gate
-  // (which checks canOperate against the current session, irrelevant here).
-  if (value?.key === 'relay_pick_select' && action?.option && larkAppId) {
+  // ─── /relay picker per-session button ──────────────────────────────────
+  // Each entry in the picker card has its own `relay_pickup` button whose
+  // value carries the source sessionId, target_chat_id, and target_root_id.
+  // Custom owner check — operator must equal the *source* session's owner,
+  // which is a different session from the current chat's ds. Handle this
+  // before the isSensitive gate (which checks canOperate against the
+  // current session, irrelevant here).
+  if (value?.action === 'relay_pickup' && larkAppId) {
     const loc = localeForBot(larkAppId);
-    const sourceSessionId = action.option;
+    const sourceSessionId = value.session_id;
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
@@ -249,6 +249,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // could let it slip through. Keep parity with the /relay command message.
       if (r.error === 'target_chat_has_session') {
         return { toast: { type: 'error', content: t('card.relay.toast_target_has_session', undefined, loc) } };
+      }
+      if (r.error === 'adopt_not_relayable') {
+        return { toast: { type: 'error', content: t('card.relay.toast_adopt_not_relayable', undefined, loc) } };
       }
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: r.error }, loc) } };
     }

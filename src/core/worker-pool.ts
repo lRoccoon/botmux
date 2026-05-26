@@ -688,6 +688,11 @@ export async function transferSession(
   if (!ds) return { ok: false, error: 'session_not_active' };
   if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
 
+  // Adopt sessions wrap a CLI process that botmux didn't spawn — the user
+  // owns it inside their own tmux pane, so moving routing here would be
+  // surprising and we don't control the tmux session's lifecycle. Refuse.
+  if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_relayable' };
+
   // Existing-session guard: a chat-scope session at the target chatId would
   // collide on sessionKey(targetChatId, larkAppId) after the rewrite, and
   // Map.set would silently orphan the prior entry's worker. Refuse instead.

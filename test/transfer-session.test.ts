@@ -108,6 +108,19 @@ describe('transferSession', () => {
     if (!r.ok) expect(r.error).toBe('session_not_active');
   });
 
+  it('returns adopt_not_relayable when source session was attached via /adopt', async () => {
+    const adoptDs = makeDs();
+    adoptDs.session.adoptedFrom = { tmuxTarget: '0:2.0', originalCliPid: 12345, cwd: '/tmp/proj' };
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), adoptDs);
+
+    const r = await callTransfer(adoptDs.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toBe('adopt_not_relayable');
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    // Adopt session must remain in source chat untouched.
+    expect(adoptDs.chatId).toBe('oc_source');
+  });
+
   it('returns same_chat when target chatId equals current chatId', async () => {
     const ds = makeDs();
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);

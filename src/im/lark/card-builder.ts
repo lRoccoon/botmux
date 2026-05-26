@@ -669,18 +669,33 @@ export interface RelayPickerEntry {
   cliId?: CliId;
   /** Last activity timestamp, used to render a relative duration. */
   lastMessageAt?: number;
+  /** Source chat's conversational topology. Drives the type tag in the
+   *  picker. Caller supplies based on getChatNameAndMode lookup + the
+   *  session's own chatType for the p2p case. */
+  chatMode?: 'group' | 'topic' | 'p2p';
+}
+
+function relayPickerTypeTag(mode: 'group' | 'topic' | 'p2p' | undefined, locale?: Locale): string {
+  switch (mode) {
+    case 'p2p':   return t('card.relay.type_p2p',   undefined, locale);
+    case 'topic': return t('card.relay.type_topic', undefined, locale);
+    default:      return t('card.relay.type_group', undefined, locale); // 'group' or undefined
+  }
 }
 
 /**
- * Card listing the operator's relayable sessions as a single dropdown so the
- * card stays short regardless of how many sessions exist. Selecting an
- * option triggers `relay_pick_select` immediately — Lark fires the action
- * callback on selection, so no separate confirm button is needed (same
- * pattern as `buildAdoptSelectCard`).
+ * Card listing the operator's relayable sessions. Each session renders as a
+ * structured block:
  *
- * The select's `value` carries `target_chat_id` + `root_id` (where the
- * picker was rendered) — card-handler combines those with the option's
- * `value` (the chosen sessionId) to invoke transferSession.
+ *   **Session title**
+ *   `[类型 tag]` · Chat name
+ *   📂 /work/dir · CLI · ⏱ 10m ago
+ *   [接力到本群]
+ *
+ * Per-session buttons rather than a single dropdown: dropdown labels are
+ * plain_text only and the multi-field info got cramped on one line
+ * (caught in review). The button's value carries the source sessionId so
+ * card-handler can resolve it independently of any selection state.
  *
  * Empty list produces a card with a single "no relayable sessions" notice —
  * keeps the UX consistent (always returns a card, never an empty message).
@@ -699,38 +714,36 @@ export function buildRelayPickerCard(
       text: { tag: 'lark_md', content: t('card.relay.empty', undefined, locale) },
     });
   } else {
-    const options = entries.map((e) => {
-      const project = e.workingDir ? (e.workingDir.split('/').filter(Boolean).pop() || e.workingDir) : '';
+    entries.forEach((e, i) => {
+      const typeTag = relayPickerTypeTag(e.chatMode, locale);
       const cliName = e.cliId ? getCliDisplayName(e.cliId) : '';
-      const age = e.lastMessageAt ? formatDuration(Date.now() - e.lastMessageAt) : '';
-      const parts = [e.chatLabel, e.title];
-      if (project) parts.push(project);
-      if (cliName) parts.push(cliName);
-      if (age) parts.push(age);
-      const label = parts.join(' · ');
-      // Lark plain_text capping — 80 leaves room for the leading bot/CLI
-      // labels and trailing "..." truncation, and stays under Lark's hard
-      // limit (which around ~250 chars).
-      const truncated = label.length > 80 ? label.slice(0, 79) + '…' : label;
-      return {
-        text: { tag: 'plain_text' as const, content: truncated },
-        value: e.sessionId,
-      };
-    });
-    elements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'select_static',
-          placeholder: { tag: 'plain_text', content: t('card.relay.placeholder_select', undefined, locale) },
-          options,
-          value: {
-            key: 'relay_pick_select',
-            target_chat_id: targetChatId,
-            root_id: targetRootMessageId,
+      const cwdLine = e.workingDir ? `📂 \`${escapeMd(e.workingDir)}\`` : '';
+      const ageLine = e.lastMessageAt ? `⏱ ${formatDuration(Date.now() - e.lastMessageAt)}` : '';
+      const meta = [cwdLine, cliName, ageLine].filter(Boolean).join(' · ');
+      const titleLine = `**${escapeMd(e.title)}**`;
+      const tagLine = `\`${typeTag}\` · ${escapeMd(e.chatLabel)}`;
+      const body = meta ? `${titleLine}\n${tagLine}\n${meta}` : `${titleLine}\n${tagLine}`;
+      elements.push({
+        tag: 'div',
+        text: { tag: 'lark_md', content: body },
+      });
+      elements.push({
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.relay.btn_pull', undefined, locale) },
+            type: 'primary',
+            value: {
+              action: 'relay_pickup',
+              session_id: e.sessionId,
+              target_chat_id: targetChatId,
+              root_id: targetRootMessageId,
+            },
           },
-        },
-      ],
+        ],
+      });
+      if (i < entries.length - 1) elements.push({ tag: 'hr' });
     });
   }
 

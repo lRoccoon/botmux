@@ -730,56 +730,68 @@ describe('buildRelayPickerCard', () => {
     expect(divs.length).toBeGreaterThan(0);
     const emptyText = divs.map((d: any) => d.text?.content ?? '').join('\n');
     expect(emptyText).toMatch(/没有可接力|No relayable/);
-    // No action buttons or dropdowns in empty state.
+    // No action buttons in empty state.
     expect(card.elements.filter((e: any) => e.tag === 'action').length).toBe(0);
   });
 
-  it('renders a single select_static dropdown with one option per session', () => {
+  it('renders each session as a div + relay_pickup button, separated by hr', () => {
     const entries: RelayPickerEntry[] = [
-      { sessionId: 'sess-a', chatLabel: 'Project A discussion', title: 'PR review', cliId: 'claude-code', workingDir: '/work/proj', lastMessageAt: Date.now() - 60_000 },
-      { sessionId: 'sess-b', chatLabel: 'Team docs',            title: 'docs sync',                                                  lastMessageAt: Date.now() - 600_000 },
+      { sessionId: 'sess-a', chatLabel: 'Project A 讨论群', title: 'PR review',  chatMode: 'group', cliId: 'claude-code', workingDir: '/work/proj', lastMessageAt: Date.now() - 60_000 },
+      { sessionId: 'sess-b', chatLabel: 'Team docs',         title: 'docs sync',  chatMode: 'topic',                                                  lastMessageAt: Date.now() - 600_000 },
     ];
     const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_target_root'));
 
-    // Exactly one action element containing exactly one select_static.
     const actions = card.elements.filter((e: any) => e.tag === 'action');
-    expect(actions).toHaveLength(1);
-    expect(actions[0].actions).toHaveLength(1);
-    const select = actions[0].actions[0];
-    expect(select.tag).toBe('select_static');
-
-    // One option per entry; option value is the sessionId.
-    expect(select.options).toHaveLength(2);
-    expect(select.options[0].value).toBe('sess-a');
-    expect(select.options[1].value).toBe('sess-b');
-
-    // Dropdown carries the target chat context for the card-handler routing.
-    expect(select.value.key).toBe('relay_pick_select');
-    expect(select.value.target_chat_id).toBe('oc_target');
-    expect(select.value.root_id).toBe('om_target_root');
+    expect(actions).toHaveLength(2);
+    actions.forEach((a: any, i: number) => {
+      const btn = a.actions[0];
+      expect(btn.tag).toBe('button');
+      expect(btn.value.action).toBe('relay_pickup');
+      expect(btn.value.session_id).toBe(entries[i].sessionId);
+      expect(btn.value.target_chat_id).toBe('oc_target');
+      expect(btn.value.root_id).toBe('om_target_root');
+    });
+    // 2 entries → 1 hr between them.
+    expect(card.elements.filter((e: any) => e.tag === 'hr').length).toBe(1);
   });
 
-  it('renders the friendly chat name (not oc_xxx) in option labels when provided', () => {
+  it('shows the session title prominently, then a tag for the chat type, then chat name', () => {
     const entries: RelayPickerEntry[] = [
-      // chatLabel was already resolved by the caller (command-handler does
-      // a getChatName lookup); the card just renders what it's given.
-      { sessionId: 'sess-1', chatLabel: 'Project Alpha 讨论群', title: 'fix the bug' },
-    ];
-    const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_root'));
-    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
-    expect(select.options[0].text.content).toContain('Project Alpha 讨论群');
-    expect(select.options[0].text.content).not.toMatch(/^oc_/);
-  });
-
-  it('truncates very long labels so the option still fits Lark plain_text limits', () => {
-    const longTitle = 'a'.repeat(200);
-    const entries: RelayPickerEntry[] = [
-      { sessionId: 'sess-x', chatLabel: 'Some Group', title: longTitle },
+      { sessionId: 'sess-1', chatLabel: 'Project Alpha 讨论群', title: 'fix the deadlock bug', chatMode: 'group' },
     ];
     const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r'));
-    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
-    const label = select.options[0].text.content;
-    expect(label.length).toBeLessThanOrEqual(80);
-    expect(label.endsWith('…')).toBe(true);
+    const div = card.elements.find((e: any) => e.tag === 'div');
+    const body = div.text.content;
+    // Title bolded.
+    expect(body).toContain('**fix the deadlock bug**');
+    // Type tag — group chats render as "普通群" or "group chat" depending on locale.
+    expect(body).toMatch(/普通群|group chat/);
+    // Friendly chat name present, raw chatId absent.
+    expect(body).toContain('Project Alpha 讨论群');
+    expect(body).not.toMatch(/^oc_/m);
+  });
+
+  it('renders the right type tag for topic group / p2p / unknown modes', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 's1', chatLabel: 'A', title: 't1', chatMode: 'topic' },
+      { sessionId: 's2', chatLabel: 'B', title: 't2', chatMode: 'p2p' },
+      { sessionId: 's3', chatLabel: 'C', title: 't3' /* chatMode undefined → defaults to group tag */ },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r'));
+    const divs = card.elements.filter((e: any) => e.tag === 'div').map((d: any) => d.text.content);
+    expect(divs[0]).toMatch(/话题群|topic chat/);
+    expect(divs[1]).toMatch(/单聊|direct message/);
+    expect(divs[2]).toMatch(/普通群|group chat/);
+  });
+
+  it('omits cwd / cli / age lines when their fields are absent', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 's1', chatLabel: 'X', title: 'minimal entry', chatMode: 'group' },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r'));
+    const div = card.elements.find((e: any) => e.tag === 'div');
+    expect(div.text.content).toContain('minimal entry');
+    expect(div.text.content).not.toContain('📂');
+    expect(div.text.content).not.toContain('⏱');
   });
 });

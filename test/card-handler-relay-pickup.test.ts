@@ -1,18 +1,20 @@
 /**
- * Tests for the `relay_pick_select` card action: target-chat picker dropdown.
+ * Tests for the `relay_pickup` card action: target-chat picker per-session button.
  *
- * The picker card renders a single `select_static` dropdown. When the user
- * picks an option, Lark fires the callback with `action.value.key =
- * 'relay_pick_select'` and `action.option = <sessionId>`. card-handler
- * resolves the source session, owner-checks, sends M1, then transferSession.
+ * Each session in the picker card has its own button whose value carries
+ * `{ action: 'relay_pickup', session_id, target_chat_id, root_id }`.
+ * card-handler resolves the source session, owner-checks, sends M1, then
+ * transferSession.
  *
  * We test:
  *   - operator must match the source session's ownerOpenId
  *   - source session must be active and known to this bot
  *   - same-chat short-circuit
- *   - happy path → sends M1, calls transferSession with the new M1 id,
- *     returns success toast
- *   - transferSession failure → error toast carries the error
+ *   - happy path → sends M1 with friendly chat name, calls transferSession
+ *     with the new M1 id, returns success toast
+ *   - transferSession failure variants → friendly toasts for
+ *     target_chat_has_session and adopt_not_relayable; raw error
+ *     passthrough for everything else
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -22,7 +24,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {} }));
 
 const sendMessageMock = vi.fn(async () => 'om_M1');
 const deleteMessageMock = vi.fn(async () => true);
-const getChatNameMock = vi.fn(async () => 'Friendly Source Chat Name');
+const getChatNameMock = vi.fn(async (): Promise<string | null> => 'Friendly Source Chat Name');
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return {
@@ -88,18 +90,17 @@ function makeDs(overrides: Partial<Session> & { chatId?: string } = {}): DaemonS
   } as DaemonSession;
 }
 
-// New action shape: dropdown selection. action.value carries the per-card
-// context (target chat / root), action.option carries the picked sessionId.
+// Per-session button action shape: value carries the full pickup context.
 function actionData(opts: { sessionId?: string; target_chat_id?: string; root_id?: string; operator?: string } = {}) {
   return {
     operator: { open_id: opts.operator ?? OWNER },
     action: {
       value: {
-        key: 'relay_pick_select',
+        action: 'relay_pickup',
+        session_id: opts.sessionId ?? 'sess-source-1',
         target_chat_id: opts.target_chat_id ?? 'oc_target',
         root_id: opts.root_id ?? 'om_target_root',
       },
-      option: opts.sessionId,
     },
   };
 }
@@ -121,19 +122,17 @@ beforeEach(() => {
   transferSessionMock.mockResolvedValue({ ok: true });
 });
 
-describe('relay_pick_select dropdown action', () => {
-  it('rejects when no option was selected (e.g. action.option missing)', async () => {
+describe('relay_pickup per-session button action', () => {
+  it('rejects when required value fields are missing', async () => {
     const r = await handleCardAction({
       operator: { open_id: OWNER },
-      action: { value: { key: 'relay_pick_select', target_chat_id: 'oc_target', root_id: 'om_root' } /* no option */ },
+      action: { value: { action: 'relay_pickup' /* missing everything */ } },
     } as any, deps(new Map()), LARK_APP_ID);
-    // Dropdown without option → handler falls through (key check requires option).
-    // Result is undefined or a non-relay toast — either way, no transfer.
+    expect(r?.toast?.type).toBe('error');
     expect(transferSessionMock).not.toHaveBeenCalled();
-    if (r) expect(r.toast?.content).not.toContain('Friendly Source');
   });
 
-  it('returns not_found when the selected sessionId is not in active registry', async () => {
+  it('returns not_found when the picked sessionId is not in active registry', async () => {
     const r = await handleCardAction(actionData({ sessionId: 'missing-sess' }), deps(new Map()), LARK_APP_ID);
     expect(r?.toast?.type).toBe('error');
     expect(transferSessionMock).not.toHaveBeenCalled();
@@ -171,8 +170,7 @@ describe('relay_pick_select dropdown action', () => {
     const r = await handleCardAction({
       operator: { open_id: OWNER },
       action: {
-        value: { key: 'relay_pick_select', target_chat_id: 'oc_target', root_id: 'om_target_root' },
-        option: 'sess-source-1',
+        value: { action: 'relay_pickup', session_id: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_target_root' },
       },
       context: { open_message_id: 'om_picker_card' },
     } as any, deps(map), LARK_APP_ID);
@@ -200,6 +198,20 @@ describe('relay_pick_select dropdown action', () => {
 
     const m1Payload = sendMessageMock.mock.calls[0][2];
     expect(m1Payload).toContain('oc_source');
+  });
+
+  it('returns a friendly toast when transferSession reports adopt_not_relayable', async () => {
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    transferSessionMock.mockResolvedValueOnce({ ok: false, error: 'adopt_not_relayable' });
+
+    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+
+    expect(r?.toast?.type).toBe('error');
+    expect(r?.toast?.content).toContain('/adopt');
+    expect(r?.toast?.content).not.toMatch(/adopt_not_relayable/);
   });
 
   it('returns a friendly toast when transferSession reports target_chat_has_session', async () => {
