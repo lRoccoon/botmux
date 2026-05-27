@@ -63,13 +63,9 @@ function pageHtml(): string {
 
 <div class="card" style="margin-bottom:16px">
   <h2 style="margin-top:0">本部署</h2>
-  <p>名称：<b id="tf-dep-name">…</b>
-    <span class="muted" style="font-size:13px;margin-left:6px">（默认用你绑定的飞书名）</span></p>
   <p>我的飞书身份：<b id="tf-owner">未绑定</b>
-    <button id="tf-autobind" class="primary" style="margin-left:8px">自动绑定</button>
-    <button id="tf-bind" class="ghost" style="margin-left:6px">用 /pair 绑定</button>
-    <span class="muted" style="font-size:13px">（绑定后拉群会自动把你拉进群；你的机器人也归到你名下）</span></p>
-  <p class="muted" style="font-size:13px">推荐「自动绑定」：用机器人凭证从允许使用者里识别你，免发码。</p>
+    <button id="tf-autobind" class="primary" style="margin-left:8px">绑定</button>
+    <span class="muted" style="font-size:13px">（用机器人凭证自动识别你；绑定后拉群会把你拉进群、机器人也归到你名下）</span></p>
   <div id="tf-bind-out" style="display:none;margin-top:6px"></div>
   <p class="muted" style="font-size:13px">别人加入你的团队时，需要你的 Hub 地址 + 邀请码。邀请码发给<b>别的部署</b>的人用（不能加入自己）。</p>
   <p><button id="tf-invite" class="primary">生成邀请码</button></p>
@@ -271,7 +267,6 @@ async function loadLocal(): Promise<void> {
   const r = await jget('/api/team/local');
   const b = r.body as LocalResp;
   if (!b?.ok) { localTeam = null; renderTeams(); return; }
-  $('tf-dep-name').textContent = b.deployment.name;
   myDeploymentId = b.deployment.deploymentId;
   $('tf-owner').textContent = b.deployment.ownerName || (b.deployment.ownerUnionId ? '已绑定' : '未绑定');
   ($('tf-teams') as HTMLElement).dataset.hub = b.suggestedHubUrl; // for invite-code display
@@ -363,32 +358,8 @@ export function renderTeamFederationPage(root: HTMLElement): void {
       });
       return;
     }
-    if (b?.error === 'no_candidates') { out.innerHTML = '<span class="err">没识别到身份（机器人 allowedUsers 为空或解析失败）。可改用「用 /pair 绑定」。</span>'; return; }
-    out.innerHTML = `<span class="err">自动绑定失败：${escapeHtml(String(b?.error || 'unknown'))}。可改用「用 /pair 绑定」。</span>`;
-  };
-
-  // Bind this deployment's Feishu identity via /pair (start → poll → consume).
-  $('tf-bind').onclick = async () => {
-    const out = $('tf-bind-out');
-    out.style.display = '';
-    const s = await jpost('/api/team/identity/start');
-    const sb: any = s.body;
-    if (!sb?.code) { out.innerHTML = '<span class="err">发起失败，请重试。</span>'; return; }
-    out.innerHTML = `在飞书里给<b>本部署任一机器人</b>发送：<code style="font-size:15px">/pair ${escapeHtml(sb.code)}</code> <span class="muted">（5 分钟内）</span>`;
-    const t0 = Date.now();
-    const timer = setInterval(async () => {
-      if (Date.now() - t0 > 5 * 60 * 1000) { clearInterval(timer); out.innerHTML = '<span class="err">配对码已过期，请重新点「绑定」。</span>'; return; }
-      const st = await jpost('/api/team/identity/status', { pairingId: sb.pairingId, browserToken: sb.browserToken });
-      const stb: any = st.body;
-      if (stb?.status === 'claimed') {
-        clearInterval(timer);
-        const c = await jpost('/api/team/identity/consume', { pairingId: sb.pairingId, browserToken: sb.browserToken });
-        if ((c.body as any)?.ok) { out.innerHTML = `<span class="ok">已绑定：${escapeHtml((c.body as any).owner?.name || '')}</span>`; loadLocal(); }
-        else { out.innerHTML = `<span class="err">绑定失败：${escapeHtml(String((c.body as any)?.error || ''))}</span>`; }
-      } else if (stb?.status === 'not_found') {
-        clearInterval(timer); out.innerHTML = '<span class="err">配对码失效，请重新点「绑定」。</span>';
-      }
-    }, 2000);
+    if (b?.error === 'no_candidates') { out.innerHTML = '<span class="err">没识别到身份：请确认机器人配置了 allowedUsers（允许使用者），且机器人有通讯录权限。</span>'; return; }
+    out.innerHTML = `<span class="err">绑定失败：${escapeHtml(String(b?.error || 'unknown'))}</span>`;
   };
 
   void loadLocal();
