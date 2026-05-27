@@ -29,6 +29,7 @@ import {
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
+import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -86,7 +87,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -234,6 +235,8 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+let hermesBridgeOffset = 0;
+let hermesBridgeBaselineDone = false;
 /** Codex sessionId we received via writeInput but haven't yet resolved a
  *  rollout file for. The poller keeps retrying — the file appears on
  *  Codex's first user submit, but with some race delay after our submit
@@ -1302,20 +1305,25 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 
 function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
-  // from append-only JSONL when the model forgets to call `botmux send`.
-  // Codex uses ~/.codex rollouts; CoCo uses ~/.cache/coco events. Both
-  // work in adopt mode now that CoCo's PID→sessionId discovery is wired.
-  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco';
+  // when the model forgets to call `botmux send`.
+  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes';
 }
 
 function structuredBridgeIsCodex(): boolean {
   return lastInitConfig?.cliId === 'codex';
 }
 
+function structuredBridgeIsHermes(): boolean {
+  return lastInitConfig?.cliId === 'hermes';
+}
+
 function structuredBridgeIngestPath(path: string, offset: number) {
-  return structuredBridgeIsCodex()
-    ? drainCodexRollout(path, offset)
-    : drainCocoEvents(path, offset);
+  if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
+  if (structuredBridgeIsHermes()) {
+    const result = drainHermesStateDb(offset);
+    return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
+  }
+  return drainCocoEvents(path, offset);
 }
 
 function codexBridgeStartTimer(): void {
@@ -1333,6 +1341,12 @@ function codexBridgeStartTimer(): void {
   // publish a half-streamed response.
   codexBridgeTimer = setInterval(() => {
     try {
+      if (structuredBridgeIsHermes()) {
+        if (!hermesBridgeBaselineDone) hermesBridgeAttach(lastInitConfig?.resume ? 'baseline-existing' : 'fresh-empty');
+        hermesBridgeIngest();
+        if (isPromptReady) emitReadyCodexTurns();
+        return;
+      }
       if (!codexBridgeRolloutPath) {
         // Two discovery paths, in order: cliSessionId (known via writeInput
         // result for non-adopt or daemon-side probe for adopt) → exact
@@ -1379,6 +1393,23 @@ function codexBridgeStartTimer(): void {
       log(`Codex bridge tick error: ${err.message}`);
     }
   }, 1000);
+}
+
+function hermesBridgeAttach(mode: 'baseline-existing' | 'fresh-empty'): void {
+  hermesBridgeOffset = currentHermesStateOffset();
+  hermesBridgeBaselineDone = true;
+  log(`Hermes bridge ${mode}: state.db offset=${hermesBridgeOffset}`);
+  codexBridgeStartTimer();
+}
+
+function hermesBridgeIngest(): void {
+  if (!hermesBridgeBaselineDone) return;
+  const result = drainHermesStateDb(hermesBridgeOffset);
+  hermesBridgeOffset = result.newOffset;
+  codexBridgeQueue.ingest(result.events);
+  if (result.events.some(e => e.kind === 'assistant_final')) {
+    idleDetector?.fireIdle();
+  }
 }
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fresh-empty' | 'split-live'): void {
@@ -1465,6 +1496,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
 }
 
 function codexBridgeIngest(): void {
+  if (structuredBridgeIsHermes()) {
+    hermesBridgeIngest();
+    return;
+  }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
@@ -1493,7 +1528,7 @@ function codexBridgeMarkPendingTurn(messageText: string): boolean {
 
 function codexBridgeDrainAndMaybeEmit(): void {
   if (!codexBridgeFallbackActive()) return;
-  if (codexBridgeRolloutPath && codexBridgeBaselineDone) {
+  if (structuredBridgeIsHermes() || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
     try { codexBridgeIngest(); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
   }
   emitReadyCodexTurns();
@@ -1561,6 +1596,8 @@ function stopCodexBridge(): void {
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
+  hermesBridgeOffset = 0;
+  hermesBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2081,9 +2118,93 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
 let trustHandled = false;
 
+// Codex App runner sends botmux control messages as OSC sequences so they do
+// not pollute the visible terminal. Strip them before xterm rendering and
+// translate them back into worker IPC.
+const CODEX_APP_OSC_PREFIX = '\x1b]777;botmux:';
+let codexAppOscPending = '';
+
+function decodeCodexAppPayload(payload: string): any | undefined {
+  try {
+    return JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+function handleCodexAppMarker(body: string): void {
+  const sep = body.indexOf(':');
+  if (sep < 0) return;
+  const kind = body.slice(0, sep);
+  const payload = decodeCodexAppPayload(body.slice(sep + 1));
+  if (!payload || typeof payload !== 'object') return;
+
+  if (kind === 'thread' && typeof payload.threadId === 'string') {
+    persistCliSessionId(payload.threadId);
+    return;
+  }
+
+  if (kind === 'final' && typeof payload.content === 'string') {
+    const startedAtMs = typeof payload.startedAtMs === 'number' ? payload.startedAtMs : undefined;
+    const completedAtMs = typeof payload.completedAtMs === 'number' ? payload.completedAtMs : Date.now();
+    if (startedAtMs !== undefined) {
+      const sentByModel = readSendMarkers().some(m =>
+        m.sentAtMs >= startedAtMs && m.sentAtMs <= completedAtMs + 5_000,
+      );
+      if (sentByModel) {
+        log('Codex App final_output suppressed (model already called botmux send)');
+        return;
+      }
+    }
+    const turnId = typeof payload.turnId === 'string' ? payload.turnId : `codex-app-${Date.now()}`;
+    send({
+      type: 'final_output',
+      content: payload.content,
+      lastUuid: turnId,
+      turnId,
+    });
+  }
+}
+
+function splitCodexAppControl(data: string): string {
+  if (lastInitConfig?.cliId !== 'codex-app' && codexAppOscPending.length === 0) return data;
+  const input = codexAppOscPending + data;
+  codexAppOscPending = '';
+
+  let out = '';
+  let cursor = 0;
+  for (;;) {
+    const start = input.indexOf(CODEX_APP_OSC_PREFIX, cursor);
+    if (start < 0) {
+      let tailStart = input.length;
+      const tail = input.slice(cursor);
+      for (let n = Math.min(CODEX_APP_OSC_PREFIX.length - 1, tail.length); n > 0; n--) {
+        if (CODEX_APP_OSC_PREFIX.startsWith(tail.slice(tail.length - n))) {
+          tailStart = input.length - n;
+          break;
+        }
+      }
+      out += input.slice(cursor, tailStart);
+      codexAppOscPending = input.slice(tailStart);
+      return out;
+    }
+
+    out += input.slice(cursor, start);
+    const end = input.indexOf('\x07', start + CODEX_APP_OSC_PREFIX.length);
+    if (end < 0) {
+      codexAppOscPending = input.slice(start);
+      return out;
+    }
+    handleCodexAppMarker(input.slice(start + CODEX_APP_OSC_PREFIX.length, end));
+    cursor = end + 1;
+  }
+}
+
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
 function onPtyData(data: string): void {
+  data = splitCodexAppControl(data);
+  if (data.length === 0) return;
   captureWorkflowTranscript(data);
   renderer?.write(data);
 
@@ -2752,8 +2873,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // calling `botmux send`, harvest the final answer from the CLI transcript
   // and post it to Lark. Codex needs late attach because its rollout id is
   // discovered after the first submit; CoCo's events path is deterministic
-  // from botmux sessionId.
-  if (cfg.cliId === 'codex') {
+  // from botmux sessionId. Hermes uses a global SQLite store, so baseline its
+  // row id at spawn and poll for rows after each queued prompt is flushed.
+  if (cfg.cliId === 'hermes') {
+    hermesBridgeAttach(cfg.resume ? 'baseline-existing' : 'fresh-empty');
+  } else if (cfg.cliId === 'codex') {
     if (cfg.cliSessionId) {
       const rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
       if (rolloutPath) {
@@ -2842,6 +2966,7 @@ function killCli(): void {
   scrollback = '';
   altBufferActive = false;
   trustHandled = false;
+  codexAppOscPending = '';
 }
 
 // ─── HTTP + WebSocket Server ─────────────────────────────────────────────────

@@ -200,7 +200,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
 
     // Diff against the canonical list. Critical-missing is the main signal;
     // non-critical is mentioned only when something critical is also missing,
-    // so single-bot deployments don't get nagged about `include_bot:readonly`.
+    // so deployments don't get nagged about purely optional scopes like
+    // `application:application:self_manage`.
     const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical && !grantedScopes.has(s.name));
     const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedScopes.has(s.name));
 

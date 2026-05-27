@@ -102,6 +102,15 @@ export interface CliAdapter {
    *  support skills (or has a non-standard layout not yet integrated). */
   readonly skillsDir?: string;
 
+  /** Optional: absolute path (with ~ expansion handled by caller) to a Claude
+   *  Code *plugin* root. When set, built-in skills are written into
+   *  `{pluginDir}/skills/<name>/SKILL.md` alongside a `.claude-plugin/plugin.json`
+   *  manifest, and the adapter passes `--plugin-dir {pluginDir}` at spawn so the
+   *  skills are scoped to botmux-spawned sessions only — they never land in the
+   *  user's global `~/.claude/skills`, so a standalone `claude` won't surface
+   *  (and mis-fire) them. Mutually exclusive with `skillsDir`. */
+  readonly pluginDir?: string;
+
   /** hook 安装描述：spawn 时写入各 CLI 的 hook 配置，使 askUserQuestion 事件转发到
    *  `botmux hook <cliId>`。undefined = 不通过 hook 接管 askUserQuestion。 */
   readonly hookInstall?: {
@@ -150,4 +159,4 @@ export interface CliAdapter {
   readonly altScreen: boolean;
 }
 
-export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes';
+export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes';
