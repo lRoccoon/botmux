@@ -1175,12 +1175,13 @@ export async function handleCommand(
         const sourceAnchor = ds.session.rootMessageId;
 
         // ── M1 announcement (sets the shared rootMessageId for all peers) ──
-        const m1Body = JSON.stringify({
-          text: t('cmd.relay.m1_announce', { sourceChat: sourceChatId, groupName }, loc),
-        });
+        // Pass the raw text — sendMessage wraps `'text'` msgType bodies into
+        // { text: content } itself. Pre-wrapping with JSON.stringify caused
+        // double-wrapping; Lark then rendered the JSON literally.
+        const m1Text = t('cmd.relay.m1_announce', { sourceChat: sourceChatId, groupName }, loc);
         let m1MessageId: string;
         try {
-          m1MessageId = await sendMessage(creatorAppId, newChatId, m1Body, 'text');
+          m1MessageId = await sendMessage(creatorAppId, newChatId, m1Text, 'text');
         } catch (err: any) {
           logger.error(`[${logTag}] /relay --create: failed to send M1 to new chat: ${err?.message ?? err}`);
           await sessionReply(rootId, t('cmd.relay.failed', { error: err?.message ?? String(err) }, loc));

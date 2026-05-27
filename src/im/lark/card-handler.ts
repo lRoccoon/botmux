@@ -304,10 +304,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // popup toast — per王皓's preference for visible/persistent error
       // ("不要用弹窗，就用消息形式"). No toast returned so the operator
       // sees the chat message land where the error actually applies.
-      const errBody = JSON.stringify({
-        text: t('cmd.relay.target_has_session_msg', { title: conflictTitle }, loc),
-      });
-      sendMessage(larkAppId, targetChatId, errBody, 'text').catch(() => undefined);
+      // Pass raw text — sendMessage wraps text-msgType bodies itself; the
+      // earlier `JSON.stringify({text: ...})` caused double-wrapping and
+      // Lark rendered the JSON literally (王皓 caught this in the M1).
+      const errText = t('cmd.relay.target_has_session_msg', { title: conflictTitle }, loc);
+      sendMessage(larkAppId, targetChatId, errText, 'text').catch(() => undefined);
       return;
     }
     // Resolve a friendly source chat label for the M1 announcement — falls
@@ -318,10 +319,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // rootMessageId after the transfer (mirrors /relay --create's flow).
     let m1MessageId: string;
     try {
-      const m1Body = JSON.stringify({
-        text: t('cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc),
-      });
-      m1MessageId = await sendMessage(larkAppId, targetChatId, m1Body, 'text');
+      const m1Text = t('cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc);
+      m1MessageId = await sendMessage(larkAppId, targetChatId, m1Text, 'text');
     } catch (err: any) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: err?.message ?? 'send_m1_failed' }, loc) } };
     }
@@ -335,10 +334,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       deleteMessage(larkAppId, m1MessageId).catch(() => { /* leave it */ });
       if (r.error === 'target_chat_has_session') {
         // Lost the race vs the pre-flight check — still surface as a message.
-        const errBody = JSON.stringify({
-          text: t('cmd.relay.target_has_session_msg', { title: '' }, loc),
-        });
-        sendMessage(larkAppId, targetChatId, errBody, 'text').catch(() => undefined);
+        const errText = t('cmd.relay.target_has_session_msg', { title: '' }, loc);
+        sendMessage(larkAppId, targetChatId, errText, 'text').catch(() => undefined);
         return;
       }
       if (r.error === 'adopt_not_relayable') {
