@@ -191,17 +191,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
-  // ─── /relay picker select_static dropdown selection ────────────────────
-  // Each entry in the picker card is an option in a select_static dropdown.
-  // action.value carries the per-card context (target chat / root_id);
-  // action.option carries the picked sessionId. Custom owner check —
-  // operator must equal the *source* session's owner, which is a different
-  // session from the current chat's ds. Handle this before the isSensitive
-  // gate (which checks canOperate against the current session, irrelevant
-  // here).
-  if (value?.key === 'relay_pick_select' && action?.option && larkAppId) {
+  // ─── /relay picker interactive_container click ─────────────────────────
+  // Each session in the picker card is rendered as a v2 interactive_container
+  // whose `behaviors[0].callback.value` carries the source sessionId, target
+  // chat, and root id. Clicking anywhere in the container fires this
+  // callback with the full value as `action.value` (same shape as a button
+  // click — no `action.option`). Custom owner check — operator must equal
+  // the *source* session's owner, which is a different session from the
+  // current chat's ds. Handle this before the isSensitive gate (which
+  // checks canOperate against the current session, irrelevant here).
+  if (value?.action === 'relay_pickup' && larkAppId) {
     const loc = localeForBot(larkAppId);
-    const sourceSessionId = action.option;
+    const sourceSessionId = value.session_id;
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
     if (!sourceSessionId || !targetChatId || !targetRootId) {

@@ -724,74 +724,68 @@ describe('buildSessionClosedCard', () => {
 });
 
 describe('buildRelayPickerCard', () => {
-  it('renders an "empty" notice when no sessions are pickable', () => {
+  it('uses Lark v2 schema (schema: 2.0)', () => {
     const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root'));
-    const divs = card.elements.filter((e: any) => e.tag === 'div');
-    expect(divs.length).toBeGreaterThan(0);
-    const emptyText = divs.map((d: any) => d.text?.content ?? '').join('\n');
-    expect(emptyText).toMatch(/没有可接力|No relayable/);
-    // No action elements in empty state.
-    expect(card.elements.filter((e: any) => e.tag === 'action').length).toBe(0);
+    expect(card.schema).toBe('2.0');
+    expect(card.body).toBeDefined();
+    expect(card.body.elements).toBeDefined();
   });
 
-  it('renders a lark_md card-style block per session with title / type / location / time', () => {
+  it('renders an "empty" notice when no sessions are pickable', () => {
+    const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root'));
+    const md = card.body.elements.find((e: any) => e.tag === 'markdown');
+    expect(md.content).toMatch(/没有可接力|No relayable/);
+    // No interactive containers in empty state.
+    expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container').length).toBe(0);
+  });
+
+  it('renders each session as a clickable interactive_container with callback carrying the sessionId', () => {
     const entries: RelayPickerEntry[] = [
-      { sessionId: 'sess-a', chatLabel: 'Project Alpha 讨论群', title: 'fix the deadlock bug', chatMode: 'group', lastMessageAt: Date.now() - 60_000 },
+      { sessionId: 'sess-a', chatLabel: 'Project A 讨论群', title: 'PR review', chatMode: 'group', lastMessageAt: Date.now() - 60_000 },
+      { sessionId: 'sess-b', chatLabel: 'Team docs',         title: 'docs sync', chatMode: 'topic', lastMessageAt: Date.now() - 600_000 },
     ];
     const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_target_root'));
 
-    const div = card.elements.find((e: any) => e.tag === 'div');
-    expect(div.text.tag).toBe('lark_md');
-    const lines = div.text.content.split('\n');
+    const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers).toHaveLength(2);
+
+    containers.forEach((c: any, i: number) => {
+      expect(c.behaviors).toHaveLength(1);
+      const cb = c.behaviors[0];
+      expect(cb.type).toBe('callback');
+      expect(cb.value.action).toBe('relay_pickup');
+      expect(cb.value.session_id).toBe(entries[i].sessionId);
+      expect(cb.value.target_chat_id).toBe('oc_target');
+      expect(cb.value.root_id).toBe('om_target_root');
+      // The container holds a markdown element with the rich content.
+      expect(c.elements).toHaveLength(1);
+      expect(c.elements[0].tag).toBe('markdown');
+    });
+  });
+
+  it('container markdown shows title / type / location / time on four labelled lines', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 'sess-1', chatLabel: 'Project Alpha 讨论群', title: 'fix the deadlock bug', chatMode: 'group', lastMessageAt: Date.now() - 60_000 },
+    ];
+    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r'));
+    const md = card.body.elements[0].elements[0].content;
+    const lines = md.split('\n');
     expect(lines).toHaveLength(4);
-    // 1. **N. title** — title is bolded and prefixed with the dropdown index.
-    expect(lines[0]).toMatch(/^\*\*1\. fix the deadlock bug\*\*$/);
-    // Labelled fields for type / location / time.
+    expect(lines[0]).toMatch(/^\*\*fix the deadlock bug\*\*$/);
     expect(lines[1]).toMatch(/^(类型|Type): (普通群|group chat)$/);
     expect(lines[2]).toMatch(/(位置|Where): Project Alpha 讨论群/);
     expect(lines[3]).toMatch(/(活跃|Active): /);
   });
 
-  it('places a single select_static dropdown at the bottom with "N. title" option labels', () => {
-    const entries: RelayPickerEntry[] = [
-      { sessionId: 'sess-a', chatLabel: 'A', title: 'PR review',  chatMode: 'group' },
-      { sessionId: 'sess-b', chatLabel: 'B', title: 'docs sync',  chatMode: 'topic' },
-    ];
-    const card = parse(buildRelayPickerCard(entries, 'oc_target', 'om_target_root'));
-
-    // Two lark_md card divs (one per session) + one action (dropdown).
-    const divs = card.elements.filter((e: any) => e.tag === 'div');
-    const actions = card.elements.filter((e: any) => e.tag === 'action');
-    expect(divs).toHaveLength(2);
-    expect(actions).toHaveLength(1);
-
-    const select = actions[0].actions[0];
-    expect(select.tag).toBe('select_static');
-    expect(select.value.key).toBe('relay_pick_select');
-    expect(select.value.target_chat_id).toBe('oc_target');
-    expect(select.value.root_id).toBe('om_target_root');
-
-    // Option labels match the per-card index: "1. PR review" / "2. docs sync".
-    expect(select.options).toHaveLength(2);
-    expect(select.options[0].text.content).toBe('1. PR review');
-    expect(select.options[0].value).toBe('sess-a');
-    expect(select.options[1].text.content).toBe('2. docs sync');
-    expect(select.options[1].value).toBe('sess-b');
-  });
-
   it('uses "单聊" / "direct message" as the location for p2p, ignoring chatLabel', () => {
     const entries: RelayPickerEntry[] = [
-      // For p2p, Lark often returns no name; chatLabel may be the raw chatId.
-      // Per spec ("含单聊，单聊就写单聊") the location should be the literal
-      // p2p label, not the chatId.
       { sessionId: 'sess-p2p', chatLabel: 'some_p2p_chat_id', title: 'private chat', chatMode: 'p2p' },
     ];
     const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r'));
-    const body = card.elements.find((e: any) => e.tag === 'div').text.content;
-    // Both the type field and location field render the same locale-aware p2p label.
-    expect(body).toMatch(/(类型|Type): (单聊|direct message)/);
-    expect(body).toMatch(/(位置|Where): (单聊|direct message)/);
-    expect(body).not.toContain('some_p2p_chat_id');
+    const md = card.body.elements[0].elements[0].content;
+    expect(md).toMatch(/(类型|Type): (单聊|direct message)/);
+    expect(md).toMatch(/(位置|Where): (单聊|direct message)/);
+    expect(md).not.toContain('some_p2p_chat_id');
   });
 
   it('omits the time line when lastMessageAt is missing', () => {
@@ -799,21 +793,7 @@ describe('buildRelayPickerCard', () => {
       { sessionId: 'sess-x', chatLabel: 'X', title: 'no time', chatMode: 'group' },
     ];
     const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r'));
-    const lines = card.elements.find((e: any) => e.tag === 'div').text.content.split('\n');
+    const lines = card.body.elements[0].elements[0].content.split('\n');
     expect(lines).toHaveLength(3); // title + type + location only
-    expect(lines[2]).toMatch(/(位置|Where):/);
-  });
-
-  it('truncates long titles in the dropdown option labels (card body untouched)', () => {
-    const longTitle = 'a'.repeat(60);
-    const entries: RelayPickerEntry[] = [
-      { sessionId: 's1', chatLabel: 'X', title: longTitle, chatMode: 'group' },
-    ];
-    const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r'));
-    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
-    expect(select.options[0].text.content.length).toBeLessThanOrEqual(35);
-    expect(select.options[0].text.content.endsWith('…')).toBe(true);
-    // Card body has the full title (only the dropdown gets truncated).
-    expect(card.elements.find((e: any) => e.tag === 'div').text.content).toContain(longTitle);
   });
 });

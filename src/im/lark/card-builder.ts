@@ -684,25 +684,24 @@ function relayPickerTypeTag(mode: 'group' | 'topic' | 'p2p' | undefined, locale?
 }
 
 /**
- * Card listing the operator's relayable sessions. Each session renders as a
- * **lark_md** info block (Lark renders \n as real line breaks in lark_md,
- * unlike plain_text which collapses them) showing four fields per the
- * spec: title (bold) / 类型 / 位置 / 活跃时间.
+ * Card listing the operator's relayable sessions as Lark v2 schema
+ * `interactive_container` blocks — each session is a clickable card body
+ * with rich markdown content. Clicking anywhere in a container fires a
+ * `relay_pickup` callback with the session id, so there's no separate
+ * dropdown or per-card button: the whole container IS the action surface.
  *
- *   **会话标题**
- *   类型: 普通群
- *   位置: Project Alpha 讨论群
- *   活跃: 10 分钟前
+ * Per王皓 spec ("卡片结构为会话标题、会话类型、会话所在群、会话时间"):
  *
- * Underneath all the info blocks, a single select_static dropdown lets the
- * user pick which session to relay — options are labelled "N. title" (with
- * the same N as the card index above) so the dropdown choice is
- * unambiguous. Single action element keeps the card from growing N
- * buttons; multi-line info comes from the lark_md divs that Lark CAN
- * render properly.
+ *   ┌────────────────────────────────────────┐
+ *   │ **会话标题**                            │  ← clickable container
+ *   │ 类型: 普通群                            │
+ *   │ 位置: Project Alpha 讨论群              │
+ *   │ 活跃: 10 分钟前                         │
+ *   └────────────────────────────────────────┘
  *
- * select_static fires the callback immediately on selection — no separate
- * confirm button (same pattern as buildAdoptSelectCard).
+ *   ┌────────────────────────────────────────┐
+ *   │ ... next session                        │
+ *   └────────────────────────────────────────┘
  *
  * Empty list produces a card with a single "no relayable sessions" notice —
  * keeps the UX consistent (always returns a card, never an empty message).
@@ -717,8 +716,8 @@ export function buildRelayPickerCard(
 
   if (entries.length === 0) {
     elements.push({
-      tag: 'div',
-      text: { tag: 'lark_md', content: t('card.relay.empty', undefined, locale) },
+      tag: 'markdown',
+      content: t('card.relay.empty', undefined, locale),
     });
   } else {
     const p2pLocationLabel = t('card.relay.type_p2p', undefined, locale);
@@ -726,14 +725,14 @@ export function buildRelayPickerCard(
     const labelLocation = t('card.relay.field_location', undefined, locale);
     const labelTime     = t('card.relay.field_time',     undefined, locale);
 
-    entries.forEach((e, i) => {
+    entries.forEach((e) => {
       const typeTag = relayPickerTypeTag(e.chatMode, locale);
       // For p2p chats the "location" is conceptually the same as the type
       // (it's a direct message — no group name). Per spec ("含单聊，单聊
       // 就写单聊") we render the literal "单聊" / "direct message" string.
       const locationLine = e.chatMode === 'p2p' ? p2pLocationLabel : e.chatLabel;
       const lines: string[] = [
-        `**${i + 1}. ${escapeMd(e.title)}**`,
+        `**${escapeMd(e.title)}**`,
         `${labelType}: ${typeTag}`,
         `${labelLocation}: ${escapeMd(locationLine)}`,
       ];
@@ -741,49 +740,42 @@ export function buildRelayPickerCard(
         lines.push(`${labelTime}: ${formatDuration(Date.now() - e.lastMessageAt)}`);
       }
       elements.push({
-        tag: 'div',
-        text: { tag: 'lark_md', content: lines.join('\n') },
-      });
-      if (i < entries.length - 1) elements.push({ tag: 'hr' });
-    });
-
-    elements.push({
-      tag: 'hr',
-    });
-    elements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'select_static',
-          placeholder: { tag: 'plain_text', content: t('card.relay.placeholder_select', undefined, locale) },
-          // Short label per option: "N. title" matching the index in the
-          // info block above. Title gets truncated to keep the dropdown
-          // single-line and clean (Lark renders plain_text dropdown text
-          // as one line regardless of \n).
-          options: entries.map((e, i) => {
-            const shortTitle = e.title.length > 30 ? e.title.slice(0, 29) + '…' : e.title;
-            return {
-              text: { tag: 'plain_text' as const, content: `${i + 1}. ${shortTitle}` },
-              value: e.sessionId,
-            };
-          }),
-          value: {
-            key: 'relay_pick_select',
-            target_chat_id: targetChatId,
-            root_id: targetRootMessageId,
+        tag: 'interactive_container',
+        width: 'fill',
+        padding: '8px 12px',
+        background_style: 'default',
+        has_border: true,
+        border_color: 'grey-200',
+        corner_radius: '8px',
+        behaviors: [
+          {
+            type: 'callback',
+            value: {
+              action: 'relay_pickup',
+              session_id: e.sessionId,
+              target_chat_id: targetChatId,
+              root_id: targetRootMessageId,
+            },
           },
-        },
-      ],
+        ],
+        elements: [
+          { tag: 'markdown', content: lines.join('\n') },
+        ],
+      });
     });
   }
 
   const card = {
-    config: { wide_screen_mode: true },
+    schema: '2.0',
+    config: { update_multi: true },
     header: {
-      template: 'blue',
       title: { tag: 'plain_text', content: t('card.relay.title', undefined, locale) },
+      template: 'blue',
     },
-    elements,
+    body: {
+      direction: 'vertical',
+      elements,
+    },
   };
   return JSON.stringify(card);
 }

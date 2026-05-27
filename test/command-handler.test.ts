@@ -115,21 +115,19 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   ),
   buildRelayPickerCard: vi.fn(
     (entries: any[], targetChatId: string, rootMessageId: string) => JSON.stringify({
-      elements: entries.length === 0 ? [
-        { tag: 'div', text: { content: 'empty' } },
-      ] : [
-        {
-          tag: 'action',
-          actions: [{
-            tag: 'select_static',
-            options: entries.map((e: any) => ({
-              text: { tag: 'plain_text', content: `${e.title}\n${e.chatMode ?? 'group'}\n${e.chatLabel}` },
-              value: e.sessionId,
-            })),
-            value: { key: 'relay_pick_select', target_chat_id: targetChatId, root_id: rootMessageId },
+      schema: '2.0',
+      body: {
+        elements: entries.length === 0 ? [
+          { tag: 'markdown', content: 'empty' },
+        ] : entries.map((e: any) => ({
+          tag: 'interactive_container',
+          behaviors: [{
+            type: 'callback',
+            value: { action: 'relay_pickup', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId },
           }],
-        },
-      ],
+          elements: [{ tag: 'markdown', content: `**${e.title}**\n${e.chatMode ?? 'group'}\n${e.chatLabel}` }],
+        })),
+      },
     }),
   ),
   getCliDisplayName: vi.fn((id: string) => {
@@ -1407,18 +1405,17 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      // Reply was an interactive card (msgType='interactive').
+      // Reply was an interactive card (msgType='interactive') with v2 schema.
       const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(msgType).toBe('interactive');
       const card = JSON.parse(replyContent as string);
-      const actions = card.elements.filter((e: any) => e.tag === 'action');
-      expect(actions).toHaveLength(1);
-      const select = actions[0].actions[0];
-      expect(select.tag).toBe('select_static');
-      expect(select.value.key).toBe('relay_pick_select');
-      expect(select.value.target_chat_id).toBe(CHAT_ID);
-      expect(select.options).toHaveLength(1);
-      expect(select.options[0].value).toBe('sess-other');
+      const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
+      expect(containers).toHaveLength(1);
+      const cb = containers[0].behaviors[0];
+      expect(cb.type).toBe('callback');
+      expect(cb.value.action).toBe('relay_pickup');
+      expect(cb.value.session_id).toBe('sess-other');
+      expect(cb.value.target_chat_id).toBe(CHAT_ID);
       expect(mockedCreate).not.toHaveBeenCalled();
     });
 
@@ -1444,8 +1441,8 @@ describe('handleCommand', () => {
 
       const [, replyContent] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
       const card = JSON.parse(replyContent as string);
-      // No buttons rendered — picker is empty after filtering out the adopt session.
-      expect(card.elements.filter((e: any) => e.tag === 'action')).toHaveLength(0);
+      // No interactive containers rendered — picker is empty after filtering out the adopt session.
+      expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
     });
 
     it('picker refuses upfront when this chat already has an active session for the bot', async () => {
@@ -1489,8 +1486,8 @@ describe('handleCommand', () => {
 
       const [, replyContent] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
       const card = JSON.parse(replyContent as string);
-      // No pickup actions — empty picker (otherUser's session filtered out).
-      expect(card.elements.filter((e: any) => e.tag === 'action')).toHaveLength(0);
+      // No interactive containers — empty picker (otherUser's session filtered out).
+      expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
     });
 
     it('rejects --create when not invoked inside an active session', async () => {
