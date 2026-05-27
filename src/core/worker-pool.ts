@@ -697,15 +697,19 @@ export async function transferSession(
   // collide on sessionKey(targetChatId, larkAppId) after the rewrite, and
   // Map.set would silently orphan the prior entry's worker. Refuse instead.
   // We only check chat-scope entries — thread-scope sessions in the same
-  // chat are keyed by rootMessageId, so they don't collide.
+  // chat are keyed by rootMessageId, so they don't collide. AND only count
+  // entries with a real worker — daemon-command scratch sessions (e.g. the
+  // /relay command's own session record) have `worker: null` and would
+  // otherwise produce a false-positive collision in the target chat where
+  // the picker was invoked.
   if (activeSessionsRegistry) {
     for (const existing of activeSessionsRegistry.values()) {
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
       if (existing.chatId !== targetChatId) continue;
-      if (existing.scope === 'chat') {
-        return { ok: false, error: 'target_chat_has_session' };
-      }
+      if (existing.scope !== 'chat') continue;
+      if (!existing.worker) continue; // scratch session, not a real running one
+      return { ok: false, error: 'target_chat_has_session' };
     }
   }
 

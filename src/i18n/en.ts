@@ -106,6 +106,7 @@ export const messages: Record<string, string> = {
   'card.relay.toast_same_chat': 'That session is already in this chat — nothing to relay.',
   'card.relay.toast_failed': 'Relay failed: {error}',
   'card.relay.toast_target_has_session': 'This chat already has an active session for the bot. Please /close it first, then relay.',
+  'cmd.relay.target_has_session_msg': '⚠️ This bot already has an active session "{title}" in this chat. Please /close it first, then relay a new one in.',
   'card.relay.toast_success': '✅ Relayed into this chat',
 
   // ─── TUI prompt card ─────────────────────────────────────────────────────

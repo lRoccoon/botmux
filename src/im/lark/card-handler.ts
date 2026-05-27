@@ -227,11 +227,36 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (sourceDs.chatId === targetChatId) {
       return { toast: { type: 'error', content: t('card.relay.toast_same_chat', undefined, loc) } };
     }
+    // Pre-flight target-chat conflict check — done BEFORE sendMessage M1 so
+    // a refusal doesn't leave a misleading "已接力" announcement in the
+    // target chat (王皓 caught this in testing). Mirror the same predicate
+    // transferSession uses, plus the `!!worker` filter that excludes daemon
+    // command scratch sessions (e.g. the /relay command's own session,
+    // which shares the bot's larkAppId + chatId but has no worker).
+    const targetConflict = [...activeSessions.values()].find(c =>
+      c !== sourceDs
+      && c.larkAppId === larkAppId
+      && c.chatId === targetChatId
+      && c.scope === 'chat'
+      && !!c.worker
+    );
+    if (targetConflict) {
+      const conflictTitle = targetConflict.session.title || targetConflict.session.sessionId.substring(0, 8);
+      // Send as a regular text message in the target chat instead of a
+      // popup toast — per王皓's preference for visible/persistent error
+      // ("不要用弹窗，就用消息形式"). No toast returned so the operator
+      // sees the chat message land where the error actually applies.
+      const errBody = JSON.stringify({
+        text: t('cmd.relay.target_has_session_msg', { title: conflictTitle }, loc),
+      });
+      sendMessage(larkAppId, targetChatId, errBody, 'text').catch(() => undefined);
+      return;
+    }
     // Resolve a friendly source chat label for the M1 announcement — falls
     // back to the raw chatId if Lark can't return a name.
     const { getChatName } = await import('./client.js');
     const sourceLabel = (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
-    // Send the M1 announcement first — its message_id becomes the new
+    // Send the M1 announcement — its message_id becomes the new
     // rootMessageId after the transfer (mirrors /relay --create's flow).
     let m1MessageId: string;
     try {
@@ -245,11 +270,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const { transferSession } = await import('../../core/worker-pool.js');
     const r = await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId);
     if (!r.ok) {
-      // Friendlier toast for the existing-session collision — the command-time
-      // check normally catches this, but a race between picker render and click
-      // could let it slip through. Keep parity with the /relay command message.
+      // Best-effort: orphan M1 cleanup so a failed transfer doesn't leave a
+      // misleading "已接力" message in the target chat (王皓's "明明失败了
+      // 却返回成功了" complaint). Race-condition fallback only — the
+      // pre-flight checks above should catch the common cases first.
+      deleteMessage(larkAppId, m1MessageId).catch(() => { /* leave it */ });
       if (r.error === 'target_chat_has_session') {
-        return { toast: { type: 'error', content: t('card.relay.toast_target_has_session', undefined, loc) } };
+        // Lost the race vs the pre-flight check — still surface as a message.
+        const errBody = JSON.stringify({
+          text: t('cmd.relay.target_has_session_msg', { title: '' }, loc),
+        });
+        sendMessage(larkAppId, targetChatId, errBody, 'text').catch(() => undefined);
+        return;
       }
       if (r.error === 'adopt_not_relayable') {
         return { toast: { type: 'error', content: t('card.relay.toast_adopt_not_relayable', undefined, loc) } };

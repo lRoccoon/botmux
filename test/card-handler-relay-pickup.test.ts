@@ -217,7 +217,86 @@ describe('relay_pick_select dropdown action', () => {
     expect(r?.toast?.content).not.toMatch(/adopt_not_relayable/);
   });
 
-  it('returns a friendly toast when transferSession reports target_chat_has_session', async () => {
+  // Helper to construct a DaemonSession with explicit chatId / scope / worker —
+  // makeDs only spreads overrides into `session`, not into the DS shell.
+  function makeDsInChat(opts: { sessionId: string; chatId: string; scope: 'chat' | 'thread'; worker: any; title?: string }): DaemonSession {
+    return {
+      session: {
+        sessionId: opts.sessionId,
+        chatId: opts.chatId,
+        rootMessageId: `om_root_${opts.sessionId}`,
+        title: opts.title ?? 't',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        scope: opts.scope,
+        chatType: 'group',
+        larkAppId: LARK_APP_ID,
+        ownerOpenId: OWNER,
+      } as any,
+      worker: opts.worker,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: LARK_APP_ID,
+      chatId: opts.chatId,
+      chatType: 'group',
+      scope: opts.scope,
+      spawnedAt: Date.now(),
+      cliVersion: '1.0.0',
+      lastMessageAt: Date.now(),
+      hasHistory: true,
+    } as DaemonSession;
+  }
+
+  it('pre-flight: refuses with a target-chat message when an active session is already there (NO M1 sent, NO transferSession called)', async () => {
+    const sourceDs = makeDs();
+    const existingDs = makeDsInChat({
+      sessionId: 'sess-existing',
+      chatId: 'oc_target',
+      scope: 'chat',
+      worker: { killed: false } as any, // real running session
+      title: 'an existing chat',
+    });
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), sourceDs);
+    map.set(sessionKey('oc_target', LARK_APP_ID), existingDs);
+
+    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+
+    // No toast — user gets a chat message in the target chat instead.
+    expect(r).toBeUndefined();
+    // Single sendMessage call = the error message to the target chat, not M1.
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    const [, sentChatId, sentBody] = sendMessageMock.mock.calls[0];
+    expect(sentChatId).toBe('oc_target');
+    expect(sentBody).toContain('已有');
+    expect(sentBody).toContain('an existing chat');
+    // transferSession was never invoked — fail-fast at the pre-flight.
+    expect(transferSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('pre-flight ignores daemon-command scratch sessions (no worker) in the target chat', async () => {
+    // Regression for王皓's "我选择 ggbone relay 它也显示我在这个群里有
+    // 活跃群聊" bug — the /relay command's own placeholder session should
+    // NOT count as a conflict, only real running sessions do.
+    const sourceDs = makeDs();
+    const scratchDs = makeDsInChat({
+      sessionId: 'sess-scratch-relay',
+      chatId: 'oc_target',
+      scope: 'chat',
+      worker: null, // scratch placeholder, no real worker
+      title: '/relay',
+    });
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), sourceDs);
+    map.set(sessionKey('oc_target', LARK_APP_ID), scratchDs);
+
+    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+    // Transfer proceeded: M1 sent + transferSession invoked + success toast.
+    expect(transferSessionMock).toHaveBeenCalledTimes(1);
+    expect(r?.toast?.type).toBe('success');
+  });
+
+  it('cleans up the orphan M1 when transferSession fails after the M1 was sent (race fallback)', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();
     map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
@@ -226,9 +305,11 @@ describe('relay_pick_select dropdown action', () => {
 
     const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
 
-    expect(r?.toast?.type).toBe('error');
-    expect(r?.toast?.content).toContain('已有');
-    expect(r?.toast?.content).not.toMatch(/target_chat_has_session/);
+    // No toast — chat message instead.
+    expect(r).toBeUndefined();
+    // M1 was sent (M1 message id is om_M1), then deleted as orphan cleanup.
+    expect(sendMessageMock).toHaveBeenCalled();
+    expect(deleteMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_M1');
   });
 
   it('returns the transferSession error as a toast when transfer fails', async () => {

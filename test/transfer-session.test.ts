@@ -241,8 +241,8 @@ describe('transferSession', () => {
     const movingDs = makeDs();
     registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
 
-    // Pre-existing chat-scope session in the target chat for the same bot.
-    // After the rewrite, the moving session's key would collide with this one.
+    // Pre-existing chat-scope session in the target chat for the same bot
+    // with a real worker — this is what should trigger the conflict.
     const existingDs = makeDs({
       session: {
         ...movingDs.session,
@@ -251,6 +251,7 @@ describe('transferSession', () => {
         rootMessageId: 'om_target_seed',
         scope: 'chat',
       },
+      worker: { killed: false } as any, // real running session
       chatId: 'oc_target',
       scope: 'chat',
     });
@@ -260,11 +261,37 @@ describe('transferSession', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('target_chat_has_session');
     expect(forkWorkerSpy).not.toHaveBeenCalled();
-    // Moving session must remain untouched — no field rewrites on refusal.
     expect(movingDs.chatId).toBe('oc_source');
     expect(movingDs.session.scope).toBe('thread');
-    // Existing target session must still be in the registry.
     expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(existingDs);
+  });
+
+  it('does NOT trigger target_chat_has_session for a daemon-command scratch session (no worker)', async () => {
+    // Regression: a /relay command in the target chat creates a placeholder
+    // session record with `worker: null`. The conflict check used to count
+    // that as a collision and refuse the transfer (王皓's "我选择 ggbone
+    // relay 它也显示我在这个群里有活跃群聊" bug). The fix: only count
+    // sessions with a real worker.
+    const movingDs = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
+
+    const scratchDs = makeDs({
+      session: {
+        ...movingDs.session,
+        sessionId: 'scratch-relay-cmd',
+        chatId: 'oc_target',
+        rootMessageId: 'om_relay_cmd_msg',
+        scope: 'chat',
+        title: '/relay',
+      },
+      worker: null, // command-time placeholder, no real worker
+      chatId: 'oc_target',
+      scope: 'chat',
+    });
+    registry.set(sessionKey('oc_target', 'cli_app_test'), scratchDs);
+
+    const r = await callTransfer(movingDs.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(true);
   });
 
   it('allows transfer when target chat has only thread-scope sessions (no chat-scope collision)', async () => {

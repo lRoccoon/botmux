@@ -109,6 +109,7 @@ export const messages: Record<string, string> = {
   'card.relay.toast_same_chat': '该会话已在本群里，无需接力。',
   'card.relay.toast_failed': '接力失败：{error}',
   'card.relay.toast_target_has_session': '本群已有该机器人的活跃会话，请先 /close 它再接力',
+  'cmd.relay.target_has_session_msg': '⚠️ 本群已有该机器人的活跃会话「{title}」。请先用 /close 关掉那个会话，再接力新的过来。',
   'card.relay.toast_success': '✅ 已接力到本群',
 
   // ─── TUI prompt card ─────────────────────────────────────────────────────
