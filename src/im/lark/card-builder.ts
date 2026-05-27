@@ -770,49 +770,26 @@ export function buildRelayPickerCard(
     selected: selectedSessionId ?? '',
   };
 
-  // ─── Search box (form) ──────────────────────────────────────────────
-  // form_submit on the 搜索 button collects the input value into
-  // form_value.search; daemon re-renders with that as the new query.
+  // ─── Search box ─────────────────────────────────────────────────────
+  // v2 input supports `behaviors` natively — pressing Enter or clicking
+  // the built-in submit icon inside the input fires the callback. No
+  // separate 搜索 button needed (王皓 reported that button rendered as
+  // "..." due to cramped column width; the auto-submit input avoids the
+  // problem entirely AND removes the manual click).
+  //
+  // On submit the callback delivers `action.input_value` (the typed
+  // string) and `action.value` (our state object). card-handler reads
+  // input_value to update search, resets page to 0 and clears selection.
   elements.push({
-    tag: 'form',
-    name: 'relay_picker_form',
-    elements: [
+    tag: 'input',
+    name: RELAY_SEARCH_FIELD,
+    placeholder: { tag: 'plain_text', content: t('card.relay.search_placeholder', undefined, locale) },
+    default_value: searchQuery,
+    width: 'fill',
+    behaviors: [
       {
-        tag: 'column_set',
-        flex_mode: 'none',
-        horizontal_spacing: 'default',
-        columns: [
-          {
-            tag: 'column',
-            width: 'weighted',
-            weight: 5,
-            vertical_align: 'center',
-            elements: [
-              {
-                tag: 'input',
-                name: RELAY_SEARCH_FIELD,
-                placeholder: { tag: 'plain_text', content: t('card.relay.search_placeholder', undefined, locale) },
-                default_value: searchQuery,
-                width: 'fill',
-              },
-            ],
-          },
-          {
-            tag: 'column',
-            width: 'weighted',
-            weight: 1,
-            vertical_align: 'center',
-            elements: [
-              {
-                tag: 'button',
-                text: { tag: 'plain_text', content: t('card.relay.btn_search', undefined, locale) },
-                action_type: 'form_submit',
-                name: 'relay_picker_search_btn',
-                value: { action: 'relay_search', ...stateValue, selected: '' /* reset selection on new search */ },
-              },
-            ],
-          },
-        ],
+        type: 'callback',
+        value: { action: 'relay_search', ...stateValue, selected: '' /* new search → reset selection */ },
       },
     ],
   });

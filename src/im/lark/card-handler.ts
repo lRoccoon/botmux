@@ -218,9 +218,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     let nextSelected: string | undefined = carriedSelected || undefined;
 
     if (value.action === 'relay_search') {
-      // Search form_submit — pull the new query out of form_value and reset page.
-      const formValue = (action as any)?.form_value ?? {};
-      nextSearch = String(formValue.search ?? '').trim();
+      // v2 input fires `behaviors[].callback` directly — the typed text
+      // arrives as action.input_value (NOT form_value), since we're no
+      // longer wrapping the input in a form. Reset page on new search.
+      nextSearch = String((action as any)?.input_value ?? '').trim();
       nextPage = 0;
       // Don't carry over the selection on a new search — the selected entry
       // may not match the new filter, and even if it does, "I just searched

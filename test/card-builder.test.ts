@@ -729,8 +729,8 @@ describe('buildRelayPickerCard', () => {
   function containers(card: any): any[] {
     return card.body.elements.filter((e: any) => e.tag === 'interactive_container');
   }
-  function searchForm(card: any): any | undefined {
-    return card.body.elements.find((e: any) => e.tag === 'form');
+  function searchInput(card: any): any | undefined {
+    return card.body.elements.find((e: any) => e.tag === 'input' && e.name === 'search');
   }
   function confirmButton(card: any): any | undefined {
     for (const e of card.body.elements) {
@@ -757,18 +757,16 @@ describe('buildRelayPickerCard', () => {
     expect(card.body.elements).toBeDefined();
   });
 
-  it('always renders the search form at the top, even when entry list is empty', () => {
+  it('always renders the search input at the top with auto-submit behavior, even when entry list is empty', () => {
     const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root'));
-    const form = searchForm(card);
-    expect(form).toBeDefined();
-    // Search input + submit button live inside a column_set inside the form.
-    const formCols = form.elements[0];
-    const input = formCols.columns[0].elements[0];
-    expect(input.tag).toBe('input');
-    expect(input.name).toBe('search');
-    const submitBtn = formCols.columns[1].elements[0];
-    expect(submitBtn.action_type).toBe('form_submit');
-    expect(submitBtn.value.action).toBe('relay_search');
+    const input = searchInput(card);
+    expect(input).toBeDefined();
+    // v2 input.behaviors fires on Enter / submit icon click — no separate
+    // 搜索 button needed (used to render as "..." in cramped column).
+    expect(input.behaviors).toHaveLength(1);
+    expect(input.behaviors[0].type).toBe('callback');
+    expect(input.behaviors[0].value.action).toBe('relay_search');
+    expect(input.behaviors[0].value.target_chat_id).toBe('oc_target');
   });
 
   it('renders "no relayable sessions" notice when entries empty (form still shown)', () => {
