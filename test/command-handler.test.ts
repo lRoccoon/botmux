@@ -90,6 +90,45 @@ vi.mock('../src/services/schedule-store.js', () => ({
   listTasks: vi.fn(() => []),
 }));
 
+vi.mock('../src/services/task-store.js', () => ({
+  createTask: vi.fn((input: any) => ({
+    taskId: 'task-abc12345',
+    name: input.name,
+    status: 'active',
+    chatId: input.chatId,
+    anchor: input.anchor,
+    sessionId: input.sessionId,
+    larkAppId: input.larkAppId,
+    ownerOpenId: input.ownerOpenId,
+    createdAt: '2026-05-25T00:00:00.000Z',
+    updatedAt: '2026-05-25T00:00:00.000Z',
+  })),
+  listTasks: vi.fn(() => []),
+  getTask: vi.fn(),
+  closeTask: vi.fn(),
+  assignTask: vi.fn(),
+  updateTaskFields: vi.fn((id: string, patch: any) => ({
+    taskId: id,
+    name: 'Fix login',
+    status: 'active',
+    chatId: 'oc_chat_xyz',
+    anchor: 'om_root_abc123',
+    sessionId: 'sess-001',
+    larkAppId: 'app-1',
+    ownerOpenId: 'ou_sender',
+    createdAt: '2026-05-25T00:00:00.000Z',
+    updatedAt: '2026-05-25T00:00:00.000Z',
+    ...patch,
+  })),
+}));
+
+vi.mock('../src/services/feishu-task-client.js', () => ({
+  FeishuTaskUnavailableError: class FeishuTaskUnavailableError extends Error {},
+  createFeishuTask: vi.fn(async () => ({ guid: 'feishu-task-guid' })),
+  completeFeishuTask: vi.fn(async () => undefined),
+  addFeishuTaskAssignee: vi.fn(async () => undefined),
+}));
+
 vi.mock('../src/core/scheduler.js', () => ({
   removeTask: vi.fn(),
   enableTask: vi.fn(),
@@ -125,6 +164,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 vi.mock('../src/im/lark/client.js', () => ({
   deleteMessage: vi.fn(),
   sendMessage: vi.fn(async () => 'card-msg-id'),
+  replyMessage: vi.fn(async () => 'reply-msg-id'),
   listChatBotMembers: vi.fn(async () => []),
 }));
 
@@ -196,12 +236,14 @@ import { killWorker, forkWorker, getCurrentCliVersion } from '../src/core/worker
 import { getSessionWorkingDir } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
+import * as taskStore from '../src/services/task-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, listChatBotMembers } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, replyMessage, listChatBotMembers } from '../src/im/lark/client.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
 import { bindOncall } from '../src/services/oncall-store.js';
+import { addFeishuTaskAssignee, completeFeishuTask, createFeishuTask } from '../src/services/feishu-task-client.js';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
@@ -271,7 +313,7 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/task', '/role', '/login', '/adopt', '/oncall', '/group', '/g'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -288,7 +330,7 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    expect(DAEMON_COMMANDS.size).toBe(14);
+    expect(DAEMON_COMMANDS.size).toBe(15);
   });
 });
 
@@ -403,6 +445,177 @@ describe('parseForceTopicInvocation', () => {
 describe('handleCommand', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+
+  // ─── /task ──────────────────────────────────────────────────────────────
+
+  describe('/task', () => {
+    it('registers the current session as a managed task', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/task', ROOT_ID, makeLarkMessage('/task new Fix login'), deps, LARK_APP_ID);
+
+      expect(taskStore.createTask).toHaveBeenCalledWith(expect.objectContaining({
+        name: 'Fix login',
+        chatId: CHAT_ID,
+        anchor: ROOT_ID,
+        sessionId: 'sess-001',
+        larkAppId: LARK_APP_ID,
+        ownerOpenId: 'ou_sender',
+      }));
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('task-abc12345'),
+        undefined,
+        LARK_APP_ID,
+      );
+      expect(createFeishuTask).toHaveBeenCalledWith(expect.objectContaining({
+        localTaskId: 'task-abc12345',
+        summary: 'Fix login',
+        sessionId: 'sess-001',
+      }));
+      expect((deps.sessionReply as any).mock.calls[0][1]).toContain('feishu-task-guid');
+    });
+
+    it('falls back to local task when Feishu task creation is unavailable', async () => {
+      vi.mocked(createFeishuTask).mockRejectedValueOnce(new Error('missing_user_token'));
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/task', ROOT_ID, makeLarkMessage('/task new Fix login'), deps, LARK_APP_ID);
+
+      expect(taskStore.createTask).toHaveBeenCalled();
+      expect(taskStore.updateTaskFields).toHaveBeenCalledWith('task-abc12345', expect.objectContaining({
+        externalSyncError: 'missing_user_token',
+      }));
+      expect((deps.sessionReply as any).mock.calls[0][1]).toContain('已降级为本地 task');
+    });
+
+    it('refuses /task new when there is no active session to bind', async () => {
+      const deps = makeDeps();
+
+      await handleCommand('/task', ROOT_ID, makeLarkMessage('/task new Fix login'), deps, LARK_APP_ID);
+
+      expect(taskStore.createTask).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('当前没有可绑定的 session'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
+    it('lists tasks filtered by current chat without mixing sessions', async () => {
+      vi.mocked(taskStore.listTasks).mockReturnValueOnce([
+        {
+          taskId: 'task-a', name: 'A', status: 'active', chatId: CHAT_ID, anchor: 'om_a', sessionId: 'sess-a', larkAppId: LARK_APP_ID, createdAt: '1', updatedAt: '1',
+        } as any,
+        {
+          taskId: 'task-b', name: 'B', status: 'active', chatId: CHAT_ID, anchor: 'om_b', sessionId: 'sess-b', larkAppId: LARK_APP_ID, createdAt: '2', updatedAt: '2',
+        } as any,
+      ]);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/task', ROOT_ID, makeLarkMessage('/task list'), deps, LARK_APP_ID);
+
+      expect(taskStore.listTasks).toHaveBeenCalledWith({ chatId: CHAT_ID });
+      const body = (deps.sessionReply as any).mock.calls[0][1] as string;
+      expect(body).toContain('task-a');
+      expect(body).toContain('sess-a');
+      expect(body).toContain('task-b');
+      expect(body).toContain('sess-b');
+    });
+
+    it('assigns a task by explicit mention and sends handoff without sessionReply footer', async () => {
+      vi.mocked(taskStore.updateTaskFields).mockImplementationOnce((_id: string, patch: any) => ({
+        taskId: 'task-a',
+        externalTaskId: 'feishu-a',
+        name: 'Fix A',
+        status: 'active',
+        chatId: CHAT_ID,
+        anchor: ROOT_ID,
+        sessionId: 'sess-a',
+        larkAppId: LARK_APP_ID,
+        ownerOpenId: 'ou_owner',
+        assigneeOpenId: 'ou_target_bot',
+        createdAt: '1',
+        updatedAt: '2',
+        ...patch,
+      } as any));
+      vi.mocked(taskStore.assignTask).mockReturnValueOnce({
+        taskId: 'task-a',
+        externalTaskId: 'feishu-a',
+        name: 'Fix A',
+        status: 'active',
+        chatId: CHAT_ID,
+        anchor: ROOT_ID,
+        sessionId: 'sess-a',
+        larkAppId: LARK_APP_ID,
+        ownerOpenId: 'ou_owner',
+        assigneeOpenId: 'ou_target_bot',
+        createdAt: '1',
+        updatedAt: '2',
+      } as any);
+      const ds = makeDaemonSession({ session: makeSession({ sessionId: 'sess-a' }), scope: 'thread' });
+      const deps = makeDeps(ds);
+      const msg = makeLarkMessage('/task assign task-a @Codex', {
+        mentions: [{ key: '@_user_1', name: 'Codex', openId: 'ou_target_bot' }],
+      });
+
+      await handleCommand('/task', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      expect(taskStore.assignTask).toHaveBeenCalledWith('task-a', 'ou_target_bot');
+      expect(addFeishuTaskAssignee).toHaveBeenCalledWith(LARK_APP_ID, 'feishu-a', 'ou_target_bot');
+      expect(replyMessage).toHaveBeenCalledWith(
+        LARK_APP_ID,
+        ROOT_ID,
+        expect.stringContaining('"tag":"at","user_id":"ou_target_bot"'),
+        'post',
+        true,
+      );
+      const postJson = vi.mocked(replyMessage).mock.calls[0][2] as string;
+      const post = JSON.parse(postJson);
+      expect(post.zh_cn.content[0][0]).toEqual({ tag: 'at', user_id: 'ou_target_bot' });
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
+    it('completes the linked Feishu task when closing a managed task', async () => {
+      vi.mocked(taskStore.updateTaskFields).mockImplementationOnce((_id: string, patch: any) => ({
+        taskId: 'task-a',
+        externalTaskId: 'feishu-a',
+        name: 'Fix A',
+        status: 'closed',
+        chatId: CHAT_ID,
+        anchor: ROOT_ID,
+        sessionId: 'sess-a',
+        larkAppId: LARK_APP_ID,
+        createdAt: '1',
+        updatedAt: '2',
+        ...patch,
+      } as any));
+      vi.mocked(taskStore.closeTask).mockReturnValueOnce({
+        taskId: 'task-a',
+        externalTaskId: 'feishu-a',
+        name: 'Fix A',
+        status: 'closed',
+        chatId: CHAT_ID,
+        anchor: ROOT_ID,
+        sessionId: 'sess-a',
+        larkAppId: LARK_APP_ID,
+        createdAt: '1',
+        updatedAt: '2',
+      } as any);
+      const ds = makeDaemonSession({ session: makeSession({ sessionId: 'sess-a' }), scope: 'thread' });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/task', ROOT_ID, makeLarkMessage('/task close task-a'), deps, LARK_APP_ID);
+
+      expect(completeFeishuTask).toHaveBeenCalledWith(LARK_APP_ID, 'feishu-a');
+      expect((deps.sessionReply as any).mock.calls[0][1]).toContain('Feishu Task 已标记完成');
+    });
   });
 
   // ─── /close ─────────────────────────────────────────────────────────────

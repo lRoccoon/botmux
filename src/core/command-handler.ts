@@ -8,11 +8,12 @@ import { config } from '../config.js';
 import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import * as taskStore from '../services/task-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage, sendMessage, listChatBotMembers } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, replyMessage, listChatBotMembers } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
@@ -22,6 +23,7 @@ import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
 import { resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
+import { addFeishuTaskAssignee, completeFeishuTask, createFeishuTask, FeishuTaskUnavailableError } from '../services/feishu-task-client.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -29,7 +31,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/task', '/role', '/login', '/adopt', '/oncall', '/group', '/g']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -354,6 +356,254 @@ async function handleScheduleCommand(
   await sessionReply(rootId, t('schedule.parse_failed', undefined, loc));
 }
 
+
+function taskUsage(): string {
+  return [
+    '用法:',
+    '/task new <name> - 登记当前 thread/chat 的任务（需要已有 session）',
+    '/task list - 列出当前群的任务',
+    '/task status <task-id> - 查看任务状态',
+    '/task close <task-id> - 关闭任务登记（不关闭 session）',
+    '/task assign <task-id> @Bot - 指派任务并显式 @目标 bot',
+  ].join('\n');
+}
+
+function formatTaskStatus(task: taskStore.ManagedTask): string {
+  return [
+    `Task: ${task.taskId}`,
+    `Feishu Task: ${task.externalTaskId ?? '-'}`,
+    `Name: ${task.name}`,
+    `Status: ${task.status}`,
+    `Session: ${task.sessionId}`,
+    `Chat: ${task.chatId}`,
+    `Anchor: ${task.anchor}`,
+    `Bot app: ${task.larkAppId}`,
+    `Owner: ${task.ownerOpenId ? `<at id=${task.ownerOpenId}></at>` : '-'}`,
+    `Assignee: ${task.assigneeOpenId ? `<at id=${task.assigneeOpenId}></at>` : '-'}`,
+    task.externalSyncError ? `Feishu sync: ${task.externalSyncError}` : undefined,
+    `Created: ${task.createdAt}`,
+    `Updated: ${task.updatedAt}`,
+  ].filter(Boolean).join('\n');
+}
+
+function buildTaskHandoffPost(task: taskStore.ManagedTask, assigneeOpenId: string): string {
+  const content: any[][] = [
+    [
+      { tag: 'at', user_id: assigneeOpenId },
+      { tag: 'text', text: ` 请接手任务 ${task.taskId}：${task.name}` },
+    ],
+    [{ tag: 'text', text: `Task: ${task.taskId}` }],
+    [{ tag: 'text', text: `Feishu Task: ${task.externalTaskId ?? '-'}` }],
+    [{ tag: 'text', text: `Session: ${task.sessionId}` }],
+    [{ tag: 'text', text: `Chat: ${task.chatId}` }],
+    [{ tag: 'text', text: `Thread/anchor: ${task.anchor}` }],
+    task.ownerOpenId
+      ? [{ tag: 'text', text: 'Owner: ' }, { tag: 'at', user_id: task.ownerOpenId }]
+      : [{ tag: 'text', text: 'Owner: -' }],
+    [{ tag: 'text', text: '请基于这个 task id 和对应 thread/session 上下文继续处理；这是显式 @ 指派，不依赖 lastCaller footer。' }],
+  ];
+  return JSON.stringify({ zh_cn: { title: '', content } });
+}
+
+function taskSyncError(err: unknown): string {
+  if (err instanceof FeishuTaskUnavailableError) return err.message;
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function tryCreateExternalTask(task: taskStore.ManagedTask): Promise<taskStore.ManagedTask> {
+  try {
+    const external = await createFeishuTask({
+      larkAppId: task.larkAppId,
+      summary: task.name,
+      localTaskId: task.taskId,
+      sessionId: task.sessionId,
+      chatId: task.chatId,
+      anchor: task.anchor,
+      ownerOpenId: task.ownerOpenId,
+    });
+    return taskStore.updateTaskFields(task.taskId, {
+      externalTaskId: external.guid,
+      externalTaskUrl: external.url,
+      externalSyncError: undefined,
+    }) ?? task;
+  } catch (err) {
+    const message = taskSyncError(err);
+    logger.warn(`[task] Feishu task create failed for ${task.taskId}: ${message}`);
+    return taskStore.updateTaskFields(task.taskId, { externalSyncError: message }) ?? task;
+  }
+}
+
+async function tryCompleteExternalTask(task: taskStore.ManagedTask): Promise<taskStore.ManagedTask> {
+  if (!task.externalTaskId) return task;
+  try {
+    await completeFeishuTask(task.larkAppId, task.externalTaskId);
+    return taskStore.updateTaskFields(task.taskId, { externalSyncError: undefined }) ?? task;
+  } catch (err) {
+    const message = taskSyncError(err);
+    logger.warn(`[task] Feishu task complete failed for ${task.taskId}: ${message}`);
+    return taskStore.updateTaskFields(task.taskId, { externalSyncError: message }) ?? task;
+  }
+}
+
+async function tryAssignExternalTask(task: taskStore.ManagedTask, assigneeOpenId: string): Promise<taskStore.ManagedTask> {
+  if (!task.externalTaskId) return task;
+  try {
+    await addFeishuTaskAssignee(task.larkAppId, task.externalTaskId, assigneeOpenId);
+    return taskStore.updateTaskFields(task.taskId, { externalSyncError: undefined }) ?? task;
+  } catch (err) {
+    const message = taskSyncError(err);
+    logger.warn(`[task] Feishu task assign failed for ${task.taskId}: ${message}`);
+    return taskStore.updateTaskFields(task.taskId, { externalSyncError: message }) ?? task;
+  }
+}
+
+function mentionedOpenIds(message: LarkMessage): string[] {
+  return (message.mentions ?? [])
+    .map(m => m.openId)
+    .filter((id): id is string => !!id);
+}
+
+function isCurrentBotMention(openId: string, larkAppId?: string): boolean {
+  if (!larkAppId) return false;
+  const self = getBotOpenId(larkAppId);
+  return !!self && self === openId;
+}
+
+async function handleTaskCommand(
+  args: string,
+  rootId: string,
+  message: LarkMessage,
+  deps: CommandHandlerDeps,
+  larkAppId?: string,
+): Promise<void> {
+  const { activeSessions } = deps;
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
+  const rawDs = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
+  const isEphemeralTaskCommandSession = !!rawDs && !rawDs.hasHistory && !rawDs.worker && rawDs.session.title.trim().startsWith('/task');
+  const commandChatId = rawDs?.chatId;
+  if (isEphemeralTaskCommandSession && larkAppId) {
+    activeSessions.delete(sessionKey(rootId, larkAppId));
+    sessionStore.closeSession(rawDs.session.sessionId);
+  }
+  const ds = isEphemeralTaskCommandSession ? undefined : rawDs;
+  const [subRaw, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+  const sub = subRaw?.toLowerCase();
+
+  if (!sub || sub === 'help' || sub === '帮助') {
+    await sessionReply(rootId, taskUsage());
+    return;
+  }
+
+  if (sub === 'new' || sub === '新建') {
+    const name = rest.join(' ').trim();
+    if (!name) {
+      await sessionReply(rootId, '请提供任务名称：/task new <name>');
+      return;
+    }
+    if (!ds) {
+      await sessionReply(rootId, '当前没有可绑定的 session。请先在独立话题里 @Bot 发起任务，或用 /t <任务内容> 开一个独立任务。');
+      return;
+    }
+    let task = taskStore.createTask({
+      name,
+      chatId: ds.chatId,
+      anchor: sessionAnchorId(ds),
+      sessionId: ds.session.sessionId,
+      larkAppId: ds.larkAppId,
+      ownerOpenId: message.senderId || ds.ownerOpenId || ds.session.ownerOpenId,
+    });
+    task = await tryCreateExternalTask(task);
+    const externalLine = task.externalTaskId
+      ? `Feishu Task: ${task.externalTaskId}`
+      : `Feishu Task: 未创建（${task.externalSyncError ?? 'unknown'}），已降级为本地 task`;
+    await sessionReply(rootId, `✅ 已登记任务 ${task.taskId}\n${externalLine}\nName: ${task.name}\nSession: ${task.sessionId}\nAnchor: ${task.anchor}`);
+    return;
+  }
+
+  if (sub === 'list' || sub === '列表') {
+    const chatId = ds?.chatId ?? commandChatId ?? (() => {
+      const all = taskStore.listTasks();
+      return all.find(t => t.anchor === rootId && t.larkAppId === larkAppId)?.chatId ?? all.find(t => t.anchor === rootId)?.chatId ?? rootId;
+    })();
+    const tasks = taskStore.listTasks({ chatId });
+    if (tasks.length === 0) {
+      await sessionReply(rootId, '当前群还没有登记 task。');
+      return;
+    }
+    const lines = tasks.map(t => `${t.taskId} [${t.status}] ${t.name}\n  feishu=${t.externalTaskId ?? '-'} session=${t.sessionId} anchor=${t.anchor} assignee=${t.assigneeOpenId ? `<at id=${t.assigneeOpenId}></at>` : '-'}`);
+    await sessionReply(rootId, `当前群任务：\n${lines.join('\n')}`);
+    return;
+  }
+
+  if (sub === 'status' || sub === '状态') {
+    const id = rest[0];
+    if (!id) {
+      await sessionReply(rootId, '请提供 task id：/task status <task-id>');
+      return;
+    }
+    const task = taskStore.getTask(id);
+    if (!task) {
+      await sessionReply(rootId, `未找到 task：${id}`);
+      return;
+    }
+    await sessionReply(rootId, formatTaskStatus(task));
+    return;
+  }
+
+  if (sub === 'close' || sub === '关闭') {
+    const id = rest[0];
+    if (!id) {
+      await sessionReply(rootId, '请提供 task id：/task close <task-id>');
+      return;
+    }
+    let task = taskStore.closeTask(id);
+    if (!task) {
+      await sessionReply(rootId, `未找到 task：${id}`);
+      return;
+    }
+    task = await tryCompleteExternalTask(task);
+    const syncLine = task.externalTaskId
+      ? (task.externalSyncError ? `\nFeishu Task 同步失败：${task.externalSyncError}` : '\nFeishu Task 已标记完成。')
+      : '';
+    await sessionReply(rootId, `✅ 已关闭任务 ${task.taskId}${syncLine}\n注意：关联 session 未关闭，如需关闭请在对应话题里使用 /close。`);
+    return;
+  }
+
+  if (sub === 'assign' || sub === '指派') {
+    const id = rest[0];
+    if (!id) {
+      await sessionReply(rootId, '请提供 task id：/task assign <task-id> @Bot');
+      return;
+    }
+    const candidates = mentionedOpenIds(message).filter(openId => !isCurrentBotMention(openId, larkAppId));
+    const assigneeOpenId = candidates[0];
+    if (!assigneeOpenId) {
+      await sessionReply(rootId, '请在 /task assign 命令里显式 @目标 Bot。');
+      return;
+    }
+    let task = taskStore.assignTask(id, assigneeOpenId);
+    if (!task) {
+      await sessionReply(rootId, `未找到 task：${id}`);
+      return;
+    }
+    task = await tryAssignExternalTask(task, assigneeOpenId);
+    const handoff = buildTaskHandoffPost(task, assigneeOpenId);
+    if (!larkAppId) {
+      await sessionReply(rootId, formatTaskStatus(task));
+      return;
+    }
+    if (ds?.scope === 'chat' || task.anchor.startsWith('oc_')) {
+      await sendMessage(larkAppId, task.chatId, handoff, 'post');
+    } else {
+      await replyMessage(larkAppId, task.anchor, handoff, 'post', true);
+    }
+    return;
+  }
+
+  await sessionReply(rootId, taskUsage());
+}
+
 // ─── Main command handler ────────────────────────────────────────────────────
 
 export async function handleCommand(
@@ -628,6 +878,13 @@ export async function handleCommand(
         const chatId = ds?.chatId!;
         await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId);
         logger.info(`[${logTag}] Schedule command handled`);
+        break;
+      }
+
+      case '/task': {
+        const taskArgs = message.content.replace(/^\/task\s*/i, '');
+        await handleTaskCommand(taskArgs, rootId, message, deps, larkAppId);
+        logger.info(`[${logTag}] Task command handled`);
         break;
       }
 
@@ -970,6 +1227,10 @@ export async function handleCommand(
           t('help.schedule_remove', undefined, loc),
           t('help.schedule_toggle', undefined, loc),
           t('help.schedule_run', undefined, loc),
+          '',
+          '任务管理:',
+          '/task new <name> — 登记当前任务',
+          '/task list | /task status <id> | /task assign <id> @Bot | /task close <id>',
           '',
           t('help.schedule_formats', undefined, loc),
           '',

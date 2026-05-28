@@ -159,6 +159,8 @@ const DEFAULT_PORT = 9768;
 const DEFAULT_SCOPES = [
   'im:message:readonly',
   'im:resource',
+  'task:task:read',
+  'task:task:write',
   'offline_access',
 ].join(' ');
 
