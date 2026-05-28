@@ -195,6 +195,8 @@ export const messages: Record<string, string> = {
   'cmd.relay.worker_busy': '⚠️ The session is mid-turn (working). Wait for the current turn to finish (idle), then try /relay again.',
   'cmd.relay.resolve_failed': '⚠️ Could not resolve the @-mentioned bots; /relay cancelled. Please retry shortly.',
   'cmd.relay.m1_announce': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\n@ the corresponding bot to continue.',
+  'cmd.relay.m1_final_all_ok': '🚀 Sessions relayed into this chat\n📋 Source: {sourceChat}\n✅ Ready: {successBots}\n⚠️ Lark message history stays in the source chat; AI memory has been carried over. @ the corresponding bot to continue.',
+  'cmd.relay.m1_final_partial': '🚀 Sessions relayed into this chat\n📋 Source: {sourceChat}\n✅ Ready: {successBots}\n⚠️ Failed to migrate: {failedBots}\n→ Run /relay in this chat to pull those bots\' sessions from the source manually.\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.',
   'cmd.relay.created': '✅ Created group "{name}" and relayed sessions\n👉 {link}\n\n{report}',
   'cmd.relay.report_leader_ok': '• {bot} (current session) relayed',
   'cmd.relay.report_leader_no_session': '• {bot} (current session) — skipped (no active session)',

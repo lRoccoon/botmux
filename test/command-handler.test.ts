@@ -1607,9 +1607,12 @@ describe('handleCommand', () => {
       expect(mockedSend).toHaveBeenCalled();
       expect(mockedSend.mock.calls[0][1]).toBe('oc_new_group');
 
-      // Leader transferred its own session.
+      // Leader transferred its own session — targetRootMessageId is now a
+      // placeholder (the newChatId) since M1 is posted AFTER all transfers
+      // settle. The leader's session.rootMessageId is patched to the real
+      // M1 id later, see the m1_final_all_ok / m1_final_partial flow.
       const wp = await import('../src/core/worker-pool.js');
-      expect(wp.transferSession).toHaveBeenCalledWith('sess-001', 'oc_new_group', 'card-msg-id');
+      expect(wp.transferSession).toHaveBeenCalledWith('sess-001', 'oc_new_group', 'oc_new_group');
 
       // Peer migrate-to-chat was POSTed exactly once.
       expect(fetchSpy).toHaveBeenCalledTimes(1);
@@ -1617,7 +1620,9 @@ describe('handleCommand', () => {
       expect(url).toMatch(/127\.0\.0\.1:9999\/api\/sessions\/migrate-to-chat$/);
       const body = JSON.parse((init as any).body);
       expect(body.targetChatId).toBe('oc_new_group');
-      expect(body.targetRootMessageId).toBe('card-msg-id');
+      // Peers also get the placeholder; their session.rootMessageId stays as
+      // the chatId (cosmetic — chat-scope routing doesn't use rootMessageId).
+      expect(body.targetRootMessageId).toBe('oc_new_group');
       expect(body.requesterLarkAppId).toBe(LARK_APP_ID);
       expect(body.requestingUserOpenId).toBe('ou_sender');
 
@@ -1698,11 +1703,15 @@ describe('handleCommand', () => {
       }), deps, LARK_APP_ID);
 
       // sourceAnchor in the POST body MUST be the pre-transfer thread root,
-      // not the M1 message id the leader transfer just wrote.
+      // not the placeholder rootMessageId (newChatId) that the leader
+      // transferSession just wrote into ds.session.rootMessageId. Also not
+      // the eventual M1 id ('card-msg-id') — peers need the ORIGINAL anchor
+      // to find their own pre-transfer session.
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       const body = JSON.parse((fetchSpy.mock.calls[0][1] as any).body);
       expect(body.sourceAnchor).toBe(ROOT_ID);
       expect(body.sourceAnchor).not.toBe('card-msg-id');
+      expect(body.sourceAnchor).not.toBe('oc_new_group');
 
       vi.unstubAllGlobals();
     });
@@ -1729,11 +1738,98 @@ describe('handleCommand', () => {
 
       // Peer fetch must NOT have happened — leader self-transfer failure aborts coordination.
       expect(fetchSpy).not.toHaveBeenCalled();
+      // And M1 must NOT have been posted — no orphan "已接力" lie in the new chat.
+      // The previous flow sent M1 first, then deleted it on failure (the
+      // --create path didn't actually delete; the picker path did). The new
+      // flow defers M1 entirely, so leader-failure means no M1 at all.
+      expect(mockedSend).not.toHaveBeenCalled();
 
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(reply).toContain('worker_busy');
 
       vi.unstubAllGlobals();
+    });
+
+    it('posts the final M1 AFTER transfers settle, with success-only template when all migrated', async () => {
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValue({ larkAppId: 'app-2', ipcPort: 9999 });
+
+      // Sequence: every Codex peer succeeds; leader succeeds (default mock).
+      const fetchSpy = vi.fn(async () => new Response(
+        JSON.stringify({ ok: true }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ));
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const wp = await import('../src/core/worker-pool.js');
+      const sendInvocationOrders: number[] = [];
+      const xferInvocationOrders: number[] = [];
+      mockedSend.mockImplementation(async (...args: any[]) => {
+        sendInvocationOrders.push(mockedSend.mock.invocationCallOrder.at(-1)!);
+        return 'final-m1-id';
+      });
+      vi.mocked(wp.transferSession).mockImplementation(async () => {
+        xferInvocationOrders.push(vi.mocked(wp.transferSession).mock.invocationCallOrder.at(-1)!);
+        return { ok: true };
+      });
+
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
+        mentions: [
+          { key: '@_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_2', name: 'Codex',  openId: 'ou_codex' },
+        ],
+      }), deps, LARK_APP_ID);
+
+      // Transfer fired before M1 (deferred-M1 contract).
+      expect(xferInvocationOrders).toHaveLength(1);
+      expect(sendInvocationOrders).toHaveLength(1);
+      expect(xferInvocationOrders[0]).toBeLessThan(sendInvocationOrders[0]);
+
+      // M1 body uses the all_ok template (both bots in successBots list,
+      // no "未能迁移" / "Failed to migrate" section).
+      const m1Body = mockedSend.mock.calls[0][2] as string;
+      expect(m1Body).toContain('Claude');
+      expect(m1Body).toContain('Codex');
+      expect(m1Body).not.toMatch(/未能迁移|Failed to migrate/);
+
+      // Leader's session.rootMessageId was patched from placeholder to final M1 id.
+      expect(ds.session.rootMessageId).toBe('final-m1-id');
+
+      vi.unstubAllGlobals();
+    });
+
+    it('posts the final M1 with partial template when some peers failed', async () => {
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      // Peer (Codex) is offline → outcome 'offline' lands in failed bucket.
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValue(null);
+
+      mockedSend.mockResolvedValue('final-m1-id' as any);
+
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
+        mentions: [
+          { key: '@_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_2', name: 'Codex',  openId: 'ou_codex' },
+        ],
+      }), deps, LARK_APP_ID);
+
+      // M1 body uses the partial template — Codex in failed list, Claude in success.
+      const m1Body = mockedSend.mock.calls[0][2] as string;
+      expect(m1Body).toContain('Claude');
+      expect(m1Body).toContain('Codex');
+      expect(m1Body).toMatch(/未能迁移|Failed to migrate/);
+      expect(m1Body).toMatch(/请在本群发 \/relay|Run \/relay in this chat/);
     });
   });
 

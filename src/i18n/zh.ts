@@ -198,6 +198,8 @@ export const messages: Record<string, string> = {
   'cmd.relay.worker_busy': '⚠️ 会话正在处理中（mid-turn），无法接力。请等当前回合结束（idle）后再发 /relay。',
   'cmd.relay.resolve_failed': '⚠️ 无法解析被 @ 的机器人，/relay 取消。请稍后重试。',
   'cmd.relay.m1_announce': '📋 已从「{sourceChat}」接力会话过来。\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。\n@ 对应机器人继续对话即可。',
+  'cmd.relay.m1_final_all_ok': '🚀 会话已接力到本群\n📋 来源：{sourceChat}\n✅ 已就绪：{successBots}\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。@ 对应机器人继续对话。',
+  'cmd.relay.m1_final_partial': '🚀 会话已接力到本群\n📋 来源：{sourceChat}\n✅ 已就绪：{successBots}\n⚠️ 未能迁移：{failedBots}\n→ 请在本群发 /relay，从菜单里把上述 bot 在源群的会话拉过来\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。',
   'cmd.relay.created': '✅ 已创建群「{name}」并接力会话\n👉 {link}\n\n{report}',
   'cmd.relay.report_leader_ok': '• {bot}（当前会话）已接力',
   'cmd.relay.report_leader_no_session': '• {bot}（当前会话）— 跳过（无活跃会话）',

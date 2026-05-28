@@ -1187,35 +1187,42 @@ export async function handleCommand(
         // leader transfer call (caught in review).
         const sourceAnchor = ds.session.rootMessageId;
 
-        // ── M1 announcement (sets the shared rootMessageId for all peers) ──
-        // Pass the raw text — sendMessage wraps `'text'` msgType bodies into
-        // { text: content } itself. Pre-wrapping with JSON.stringify caused
-        // double-wrapping; Lark then rendered the JSON literally.
-        const m1Text = t('cmd.relay.m1_announce', { sourceChat: sourceChatId, groupName }, loc);
-        let m1MessageId: string;
-        try {
-          m1MessageId = await sendMessage(creatorAppId, newChatId, m1Text, 'text');
-        } catch (err: any) {
-          logger.error(`[${logTag}] /relay --create: failed to send M1 to new chat: ${err?.message ?? err}`);
-          await sessionReply(rootId, t('cmd.relay.failed', { error: err?.message ?? String(err) }, loc));
-          break;
-        }
+        // ── M1 deferred: post the announcement AFTER all transfers settle ──
+        // Previous flow sent an optimistic "已接力" M1 before running any
+        // transfer. When leader/peers later failed, that M1 was a lie — and
+        // the --create path had no orphan-cleanup (picker path did).
+        //
+        // New flow: pass `newChatId` as a placeholder for targetRootMessageId
+        // into transferSession. Chat-scope routing ignores rootMessageId
+        // (worker-pool transferSession only stores it for audit/UX), so the
+        // placeholder doesn't break routing. Once all outcomes are in, we
+        // post the real M1 with success/failure breakdown, then patch the
+        // leader's session.rootMessageId to that final M1 id. Peer sessions
+        // keep newChatId as a cosmetic placeholder — fixing them would
+        // require another round-trip; chat-scope doesn't actually care.
+        const placeholderRootMessageId = newChatId;
+
+        // Resolve friendly source-chat label for the M1 body — falls back to
+        // raw chatId if Lark can't return a name. Mirrors picker-path
+        // (card-handler.ts:341) so the message reads the same in both UX
+        // entry points.
+        const { getChatName } = await import('../im/lark/client.js');
+        const sourceLabel = (await getChatName(creatorAppId, sourceChatId).catch(() => null)) ?? sourceChatId;
 
         // ── Step 1: leader transfers its own session ───────────────────────
         const reportLines: string[] = [];
         const leaderName = nameOf(creatorAppId);
         const { transferSession } = await import('./worker-pool.js');
-        const leaderResult = await transferSession(ds.session.sessionId, newChatId, m1MessageId);
-        if (leaderResult.ok) {
-          reportLines.push(t('cmd.relay.report_leader_ok', { bot: leaderName }, loc));
-        } else {
+        const leaderResult = await transferSession(ds.session.sessionId, newChatId, placeholderRootMessageId);
+        if (!leaderResult.ok) {
+          // Leader's own transfer failed. Don't post any M1 — there's no
+          // misleading announcement to clean up. New chat exists but is
+          // empty of botmux sessions; user can /disband or relay manually.
           reportLines.push(t('cmd.relay.report_leader_failed', { bot: leaderName, error: leaderResult.error }, loc));
-          // Leader's own transfer failed — abort peer coordination. The leader
-          // can't even relay its own session, so the new chat would be left
-          // half-populated. New chat already exists; user can disband manually.
           await sessionReply(rootId, t('cmd.relay.created', { name: groupName, link: inviteLink, report: reportLines.join('\n') }, loc));
           break;
         }
+        reportLines.push(t('cmd.relay.report_leader_ok', { bot: leaderName }, loc));
 
         // ── Step 2: coordinate peer daemons (parallel) ─────────────────────
         const { findOnlineDaemon } = await import('../utils/daemon-discovery.js');
@@ -1235,7 +1242,7 @@ export async function handleCommand(
                 body: JSON.stringify({
                   sourceAnchor,
                   targetChatId: newChatId,
-                  targetRootMessageId: m1MessageId,
+                  targetRootMessageId: placeholderRootMessageId,
                   requesterLarkAppId: creatorAppId,
                   requestingUserOpenId: senderOpenId,
                 }),
@@ -1254,15 +1261,52 @@ export async function handleCommand(
           }
         }));
 
+        // Bucket outcomes for the final M1 (success / failure) AND extend the
+        // source-chat report with per-peer detail.
+        const successBotNames: string[] = [leaderName];
+        const failedBotNames: string[] = [];
         for (const r of peerOutcomes) {
-          switch (r.status) {
-            case 'ok':         reportLines.push(t('cmd.relay.report_peer_ok',         { bot: r.botName },                             loc)); break;
-            case 'no_session': reportLines.push(t('cmd.relay.report_peer_no_session', { bot: r.botName },                             loc)); break;
-            case 'not_owner':  reportLines.push(t('cmd.relay.report_peer_not_owner',  { bot: r.botName },                             loc)); break;
-            case 'offline':    reportLines.push(t('cmd.relay.report_peer_offline',    { bot: r.botName },                             loc)); break;
-            case 'busy':       reportLines.push(t('cmd.relay.report_peer_busy',       { bot: r.botName },                             loc)); break;
-            case 'failed':     reportLines.push(t('cmd.relay.report_peer_failed',     { bot: r.botName, error: r.error ?? 'unknown' }, loc)); break;
+          if (r.status === 'ok') {
+            successBotNames.push(r.botName);
+            reportLines.push(t('cmd.relay.report_peer_ok', { bot: r.botName }, loc));
+          } else {
+            failedBotNames.push(r.botName);
+            switch (r.status) {
+              case 'no_session': reportLines.push(t('cmd.relay.report_peer_no_session', { bot: r.botName },                             loc)); break;
+              case 'not_owner':  reportLines.push(t('cmd.relay.report_peer_not_owner',  { bot: r.botName },                             loc)); break;
+              case 'offline':    reportLines.push(t('cmd.relay.report_peer_offline',    { bot: r.botName },                             loc)); break;
+              case 'busy':       reportLines.push(t('cmd.relay.report_peer_busy',       { bot: r.botName },                             loc)); break;
+              case 'failed':     reportLines.push(t('cmd.relay.report_peer_failed',     { bot: r.botName, error: r.error ?? 'unknown' }, loc)); break;
+            }
           }
+        }
+
+        // ── Step 3: post the real M1 with status breakdown ─────────────────
+        // Pass the raw text — sendMessage wraps `'text'` msgType bodies into
+        // { text: content } itself.
+        const finalM1Text = failedBotNames.length === 0
+          ? t('cmd.relay.m1_final_all_ok', {
+              sourceChat: sourceLabel,
+              successBots: successBotNames.join('、'),
+            }, loc)
+          : t('cmd.relay.m1_final_partial', {
+              sourceChat: sourceLabel,
+              successBots: successBotNames.join('、'),
+              failedBots: failedBotNames.join('、'),
+            }, loc);
+        try {
+          const finalM1Id = await sendMessage(creatorAppId, newChatId, finalM1Text, 'text');
+          // Patch the leader's session.rootMessageId to the real M1 id.
+          // Chat-scope doesn't route on it but the audit/UX field is worth
+          // keeping accurate for dashboards / future debugging. Peer
+          // sessions retain the chatId placeholder (different daemon — we
+          // don't reach in to fix theirs, and it's cosmetic).
+          ds.session.rootMessageId = finalM1Id;
+          sessionStore.updateSession(ds.session);
+        } catch (err: any) {
+          // Non-fatal: transfers already succeeded. The source-chat report
+          // (sessionReply below) is the user's authoritative status.
+          logger.warn(`[${logTag}] /relay --create: final M1 send failed: ${err?.message ?? err}`);
         }
 
         await sessionReply(rootId, t('cmd.relay.created', { name: groupName, link: inviteLink, report: reportLines.join('\n') }, loc));
