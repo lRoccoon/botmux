@@ -10,7 +10,7 @@ import * as brandStore from '../services/brand-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession } from './worker-pool.js';
-import { getAllBots } from '../bot-registry.js';
+import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage } from '../im/lark/client.js';
 import { resumeSession } from './session-manager.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
@@ -222,8 +222,14 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'missing_field' });
   }
 
-  // Requester must be a bot we know about on this host.
-  const requesterKnown = getAllBots().some(b => b.config.larkAppId === requesterLarkAppId);
+  // Requester must be a live botmux daemon — not a random localhost process
+  // pretending to be one. We check the cross-process daemon registry
+  // (~/.botmux/data/dashboard-daemons/<larkAppId>.json + heartbeat) rather
+  // than this process's local bot list: in production each bot has its own
+  // daemon process, and a per-process `getAllBots()` only sees its OWN bot
+  // (botmux is one-daemon-per-bot at boot, daemon.ts:2367). Using the
+  // registry lets the peer recognise the leader bot.
+  const requesterKnown = listOnlineDaemons().some(d => d.larkAppId === requesterLarkAppId);
   if (!requesterKnown) return jsonRes(res, 403, { ok: false, error: 'unknown_requester' });
 
   // Locate this daemon's own session at the given source anchor. We match
