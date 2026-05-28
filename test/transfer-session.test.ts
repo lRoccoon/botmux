@@ -380,6 +380,27 @@ describe('transferSession', () => {
     expect(body).toMatch(/已搬迁|Relayed away/);
     // Freeze card has NO action elements — buttons removed.
     expect(body).not.toMatch(/"tag":\s*"action"/);
+    // ds.currentImageKey is 'old_image_key' in makeDs → frozen card should
+    // embed an img element referencing it (preferred over the text fallback).
+    expect(body).toMatch(/"tag":\s*"img"/);
+    expect(body).toMatch(/"img_key":\s*"old_image_key"/);
+  });
+
+  it('frozen card falls back to text content when no currentImageKey is set', async () => {
+    // Sessions in hidden / text-only display mode have no img_key at relay
+    // time. The frozen card should still render the cached pane content as
+    // a markdown code block so history readers can see the last frame.
+    const ds = makeDs({ currentImageKey: undefined, lastScreenContent: 'hello from tmux\n$ idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    updateMessageMock.mockClear();
+
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(true);
+
+    const body = updateMessageMock.mock.calls[0][2];
+    expect(body).not.toMatch(/"tag":\s*"img"/);
+    // Markdown code block with cached content (newlines escape to \\n in JSON).
+    expect(body).toMatch(/hello from tmux/);
   });
 
   it('still succeeds when freezing the source-chat card fails (best-effort)', async () => {

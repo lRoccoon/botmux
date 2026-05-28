@@ -810,6 +810,7 @@ export async function transferSession(
         ds.currentTurnTitle || ds.session.title || '',
         cliId,
         ds.lastScreenContent,
+        ds.currentImageKey,
         localeForBot(ds.larkAppId),
       );
       await updateMessage(ds.larkAppId, ds.streamCardId, frozenJson);

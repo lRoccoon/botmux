@@ -171,33 +171,52 @@ export function buildSessionClosedCard(
  * console" while actually being a footgun. PATCH it to an inert snapshot
  * so the user sees clearly it's historical.
  *
- * The body retains the cached last-frame screen content (so scrolling
- * history is still informative). No action buttons are rendered.
+ * Last-frame rendering:
+ *   - imageKey present (session was in 'screenshot' mode at relay time) →
+ *     embed the same img element the live card had. img_key is a Lark
+ *     server resource independent of the card it lived on, so the PATCHed
+ *     card can still reference it.
+ *   - imageKey absent (hidden / text-only mode) → fall back to a markdown
+ *     code block of the cached pane content.
+ *   - Neither → just the header + body notice.
+ *
+ * No action buttons are rendered in either case.
  */
 export function buildRelayedFrozenCard(
   title: string,
   cliId?: CliId,
   lastScreenContent?: string,
+  imageKey?: string,
   locale?: Locale,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
-  const trimmed = (lastScreenContent ?? '').trim();
-  const contentBlock = trimmed
-    ? `\n\`\`\`\n${truncateContent(trimmed, locale)}\n\`\`\``
-    : '';
   const body =
     `**${escapeMd(title || cliName)}**\n` +
-    `${t('card.body.relay_frozen', undefined, locale)}` +
-    contentBlock;
+    `${t('card.body.relay_frozen', undefined, locale)}`;
+  const elements: any[] = [
+    { tag: 'markdown', content: body },
+  ];
+  if (imageKey) {
+    elements.push({
+      tag: 'img',
+      img_key: imageKey,
+      alt: { tag: 'plain_text', content: '' },
+      mode: 'fit_horizontal',
+      preview: true,
+    });
+  } else {
+    const trimmed = (lastScreenContent ?? '').trim();
+    if (trimmed) {
+      elements.push({ tag: 'markdown', content: `\`\`\`\n${truncateContent(trimmed, locale)}\n\`\`\`` });
+    }
+  }
   const card = {
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: t('card.status.relay_frozen', undefined, locale) },
       template: 'grey',
     },
-    elements: [
-      { tag: 'markdown', content: body },
-    ],
+    elements,
   };
   return JSON.stringify(card);
 }
