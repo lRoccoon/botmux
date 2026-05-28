@@ -1087,6 +1087,13 @@ export async function handleCommand(
           break;
         }
         const senderOpenId = message.senderId;
+        // Cross-app stable identity — peer daemons can't compare against
+        // leader's open_id directly because the same user has a different
+        // open_id in each bot's namespace. union_id is shared per tenant.
+        // We pass it through the migrate-to-chat HTTP body; peers compare
+        // against their session's `ownerUnionId` (with fallback to
+        // open_id for sessions persisted before this field existed).
+        const senderUnionId = message.senderUnionId;
         if (!senderOpenId) {
           await sessionReply(rootId, t('cmd.relay.no_sender', undefined, loc));
           break;
@@ -1280,6 +1287,11 @@ export async function handleCommand(
                   targetRootMessageId: placeholderRootMessageId,
                   requesterLarkAppId: creatorAppId,
                   requestingUserOpenId: senderOpenId,
+                  // union_id is cross-app stable within a tenant — peer
+                  // compares against its own session.ownerUnionId rather
+                  // than translating open_ids per bot. Optional for
+                  // backward compat with daemons older than this commit.
+                  requestingUserUnionId: senderUnionId,
                 }),
                 signal: ctrl.signal,
               },

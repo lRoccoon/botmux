@@ -11,7 +11,7 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId } from '../im/lark/client.js';
 import { resumeSession } from './session-manager.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -211,13 +211,14 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
     targetRootMessageId?: string;
     requesterLarkAppId?: string;
     requestingUserOpenId?: string;
+    requestingUserUnionId?: string;
   };
   try {
     body = await readJsonBody(req);
   } catch {
     return jsonRes(res, 400, { ok: false, error: 'invalid_json' });
   }
-  const { sourceAnchor, targetChatId, targetRootMessageId, requesterLarkAppId, requestingUserOpenId } = body;
+  const { sourceAnchor, targetChatId, targetRootMessageId, requesterLarkAppId, requestingUserOpenId, requestingUserUnionId } = body;
   if (!sourceAnchor || !targetChatId || !targetRootMessageId || !requesterLarkAppId || !requestingUserOpenId) {
     return jsonRes(res, 400, { ok: false, error: 'missing_field' });
   }
@@ -253,8 +254,36 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   // session too. If a peer's session is owned by someone else, we refuse —
   // the leader summarises this as "skipped: not your session" rather than
   // forcing a transfer of someone else's work.
-  if (ds.session.ownerOpenId && ds.session.ownerOpenId !== requestingUserOpenId) {
-    return jsonRes(res, 403, { ok: false, error: 'not_session_owner' });
+  //
+  // Cross-app identity: Lark `open_id` is app-scoped — the same user has a
+  // different open_id in each bot's namespace, so leader's senderOpenId
+  // and peer's stored ownerOpenId cannot be compared directly. Prefer
+  // `union_id` (stable across apps within a tenant) when both sides have
+  // it. Sessions persisted before ownerUnionId existed fall through to a
+  // lazy backfill: resolve peer's stored open_id → union_id via Lark API
+  // (using PEER's bot client, so the open_id is in the right namespace),
+  // persist for next time, and compare.
+  if (ds.session.ownerOpenId) {
+    let peerOwnerUnionId = ds.session.ownerUnionId;
+    if (!peerOwnerUnionId && requestingUserUnionId) {
+      // Backfill: legacy session, look up the union_id via Lark API once
+      // and persist it so subsequent comparisons (and any other code path
+      // that grows to read it) are fast.
+      const looked = await resolveUnionIdFromOpenId(ds.larkAppId, ds.session.ownerOpenId);
+      if (looked) {
+        peerOwnerUnionId = looked;
+        ds.session.ownerUnionId = looked;
+        sessionStore.updateSession(ds.session);
+      }
+    }
+    const ownerMatch = (peerOwnerUnionId && requestingUserUnionId)
+      ? peerOwnerUnionId === requestingUserUnionId
+      // Same-bot fallback (no union_id on either side): open_id namespaces
+      // match, so direct compare works.
+      : ds.session.ownerOpenId === requestingUserOpenId;
+    if (!ownerMatch) {
+      return jsonRes(res, 403, { ok: false, error: 'not_session_owner' });
+    }
   }
 
   // Target chat was built by the leader's /relay --create — by

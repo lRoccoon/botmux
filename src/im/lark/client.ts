@@ -168,6 +168,38 @@ export async function removeReaction(larkAppId: string, messageId: string, react
   logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
 }
 
+/**
+ * Resolve a user's tenant-stable `union_id` from their app-scoped `open_id`.
+ * Used by cross-daemon owner checks (e.g. /relay --create peer migrate)
+ * to compare identities across bot namespaces — open_id alone is
+ * app-scoped, so two daemons looking at the same physical user see
+ * different open_ids.
+ *
+ * Best-effort: returns null on API failure / missing scope / empty
+ * response, so callers can fall back to other identity strategies
+ * instead of failing the whole flow.
+ */
+export async function resolveUnionIdFromOpenId(
+  larkAppId: string,
+  openId: string,
+): Promise<string | null> {
+  const c = getBotClient(larkAppId);
+  try {
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
+    });
+    if (res?.code !== 0) {
+      logger.debug(`[union_id] resolve failed for ${openId.substring(0, 12)}: code=${res?.code} msg=${res?.msg ?? ''}`);
+      return null;
+    }
+    const unionId: string | undefined = res?.data?.user?.union_id;
+    return unionId ?? null;
+  } catch (err) {
+    logger.debug(`[union_id] resolve threw for ${openId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
 export async function sendUserMessage(larkAppId: string, openId: string, content: string, msgType: string = 'text'): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
