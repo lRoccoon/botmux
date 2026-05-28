@@ -33,6 +33,10 @@ interface ActiveTurn {
 const OSC_PREFIX = '\x1b]777;botmux:';
 const OSC_END = '\x07';
 
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
 function parseArgs(argv: string[]): Args {
   const out: Args = {
     sessionId: '',
@@ -105,6 +109,7 @@ class AppServerClient {
   private notificationHandlers: Array<(msg: JsonObject) => void> = [];
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
+  private fatalError?: Error;
 
   constructor(private readonly codexBin: string, private readonly cwd: string) {
     this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
@@ -114,15 +119,21 @@ class AppServerClient {
     });
 
     this.child.stdout.on('data', chunk => this.onStdout(chunk.toString('utf8')));
+    this.child.stdin.on('error', err => this.failAll(new Error(`Codex app-server stdin error: ${err.message}`)));
     this.child.stderr.on('data', chunk => {
       const text = chunk.toString('utf8');
       this.lastStderr = (this.lastStderr + text).slice(-8000);
       if (process.env.BOTMUX_CODEX_APP_DEBUG === '1') process.stderr.write(text);
     });
+    this.child.on('error', err => {
+      const hint = (err as NodeJS.ErrnoException).code === 'ENOENT'
+        ? '\nHint: install the Codex CLI, or set cliPathOverride to the Codex App bundled binary, for example /Applications/Codex.app/Contents/Resources/codex.'
+        : '';
+      this.failAll(new Error(`Failed to start Codex app-server with "${codexBin}": ${err.message}${hint}`));
+    });
     this.child.on('exit', (code, signal) => {
-      const err = new Error(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
-      for (const pending of this.pending.values()) pending.reject(err);
-      this.pending.clear();
+      const err = this.fatalError ?? new Error(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
+      this.failAll(err);
     });
   }
 
@@ -144,9 +155,14 @@ class AppServerClient {
 
   request(method: string, params: unknown): Promise<any> {
     const id = this.nextId++;
-    this.write({ jsonrpc: '2.0', id, method, params });
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject, method });
+      try {
+        this.write({ jsonrpc: '2.0', id, method, params });
+      } catch (err) {
+        this.pending.delete(id);
+        reject(asError(err));
+      }
     });
   }
 
@@ -165,7 +181,15 @@ class AppServerClient {
   }
 
   private write(msg: JsonObject): void {
+    if (this.fatalError) throw this.fatalError;
     this.child.stdin.write(JSON.stringify(msg) + '\n');
+  }
+
+  private failAll(err: Error): void {
+    this.fatalError = this.fatalError ?? err;
+    const fatal = this.fatalError;
+    for (const pending of this.pending.values()) pending.reject(fatal);
+    this.pending.clear();
   }
 
   private onStdout(data: string): void {

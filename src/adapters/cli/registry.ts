@@ -1,5 +1,7 @@
 import { execSync } from 'node:child_process';
-import { isAbsolute } from 'node:path';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import type { CliAdapter, CliId } from './types.js';
 import { createClaudeCodeAdapter } from './claude-code.js';
 import { createAidenAdapter } from './aiden.js';
@@ -31,6 +33,15 @@ export function resolveCommand(cmd: string): string {
         }).trim();
         if (result && isAbsolute(result)) return result;
       } catch { /* try next */ }
+    }
+  }
+  if (process.platform === 'darwin' && cmd === 'codex') {
+    const bundledCodexCandidates = [
+      '/Applications/Codex.app/Contents/Resources/codex',
+      join(homedir(), 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex'),
+    ];
+    for (const candidate of bundledCodexCandidates) {
+      if (existsSync(candidate)) return candidate;
     }
   }
   return cmd;
