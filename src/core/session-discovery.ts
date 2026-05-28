@@ -43,7 +43,8 @@ const CLI_COMM_MAP: Record<string, CliId> = {
 };
 
 function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefined {
-  const direct = CLI_COMM_MAP[comm];
+  const normalizedComm = comm.startsWith('.') ? comm.slice(1) : comm;
+  const direct = CLI_COMM_MAP[comm] ?? CLI_COMM_MAP[normalizedComm];
   // MTR is an OpenCode fork and some installs still expose the underlying
   // native process as "opencode". When an MTR bot asks to adopt, treat that
   // process as MTR so the bot's filter does not hide its own sessions.
