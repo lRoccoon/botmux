@@ -580,29 +580,43 @@ export async function handleCommand(
           const selfBot = getBot(ds!.larkAppId);
           const botCfg = selfBot.config;
           ds!.pendingRepo = false;
-          const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
           const pendingPrompt = ds!.pendingPrompt ?? '';
-          const prompt = buildNewTopicPrompt(
-            pendingPrompt,
-            ds!.session.sessionId,
-            botCfg.cliId,
-            botCfg.cliPathOverride,
-            ds!.pendingAttachments,
-            ds!.pendingMentions,
-            await getAvailableBots(ds!.larkAppId, ds!.chatId),
-            ds!.pendingFollowUps,
-            { name: selfBot.botName, openId: selfBot.botOpenId },
-            loc,
-            ds!.pendingSender,
-            { larkAppId, chatId: ds!.chatId },
-          );
-          rememberLastCliInput(ds!, pendingPrompt, prompt);
+          // Was there an actual buffered user message to deliver? A session
+          // launched *via* `/repo` (the command itself is the first message) has
+          // none — so boot the CLI idle and let the user's NEXT message be the
+          // first prompt, instead of submitting an empty/boilerplate user_message.
+          const hasBufferedInput =
+            pendingPrompt.trim().length > 0 ||
+            (ds!.pendingAttachments?.length ?? 0) > 0 ||
+            (ds!.pendingFollowUps?.length ?? 0) > 0;
+          if (hasBufferedInput) {
+            const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+            const prompt = buildNewTopicPrompt(
+              pendingPrompt,
+              ds!.session.sessionId,
+              botCfg.cliId,
+              botCfg.cliPathOverride,
+              ds!.pendingAttachments,
+              ds!.pendingMentions,
+              await getAvailableBots(ds!.larkAppId, ds!.chatId),
+              ds!.pendingFollowUps,
+              { name: selfBot.botName, openId: selfBot.botOpenId },
+              loc,
+              ds!.pendingSender,
+              { larkAppId, chatId: ds!.chatId },
+            );
+            rememberLastCliInput(ds!, pendingPrompt, prompt);
+            forkWorker(ds!, prompt);
+          } else {
+            // Empty initial prompt → worker spawns the CLI without submitting
+            // anything (see worker.ts: the init prompt is only queued when truthy).
+            forkWorker(ds!, '', false);
+          }
           ds!.pendingPrompt = undefined;
           ds!.pendingAttachments = undefined;
           ds!.pendingMentions = undefined;
           ds!.pendingSender = undefined;
           ds!.pendingFollowUps = undefined;
-          forkWorker(ds!, prompt);
           await sessionReply(rootId, replyText);
         };
 

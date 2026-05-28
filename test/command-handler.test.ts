@@ -288,7 +288,7 @@ import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { killWorker, forkWorker, getCurrentCliVersion } from '../src/core/worker-pool.js';
-import { getSessionWorkingDir } from '../src/core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
@@ -930,14 +930,16 @@ describe('handleCommand', () => {
   // ─── bare /repo while pending (replaces the old /skip command) ────────────
 
   describe('/repo (bare) while pending', () => {
-    it('should launch the CLI in the default workingDir without showing a card', async () => {
+    it('should boot the CLI idle (no prompt submitted) when launched via /repo itself', async () => {
       const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', repoCardMessageId: 'om_card' });
       const deps = makeDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
-      // Forked the pending CLI (not the close+recreate switch path).
-      expect(forkWorker).toHaveBeenCalledWith(ds, expect.any(String));
+      // No buffered message → spawn idle with an empty prompt so the user's NEXT
+      // message becomes the first prompt (not an empty/boilerplate user_message).
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(buildNewTopicPrompt).not.toHaveBeenCalled();
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.createSession).not.toHaveBeenCalled();
       // Cleared pending state + withdrew the (already-sent) card.
@@ -949,6 +951,21 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('已直接开启会话');
       // Did NOT fall through to the card-display scan path.
       expect(scanMultipleProjects).not.toHaveBeenCalled();
+    });
+
+    it('should still submit a buffered first message when bare /repo skips the card', async () => {
+      // Normal flow: real first message → card shown → user types bare /repo to
+      // skip. The buffered message must be delivered, not dropped.
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '帮我看看这个 bug' });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      // The buffered message is wrapped (mock → `WRAPPED:<prompt>`) and forked.
+      expect(buildNewTopicPrompt).toHaveBeenCalled();
+      expect((buildNewTopicPrompt as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('帮我看看这个 bug');
+      expect(forkWorker).toHaveBeenCalledWith(ds, 'WRAPPED:帮我看看这个 bug');
+      expect(ds.pendingRepo).toBe(false);
     });
 
     it('should report an invalid workingDir and not spawn (keeps pending for recovery)', async () => {
