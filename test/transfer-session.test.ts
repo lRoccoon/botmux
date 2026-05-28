@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn(),
   getSession: vi.fn(),
+  closeSession: vi.fn(),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -32,7 +33,7 @@ vi.mock('../src/core/dashboard-events.js', () => ({
 const forkWorkerSpy = vi.fn();
 const killWorkerSpy = vi.fn();
 
-import { transferSession, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
+import { transferSession, setActiveSessionsRegistry, setActiveSessionSafe } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { sessionKey } from '../src/core/types.js';
@@ -83,17 +84,14 @@ describe('transferSession', () => {
   let registry: Map<string, DaemonSession>;
 
   // Helper: always inject spy implementations so the real forkWorker doesn't
-  // try to spawn a child process / attach tmux during unit testing. waitForIdleMs
-  // can still be overridden per-test.
+  // try to spawn a child process / attach tmux during unit testing.
   const callTransfer = (
     sessionId: string,
     targetChatId: string,
     targetRootMessageId: string,
-    extra: { waitForIdleMs?: number } = {},
   ) => transferSession(sessionId, targetChatId, targetRootMessageId, {
     forkWorkerImpl: forkWorkerSpy as any,
     killWorkerImpl: killWorkerSpy as any,
-    ...extra,
   });
 
   beforeEach(() => {
@@ -220,21 +218,37 @@ describe('transferSession', () => {
     expect(resume).toBe(true);
   });
 
-  it('returns worker_busy_timeout when worker stays busy past the idle deadline', async () => {
-    // Create a session whose worker exists and never reaches idle. We use a
-    // small timeout so the test finishes quickly. ds.worker must be truthy
-    // and not killed for the busy check to apply.
+  it('returns worker_busy immediately when worker is mid-turn (no idle-wait loop)', async () => {
+    // Source worker is alive and not in idle/limited → refuse on first check.
+    // This is the design contract change: previously transferSession waited
+    // up to 60s for the worker to settle; now it refuses on first miss so
+    // leader / peer reports stay consistent under the 5s HTTP timeout used
+    // by /relay --create's peer coordinator.
     const fakeWorker = { killed: false } as any;
     const ds = makeDs({ worker: fakeWorker, lastScreenStatus: 'working' });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
 
-    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target', { waitForIdleMs: 50 });
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toBe('worker_busy_timeout');
+    if (!r.ok) expect(r.error).toBe('worker_busy');
     expect(forkWorkerSpy).not.toHaveBeenCalled();
-    // Routing fields must be untouched after a busy timeout abort.
+    // Routing fields must be untouched after a busy abort.
     expect(ds.chatId).toBe('oc_source');
     expect(ds.session.scope).toBe('thread');
+  });
+
+  it('returns not_started_yet when source session is in pendingRepo state', async () => {
+    // pendingRepo session: worker never started, no CLI memory to relay.
+    // Refuse so the user finishes setup in the source chat first instead
+    // of producing an empty new-chat session.
+    const ds = makeDs({ pendingRepo: true });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toBe('not_started_yet');
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(ds.chatId).toBe('oc_source');
   });
 
   it('refuses with target_chat_has_session when target chat already has a chat-scope session for this bot', async () => {
@@ -266,12 +280,15 @@ describe('transferSession', () => {
     expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(existingDs);
   });
 
-  it('does NOT trigger target_chat_has_session for a daemon-command scratch session (no worker)', async () => {
+  it('closes the daemon-command scratch session occupying the target chat slot', async () => {
     // Regression: a /relay command in the target chat creates a placeholder
-    // session record with `worker: null`. The conflict check used to count
-    // that as a collision and refuse the transfer (王皓's "我选择 ggbone
-    // relay 它也显示我在这个群里有活跃群聊" bug). The fix: only count
-    // sessions with a real worker.
+    // session record with `worker: null`. Previously the pre-flight scan
+    // `continue`d past it as not-a-conflict, then the post-transfer
+    // activeSessions.set silently overwrote the scratch's Map entry while
+    // leaving its sessionStore row as status='active' — a ghost-active
+    // that resurfaced on next daemon restart (王皓's "占用者：e833de5e"
+    // toast). The fix: close the scratch in-line so the slot is properly
+    // freed before we set the relayed session at the same key.
     const movingDs = makeDs();
     registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
 
@@ -289,9 +306,19 @@ describe('transferSession', () => {
       scope: 'chat',
     });
     registry.set(sessionKey('oc_target', 'cli_app_test'), scratchDs);
+    // getSession is consulted by closeSession to decide whether to mark
+    // the store row closed — return a status='active' record so the store
+    // close path fires.
+    vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
+      sid === 'scratch-relay-cmd' ? ({ ...scratchDs.session, status: 'active' }) as any : undefined,
+    );
 
     const r = await callTransfer(movingDs.session.sessionId, 'oc_target', 'om_M1_target');
     expect(r.ok).toBe(true);
+    // Scratch must be marked closed in the store, not silently orphaned.
+    expect(sessionStore.closeSession).toHaveBeenCalledWith('scratch-relay-cmd');
+    // The target-chat Map slot now holds the relayed session, not the scratch.
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(movingDs);
   });
 
   it('allows transfer when target chat has only thread-scope sessions (no chat-scope collision)', async () => {
@@ -326,5 +353,89 @@ describe('transferSession', () => {
     expect(r.ok).toBe(true);
     expect(killWorkerSpy).toHaveBeenCalledWith(ds);
     expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('setActiveSessionSafe', () => {
+  let registry: Map<string, DaemonSession>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registry = new Map();
+    setActiveSessionsRegistry(registry);
+  });
+
+  function makeSimpleDs(sessionId: string, chatId = 'oc_c'): DaemonSession {
+    const session: Session = {
+      sessionId,
+      chatId,
+      rootMessageId: `om_${sessionId}`,
+      title: 't',
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      scope: 'chat',
+      chatType: 'group',
+      larkAppId: 'cli_app_test',
+      ownerOpenId: 'ou_u',
+      workingDir: '/tmp',
+      cliId: 'claude-code',
+    };
+    return {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: 'cli_app_test',
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.now(),
+      cliVersion: '1.0.0',
+      lastMessageAt: Date.now(),
+      hasHistory: true,
+      workingDir: '/tmp',
+    } as DaemonSession;
+  }
+
+  it('closes the prior occupant when the key is already held by a different session', async () => {
+    // Same-key collision: this is the second half of the scratch-ghost fix.
+    // restoreActiveSessions iterates two on-disk active sessions resolving
+    // to the same chat-scope key. Bare Map.set silently drops the loser;
+    // setActiveSessionSafe closes it instead so its store row doesn't stay
+    // status='active' as a ghost.
+    const prevDs = makeSimpleDs('prev-sess');
+    const newDs = makeSimpleDs('new-sess');
+    vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
+      sid === 'prev-sess' ? ({ ...prevDs.session, status: 'active' }) as any : undefined,
+    );
+
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, prevDs);
+
+    await setActiveSessionSafe(registry, key, newDs);
+
+    expect(registry.get(key)).toBe(newDs);
+    expect(sessionStore.closeSession).toHaveBeenCalledWith('prev-sess');
+  });
+
+  it('is a no-op when the key already holds the same session instance', async () => {
+    const ds = makeSimpleDs('only-sess');
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, ds);
+
+    await setActiveSessionSafe(registry, key, ds);
+
+    expect(registry.get(key)).toBe(ds);
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+  });
+
+  it('sets the entry on an empty key without calling closeSession', async () => {
+    const ds = makeSimpleDs('fresh-sess');
+    const key = sessionKey('oc_c', 'cli_app_test');
+
+    await setActiveSessionSafe(registry, key, ds);
+
+    expect(registry.get(key)).toBe(ds);
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
   });
 });

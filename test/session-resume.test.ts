@@ -39,6 +39,11 @@ vi.mock('../src/core/worker-pool.js', () => ({
   killStalePids: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  // Stub: bypass the closeSession-on-collision path and just set the entry.
+  // The collision-detection behavior is exercised in transfer-session.test.ts.
+  setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
+    map.set(key, ds);
+  }),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({

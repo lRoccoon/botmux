@@ -1713,7 +1713,7 @@ describe('handleCommand', () => {
         { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
       ]);
       const wp = await import('../src/core/worker-pool.js');
-      vi.mocked(wp.transferSession).mockResolvedValue({ ok: false, error: 'worker_busy_timeout' });
+      vi.mocked(wp.transferSession).mockResolvedValue({ ok: false, error: 'worker_busy' });
 
       const fetchSpy = vi.fn();
       vi.stubGlobal('fetch', fetchSpy);
@@ -1731,7 +1731,7 @@ describe('handleCommand', () => {
       expect(fetchSpy).not.toHaveBeenCalled();
 
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(reply).toContain('worker_busy_timeout');
+      expect(reply).toContain('worker_busy');
 
       vi.unstubAllGlobals();
     });

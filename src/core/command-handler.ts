@@ -1042,7 +1042,7 @@ export async function handleCommand(
           const { collectRelayPickerEntries } = await import('../services/relay-picker.js');
           const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetChatId, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
-          const card = buildRelayPickerCard(entries, targetChatId, rootId, loc);
+          const card = buildRelayPickerCard(entries, targetChatId, rootId, operatorOpenId, loc);
           await sessionReply(rootId, card, 'interactive');
           break;
         }
@@ -1063,6 +1063,19 @@ export async function handleCommand(
         // allowed without a session.)
         if (!ds) {
           await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
+          break;
+        }
+
+        // Front-loaded guards — transferSession refuses adoptedFrom /
+        // pendingRepo too, but only after createGroupWithBots has already
+        // built a new chat. Failing here keeps relay clean and avoids
+        // orphan-chat garbage when the operation can't possibly succeed.
+        if (ds.session.adoptedFrom) {
+          await sessionReply(rootId, t('cmd.relay.adopt_not_relayable', undefined, loc));
+          break;
+        }
+        if (ds.pendingRepo) {
+          await sessionReply(rootId, t('cmd.relay.not_started_yet', undefined, loc));
           break;
         }
 
@@ -1233,7 +1246,7 @@ export async function handleCommand(
             if (res.ok && body.ok) return { peerAppId, botName, status: 'ok' as const };
             if (body.error === 'no_session_at_anchor') return { peerAppId, botName, status: 'no_session' as const };
             if (body.error === 'not_session_owner') return { peerAppId, botName, status: 'not_owner' as const };
-            if (body.error === 'worker_busy_timeout') return { peerAppId, botName, status: 'busy' as const };
+            if (body.error === 'worker_busy') return { peerAppId, botName, status: 'busy' as const };
             return { peerAppId, botName, status: 'failed' as const, error: body.error ?? `http_${res.status}` };
           } catch (err: any) {
             const reason = err?.name === 'AbortError' ? 'busy' : 'failed';

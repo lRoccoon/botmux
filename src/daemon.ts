@@ -2516,7 +2516,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 
   // Restore active sessions from previous run
-  restoreActiveSessions(activeSessions);
+  await restoreActiveSessions(activeSessions);
 
   await attachColdWorkflowRuns(cfg.larkAppId);
 

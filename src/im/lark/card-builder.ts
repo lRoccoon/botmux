@@ -745,6 +745,7 @@ export function buildRelayPickerCard(
   entries: RelayPickerEntry[],
   targetChatId: string,
   targetRootMessageId: string,
+  invokerOpenId: string,
   locale?: Locale,
   state?: RelayPickerState,
 ): string {
@@ -761,10 +762,14 @@ export function buildRelayPickerCard(
   const visible = filtered.slice(start, start + RELAY_PICKER_PAGE_SIZE);
 
   // Common state object carried by every interactive value so re-renders
-  // can reconstruct what the user was looking at.
+  // can reconstruct what the user was looking at. `invoker_open_id` pins the
+  // card to the user who originally summoned it — card-handler refuses
+  // re-render / confirm clicks from anyone else, so the menu doesn't get
+  // silently swapped to a passer-by's session list.
   const stateValue = {
     target_chat_id: targetChatId,
     root_id: targetRootMessageId,
+    invoker_open_id: invokerOpenId,
     search: searchQuery,
     page,
     selected: selectedSessionId ?? '',

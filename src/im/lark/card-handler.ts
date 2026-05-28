@@ -204,8 +204,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const loc = localeForBot(larkAppId);
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
+    const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!targetChatId || !targetRootId || !operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
+    }
+    // Picker is owner-only: only the user who summoned it may flip pages,
+    // search, or select. Otherwise A's invocation in a shared chat could be
+    // silently swapped to C's session list when C clicks a button. Cards
+    // built before this guard was deployed lack invoker_open_id — we let
+    // them through (legacy) rather than break in-flight pickers; new cards
+    // are protected from the moment they're rendered.
+    if (invokerOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.relay.toast_not_invoker', undefined, loc) } };
     }
 
     // Reconstruct the next state from the action.
@@ -240,6 +250,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       entries,
       targetChatId,
       targetRootId,
+      // Preserve the original invoker so the re-rendered card stays bound
+      // to them. Fall back to operatorOpenId for legacy cards rendered
+      // before invoker_open_id was added (shouldn't normally happen since
+      // the check above already lets legacy through, but a render needs a
+      // string regardless).
+      invokerOpenId ?? operatorOpenId,
       loc,
       {
         selectedSessionId: nextSelected,
@@ -262,8 +278,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sourceSessionId = value.session_id;
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
+    const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
+    }
+    // Invoker-only confirm: redundant with the ownerOpenId check below in
+    // normal flow (invoker = session owner = picker invoker), but defends
+    // against the edge case where the source session changed owners after
+    // the picker was rendered, OR where the picker was shared/forwarded.
+    // Legacy cards (no invoker_open_id) fall through to ownerOpenId only.
+    if (invokerOpenId && operatorOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.relay.toast_not_invoker', undefined, loc) } };
     }
     // Locate the source session in the in-process registry. Since picker only
     // lists sessions of THIS bot in OTHER chats, the source must live in our
@@ -340,6 +365,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       if (r.error === 'adopt_not_relayable') {
         return { toast: { type: 'error', content: t('card.relay.toast_adopt_not_relayable', undefined, loc) } };
+      }
+      if (r.error === 'worker_busy') {
+        return { toast: { type: 'error', content: t('card.relay.toast_worker_busy', undefined, loc) } };
+      }
+      if (r.error === 'not_started_yet') {
+        return { toast: { type: 'error', content: t('card.relay.toast_not_started_yet', undefined, loc) } };
       }
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: r.error }, loc) } };
     }

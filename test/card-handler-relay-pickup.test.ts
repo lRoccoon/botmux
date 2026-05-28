@@ -135,6 +135,31 @@ describe('relay_confirm button click', () => {
     expect(transferSessionMock).not.toHaveBeenCalled();
   });
 
+  it('refuses confirm when invoker_open_id is present and the clicker is not the invoker', async () => {
+    // Owner-only invocations: the picker carries invoker_open_id so a passer-by
+    // can't hijack someone else's summoned card. The pre-flight rejects the
+    // mismatched operator before touching transferSession.
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    const r = await handleCardAction({
+      operator: { open_id: 'ou_passerby' },
+      action: {
+        value: {
+          action: 'relay_confirm',
+          session_id: 'sess-source-1',
+          target_chat_id: 'oc_target',
+          root_id: 'om_target_root',
+          invoker_open_id: OWNER, // original invoker — different from operator above
+        },
+      },
+    } as any, deps(map), LARK_APP_ID);
+
+    expect(r?.toast?.type).toBe('error');
+    expect(transferSessionMock).not.toHaveBeenCalled();
+  });
+
   it('returns not_owner when operator differs from session.ownerOpenId', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();
@@ -306,16 +331,32 @@ describe('relay_confirm button click', () => {
     expect(deleteMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_M1');
   });
 
-  it('returns the transferSession error as a toast when transfer fails', async () => {
+  it('returns a friendly toast when transferSession reports worker_busy', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();
     map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
 
-    transferSessionMock.mockResolvedValueOnce({ ok: false, error: 'worker_busy_timeout' });
+    transferSessionMock.mockResolvedValueOnce({ ok: false, error: 'worker_busy' as any });
 
     const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
 
     expect(r?.toast?.type).toBe('error');
-    expect(r?.toast?.content).toContain('worker_busy_timeout');
+    // Specific toast string, not the raw error code via toast_failed.
+    expect(r?.toast?.content).not.toMatch(/worker_busy/);
+    expect(r?.toast?.content).toMatch(/正在处理|mid-turn|wait/i);
+  });
+
+  it('returns a friendly toast when transferSession reports not_started_yet', async () => {
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    transferSessionMock.mockResolvedValueOnce({ ok: false, error: 'not_started_yet' as any });
+
+    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+
+    expect(r?.toast?.type).toBe('error');
+    expect(r?.toast?.content).not.toMatch(/not_started_yet/);
+    expect(r?.toast?.content).toMatch(/选仓库|pick a repo/i);
   });
 });

@@ -645,6 +645,42 @@ export async function closeSession(
   return { ok: true, alreadyClosed };
 }
 
+/**
+ * Set an entry on an active-sessions Map, but if the key is already occupied
+ * by a DIFFERENT DaemonSession, close that occupant first. Replaces bare
+ * `activeSessions.set(key, ds)` at sites where a silent overwrite would leak
+ * the prior entry's worker + leave its store row stuck in `status='active'`.
+ *
+ * The Map is passed explicitly so callers operate on the same instance they
+ * already hold (restoreActiveSessions takes the daemon's Map as a parameter;
+ * transferSession reaches it through `activeSessionsRegistry`). In production
+ * both refer to the same object — the daemon registers its Map at boot — but
+ * decoupling avoids module-state assumptions in tests.
+ *
+ * Canonical collision case: restoreActiveSessions at daemon boot iterating
+ * two on-disk active sessions that resolve to the same chat-scope key (e.g.
+ * a /relay command's scratch session + the real session that was transferred
+ * into the same chat by a prior daemon run). Without this helper the later
+ * iterated entry silently wins, the earlier one becomes a ghost-active.
+ *
+ * Setting the same `ds` at its own key is a no-op (no close).
+ */
+export async function setActiveSessionSafe(
+  map: Map<string, DaemonSession>,
+  key: string,
+  ds: DaemonSession,
+): Promise<void> {
+  const prev = map.get(key);
+  if (prev && prev !== ds) {
+    logger.warn(
+      `[setActiveSessionSafe] key already occupied by ${prev.session.sessionId.substring(0, 8)} ` +
+      `(worker=${prev.worker ? 'live' : 'null'}); closing it before set`,
+    );
+    await closeSession(prev.session.sessionId);
+  }
+  map.set(key, ds);
+}
+
 // ─── Session transfer (cross-chat relay) ────────────────────────────────────
 
 /**
@@ -662,10 +698,19 @@ export async function closeSession(
  *     streamCardId/Nonce/imageKey so the new worker posts fresh cards in the
  *     target chat instead of trying to PATCH unreachable old ones.
  *
- * Pre-conditions:
+ * Pre-conditions (entry guards, all checked synchronously up-front — no
+ * idle-wait loop; busy workers are refused immediately so the caller can
+ * report a deterministic outcome and the user retries when the worker
+ * quiets):
  *   - Session must be currently active (live worker + activeSessions entry)
- *   - Worker must reach `idle` or `limited` within `waitForIdleMs` (default
- *     60s) — transferring mid-turn would tear the in-progress jsonl write.
+ *   - Source must not be a pendingRepo placeholder (no CLI ever started)
+ *   - Source must not be an adopted external-tmux session
+ *   - Source worker must be in idle/limited (or already dead) — otherwise
+ *     refuse with `worker_busy`
+ *   - Target chat must not already host a real chat-scope session for the
+ *     same bot (`target_chat_has_session`). Scratch (worker:null) occupants
+ *     are NOT a conflict — they're command-time placeholders and we close
+ *     them in-line to free the slot before continuing.
  *
  * Idempotent for `same_chat`: returns error without side effects when the
  * source chat equals the target chat.
@@ -675,7 +720,6 @@ export async function transferSession(
   targetChatId: string,
   targetRootMessageId: string,
   opts?: {
-    waitForIdleMs?: number;
     /** @internal Override for tests — the real implementation forks a child
      *  process and tries to attach to tmux, neither of which is appropriate
      *  in a unit test environment. Defaults to module-level forkWorker. */
@@ -688,49 +732,62 @@ export async function transferSession(
   if (!ds) return { ok: false, error: 'session_not_active' };
   if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
 
+  // pendingRepo: the user created a session via M0 but hasn't picked a repo
+  // yet, so worker is null and the CLI has never run. Relaying produces an
+  // empty new-chat session with no AI memory — refuse so the user finishes
+  // setup in the original chat first.
+  if (ds.pendingRepo) return { ok: false, error: 'not_started_yet' };
+
   // Adopt sessions wrap a CLI process that botmux didn't spawn — the user
   // owns it inside their own tmux pane, so moving routing here would be
   // surprising and we don't control the tmux session's lifecycle. Refuse.
   if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_relayable' };
 
+  // Busy worker: refuse immediately rather than waiting. An idle-wait loop
+  // (previously 60s) created an asymmetry with the peer-dispatch HTTP
+  // timeout (5s) — peer's transferSession was still polling while the
+  // leader had already abort+report 'busy', producing reports that
+  // disagreed with reality. Cleaner contract: refuse on first miss, let
+  // the user retry when the turn settles.
+  const st = ds.lastScreenStatus;
+  if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
+    return { ok: false, error: 'worker_busy' };
+  }
+
   // Existing-session guard: a chat-scope session at the target chatId would
   // collide on sessionKey(targetChatId, larkAppId) after the rewrite, and
-  // Map.set would silently orphan the prior entry's worker. Refuse instead.
+  // Map.set would silently orphan the prior entry's worker. We split the
+  // collision predicate two ways:
+  //   - real session (worker !== null): refuse the transfer
+  //   - scratch session (worker === null): a daemon-command placeholder
+  //     (e.g. the /relay command itself created one when typed in this
+  //     chat); the slot is logically free, but the placeholder lingers in
+  //     the store with status='active'. Collect and close it so the post-
+  //     transfer Map.set doesn't silently overwrite it (which leaves the
+  //     scratch as a ghost-active on next daemon restart — exact bug we're
+  //     fixing).
   // We only check chat-scope entries — thread-scope sessions in the same
-  // chat are keyed by rootMessageId, so they don't collide. AND only count
-  // entries with a real worker — daemon-command scratch sessions (e.g. the
-  // /relay command's own session record) have `worker: null` and would
-  // otherwise produce a false-positive collision in the target chat where
-  // the picker was invoked.
+  // chat are keyed by rootMessageId, so they don't collide.
+  const scratchesToClose: string[] = [];
   if (activeSessionsRegistry) {
     for (const existing of activeSessionsRegistry.values()) {
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
       if (existing.chatId !== targetChatId) continue;
       if (existing.scope !== 'chat') continue;
-      if (!existing.worker) continue; // scratch session, not a real running one
+      if (!existing.worker) {
+        scratchesToClose.push(existing.session.sessionId);
+        continue;
+      }
       return { ok: false, error: 'target_chat_has_session' };
     }
+  }
+  for (const sid of scratchesToClose) {
+    await closeSession(sid);
   }
 
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
   const kw = opts?.killWorkerImpl ?? killWorker;
-
-  // Wait for the worker to leave a mid-turn state so the CLI's jsonl reaches
-  // a consistent line boundary before we kill. We treat `limited` as a stable
-  // resting state too — the CLI is parked on a usage-limit prompt, not
-  // streaming output.
-  const timeoutMs = opts?.waitForIdleMs ?? 60_000;
-  const idleStart = Date.now();
-  while (Date.now() - idleStart < timeoutMs) {
-    if (!ds.worker || ds.worker.killed) break;
-    const st = ds.lastScreenStatus;
-    if (st === 'idle' || st === 'limited') break;
-    await new Promise(r => setTimeout(r, 500));
-  }
-  const stillBusy = ds.worker && !ds.worker.killed
-    && ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited';
-  if (stillBusy) return { ok: false, error: 'worker_busy_timeout' };
 
   const tagPrefix = sessionId.substring(0, 8);
   const oldAnchor = sessionAnchorId(ds);
@@ -767,7 +824,9 @@ export async function transferSession(
   sessionStore.updateSession(ds.session);
 
   const newAnchor = sessionAnchorId(ds);
-  activeSessionsRegistry?.set(sessionKey(newAnchor, ds.larkAppId), ds);
+  if (activeSessionsRegistry) {
+    await setActiveSessionSafe(activeSessionsRegistry, sessionKey(newAnchor, ds.larkAppId), ds);
+  }
 
   dashboardEventBus.publish({
     type: 'session.update',
