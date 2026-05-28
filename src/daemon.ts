@@ -1608,6 +1608,38 @@ function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Resolve the pinned working dir for a brand-new topic via the layered lookup:
+ *   1) an existing oncall binding (this bot or a sibling)
+ *   2) this bot's defaultOncall — auto-binds a brand-new chat when the flag is on
+ *      (this WRITES state, so it must run identically on every spawn path)
+ *   3) a sibling session's workingDir (cross-bot / chat-scope inheritance)
+ *   4) this bot's `defaultWorkingDir` (pure runtime fallback)
+ * Returns the dir plus the oncall / inherited source so callers can log the reason.
+ * Shared by the normal spawn path and the first-message `/repo` command branch so
+ * both honor the defaultOncall auto-bind the same way.
+ */
+async function resolvePinnedWorkingDir(ctx: {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  larkAppId: string;
+}) {
+  let oncallEntry = findOncallChatForAnyBot(ctx.chatId);
+  if (!oncallEntry) {
+    oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
+  }
+  const inheritedFrom = !oncallEntry
+    ? findInheritablePeer({ scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType, selfAppId: ctx.larkAppId })
+    : null;
+  const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
+    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
+    : undefined;
+  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  return { pinnedWorkingDir, oncallEntry, inheritedFrom };
+}
+
 async function replyInvalidWorkingDirs(
   anchor: string,
   larkAppId: string,
@@ -1717,18 +1749,12 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // uses, so the `/repo` handler launches the CLI straight away —
       // `/repo <arg>` in that repo, bare `/repo` in the default workingDir —
       // instead of taking the mid-session close+recreate path or re-showing the
-      // card. Honor a pinned dir (oncall / inherited / bot default) so a bound
-      // chat still launches in the right place when no arg is given.
+      // card. Use the SAME pinned-dir resolver as the normal spawn path (incl.
+      // defaultOncall auto-bind) so a bound/auto-bound chat still launches in the
+      // right place when no arg is given.
       let cmdPending: Partial<DaemonSession> | undefined;
       if (cmd === '/repo') {
-        const oncallEntry = findOncallChatForAnyBot(chatId);
-        const inheritedFrom = !oncallEntry
-          ? findInheritablePeer({ scope, anchor, chatId, chatType, selfAppId: larkAppId })
-          : null;
-        const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
-          ? resolveBotDefaultWorkingDir(larkAppId)
-          : undefined;
-        const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+        const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
         if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
         // pendingPrompt is empty (the message *is* the command), so the CLI just
         // boots and waits for the user's next message; no sender tag needed.
@@ -1810,34 +1836,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
 
-  // Oncall group: pin working dir from the chat-level binding, even if a
-  // sibling bot (running in another daemon) is the one that persisted it.
-  // Layered lookup:
-  //   1) any existing binding (this bot or sibling)
-  //   2) this bot's defaultOncall — auto-binds the chat if it's brand new
-  //      and the flag is on. Once auto-bound, the chat appears in oncallChats
-  //      so the next handleNewTopic sees it via (1).
-  let oncallEntry = findOncallChatForAnyBot(chatId);
-  if (!oncallEntry) {
-    oncallEntry = await maybeAutoBindDefaultOncall(larkAppId, chatId, chatType);
-  }
-
-  // Cross-bot / chat-scope inheritance: reuse a sibling session's workingDir
-  // and skip the repo card. Same block lives in handleThreadReply's auto-create
-  // branch — both handlers land unowned messages after the 4fec43c routing
-  // change. Helper is shared.
-  const inheritedFrom = !oncallEntry
-    ? findInheritablePeer({ scope, anchor, chatId, chatType, selfAppId: larkAppId })
-    : null;
-
-  // Last-resort fallback: this bot's `defaultWorkingDir`. Pure runtime — no
-  // oncall binding written, no permission-model change. Lets a single-repo
-  // bot skip the repo-select card without committing to oncall semantics.
-  const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
-    ? resolveBotDefaultWorkingDir(larkAppId)
-    : undefined;
-
-  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  // Pin the working dir via the layered oncall / inherit / default lookup
+  // (auto-binds a defaultOncall chat as a side effect). Shared with the
+  // first-message `/repo` command branch so both paths stay consistent.
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   const ds: DaemonSession = {
     session,
     worker: null,

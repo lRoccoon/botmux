@@ -173,7 +173,7 @@ export const messages: Record<string, string> = {
   'help.close': '/close      - Close current session, kill {cliName}',
   'help.restart': '/restart    - Restart {cliName} (keep session)',
   'help.cd': '/cd <path>  - Change working dir and restart {cliName}',
-  'help.repo_list': '/repo       - Show project list (interactive dropdown + text list)',
+  'help.repo_list': '/repo       - Pending selection: start in default dir; mid-session: show project picker',
   'help.repo_n': '/repo <N>   - Switch to project #N',
   'help.repo_path': '/repo <path|name> - Use a path or a project name under workingDir, skipping the card',
   'help.status': '/status     - Show current session status (incl. terminal URL)',

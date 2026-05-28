@@ -852,6 +852,25 @@ describe('handleCommand', () => {
       // Did NOT fall through to the card-display scan path.
       expect(scanMultipleProjects).not.toHaveBeenCalled();
     });
+
+    it('should report an invalid workingDir and not spawn (keeps pending for recovery)', async () => {
+      // forkWorker doesn't validate cwd, so a dead workingDir must be caught
+      // before launch. Keep pendingRepo so the user can `/repo <valid-path>`.
+      vi.mocked(statSync).mockImplementation(() => { throw new Error('ENOENT'); });
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', workingDir: '/gone' });
+      const deps = makeDeps(ds);
+
+      try {
+        await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+      } finally {
+        vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
+      }
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(true); // pending kept — recoverable
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('配置的工作目录不存在');
+    });
     // The non-pending (mid-session) bare `/repo` → card path is covered by
     // "should show project list card when called without argument" above.
   });

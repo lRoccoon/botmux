@@ -176,7 +176,7 @@ export const messages: Record<string, string> = {
   'help.close': '/close      - 关闭当前会话，终止 {cliName} 进程',
   'help.restart': '/restart    - 重启 {cliName} 进程（保留 session）',
   'help.cd': '/cd <path>  - 切换工作目录并重启 {cliName} 进程',
-  'help.repo_list': '/repo       - 查看项目列表（交互式下拉 + 文本列表）',
+  'help.repo_list': '/repo       - 仓库待选时直接在默认目录开会话；会话中则弹项目选择卡片',
   'help.repo_n': '/repo <N>   - 切换到第 N 个项目',
   'help.repo_path': '/repo <路径|项目名> - 直接指定路径或 workingDir 下的项目名，跳过选择卡片',
   'help.status': '/status     - 查看当前会话状态（含终端链接）',

@@ -621,6 +621,15 @@ export async function handleCommand(
         // "start directly" button (and replaces the old `/skip` command).
         // Mid-session bare `/repo` (no pending) still falls through to the card.
         if (!repoArg && ds?.pendingRepo) {
+          // Validate the configured workingDir before spawning — `forkWorker`
+          // doesn't, so a dead cwd would otherwise spawn-and-fail silently. Same
+          // guard the card path runs below. On failure we keep the pending state
+          // so the user can recover with `/repo <valid-path>` (no card here).
+          const invalidDirs = invalidConfiguredWorkingDirs(ds, ds.larkAppId ?? larkAppId);
+          if (invalidDirs.length > 0) {
+            await sessionReply(rootId, t('cmd.repo.working_dir_not_exist', { dirs: invalidDirs.map(d => `\`${d}\``).join(', ') }, loc));
+            break;
+          }
           const cwd = getSessionWorkingDir(ds);
           await forkPendingCli(t('cmd.skip.opened', { cwd }, loc));
           if (ds.repoCardMessageId) {
