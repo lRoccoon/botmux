@@ -172,20 +172,20 @@ export function buildSessionClosedCard(
  * so the user sees clearly it's historical.
  *
  * Last-frame rendering:
- *   - imageKey present (session was in 'screenshot' mode at relay time) →
- *     embed the same img element the live card had. img_key is a Lark
- *     server resource independent of the card it lived on, so the PATCHed
- *     card can still reference it.
- *   - imageKey absent (hidden / text-only mode) → fall back to a markdown
- *     code block of the cached pane content.
- *   - Neither → just the header + body notice.
+ *   - imageKey present (session was in 'screenshot' / expanded mode at
+ *     relay time) → embed the same img element the live card had.
+ *     img_key is a Lark server resource independent of the card it lived
+ *     on, so the PATCHed card can still reference it.
+ *   - imageKey absent (hidden / collapsed mode) → render nothing extra.
+ *     The header + body notice already convey the state; raw tmux pane
+ *     text as a code-block is too long and noisy (王皓 caught this in
+ *     testing).
  *
  * No action buttons are rendered in either case.
  */
 export function buildRelayedFrozenCard(
   title: string,
   cliId?: CliId,
-  lastScreenContent?: string,
   imageKey?: string,
   locale?: Locale,
 ): string {
@@ -204,11 +204,6 @@ export function buildRelayedFrozenCard(
       mode: 'fit_horizontal',
       preview: true,
     });
-  } else {
-    const trimmed = (lastScreenContent ?? '').trim();
-    if (trimmed) {
-      elements.push({ tag: 'markdown', content: `\`\`\`\n${truncateContent(trimmed, locale)}\n\`\`\`` });
-    }
   }
   const card = {
     config: { wide_screen_mode: true },

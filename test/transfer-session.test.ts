@@ -386,10 +386,12 @@ describe('transferSession', () => {
     expect(body).toMatch(/"img_key":\s*"old_image_key"/);
   });
 
-  it('frozen card falls back to text content when no currentImageKey is set', async () => {
-    // Sessions in hidden / text-only display mode have no img_key at relay
-    // time. The frozen card should still render the cached pane content as
-    // a markdown code block so history readers can see the last frame.
+  it('frozen card renders no extra element when no currentImageKey is set (hidden mode)', async () => {
+    // Sessions in hidden / collapsed display mode never produced a server-
+    // rendered screenshot, so currentImageKey is undefined. We deliberately
+    // do NOT fall back to a raw-tmux-pane code block — that text is long,
+    // noisy, and not useful as a historical snapshot (王皓 caught this).
+    // The frozen card stays minimal: header + "已搬迁" notice text only.
     const ds = makeDs({ currentImageKey: undefined, lastScreenContent: 'hello from tmux\n$ idle' });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
     updateMessageMock.mockClear();
@@ -399,8 +401,11 @@ describe('transferSession', () => {
 
     const body = updateMessageMock.mock.calls[0][2];
     expect(body).not.toMatch(/"tag":\s*"img"/);
-    // Markdown code block with cached content (newlines escape to \\n in JSON).
-    expect(body).toMatch(/hello from tmux/);
+    // No code block, no echoing of cached pane content.
+    expect(body).not.toContain('hello from tmux');
+    expect(body).not.toContain('```');
+    // Still has the body notice + header.
+    expect(body).toMatch(/已搬迁|Relayed away/);
   });
 
   it('still succeeds when freezing the source-chat card fails (best-effort)', async () => {

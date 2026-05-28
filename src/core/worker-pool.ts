@@ -809,7 +809,6 @@ export async function transferSession(
       const frozenJson = buildRelayedFrozenCard(
         ds.currentTurnTitle || ds.session.title || '',
         cliId,
-        ds.lastScreenContent,
         ds.currentImageKey,
         localeForBot(ds.larkAppId),
       );
