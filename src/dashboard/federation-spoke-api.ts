@@ -238,6 +238,16 @@ export async function handleFederationSpokeApi(
     // first so the implicit default team always passes.
     ensureDefaultTeam(dataDir);
     if (!getTeam(dataDir, teamId)) { jsonRes(res, 404, { ok: false, error: 'team_not_found' }); return true; }
+    // Operator must end up in the group; only a bot in the operator's OWN
+    // deployment+scope can add them. If this deployment HAS online bots but the
+    // user selected none, the group would be built by a remote bot that can't add
+    // the operator → make them pick one. (If there are no local online bots at
+    // all, fall through to delegate-build — degenerate case, operator may not be
+    // addable, surfaced as missingOperatorIdentity.)
+    const localOnline = new Set((live ?? []).map(b => b.larkAppId));
+    if (localOnline.size > 0 && !larkAppIds.some(id => localOnline.has(id))) {
+      jsonRes(res, 400, { ok: false, error: 'no_local_online_bot' }); return true;
+    }
     const out = await orchestrateFederatedGroup(dataDir, { name, larkAppIds, operatorUnionId, requestId: randomUUID(), teamId }, { createTeamGroup: deps.createTeamGroup, fetcher, live });
     jsonRes(res, out.status, out.body);
     return true;

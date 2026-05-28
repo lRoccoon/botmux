@@ -40,6 +40,7 @@ let myDeploymentId = '';
 let suggestedHubUrl = '';
 const pickedByTeam = new Map<string, Set<string>>();
 const expandedTeams = new Set<string>(); // default empty → all teams collapsed; click a team header to expand
+const expandedDeps = new Set<string>(); // `${team.key}::${dep.id}` — default empty → deployment groups collapsed too
 
 function $(id: string): HTMLElement { return document.getElementById(id)!; }
 function allTeams(): Team[] { return [...localTeams, ...remoteTeams]; }
@@ -113,7 +114,11 @@ function renderTeamBody(t: Team, filtered: RosterBot[]): string {
     const rm = (t.kind === 'local' && !mine)
       ? ` <button class="tf-rmmember ghost" data-team="${escapeHtml(t.teamId)}" data-dep="${escapeHtml(dep.id)}" data-name="${escapeHtml(dep.name)}" style="font-size:12px">移除</button>`
       : '';
-    h += `<div style="margin:10px 0 2px"><b>${escapeHtml(dep.name)}</b> <span class="muted" style="font-size:12px">（${tag}）· ${depBots.length} 个</span>${rm}</div>`;
+    const depKey = `${t.key}::${dep.id}`;
+    const depOpen = expandedDeps.has(depKey);
+    const npick = depBots.filter(b => pickedSet(t.key).has(b.larkAppId)).length;
+    h += `<div class="tf-dep-h" data-dk="${escapeHtml(depKey)}" style="cursor:pointer;margin:10px 0 2px"><b>${depOpen ? '▾' : '▸'} ${escapeHtml(dep.name)}</b> <span class="muted" style="font-size:12px">（${tag}）· ${depBots.length} 个${npick ? `，已选 ${npick}` : ''}</span>${rm}</div>`;
+    if (!depOpen) continue; // collapsed: header only (picks persist)
     h += '<table style="width:100%;border-collapse:collapse;font-size:14px"><tbody>';
     for (const b of depBots) {
       const app = escapeHtml(b.larkAppId);
@@ -175,6 +180,9 @@ function wireTeams(): void {
   el.querySelectorAll<HTMLElement>('.tf-team-h').forEach(h => {
     h.onclick = () => { const k = h.dataset.tk!; if (expandedTeams.has(k)) expandedTeams.delete(k); else expandedTeams.add(k); renderTeams(); };
   });
+  el.querySelectorAll<HTMLElement>('.tf-dep-h').forEach(h => {
+    h.onclick = () => { const k = h.dataset.dk!; if (expandedDeps.has(k)) expandedDeps.delete(k); else expandedDeps.add(k); renderTeams(); };
+  });
   el.querySelectorAll<HTMLInputElement>('.tf-pick').forEach(cb => {
     cb.onchange = () => { const s = pickedSet(cb.dataset.tk!); if (cb.checked) s.add(cb.dataset.app!); else s.delete(cb.dataset.app!); };
   });
@@ -187,7 +195,8 @@ function wireTeams(): void {
   });
   el.querySelectorAll<HTMLButtonElement>('.tf-role').forEach(btn => { btn.onclick = () => openRoleModal(btn.dataset.app!, btn.dataset.name || ''); });
   el.querySelectorAll<HTMLButtonElement>('.tf-rmmember').forEach(btn => {
-    btn.onclick = async () => {
+    btn.onclick = async (e) => {
+      e.stopPropagation(); // inside the clickable dep header — don't toggle collapse
       if (!confirm(`把「${btn.dataset.name}」移出这个团队？它的机器人将从本团队花名册消失（不影响对方自己的部署）。`)) return;
       await jsend('DELETE', `/api/team/hosted/${encodeURIComponent(btn.dataset.team!)}/members/${encodeURIComponent(btn.dataset.dep!)}`);
       loadLocal();
@@ -216,11 +225,14 @@ function renderGroupResult(out: HTMLElement, b: any, status: number): void {
     const invalid = (b.invalidBotIds || []).length ? `<span class="err"> · 未加入的机器人：${escapeHtml((b.invalidBotIds || []).join(', '))}</span>` : '';
     const invOwners = (b.invalidOwnerUnionIds || []).length ? `<span class="err"> · ${(b.invalidOwnerUnionIds || []).length} 个 owner 未能拉进</span>` : '';
     const miss = b.missingOperatorIdentity ? `<span class="err"> · 你未绑定飞书身份，没把你自己拉进群（去「我的团队」绑定）</span>` : '';
+    const skipped = (b.skippedNoOwner || []).length ? `<span class="err"> · ${(b.skippedNoOwner || []).length} 个机器人因负责人未绑定身份被跳过（未加入群）</span>` : '';
     const by = b.delegatedTo ? `（由「${escapeHtml(b.delegatedTo)}」建群）` : '';
-    out.innerHTML = `<span class="ok">群已创建</span>${by} · <a href="${escapeHtml(link)}" target="_blank">在飞书打开</a>${invalid}${invOwners}${miss}`;
+    out.innerHTML = `<span class="ok">群已创建</span>${by} · <a href="${escapeHtml(link)}" target="_blank">在飞书打开</a>${invalid}${invOwners}${miss}${skipped}`;
   } else {
     const e = b?.error || status;
-    const msg = e === 'no_creator_available' ? '没有可用的建群发起方（相关部署都没有在线机器人，或不可达）'
+    const msg = e === 'no_local_online_bot' ? '请至少勾选一个你自己（本部署）的在线机器人——群要由它创建并把你（发起人）拉进群。'
+      : e === 'all_bots_skipped_no_owner' ? '所选机器人的负责人都没绑定身份，无法拉群（机器人不能进一个 owner 不在的群）。请让对应部署先绑定身份。'
+      : e === 'no_creator_available' ? '没有可用的建群发起方（相关部署都没有在线机器人，或不可达）'
       : e === 'delegation_timeout' ? '委托对方部署建群超时（可能已建，去飞书确认，勿重复点）'
       : `建群失败：${e}`;
     out.innerHTML = `<span class="err">${escapeHtml(String(msg))}</span>`;
@@ -276,7 +288,7 @@ async function loadRemote(): Promise<void> {
 
 export function renderTeamFederationPage(root: HTMLElement): void {
   root.innerHTML = homeHtml();
-  pickedByTeam.clear(); expandedTeams.clear();
+  pickedByTeam.clear(); expandedTeams.clear(); expandedDeps.clear();
   ['tf-search', 'tf-cli', 'tf-fcap', 'tf-frole'].forEach(id => { const el = $(id); el.oninput = renderTeams; el.onchange = renderTeams; });
   $('tf-modal-cancel').onclick = () => { $('tf-modal').style.display = 'none'; };
   $('tf-modal-save').onclick = async () => {

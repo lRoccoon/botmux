@@ -82,14 +82,22 @@ export async function orchestrateFederatedGroup(
   const unknown = larkAppIds.filter(id => !byId.has(id));
   if (unknown.length) return { status: 400, body: { ok: false, error: 'unknown_bot', unknown } };
 
-  // Invitees = operator (if bound) + each selected bot's owner. union_id, deduped.
+  // Owner-in-group policy (申晗): a bot should only join if its owner is in the
+  // group too (else it's "打黑工" — in a group its owner can't see). A REMOTE bot
+  // whose owner is unbound has no owner to pull → skip it. (LOCAL bots are covered
+  // by the operator, who is always pulled in.)
+  const skippedNoOwner = larkAppIds.filter(id => { const b = byId.get(id); return !!b && !b.deployment.local && !b.owner?.unionId; });
+  const eligible = larkAppIds.filter(id => !skippedNoOwner.includes(id));
+  if (eligible.length === 0) return { status: 400, body: { ok: false, error: 'all_bots_skipped_no_owner', skippedNoOwner } };
+
+  // Invitees = operator (if bound) + each eligible bot's owner. union_id, deduped.
   const ownerUnionIds = Array.from(new Set([
     ...(operatorUnionId ? [operatorUnionId] : []),
-    ...larkAppIds.map(id => byId.get(id)?.owner?.unionId).filter((u): u is string => !!u),
+    ...eligible.map(id => byId.get(id)?.owner?.unionId).filter((u): u is string => !!u),
   ]));
   const missingOperatorIdentity = !operatorUnionId;
 
-  const r = await deps.createTeamGroup({ name, larkAppIds, ownerUnionIds });
+  const r = await deps.createTeamGroup({ name, larkAppIds: eligible, ownerUnionIds });
   if (r.ok) {
     // The creator bot adds the owners IT can reach; owners outside its app's
     // visibility scope (Lark code 232024 — typically owners of OTHER deployments)
@@ -97,15 +105,15 @@ export async function orchestrateFederatedGroup(
     // deployment's bot (which has them in scope) — hub→spoke delegate-add-owner.
     let invalidOwners = r.invalidOwnerUnionIds ?? [];
     if (invalidOwners.length > 0 && r.chatId) {
-      invalidOwners = await delegateAddOwners(dataDir, teamId, r.chatId, invalidOwners, larkAppIds, requestId, deps.fetcher);
+      invalidOwners = await delegateAddOwners(dataDir, teamId, r.chatId, invalidOwners, eligible, requestId, deps.fetcher);
     }
-    return { status: 200, body: { ...r, invalidOwnerUnionIds: invalidOwners, missingOperatorIdentity } };
+    return { status: 200, body: { ...r, invalidOwnerUnionIds: invalidOwners, missingOperatorIdentity, skippedNoOwner } };
   }
 
   // No local online creator → delegate to a reachable deployment that owns a
   // selected bot (hub→spoke). requestId makes each delegate idempotent.
   if (r.error === 'no_online_daemon') {
-    const selected = new Set(larkAppIds);
+    const selected = new Set(eligible);
     let lastErr = 'no_creator_available';
     for (const dep of listFederatedDeployments(dataDir, teamId)) {
       if (!dep.callbackUrl || !dep.delegationToken) continue;
@@ -114,7 +122,7 @@ export async function orchestrateFederatedGroup(
         const dr = await fetchWithTimeout(deps.fetcher, `${dep.callbackUrl}/api/federation/delegate-group`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${dep.delegationToken}` },
-          body: JSON.stringify({ name, larkAppIds, ownerUnionIds, requestId }),
+          body: JSON.stringify({ name, larkAppIds: eligible, ownerUnionIds, requestId }),
         });
         const dj = await dr.json().catch(() => ({} as any));
         if (dr.ok && dj?.ok && dj.chatId) {
@@ -123,9 +131,9 @@ export async function orchestrateFederatedGroup(
           // own deployment — same post-create delegation as the local-create path.
           let invalidOwners = dj.invalidOwnerUnionIds ?? [];
           if (invalidOwners.length > 0) {
-            invalidOwners = await delegateAddOwners(dataDir, teamId, dj.chatId, invalidOwners, larkAppIds, requestId, deps.fetcher);
+            invalidOwners = await delegateAddOwners(dataDir, teamId, dj.chatId, invalidOwners, eligible, requestId, deps.fetcher);
           }
-          return { status: 200, body: { ...dj, invalidOwnerUnionIds: invalidOwners, delegatedTo: dep.name, missingOperatorIdentity } };
+          return { status: 200, body: { ...dj, invalidOwnerUnionIds: invalidOwners, delegatedTo: dep.name, missingOperatorIdentity, skippedNoOwner } };
         }
         lastErr = dj?.error || `hub_${dr.status}`;
       } catch (e) {

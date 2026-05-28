@@ -244,6 +244,22 @@ describe('handleFederationSpokeApi', () => {
     expect(createTeamGroup).not.toHaveBeenCalled();
   });
 
+  it('federated-group: requires a selected local online bot (operator guarantee)', async () => {
+    writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
+    registerDeployment(dataDir, 'default', { deploymentId: 'dep_r', name: 'R', bots: [{ larkAppId: 'cli_remote', botName: 'R', cliId: 'codex', ownerUnionId: 'on_r' } as any] });
+    const createTeamGroup = vi.fn(async () => ({ ok: true, chatId: 'oc', invalidBotIds: [] }));
+    // this deployment HAS an online bot (cli_a) but the user selected only the
+    // remote bot → refused (operator couldn't be added by a remote creator)
+    let res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { name: 'g', larkAppIds: ['cli_remote'] }), res, url('/api/team/federated-group'), { dataDir, createTeamGroup: createTeamGroup as any, liveBots: () => [{ larkAppId: 'cli_a', botName: 'A', cliId: 'claude' } as any] });
+    expect(json(res).error).toBe('no_local_online_bot');
+    expect(createTeamGroup).not.toHaveBeenCalled();
+    // a local online bot in the selection → proceeds
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { name: 'g', larkAppIds: ['cli_a', 'cli_remote'] }), res, url('/api/team/federated-group'), { dataDir, createTeamGroup: createTeamGroup as any, liveBots: () => [{ larkAppId: 'cli_a', botName: 'A', cliId: 'claude' } as any] });
+    expect(createTeamGroup).toHaveBeenCalled();
+  });
+
   it('hosted member remove: hub kicks a joined deployment; cannot remove self; unknown → 404', async () => {
     writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
     registerDeployment(dataDir, 'default', { deploymentId: 'dep_spoke', name: 'S', bots: [{ larkAppId: 'cli_sp', botName: 'SP', cliId: 'codex' }] });
@@ -354,7 +370,7 @@ describe('handleFederationSpokeApi', () => {
     writeBots([{ larkAppId: 'cli_local', botOpenId: null, botName: '本地', cliId: 'claude' }]);
     // a federated deployment that owns cli_remote + is reachable for delegation
     registerDeployment(dataDir, DEFAULT_TEAM_ID, {
-      deploymentId: 'dep_r', name: '远端', bots: [{ larkAppId: 'cli_remote', botName: '远端Bot', cliId: 'codex' }],
+      deploymentId: 'dep_r', name: '远端', bots: [{ larkAppId: 'cli_remote', botName: '远端Bot', cliId: 'codex', ownerUnionId: 'on_r' } as any],
       callbackUrl: 'http://spoke:7891', delegationToken: 'DTOK',
     });
     // local create has no online bot
@@ -379,8 +395,8 @@ describe('handleFederationSpokeApi', () => {
 
   it('federated-group: delegate timeout → stops (no duplicate group), does not try next deployment', async () => {
     writeBots([{ larkAppId: 'cli_local', botOpenId: null, botName: '本地', cliId: 'claude' }]);
-    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_a', name: 'A', bots: [{ larkAppId: 'cli_remote', botName: 'R', cliId: 'codex' }], callbackUrl: 'http://a:7891', delegationToken: 'TA' });
-    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_b', name: 'B', bots: [{ larkAppId: 'cli_remote', botName: 'R', cliId: 'codex' }], callbackUrl: 'http://b:7891', delegationToken: 'TB' });
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_a', name: 'A', bots: [{ larkAppId: 'cli_remote', botName: 'R', cliId: 'codex', ownerUnionId: 'on_r' } as any], callbackUrl: 'http://a:7891', delegationToken: 'TA' });
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_b', name: 'B', bots: [{ larkAppId: 'cli_remote', botName: 'R', cliId: 'codex', ownerUnionId: 'on_r' } as any], callbackUrl: 'http://b:7891', delegationToken: 'TB' });
     const createTeamGroup = vi.fn(async () => ({ ok: false, error: 'no_online_daemon' }));
     // first delegate call times out — must NOT fall through to the second deployment
     const fetcher = vi.fn(async () => { const e: any = new Error('aborted'); e.name = 'AbortError'; throw e; });

@@ -326,6 +326,30 @@ describe('handleFederationApi', () => {
     expect(delegated).toMatchObject({ chatId: 'oc_g', viaLarkAppId: 'cli_sp', ownerUnionIds: ['on_spoke'] });
   });
 
+  it('federation/group: a remote bot with unbound owner is skipped (owner-in-group policy)', async () => {
+    writeBots([{ larkAppId: 'cli_hub', botOpenId: null, botName: 'Hub', cliId: 'claude' }]);
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_u', name: 'U', bots: [{ larkAppId: 'cli_sp', botName: 'SP', cliId: 'codex' } as any] }); // bot has no ownerUnionId
+    const syncToken = (await import('../src/services/federation-store.js')).listFederatedDeployments(dataDir, DEFAULT_TEAM_ID)[0].syncToken;
+    let captured: any = null;
+    const createTeamGroup = vi.fn(async (a: any) => { captured = a; return { ok: true, chatId: 'oc_g', invalidBotIds: [], invalidOwnerUnionIds: [] }; });
+    const res = makeRes();
+    await callWithGroup(makeReq('POST', '/api/federation/group', { name: 'g', larkAppIds: ['cli_hub', 'cli_sp'], requestId: 's1' }, bearer(syncToken)), res, '/api/federation/group', createTeamGroup);
+    expect(res.statusCode).toBe(200);
+    expect(captured.larkAppIds).toEqual(['cli_hub']);        // cli_sp (remote, unbound owner) skipped, not built into the group
+    expect(json(res).skippedNoOwner).toEqual(['cli_sp']);
+  });
+
+  it('federation/group: all selected bots have no owner → all_bots_skipped_no_owner, no group', async () => {
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_u', name: 'U', bots: [{ larkAppId: 'cli_sp', botName: 'SP', cliId: 'codex' } as any] });
+    const syncToken = (await import('../src/services/federation-store.js')).listFederatedDeployments(dataDir, DEFAULT_TEAM_ID)[0].syncToken;
+    const createTeamGroup = vi.fn(async () => ({ ok: true, chatId: 'x' }));
+    const res = makeRes();
+    await callWithGroup(makeReq('POST', '/api/federation/group', { larkAppIds: ['cli_sp'], requestId: 's2' }, bearer(syncToken)), res, '/api/federation/group', createTeamGroup);
+    expect(res.statusCode).toBe(400);
+    expect(json(res).error).toBe('all_bots_skipped_no_owner');
+    expect(createTeamGroup).not.toHaveBeenCalled();
+  });
+
   it('federation/group: token is header-only (rejects ?syncToken= and body token)', async () => {
     writeBots([{ larkAppId: 'cli_hub', botOpenId: null, botName: 'Hub', cliId: 'claude' }]);
     registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_s', name: 'S', ownerUnionId: 'on_s', bots: [{ larkAppId: 'cli_sp', botName: 'SP', cliId: 'codex' }] });
