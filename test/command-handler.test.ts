@@ -280,7 +280,7 @@ vi.mock('../src/services/oncall-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
 import { writeTeamRoleFile, deleteTeamRoleFile, resolveRole } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
@@ -395,6 +395,28 @@ describe('DAEMON_COMMANDS set', () => {
 
   it('should have the correct size', () => {
     expect(DAEMON_COMMANDS.size).toBe(16);
+  });
+});
+
+describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
+  it('contains /group and its /g alias', () => {
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/group')).toBe(true);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/g')).toBe(true);
+  });
+
+  it('is a subset of DAEMON_COMMANDS (they are still daemon-handled)', () => {
+    for (const cmd of SESSIONLESS_DAEMON_COMMANDS) {
+      expect(DAEMON_COMMANDS.has(cmd), `${cmd} must also be a daemon command`).toBe(true);
+    }
+  });
+
+  it('excludes conversation/state commands that need a session', () => {
+    // These attach state to or operate on an active session, so they must
+    // keep going through the session-creating path.
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/repo')).toBe(false);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/cd')).toBe(false);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/close')).toBe(false);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/card')).toBe(false);
   });
 });
 
@@ -1392,6 +1414,49 @@ describe('handleCommand', () => {
       expect(mockedSend).not.toHaveBeenCalled();
       // No chat-scope session registered for the new group.
       expect(deps.activeSessions.has(sessionKey('oc_new_group', LARK_APP_ID))).toBe(false);
+    });
+
+    it('runs with NO active session, reading the source chat from message.chatId', async () => {
+      // The daemon runs /group through SESSIONLESS_DAEMON_COMMANDS — no
+      // sessionStore record, so handleCommand sees no ds. Resolving the
+      // @-mentioned bots needs the source chatId, which now rides on the
+      // message instead of ds.chatId.
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+        { larkAppId: 'app-2', openId: 'ou_codex', name: 'codex', displayName: 'Codex', source: 'configured' },
+      ]);
+      const deps = makeDeps(); // no ds — the sessionless path
+      const msg = makeLarkMessage('/group @Codex 项目', {
+        chatId: CHAT_ID,
+        mentions: [
+          { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+        ],
+      });
+
+      await handleCommand('/group', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      // Roster lookup used the chatId from the message, and the group was created.
+      expect(mockedListBots).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      expect(mockedCreate.mock.calls[0][0].larkAppIds).toEqual(['app-1', 'app-2']);
+    });
+
+    it('fails closed (no group) with bots mentioned but no chatId on message and no ds', async () => {
+      const deps = makeDeps(); // no ds
+      const msg = makeLarkMessage('/group @Codex 项目', {
+        // chatId intentionally omitted
+        mentions: [
+          { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+          { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+        ],
+      });
+
+      await handleCommand('/group', ROOT_ID, msg, deps, LARK_APP_ID);
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('无法解析');
     });
 
     it('invites every @-mentioned bot when the first mentioned bot is us', async () => {

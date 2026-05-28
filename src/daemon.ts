@@ -48,7 +48,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -1737,6 +1737,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
+      // `/group` (`/g`) doesn't open a conversation — creating a sessionStore
+      // record for it would surface a phantom session in the dashboard. Run it
+      // without a session; pass chatId on the message so the handler can reach
+      // the chat roster (it normally reads it from the active session's ds).
+      if (SESSIONLESS_DAEMON_COMMANDS.has(cmd)) {
+        await handleCommand(cmd, anchor, { ...parsed, content: commandContent, chatId }, commandDeps, larkAppId);
+        return;
+      }
       // Same rootMessageId reasoning as below in the main spawn path:
       // thread-scope MUST anchor on the thread root or sessionAnchorId() will
       // disagree with activeSessions's key and downstream card buttons silently
@@ -2076,7 +2084,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         return;
       }
       // Pass mention-stripped content so /command argument parsing works.
-      handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
+      // chatId lets session-less handlers (e.g. /group) reach the chat roster.
+      handleCommand(cmd, anchor, { ...parsed, content: commandContent, chatId: threadChatId }, commandDeps, larkAppId);
       return;
     }
   }

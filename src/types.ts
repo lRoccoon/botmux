@@ -97,6 +97,10 @@ export interface LarkMention {
 export interface LarkMessage {
   messageId: string;
   rootId: string;
+  /** Source chat the message came from. Populated for commands that run
+   *  without a session (e.g. `/group`) so the handler can reach the chat
+   *  roster without an active session to read `ds.chatId` from. */
+  chatId?: string;
   /** Immediate parent — set when the user used the Lark "quote/reply"
    *  UI to reference a specific earlier message. Empty otherwise. */
   parentId?: string;

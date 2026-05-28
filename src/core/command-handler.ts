@@ -34,6 +34,16 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/pair', '/login', '/adopt', '/oncall', '/group', '/g', '/relay', '/card']);
 
 /**
+ * Daemon commands that act on the chat itself rather than opening a
+ * conversation. `/group` (`/g`) just creates a Lark group and replies once —
+ * no follow-up turns, no CLI worker. The new-topic spawn path normally
+ * pre-creates a sessionStore record so a command can attach state and keep
+ * card buttons routable, but for these that record is a phantom conversation
+ * that pollutes the dashboard's session list. Handle them without a session.
+ */
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g']);
+
+/**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
  * Claude Code's `/compact`, `/model`, `/usage`). The daemon does NOT handle
  * these — it just relays them to the worker via a raw_input IPC message,
@@ -962,7 +972,10 @@ export async function handleCommand(
         //   • RESOLUTION (bot → larkAppId for the invite) uses the live roster
         //     listChatBotMembers(), failing CLOSED on any miss.
         const mentions = message.mentions ?? [];
-        const sourceChatId = ds?.chatId;
+        // `/group` runs without a pre-created session (see
+        // SESSIONLESS_DAEMON_COMMANDS), so the source chat comes from the
+        // message; fall back to the active session when invoked mid-session.
+        const sourceChatId = message.chatId ?? ds?.chatId;
         const knownBotNames = globalKnownBotNames();
 
         // Degraded-state guard: if the user @-mentioned someone but the global bot
