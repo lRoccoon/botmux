@@ -1021,13 +1021,19 @@ export async function handleCommand(
           // If this bot already runs a real session in the target chat, pulling
           // another session in would collide on sessionKey(targetChatId, larkAppId)
           // — Map.set would silently overwrite, orphaning the existing worker.
-          // Refuse upfront with an actionable message. The /relay command's own
-          // session (just created by daemon to route this command) is excluded
-          // via sessionId mismatch; only *other* sessions in this chat count.
+          // Refuse upfront with an actionable message.
+          //
+          // Scratch sessions (the placeholder a `/relay` typed in a fresh chat
+          // gets routed through) are filtered by `!!c.worker` — they have no
+          // worker process. We do NOT exclude `ds` by sessionId: when `/relay`
+          // rides an EXISTING real session (daemon.ts:2034's "existing-session
+          // DAEMON_COMMANDS" path skips the scratch and binds `ds` to the
+          // chat's real session), `ds` itself IS the conflict — excluding it
+          // would let the picker render and the user pick a remote session
+          // that the eventual transferSession would have to refuse anyway.
           const conflict = [...activeSessions.values()].find(c =>
             c.larkAppId === myAppId
             && c.chatId === targetChatId
-            && ds && c.session.sessionId !== ds.session.sessionId
             && !!c.worker   // real running session, not a placeholder
           );
           if (conflict) {

@@ -1494,6 +1494,33 @@ describe('handleCommand', () => {
       expect(reply).not.toContain('relay_pick_select');
     });
 
+    // Regression: when /relay rides an EXISTING real session in the current
+    // chat (daemon.ts:2034's existing-session DAEMON_COMMANDS path → handle-
+    // Command's `ds` IS that session), the conflict scan must STILL flag it
+    // as a conflict — even though `c === ds`. Earlier code excluded `ds` by
+    // sessionId mismatch, which made this case pass the check and render an
+    // empty/misleading picker (王皓 caught this in testing). The fix: drop
+    // the sessionId exclusion; rely on `!!c.worker` to filter scratch alone.
+    it('picker refuses even when ds itself IS the chat\'s only running session', async () => {
+      const ds = makeDaemonSession({
+        worker: { killed: false } as any,  // truthy → this IS a real running session
+        session: makeSession({ sessionId: 'real-in-chat', title: 'live work', ownerOpenId: 'ou_sender' }),
+      });
+      // makeDeps registers ds at sessionKey(ROOT_ID, LARK_APP_ID); ds.chatId
+      // === CHAT_ID === targetChatId by default, so the conflict scan must
+      // see ds itself.
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('live work');
+      expect(reply).toContain('已经有一个活跃会话');
+      // Picker MUST NOT have rendered.
+      expect(reply).not.toContain('relay_pick_select');
+      expect(reply).not.toContain('选择要接力');
+    });
+
     it('picker excludes sessions whose owner is not the operator', async () => {
       const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
       const otherUserDs: DaemonSession = {
