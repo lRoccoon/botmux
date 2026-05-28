@@ -31,12 +31,14 @@ export const messages: Record<string, string> = {
   'card.status.retry_ready': '可重试',
   'card.status.executing': '正在执行…',
   'card.status.session_closed': '🛑 会话已关闭',
+  'card.status.relay_frozen': '🔄 会话已搬迁',
   'card.status.selected': '已选择',
   'card.status.waiting_screenshot': '_(等待第一张截图…)_',
   'card.status.truncated_prefix': '… (已截断)',
 
   // ─── Card body text ──────────────────────────────────────────────────────
   'card.body.cli_terminated': '{cliName} 进程已终止。',
+  'card.body.relay_frozen': '本会话已通过 /relay 搬到其他群继续，本卡片冻结作为存档；按钮已移除，避免误操作影响新群里活着的会话。',
   'card.body.click_resume_or_run': '点击「恢复会话」继续，或在终端执行：',
   'card.body.click_resume_only': '点击「恢复会话」继续。',
   'card.body.cli_no_cli_resume': '{cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。',

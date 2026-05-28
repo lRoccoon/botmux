@@ -20,12 +20,25 @@ vi.mock('../src/services/session-store.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: vi.fn(),
+  getBot: vi.fn(() => ({
+    config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
+    botName: 'TestBot',
+  })),
   getAllBots: vi.fn(() => []),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
   dashboardEventBus: { publish: vi.fn() },
+}));
+
+// updateMessage is used by transferSession to freeze the source-chat card
+// (replace the live streaming card with an inert "已搬迁" snapshot before
+// clearing streamCardId). Mock it so tests don't try real Lark API calls.
+const updateMessageMock = vi.fn(async () => undefined);
+vi.mock('../src/im/lark/client.js', () => ({
+  updateMessage: (...a: any[]) => updateMessageMock(...a),
+  deleteMessage: vi.fn(),
+  MessageWithdrawnError: class extends Error {},
 }));
 
 // transferSession accepts forkWorker/killWorker overrides for testability —
@@ -342,6 +355,55 @@ describe('transferSession', () => {
 
     const r = await callTransfer(movingDs.session.sessionId, 'oc_target', 'om_M1_target');
     expect(r.ok).toBe(true);
+  });
+
+  it('freezes the source-chat streaming card before clearing streamCardId', async () => {
+    // After /relay, the source-chat card's action buttons (close / toggle /
+    // get write link) carried `session_id` and would still reach the now-
+    // relocated session — clicking ❌关闭 on the source-chat card would close
+    // the (now-live in target chat) session. Fix: PATCH the source card to
+    // an inert snapshot before the transfer proceeds. This test pins that
+    // patch invocation so a refactor can't silently drop it.
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    updateMessageMock.mockClear();
+
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(true);
+
+    // updateMessage was called once, targeting the OLD card with a JSON body
+    // that contains the "已搬迁" status string (i18n key card.status.relay_frozen).
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    const [appId, cardId, body] = updateMessageMock.mock.calls[0];
+    expect(appId).toBe('cli_app_test');
+    expect(cardId).toBe('om_old_card');
+    expect(body).toMatch(/已搬迁|Relayed away/);
+    // Freeze card has NO action elements — buttons removed.
+    expect(body).not.toMatch(/"tag":\s*"action"/);
+  });
+
+  it('still succeeds when freezing the source-chat card fails (best-effort)', async () => {
+    // Freeze is best-effort — Lark may reject the patch (card withdrawn,
+    // expired). The transfer itself must not depend on it.
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    updateMessageMock.mockRejectedValueOnce(new Error('card withdrawn'));
+
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(true);
+    expect(ds.session.chatId).toBe('oc_target');
+  });
+
+  it('does not call updateMessage when there is no source-chat card to freeze', async () => {
+    const ds = makeDs({ streamCardId: undefined, session: {
+      ...makeDs().session, streamCardId: undefined,
+    }});
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    updateMessageMock.mockClear();
+
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(true);
+    expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
   it('proceeds when worker is in limited state (parked on usage-limit prompt)', async () => {

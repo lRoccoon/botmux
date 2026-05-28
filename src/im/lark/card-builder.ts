@@ -159,6 +159,50 @@ export function buildSessionClosedCard(
 }
 
 /**
+ * Build a frozen-snapshot card to PATCH onto the source-chat streaming card
+ * after `/relay` moves the session elsewhere.
+ *
+ * Why this exists: a live streaming card carries action buttons (close /
+ * toggle display / get write link). Those buttons identify their session by
+ * `session_id` in the value payload, so clicking them after relay still
+ * reaches the now-relocated session — closing it, toggling its display
+ * mode, etc. — but the visible feedback all lands on the NEW card in the
+ * target chat, not this one. The source-chat card then looks like a "live
+ * console" while actually being a footgun. PATCH it to an inert snapshot
+ * so the user sees clearly it's historical.
+ *
+ * The body retains the cached last-frame screen content (so scrolling
+ * history is still informative). No action buttons are rendered.
+ */
+export function buildRelayedFrozenCard(
+  title: string,
+  cliId?: CliId,
+  lastScreenContent?: string,
+  locale?: Locale,
+): string {
+  const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  const trimmed = (lastScreenContent ?? '').trim();
+  const contentBlock = trimmed
+    ? `\n\`\`\`\n${truncateContent(trimmed, locale)}\n\`\`\``
+    : '';
+  const body =
+    `**${escapeMd(title || cliName)}**\n` +
+    `${t('card.body.relay_frozen', undefined, locale)}` +
+    contentBlock;
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.status.relay_frozen', undefined, locale) },
+      template: 'grey',
+    },
+    elements: [
+      { tag: 'markdown', content: body },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
+/**
  * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
  * Cap markdown content byte size with headroom for card JSON overhead.
  */

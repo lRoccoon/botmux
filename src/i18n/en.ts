@@ -28,12 +28,14 @@ export const messages: Record<string, string> = {
   'card.status.retry_ready': 'Ready to retry',
   'card.status.executing': 'Executing…',
   'card.status.session_closed': '🛑 Session Closed',
+  'card.status.relay_frozen': '🔄 Relayed away',
   'card.status.selected': 'Selected',
   'card.status.waiting_screenshot': '_(Waiting for first screenshot…)_',
   'card.status.truncated_prefix': '… (truncated)',
 
   // ─── Card body text ──────────────────────────────────────────────────────
   'card.body.cli_terminated': '{cliName} process has exited.',
+  'card.body.relay_frozen': 'This session was relayed elsewhere via /relay; this card is frozen as a historical snapshot. Action buttons removed to prevent accidentally affecting the now-live session in the other chat.',
   'card.body.click_resume_or_run': 'Click "Resume Session" to continue, or run in your terminal:',
   'card.body.click_resume_only': 'Click "Resume Session" to continue.',
   'card.body.cli_no_cli_resume': '_{cliName} cannot resume a specific session from the CLI; you can resume here in Lark._',

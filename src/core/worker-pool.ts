@@ -15,7 +15,7 @@ import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
 import { updateMessage, deleteMessage, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -793,6 +793,31 @@ export async function transferSession(
   const oldAnchor = sessionAnchorId(ds);
   const oldChatId = ds.chatId;
 
+  // Freeze the source-chat streaming card BEFORE we kill the worker (and
+  // before we clear streamCardId below). The live card's action buttons
+  // (close / toggle / get write link) carry `session_id` in their value, so
+  // clicks AFTER relay still reach the now-relocated session — closing it,
+  // toggling its display mode, etc. — with feedback landing on the NEW
+  // card in the target chat. PATCH the source-chat card to an inert
+  // snapshot so the user sees clearly it's historical, and so the buttons
+  // are gone. Best-effort: on PATCH failure (card withdrawn, expired) we
+  // log and continue; the relay itself must not depend on this.
+  if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+    try {
+      const cliId = (ds.session.cliId as CliId | undefined)
+        ?? (() => { try { return getBot(ds.larkAppId).config.cliId; } catch { return undefined; } })();
+      const frozenJson = buildRelayedFrozenCard(
+        ds.currentTurnTitle || ds.session.title || '',
+        cliId,
+        ds.lastScreenContent,
+        localeForBot(ds.larkAppId),
+      );
+      await updateMessage(ds.larkAppId, ds.streamCardId, frozenJson);
+    } catch (err) {
+      logger.warn(`[${tagPrefix}] freeze source-chat card failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
   // Detach worker — TmuxBackend.kill() does NOT destroy the tmux session, so
   // the CLI process and its rolling jsonl continue running.
   kw(ds);
@@ -808,7 +833,7 @@ export async function transferSession(
   ds.session.lastMessageAt = new Date().toISOString();
   // Card state was pinned to the source chat — clear so the new worker posts
   // a fresh card in the target chat instead of trying to PATCH a message that
-  // lives in another chat entirely.
+  // lives in another chat entirely (the source card was just frozen above).
   ds.session.streamCardId = undefined;
   ds.session.streamCardNonce = undefined;
   ds.session.currentImageKey = undefined;
