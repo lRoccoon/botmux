@@ -204,7 +204,7 @@ describe('resumeSession', () => {
   });
 
   describe('success path', () => {
-    it('restores usage-limit runtime state for active sessions after daemon restart', () => {
+    it('restores usage-limit runtime state for active sessions after daemon restart', async () => {
       const s = sessionStore.createSession('oc_chat_limit', 'om_limit', 'Limited topic');
       s.larkAppId = 'app_test';
       s.scope = 'thread';
@@ -218,7 +218,10 @@ describe('resumeSession', () => {
       sessionStore.updateSession(s);
       const map = new Map<string, DaemonSession>();
 
-      restoreActiveSessions(map);
+      // restoreActiveSessions is async (became so when setActiveSessionSafe
+      // landed) — without await the post-restore Map lookup below races
+      // ahead of the for-of body that populates the map.
+      await restoreActiveSessions(map);
 
       const ds = map.get(sessionKey('om_limit', 'app_test'));
       expect(ds).toBeDefined();

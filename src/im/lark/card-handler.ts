@@ -313,6 +313,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (sourceDs.chatId === targetChatId) {
       return { toast: { type: 'error', content: t('card.relay.toast_same_chat', undefined, loc) } };
     }
+    // Real-session preflight — done BEFORE M1 send so a refusal doesn't
+    // leave a misleading "已接力" announcement in the target chat.
+    // collectRelayPickerEntries already filters scratches at render time,
+    // but a stale picker (rendered before a scratch was created) could
+    // still produce a confirm click; this is the depth defense.
+    {
+      const { isRelayableRealSession } = await import('../../core/worker-pool.js');
+      if (!isRelayableRealSession(sourceDs)) {
+        return { toast: { type: 'error', content: t('card.relay.toast_not_started_yet', undefined, loc) } };
+      }
+    }
     // Pre-flight target-chat conflict check — done BEFORE sendMessage M1 so
     // a refusal doesn't leave a misleading "已接力" announcement in the
     // target chat (王皓 caught this in testing). Mirror the same predicate

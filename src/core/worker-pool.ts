@@ -92,6 +92,43 @@ export function getActiveSessionsRegistry(): Map<string, DaemonSession> | undefi
   return activeSessionsRegistry;
 }
 
+// ─── "Real relayable session" predicate ─────────────────────────────────────
+
+/**
+ * True iff this DaemonSession represents a real CLI-backed conversation
+ * that's safe to migrate via /relay. Returns false for daemon-command
+ * scratch placeholders (the `worker:null + hasHistory:false` records that
+ * daemon.ts creates for /help, an unfinished picker /relay, etc.) — those
+ * have no CLI history, no tmux, and migrating them yields an empty shell
+ * in the target chat with a fake "已就绪" M1.
+ *
+ * Why not just `!!ds.worker || ds.hasHistory`:
+ *   - `ds.worker` is runtime-only; null after daemon restart until
+ *     forkWorker re-attaches.
+ *   - `ds.hasHistory` is a runtime field too — restoreActiveSessions sets
+ *     it `true` UNCONDITIONALLY for any persisted non-adopt session
+ *     (session-manager.ts:618). A scratch that survived a restart comes
+ *     back with hasHistory:true, defeating the guard.
+ *
+ * Use persisted markers instead: `ds.session.cliId` and
+ * `ds.session.lastCliInput` are written ONLY after a real worker started
+ * the CLI (worker-pool's fork path stamps cliId; rememberLastCliInput
+ * writes lastCliInput on every input). Daemon-command scratches never set
+ * either, so the predicate survives restart and is robust across paths.
+ *
+ * Apply at every relay surface that consumes a candidate `ds`:
+ *   - relay-picker.ts collectRelayPickerEntries (don't list scratches)
+ *   - card-handler.ts relay_confirm preflight (don't M1 + transferSession a scratch)
+ *   - this file's transferSession depth defense (catch any caller that bypassed both upstream guards)
+ *   - command-handler.ts /relay --create leader guard
+ */
+export function isRelayableRealSession(ds: DaemonSession): boolean {
+  if (ds.worker) return true;
+  if (ds.session.cliId) return true;
+  if (ds.session.lastCliInput) return true;
+  return false;
+}
+
 // ─── Terminal URL helpers ──────────────────────────────────────────────────
 // config.web.externalHost is a live getter (re-resolves the LAN IP each read
 // when WEB_EXTERNAL_HOST is unset), so building the URL fresh at every card
@@ -930,6 +967,16 @@ export async function transferSession(
   // empty new-chat session with no AI memory — refuse so the user finishes
   // setup in the original chat first.
   if (ds.pendingRepo) return { ok: false, error: 'not_started_yet' };
+
+  // Depth defense: daemon-command scratch (worker:null + no persisted CLI
+  // markers) must not be migrated. Upstream paths (picker filter, card-
+  // handler confirm preflight, /relay --create leader guard) should already
+  // refuse these — this catches any caller that bypassed all three (e.g.
+  // a future code path, a direct dashboard IPC, a test reaching in
+  // manually). Using `isRelayableRealSession` instead of `ds.hasHistory`
+  // makes the predicate survive restoreActiveSessions which currently sets
+  // hasHistory:true unconditionally (session-manager.ts:618).
+  if (!isRelayableRealSession(ds)) return { ok: false, error: 'not_started_yet' };
 
   // Adopt sessions wrap a CLI process that botmux didn't spawn — the user
   // owns it inside their own tmux pane, so moving routing here would be

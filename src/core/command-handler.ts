@@ -1415,7 +1415,15 @@ export async function handleCommand(
         const leaderName = nameOf(creatorAppId);
         const successBotNames: string[] = [];
         const failedBotNames: string[] = [];
-        const leaderHasRealSession = !!ds.worker || ds.hasHistory;
+        // Use the persisted-marker predicate, not runtime ds.hasHistory:
+        // restoreActiveSessions sets hasHistory:true UNCONDITIONALLY on
+        // restart (session-manager.ts:618), so a scratch that survives a
+        // restart comes back with hasHistory:true and would defeat a
+        // naive `!!ds.worker || ds.hasHistory` check. cliId / lastCliInput
+        // are only written after a real worker started the CLI, so they
+        // survive restart correctly.
+        const { isRelayableRealSession } = await import('./worker-pool.js');
+        const leaderHasRealSession = isRelayableRealSession(ds);
         if (leaderHasRealSession) {
           const { transferSession } = await import('./worker-pool.js');
           // Target chat was just built by createGroupWithBots — by

@@ -157,6 +157,39 @@ describe('transferSession', () => {
     expect(forkWorkerSpy).not.toHaveBeenCalled();
   });
 
+  it('refuses with not_started_yet when source is a daemon-command scratch (no worker + no persisted CLI markers)', async () => {
+    // Codex review: transferSession had no depth defense against scratch
+    // sessions. pendingRepo / adopt / busy checks all let `worker:null +
+    // !cliId + !lastCliInput` records through, and the body would then
+    // forkWorker(resume=true) into a non-existent tmux. Picker filter +
+    // card-handler preflight + --create leader guard upstream are the
+    // primary protection, but this is the catch-all for any caller that
+    // bypassed all three (HTTP migrate-to-chat from a future buggy
+    // leader, direct registry pokes in tests, etc.).
+    //
+    // Also: restoreActiveSessions sets hasHistory:true unconditionally on
+    // restart, so a scratch that survived a restart would defeat any
+    // hasHistory-based guard — that's why the helper reads persisted
+    // markers (cliId / lastCliInput) instead.
+    const scratch = makeDs({
+      worker: null,
+      hasHistory: true,  // simulate post-restart state (hasHistory clobbered to true)
+      session: {
+        ...makeDs().session,
+        cliId: undefined as any,
+        lastCliInput: undefined as any,
+      },
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), scratch);
+
+    const r = await callTransfer(scratch.session.sessionId, 'oc_target', 'om_M1_target');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toBe('not_started_yet');
+    // Routing untouched, no fork attempted.
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(scratch.chatId).toBe('oc_source');
+  });
+
   it('rewrites chatId, rootMessageId, scope, chatType in both ds and session', async () => {
     const ds = makeDs();
     // thread-scope source: key is rootMessageId-based

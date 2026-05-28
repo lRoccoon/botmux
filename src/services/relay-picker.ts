@@ -19,6 +19,7 @@
 import type { DaemonSession } from '../core/types.js';
 import type { RelayPickerEntry } from '../im/lark/card-builder.js';
 import { getChatNameAndMode } from '../im/lark/client.js';
+import { isRelayableRealSession } from '../core/worker-pool.js';
 
 export async function collectRelayPickerEntries(
   activeSessions: Map<string, DaemonSession>,
@@ -32,6 +33,11 @@ export async function collectRelayPickerEntries(
     if (c.chatId === currentChatId) continue;
     if (c.session.ownerOpenId !== operatorOpenId) continue;
     if (c.session.adoptedFrom) continue;
+    // Daemon-command scratches (worker:null + no persisted CLI markers)
+    // are placeholder records for /help / unfinished /relay etc. — they
+    // have no real conversation to bring along. Don't surface them in
+    // anyone's picker.
+    if (!isRelayableRealSession(c)) continue;
     candidates.push(c);
   }
   // Skip the API call entirely for p2p chats. session.chatType is recorded

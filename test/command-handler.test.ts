@@ -199,6 +199,14 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // resolves as idempotent close so unrelated tests don't need to think
   // about it.
   closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  // `isRelayableRealSession(ds)` — true when ds.worker is set OR persisted
+  // CLI markers exist (session.cliId / session.lastCliInput). The default
+  // makeSession fixture sets cliId='claude-code' so most tests pass the
+  // predicate; empty-leader tests override `cliId: undefined`. We use the
+  // real implementation here (not a vi.fn stub) so the predicate's branch
+  // logic is genuinely exercised in every /relay --create scenario.
+  isRelayableRealSession: (ds: any) =>
+    !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -236,6 +244,11 @@ vi.mock('../src/utils/user-token.js', () => ({
 vi.mock('../src/services/relay-picker.js', () => ({
   // Default returns whatever sessions are in the registry that match the
   // picker filter (same shape as the real impl). Tests can override.
+  // MUST mirror the real predicate set in relay-picker.ts —
+  // isRelayableRealSession added there as Codex review fix to filter out
+  // daemon-command scratches (worker:null + no persisted CLI markers).
+  // Skipping the same filter here would silently regress the picker-
+  // scratch-exclusion test, which is exactly the bug Codex flagged.
   collectRelayPickerEntries: vi.fn(async (activeSessions: Map<string, any>, larkAppId: string, currentChatId: string, operatorOpenId: string) => {
     const out: any[] = [];
     for (const c of activeSessions.values()) {
@@ -243,6 +256,8 @@ vi.mock('../src/services/relay-picker.js', () => ({
       if (c.chatId === currentChatId) continue;
       if (c.session.ownerOpenId !== operatorOpenId) continue;
       if (c.session.adoptedFrom) continue;
+      // Real-session filter (same predicate as production picker).
+      if (!c.worker && !c.session?.cliId && !c.session?.lastCliInput) continue;
       out.push({
         sessionId: c.session.sessionId,
         chatLabel: c.chatId,
@@ -300,6 +315,13 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     title: 'Test Session',
     status: 'active',
     createdAt: new Date().toISOString(),
+    // Default fixture represents a REAL session — a real CLI started here
+    // at some point. `cliId` is a persisted marker that survives restart
+    // (unlike runtime `hasHistory`); isRelayableRealSession reads it to
+    // decide whether the session is safe to migrate. Tests simulating
+    // daemon-command scratches (the worker:null + no-CLI-history case)
+    // should explicitly override `cliId: undefined`.
+    cliId: 'claude-code',
     ...overrides,
   };
 }
@@ -1538,6 +1560,41 @@ describe('handleCommand', () => {
       expect(mockedCreate).not.toHaveBeenCalled();
     });
 
+    it('picker excludes daemon-command scratch sessions (worker:null + no persisted CLI markers)', async () => {
+      // Codex review caught: collectRelayPickerEntries only filtered same-
+      // bot / non-current-chat / owner / adopt — NOT scratch placeholders.
+      // A /help / unfinished /relay in some other chat would leave behind
+      // a worker:null + no-cliId session at the operator's owner; that
+      // scratch would surface in this picker as a valid pick, and
+      // confirming it would migrate an empty shell into the current chat.
+      // The fix: pickers filter via isRelayableRealSession too.
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const scratchDs: DaemonSession = {
+        ...makeDaemonSession(),
+        worker: null,
+        hasHistory: false,
+        session: makeSession({
+          sessionId: 'sess-scratch',
+          chatId: 'oc_other',
+          rootMessageId: 'om_other_root',
+          title: '/help',
+          ownerOpenId: 'ou_sender',
+          // No persisted CLI markers — never started a real worker.
+          cliId: undefined,
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), scratchDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const [, replyContent] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      const card = JSON.parse(replyContent as string);
+      // Scratch must NOT show — picker empty (no interactive_containers).
+      expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
+    });
+
     it('picker excludes adopt sessions (those wrapping a user-attached tmux)', async () => {
       const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
       // Adopt session in another chat — should NOT appear in the picker.
@@ -1936,11 +1993,17 @@ describe('handleCommand', () => {
       vi.mocked(wp.transferSession).mockClear();
       mockedSend.mockResolvedValue('final-m1-id' as any);
 
-      // Empty leader: worker null + hasHistory false (scratch shape).
+      // Empty leader (daemon-command scratch shape): no worker, no
+      // persisted CLI markers (cliId / lastCliInput both unset).
+      // hasHistory false too — though after this guard switched to the
+      // persisted-marker predicate, hasHistory alone no longer matters
+      // (it's what restoreActiveSessions flips to true on every restart
+      // regardless of session kind, which is exactly the trap Codex
+      // review caught — see isRelayableRealSession).
       const ds = makeDaemonSession({
         worker: null,
         hasHistory: false,
-        session: makeSession({ ownerOpenId: 'ou_sender' }),
+        session: makeSession({ ownerOpenId: 'ou_sender', cliId: undefined }),
       });
       const deps = makeDeps(ds);
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
@@ -1983,7 +2046,7 @@ describe('handleCommand', () => {
       const ds = makeDaemonSession({
         worker: null,
         hasHistory: false,
-        session: makeSession({ ownerOpenId: 'ou_sender' }),
+        session: makeSession({ ownerOpenId: 'ou_sender', cliId: undefined }),
       });
       const deps = makeDeps(ds);
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Claude @Codex', {
