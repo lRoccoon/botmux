@@ -118,7 +118,6 @@ export const messages: Record<string, string> = {
   'cmd.repo.working_dir_not_exist': '❌ 配置的工作目录不存在或不是目录：{dirs}\n请检查 ~/.botmux/bots.json 中的 workingDir / workingDirs，或重新运行 `botmux setup` 修改为已存在的目录。',
   'cmd.repo.no_git_repos': '在 {dirs} 下未找到 git 仓库。',
   'cmd.skip.opened': '▶️ 已直接开启会话（工作目录：{cwd}）',
-  'cmd.skip.no_pending': '当前没有待选择的仓库。',
   'cmd.status.running': '运行中',
   'cmd.status.waiting': '等待中',
   'cmd.status.fallback_no_session': '当前话题没有活跃的会话。\nDaemon active sessions: {count}\n{cliName}: v{version}',

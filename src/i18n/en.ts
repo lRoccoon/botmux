@@ -115,7 +115,6 @@ export const messages: Record<string, string> = {
   'cmd.repo.working_dir_not_exist': '❌ Configured working directory does not exist or is not a directory: {dirs}\nCheck workingDir / workingDirs in ~/.botmux/bots.json, or run `botmux setup` and choose an existing directory.',
   'cmd.repo.no_git_repos': 'No git repositories found under {dirs}.',
   'cmd.skip.opened': '▶️ Session started (working dir: {cwd})',
-  'cmd.skip.no_pending': 'No pending repo selection.',
   'cmd.status.running': 'running',
   'cmd.status.waiting': 'idle',
   'cmd.status.fallback_no_session': 'No active session in this topic.\nDaemon active sessions: {count}\n{cliName}: v{version}',

@@ -1712,6 +1712,28 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       session.lastCallerOpenId = senderOpenId;
       session.lastMessageAt = new Date(now).toISOString();
       session.scope = scope;
+
+      // First-message `/repo`: seed the same pending-repo state the card flow
+      // uses, so the `/repo` handler launches the CLI straight away —
+      // `/repo <arg>` in that repo, bare `/repo` in the default workingDir —
+      // instead of taking the mid-session close+recreate path or re-showing the
+      // card. Honor a pinned dir (oncall / inherited / bot default) so a bound
+      // chat still launches in the right place when no arg is given.
+      let cmdPending: Partial<DaemonSession> | undefined;
+      if (cmd === '/repo') {
+        const oncallEntry = findOncallChatForAnyBot(chatId);
+        const inheritedFrom = !oncallEntry
+          ? findInheritablePeer({ scope, anchor, chatId, chatType, selfAppId: larkAppId })
+          : null;
+        const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
+          ? resolveBotDefaultWorkingDir(larkAppId)
+          : undefined;
+        const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+        if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+        // pendingPrompt is empty (the message *is* the command), so the CLI just
+        // boots and waits for the user's next message; no sender tag needed.
+        cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
+      }
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(anchor, larkAppId), {
         session,
@@ -1727,6 +1749,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         lastMessageAt: now,
         hasHistory: false,
         ownerOpenId: senderOpenId,
+        ...cmdPending,
       });
       // Pass mention-stripped content so /command argument parsing works.
       await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);

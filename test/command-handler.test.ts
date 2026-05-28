@@ -168,6 +168,9 @@ vi.mock('../src/core/session-manager.js', () => ({
     ds.lastUserPrompt = userPrompt;
     ds.lastCliInput = cliInput;
   }),
+  // Dynamically imported by the /repo pending-launch path (bare /repo + repo selection).
+  buildNewTopicPrompt: vi.fn((prompt: string) => `WRAPPED:${prompt}`),
+  getAvailableBots: vi.fn(async () => []),
 }));
 
 vi.mock('../src/core/session-discovery.js', () => ({
@@ -272,10 +275,14 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/card'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/card'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
+  });
+
+  it('should no longer contain the removed /skip command (folded into bare /repo)', () => {
+    expect(DAEMON_COMMANDS.has('/skip')).toBe(false);
   });
 
   it('should not contain passthrough or unknown commands', () => {
@@ -289,7 +296,7 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    expect(DAEMON_COMMANDS.size).toBe(15);
+    expect(DAEMON_COMMANDS.size).toBe(14);
   });
 });
 
@@ -822,27 +829,31 @@ describe('handleCommand', () => {
     });
   });
 
-  // ─── /skip ──────────────────────────────────────────────────────────────
+  // ─── bare /repo while pending (replaces the old /skip command) ────────────
 
-  describe('/skip', () => {
-    it('should reply no pending repo when not waiting for selection', async () => {
-      const ds = makeDaemonSession({ pendingRepo: false });
+  describe('/repo (bare) while pending', () => {
+    it('should launch the CLI in the default workingDir without showing a card', async () => {
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', repoCardMessageId: 'om_card' });
       const deps = makeDeps(ds);
 
-      await handleCommand('/skip', ROOT_ID, makeLarkMessage('/skip'), deps, LARK_APP_ID);
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
+      // Forked the pending CLI (not the close+recreate switch path).
+      expect(forkWorker).toHaveBeenCalledWith(ds, expect.any(String));
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      // Cleared pending state + withdrew the (already-sent) card.
+      expect(ds.pendingRepo).toBe(false);
+      expect(ds.pendingPrompt).toBeUndefined();
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_card');
+      expect(ds.repoCardMessageId).toBeUndefined();
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('当前没有待选择的仓库');
+      expect(replyContent).toContain('已直接开启会话');
+      // Did NOT fall through to the card-display scan path.
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
     });
-
-    it('should reply no pending repo when session does not exist', async () => {
-      const deps = makeDeps();
-
-      await handleCommand('/skip', ROOT_ID, makeLarkMessage('/skip'), deps, LARK_APP_ID);
-
-      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('当前没有待选择的仓库');
-    });
+    // The non-pending (mid-session) bare `/repo` → card path is covered by
+    // "should show project list card when called without argument" above.
   });
 
   // ─── /schedule ──────────────────────────────────────────────────────────

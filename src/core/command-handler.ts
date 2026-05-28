@@ -29,7 +29,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/card']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/card']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -521,6 +521,40 @@ export async function handleCommand(
       case '/repo': {
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
 
+        // First-spawn fork: consume the buffered prompt/attachments and start the
+        // CLI in whatever workingDir is currently set on the session. Shared by
+        // `commitRepoSelection` (a repo was named) and the bare-`/repo` launch
+        // (use the default workingDir) — both only run while `pendingRepo`.
+        const forkPendingCli = async (replyText: string) => {
+          const selfBot = getBot(ds!.larkAppId);
+          const botCfg = selfBot.config;
+          ds!.pendingRepo = false;
+          const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+          const pendingPrompt = ds!.pendingPrompt ?? '';
+          const prompt = buildNewTopicPrompt(
+            pendingPrompt,
+            ds!.session.sessionId,
+            botCfg.cliId,
+            botCfg.cliPathOverride,
+            ds!.pendingAttachments,
+            ds!.pendingMentions,
+            await getAvailableBots(ds!.larkAppId, ds!.chatId),
+            ds!.pendingFollowUps,
+            { name: selfBot.botName, openId: selfBot.botOpenId },
+            loc,
+            ds!.pendingSender,
+            { larkAppId, chatId: ds!.chatId },
+          );
+          rememberLastCliInput(ds!, pendingPrompt, prompt);
+          ds!.pendingPrompt = undefined;
+          ds!.pendingAttachments = undefined;
+          ds!.pendingMentions = undefined;
+          ds!.pendingSender = undefined;
+          ds!.pendingFollowUps = undefined;
+          forkWorker(ds!, prompt);
+          await sessionReply(rootId, replyText);
+        };
+
         // Shared commit path for an already-resolved repo: update the session's
         // working dir, then either fork into the pending CLI (first spawn) or
         // close + recreate the session (mid-session switch). Used by both the
@@ -531,33 +565,7 @@ export async function handleCommand(
           sessionStore.updateSession(ds!.session);
 
           if (ds!.pendingRepo) {
-            const selfBot = getBot(ds!.larkAppId);
-            const botCfg = selfBot.config;
-            ds!.pendingRepo = false;
-            const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
-            const pendingPrompt = ds!.pendingPrompt ?? '';
-            const prompt = buildNewTopicPrompt(
-              pendingPrompt,
-              ds!.session.sessionId,
-              botCfg.cliId,
-              botCfg.cliPathOverride,
-              ds!.pendingAttachments,
-              ds!.pendingMentions,
-              await getAvailableBots(ds!.larkAppId, ds!.chatId),
-              ds!.pendingFollowUps,
-              { name: selfBot.botName, openId: selfBot.botOpenId },
-              loc,
-              ds!.pendingSender,
-              { larkAppId, chatId: ds!.chatId },
-            );
-            rememberLastCliInput(ds!, pendingPrompt, prompt);
-            ds!.pendingPrompt = undefined;
-            ds!.pendingAttachments = undefined;
-            ds!.pendingMentions = undefined;
-            ds!.pendingSender = undefined;
-            ds!.pendingFollowUps = undefined;
-            forkWorker(ds!, prompt);
-            await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, loc));
+            await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
@@ -608,6 +616,21 @@ export async function handleCommand(
           break;
         }
 
+        // Bare `/repo` while a repo card is pending → launch right away in the
+        // default workingDir. This is the text-command twin of the card's
+        // "start directly" button (and replaces the old `/skip` command).
+        // Mid-session bare `/repo` (no pending) still falls through to the card.
+        if (!repoArg && ds?.pendingRepo) {
+          const cwd = getSessionWorkingDir(ds);
+          await forkPendingCli(t('cmd.skip.opened', { cwd }, loc));
+          if (ds.repoCardMessageId) {
+            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
+            ds.repoCardMessageId = undefined;
+          }
+          logger.info(`[${logTag}] Bare /repo while pending → launch in workingDir ${cwd}`);
+          break;
+        }
+
         if (ds?.worker && !ds.worker.killed) {
           await sessionReply(rootId, t('cmd.repo.warning_running', undefined, loc));
         }
@@ -634,47 +657,6 @@ export async function handleCommand(
         const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
         if (ds) ds.repoCardMessageId = repoCardMsgId;
         logger.info(`[${logTag}] Sent repo card with ${projects.length} project(s)`);
-        break;
-      }
-
-      case '/skip': {
-        if (ds?.pendingRepo) {
-          const selfBot = getBot(ds.larkAppId);
-          const botCfg = selfBot.config;
-          ds.pendingRepo = false;
-          const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
-          const pendingPrompt = ds.pendingPrompt ?? '';
-          const prompt = buildNewTopicPrompt(
-            pendingPrompt,
-            ds.session.sessionId,
-            botCfg.cliId,
-            botCfg.cliPathOverride,
-            ds.pendingAttachments,
-            ds.pendingMentions,
-            await getAvailableBots(ds.larkAppId, ds.chatId),
-            ds.pendingFollowUps,
-            { name: selfBot.botName, openId: selfBot.botOpenId },
-            loc,
-            ds.pendingSender,
-            { larkAppId, chatId: ds.chatId },
-          );
-          rememberLastCliInput(ds, pendingPrompt, prompt);
-          ds.pendingPrompt = undefined;
-          ds.pendingAttachments = undefined;
-          ds.pendingMentions = undefined;
-          ds.pendingSender = undefined;
-          ds.pendingFollowUps = undefined;
-          forkWorker(ds, prompt);
-          const cwd = getSessionWorkingDir(ds);
-          await sessionReply(rootId, t('cmd.skip.opened', { cwd }, loc));
-          if (ds.repoCardMessageId) {
-            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
-            ds.repoCardMessageId = undefined;
-          }
-          logger.info(`[${logTag}] Skip repo via /skip, spawning CLI in ${cwd}`);
-        } else {
-          await sessionReply(rootId, t('cmd.skip.no_pending', undefined, loc));
-        }
         break;
       }
 
