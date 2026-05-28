@@ -30,6 +30,30 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(),
 }));
 
+// The endpoint identifies legitimate requesters via the cross-process
+// online-daemon registry (`listOnlineDaemons`), NOT this process's local
+// bot list — botmux runs one-daemon-per-bot, so a peer's `getAllBots()`
+// only sees its OWN bot and cannot recognise the leader bot. Stub the
+// registry so tests still exercise the requester-known happy path.
+vi.mock('../src/utils/daemon-discovery.js', () => ({
+  listOnlineDaemons: vi.fn(() => [
+    { larkAppId: 'cli_leader', ipcPort: 0, lastHeartbeat: Date.now() },
+    { larkAppId: 'cli_peer', ipcPort: 0, lastHeartbeat: Date.now() },
+  ]),
+  findOnlineDaemon: vi.fn(),
+}));
+
+// Stub the lark client just for `resolveUnionIdFromOpenId` — invoked by
+// the lazy-backfill path when a peer session lacks ownerUnionId. Returning
+// null lets the handler fall through to the open_id same-bot comparison
+// (which works in these tests since they all use the same namespace).
+vi.mock('../src/im/lark/client.js', () => ({
+  getChatMode: vi.fn(),
+  replyMessage: vi.fn(),
+  sendMessage: vi.fn(),
+  resolveUnionIdFromOpenId: vi.fn(async () => null),
+}));
+
 vi.mock('../src/core/dashboard-events.js', () => ({
   dashboardEventBus: { publish: vi.fn() },
 }));
