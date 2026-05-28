@@ -231,6 +231,12 @@ export async function handleFederationSpokeApi(
     // operator (for spoke-initiated /api/federation/group) is handled separately.
     const operatorUnionId = getDeploymentIdentity(dataDir).ownerUnionId;
     const teamId = String(body?.teamId ?? '').trim() || DEFAULT_TEAM_ID; // which hosted team's roster gates the selection
+    // Validate the team exists — buildFederatedRoster falls back to the default
+    // team for an unknown teamId, so a stale/deleted teamId must be refused here
+    // (else 拉群 would silently use the default team's roster). ensureDefaultTeam
+    // first so the implicit default team always passes.
+    ensureDefaultTeam(dataDir);
+    if (!getTeam(dataDir, teamId)) { jsonRes(res, 404, { ok: false, error: 'team_not_found' }); return true; }
     const out = await orchestrateFederatedGroup(dataDir, { name, larkAppIds, operatorUnionId, requestId: randomUUID(), teamId }, { createTeamGroup: deps.createTeamGroup, fetcher, live });
     jsonRes(res, out.status, out.body);
     return true;
@@ -350,6 +356,8 @@ export async function handleFederationSpokeApi(
     let body: any; try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
     const name = String(body?.name ?? '').trim();
     if (!name) { jsonRes(res, 400, { ok: false, error: 'name_required' }); return true; }
+    if (name.length > 64) { jsonRes(res, 400, { ok: false, error: 'name_too_long' }); return true; }
+    if (listTeams(dataDir).length >= 100) { jsonRes(res, 400, { ok: false, error: 'too_many_teams' }); return true; } // guardrail (team-internal trust, not a security boundary)
     const t = createTeam(dataDir, name);
     jsonRes(res, 200, { ok: true, teamId: t.id, name: t.name });
     return true;
@@ -366,7 +374,9 @@ export async function handleFederationSpokeApi(
   }
   // Generate an invite for a hosted team (defaults to the default team).
   if (path === '/api/team/local-invite' && method === 'POST') {
-    let body: any = {}; try { body = await readBody(req); } catch { /* no body = default team */ }
+    // Empty body → default team (readBody returns {}); malformed/oversized JSON
+    // throws → reject with bad_json (don't silently fall back to default team).
+    let body: any; try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
     ensureDefaultTeam(dataDir);
     const teamId = String(body?.teamId ?? '').trim() || DEFAULT_TEAM_ID;
     if (!getTeam(dataDir, teamId)) { jsonRes(res, 404, { ok: false, error: 'team_not_found' }); return true; }

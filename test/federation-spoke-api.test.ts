@@ -227,6 +227,23 @@ describe('handleFederationSpokeApi', () => {
     expect(json(res).teams.some((t: any) => t.teamId === tid)).toBe(false);
   });
 
+  it('federated-group: a deleted/unknown teamId is refused (no fallback to default team)', async () => {
+    writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
+    // create then delete a team
+    let res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/hosted', { name: 'Temp' }), res, url('/api/team/hosted'), { dataDir });
+    const tid = json(res).teamId;
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('DELETE', '/api/team/hosted/' + tid), res, url('/api/team/hosted/' + tid), { dataDir });
+    // 拉群 with the deleted teamId → 404, createTeamGroup NOT called
+    const createTeamGroup = vi.fn(async () => ({ ok: true, chatId: 'oc', invalidBotIds: [] }));
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { name: 'g', larkAppIds: ['cli_a'], teamId: tid }), res, url('/api/team/federated-group'), { dataDir, createTeamGroup: createTeamGroup as any });
+    expect(res.statusCode).toBe(404);
+    expect(json(res).error).toBe('team_not_found');
+    expect(createTeamGroup).not.toHaveBeenCalled();
+  });
+
   it('local-invite accepts a teamId; unknown team → 404', async () => {
     let res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/hosted', { name: 'X' }), res, url('/api/team/hosted'), { dataDir });
