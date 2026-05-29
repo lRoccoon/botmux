@@ -98,9 +98,17 @@ describe('card-handler grant actions', () => {
     expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', false);
   });
 
-  it('thread_id 探测失败 → 退回线程化回复（reply_in_thread=true）', async () => {
+  it('thread_id 探测失败（API 抛错）→ 退回线程化回复（reply_in_thread=true）', async () => {
     const { pending, handler } = await fresh();
     getMessageDetailMock.mockRejectedValueOnce(new Error('lark 500'));
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
+    expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
+  });
+
+  it('detail.items 为空 → 视为探测失败，退回线程化回复（不误判成普通回复）', async () => {
+    const { pending, handler } = await fresh();
+    getMessageDetailMock.mockResolvedValueOnce({ items: [] });
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
     expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);

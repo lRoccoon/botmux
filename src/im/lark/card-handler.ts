@@ -186,7 +186,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       let replyInThread = true;
       try {
         const detail = await getMessageDetail(larkAppId, cardMessageId);
-        replyInThread = Boolean(detail?.items?.[0]?.thread_id);
+        const item = detail?.items?.[0];
+        // 拿不到 message item 视为探测失败（走 catch 退回 true），而不是误判成
+        // 「无 thread_id → 普通回复」——后者会在话题群里破坏原有的线程化行为。
+        if (!item) throw new Error('no message item in getMessageDetail response');
+        replyInThread = Boolean(item.thread_id);
       } catch (err) {
         logger.debug(`grant notify thread-mode probe failed, defaulting to thread reply: ${err}`);
       }
