@@ -1451,9 +1451,12 @@ function mtrBridgeAttach(source: MtrTranscriptSource, mode: 'baseline-existing' 
     log(`MTR bridge split-live: ${source.dbPath}#${source.sessionId} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${mtrBridgeOffset})`);
     maybeEmitCodexAdoptPreamble(history);
   } else if (mode === 'baseline-existing') {
-    mtrBridgeOffset = currentMtrSessionOffset(source);
+    const baseline = currentMtrSessionOffset(source);
+    const result = drainMtrSession(source, baseline);
+    codexBridgeQueue.absorb(result.events);
+    mtrBridgeOffset = Math.max(baseline, result.newOffset);
     mtrBridgeBaselineDone = true;
-    log(`MTR bridge baselined: ${source.dbPath}#${source.sessionId} (offset=${mtrBridgeOffset})`);
+    log(`MTR bridge baselined: ${source.dbPath}#${source.sessionId} (offset=${mtrBridgeOffset}, absorbed=${result.events.length})`);
   } else {
     mtrBridgeOffset = 0;
     mtrBridgeBaselineDone = true;

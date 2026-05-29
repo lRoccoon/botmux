@@ -14,6 +14,7 @@ import type { CodexBridgeEvent } from './codex-transcript.js';
 
 const MTR_DATA_DIR = join(homedir(), '.local', 'share', 'opencode');
 const MTR_DB_RE = /^mtr(?:-[A-Za-z0-9._-]+)?\.db$/;
+const MTR_CURSOR_LOOKBACK_MS = 5_000;
 
 export interface MtrTranscriptSource {
   dbPath: string;
@@ -120,6 +121,10 @@ function groupRows(rows: MtrJoinedRow[]): GroupedMessage[] {
 }
 
 function queryChangedRows(source: MtrTranscriptSource, offset: number): MtrJoinedRow[] {
+  // MTR only gives us timestamp cursors. Re-read a small overlap so rows that
+  // share the previous max timestamp but commit after the last poll are not
+  // skipped by the exclusive SQL predicate. The bridge queue de-dupes by uuid.
+  const lowerBound = Math.max(0, offset - MTR_CURSOR_LOOKBACK_MS);
   const script = `
 import json
 import sqlite3
@@ -150,7 +155,7 @@ rows = conn.execute(
     WHERE m.id IN (SELECT id FROM changed)
     ORDER BY m.time_created, m.id, p.time_created, p.id
     """,
-    (${JSON.stringify(source.sessionId)}, ${JSON.stringify(offset)}, ${JSON.stringify(offset)}),
+    (${JSON.stringify(source.sessionId)}, ${JSON.stringify(lowerBound)}, ${JSON.stringify(lowerBound)}),
 ).fetchall()
 print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
 `;

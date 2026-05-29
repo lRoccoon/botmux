@@ -115,6 +115,20 @@ describe('mtr transcript reader', () => {
     });
   });
 
+  it('re-reads a small timestamp overlap to avoid same-ms cursor misses', async () => {
+    existsSyncMock.mockReturnValue(true);
+    spawnSyncMock.mockReturnValue({ status: 0, stderr: '', stdout: '[]' } as any);
+    const { drainMtrSession } = await import('../src/services/mtr-transcript.js');
+
+    expect(drainMtrSession({ dbPath: '/tmp/mtr-alpha.db', sessionId: 'ses_1' }, 10_000)).toEqual({
+      events: [],
+      newOffset: 10_000,
+    });
+
+    const script = spawnSyncMock.mock.calls[0]![1]![1] as string;
+    expect(script).toContain('("ses_1", 5000, 5000)');
+  });
+
   it('finds the newest MTR db session for a directory', async () => {
     existsSyncMock.mockReturnValue(true);
     readdirSyncMock.mockReturnValue(['mtr.db', 'mtr-alpha.db', 'mtr-alpha.db-wal'] as any);
