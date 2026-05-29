@@ -1014,54 +1014,11 @@ botmux 通过适配器桥接不同 CLI，`bots.json` 里用 `cliId` 选择。一
 3. **`chmod +x` 加可执行位（最容易漏！）**——botmux 用 node-pty 直接 exec 脚本，没有可执行位会 `EACCES`、CLI 起来即退、bot 崩溃重启。
 4. **直接执行脚本验证**（用 `~/.botmux/bin/xxx --version`，别用 `bash xxx` 测——走 bash 不需要可执行位会掩盖第 3 步问题）。然后在 `bots.json` 配 `cliPathOverride`（写**绝对路径**，别用 `~`），`botmux restart` 生效。
 
-**示例 · ttadk × claude**（`~/.botmux/bin/ttadk-claude`，记得 `chmod +x`）：
+各网关的**具体 wrapper 脚本**见对应配置文档（这些文档随上游更新，这里只放链接、不复制原文）：
 
-```bash
-#!/usr/bin/env bash
-if [ "$#" -eq 0 ]; then exec ttadk claude --model glm-5 --skip-check; fi
-argv=""; for arg in "$@"; do [ -n "$argv" ] && argv="$argv "; argv="$argv$(printf '%q' "$arg")"; done
-exec ttadk claude --model glm-5 --skip-check --args "$argv"
-```
-
-```json
-{ "cliId": "claude-code", "cliPathOverride": "/root/.botmux/bin/ttadk-claude" }
-```
-
-**示例 · aiden × claude**（剥掉 `--settings`，其余透传）：
-
-```bash
-#!/usr/bin/env bash
-args=(); skip=0
-for a in "$@"; do
-  [ $skip = 1 ] && { skip=0; continue; }
-  case "$a" in --settings) skip=1; continue;; --settings=*) continue;; esac
-  args+=("$a")
-done
-exec aiden x claude "${args[@]}"
-```
-
-```json
-{ "cliId": "claude-code", "cliPathOverride": "/root/.botmux/bin/aiden-x-claude" }
-```
-
-**示例 · aiden × codex**（codex 需要真 TTY 才能写 `history.jsonl`，用 `script` 强套 PTY 兜底）：
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-MODEL=gpt-5.5-paygo
-if script --version 2>/dev/null | grep -qi util-linux; then
-  exec script -qfe -c "exec aiden x codex --model $MODEL $(printf '%q ' "$@")" /dev/null
-else
-  exec script -q /dev/null aiden x codex --model "$MODEL" "$@"
-fi
-```
-
-```json
-{ "cliId": "codex", "cliPathOverride": "/root/.botmux/bin/aiden-x-codex" }
-```
-
-> **MTR**：社区贡献的接入方式，安装 `npm i -g @metamove-code/mtr-cli@latest`、`/login` 选 metamove 登录（开发机用 scan SSO）后按其文档接入。详见各自的飞书配置文档。
+- **aiden × claude / aiden × codex** — [配置文档](https://bytedance.larkoffice.com/docx/T63VdOsCxoLnlSxCjARcd6ocnNf)（aiden×codex 需用 `script` 强套 PTY）
+- **ttadk** — [配置指南](https://bytedance.larkoffice.com/docx/SkG3dVFLsoRnNgxzE6NcvdeCnws)（含各 CLI 的 wrapper 脚本一览）
+- **MTR** — [使用文档](https://bytedance.larkoffice.com/wiki/XjYKwXjlTivKoWksIVtcnmN6noH)（社区贡献，`npm i -g @metamove-code/mtr-cli@latest`）
 >
 > 排查 wrapper 问题的通用手法：`botmux logs` 找 `Spawning fresh CLI:` 那行，复制完整命令在本地手动跑一遍即可定位（权限 / 参数黑名单 / 登录态）。
 
