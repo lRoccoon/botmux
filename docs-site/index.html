@@ -1390,10 +1390,12 @@ Claude Code · Codex · Cursor · Gemini · OpenCode · CoCo(Trae) · Aiden · A
     // 深链直达靠读 parentHref；分享链接也基于它拼。点击导航不改地址栏（navigate 会重载），
     // 要分享当前页用右上角「🔗 复制链接」按钮。
     let CUR = 'intro';
+    let navLock = false;   // 用户一旦手动导航，就停止「深链重试」对页面的接管（否则 parentHref 快照会几秒后把页面拉回进入页）
     function parentUrl(){ try{ return (window.magic && window.magic.parentHref) ? window.magic.parentHref : location.href; }catch(e){ return location.href; } }
     function deepLinkId(){ const h = (parentUrl().split('#')[1] || '').replace(/^\//,''); return h; }
     function shareUrl(){ return parentUrl().split('#')[0] + '#/' + CUR; }
     function go(id){
+      navLock = true;   // 用户手动导航，接管路由，关掉深链重试
       render(id);
       // 同步外层地址栏：iframe 写自身 hash 不影响母页，唯一能动外层 URL 的是 magic.navigate
       // （仅 hash 变化，浏览器不会重载）
@@ -1473,7 +1475,7 @@ Claude Code · Codex · Cursor · Gemini · OpenCode · CoCo(Trae) · Aiden · A
     });
 
     // 初始渲染 + 深链直达：window.magic.parentHref 可能在 init 后才注入，故重试几次读取
-    function routeIn(){ const id=deepLinkId(); if(id && DOCS[id] && id!==CUR) render(id); }
+    function routeIn(){ if(navLock) return; const id=deepLinkId(); if(id && DOCS[id] && id!==CUR) render(id); }
     const _id0 = deepLinkId();
     render(_id0 && DOCS[_id0] ? _id0 : 'intro');
     [150,400,900,1800,3000].forEach(ms=> setTimeout(routeIn, ms));
