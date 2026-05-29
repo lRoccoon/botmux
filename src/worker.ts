@@ -30,15 +30,7 @@ import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
-import {
-  currentMtrSessionOffset,
-  drainMtrSession,
-  findLatestMtrSessionByDirectory,
-  findMtrSessionById,
-  findMtrSessionByPid,
-  findMtrSessionForAdopt,
-  type MtrTranscriptSource,
-} from './services/mtr-transcript.js';
+import { currentMtrSessionOffset, drainMtrSession, findMtrSessionById, findMtrSessionForAdopt, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -250,8 +242,6 @@ let hermesBridgeBaselineDone = false;
 let mtrBridgeSource: MtrTranscriptSource | undefined;
 let mtrBridgeOffset = 0;
 let mtrBridgeBaselineDone = false;
-let mtrBridgeAdoptDirectory: string | undefined;
-let mtrBridgeAllowAdoptRetarget = false;
 /** Codex sessionId we received via writeInput but haven't yet resolved a
  *  rollout file for. The poller keeps retrying — the file appears on
  *  Codex's first user submit, but with some race delay after our submit
@@ -1379,7 +1369,6 @@ function codexBridgeStartTimer(): void {
             mtrBridgeAttach(source, lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty');
           }
         }
-        mtrBridgeMaybeRetarget();
         mtrBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
@@ -1471,21 +1460,6 @@ function mtrBridgeAttach(source: MtrTranscriptSource, mode: 'baseline-existing' 
     log(`MTR bridge fresh-empty: ${source.dbPath}#${source.sessionId}`);
   }
   codexBridgeStartTimer();
-}
-
-function mtrBridgeMaybeRetarget(): void {
-  if (!mtrBridgeAllowAdoptRetarget || !mtrBridgeAdoptDirectory) return;
-  const latest = findLatestMtrSessionByDirectory(mtrBridgeAdoptDirectory);
-  if (!latest) return;
-  if (mtrBridgeSource?.dbPath === latest.dbPath && mtrBridgeSource.sessionId === latest.sessionId) return;
-
-  // Bare adopted MTR panes may start without --session and create a fresh
-  // native session only after the first submitted prompt. If we attached to
-  // the pre-existing cwd session at adopt time, switch to the newer cwd session
-  // once it appears so final_output forwarding follows the real conversation.
-  const previous = mtrBridgeSource ? `${mtrBridgeSource.dbPath}#${mtrBridgeSource.sessionId}` : 'none';
-  log(`MTR bridge retarget: ${previous} -> ${latest.dbPath}#${latest.sessionId}`);
-  mtrBridgeAttach(latest, 'split-live');
 }
 
 function mtrBridgeIngest(): void {
@@ -1702,8 +1676,6 @@ function stopCodexBridge(): void {
   mtrBridgeSource = undefined;
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
-  mtrBridgeAdoptDirectory = undefined;
-  mtrBridgeAllowAdoptRetarget = false;
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2800,13 +2772,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       codexAdoptStartMs = adoptStartMs;
       codexBridgeQueue.setLocalTurns(true, adoptStartMs);
       if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
-      mtrBridgeAdoptDirectory = cfg.adoptCwd ?? cfg.workingDir;
-      const sourceFromPid = findMtrSessionByPid(cfg.adoptCliPid);
-      mtrBridgeAllowAdoptRetarget = !cfg.cliSessionId && !sourceFromPid;
       const source =
         findMtrSessionById(cfg.cliSessionId)
-        ?? sourceFromPid
-        ?? findLatestMtrSessionByDirectory(mtrBridgeAdoptDirectory);
+        ?? findMtrSessionForAdopt(cfg.adoptCliPid, cfg.adoptCwd ?? cfg.workingDir);
       if (source) {
         codexBridgePendingSessionId = undefined;
         mtrBridgeAttach(source, 'split-live');
