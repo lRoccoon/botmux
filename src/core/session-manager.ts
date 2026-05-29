@@ -11,7 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe } from './worker-pool.js';
+import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -690,11 +690,11 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
  *   - 'adopt_unsupported' — adopt sessions are torn down by /close and have
  *                          no resume semantics
  */
-export function resumeSession(
+export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
-): { ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported'; activeSessionId?: string } {
+): Promise<{ ok: true; ds: DaemonSession }
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported'; activeSessionId?: string }> {
   const session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -711,9 +711,25 @@ export function resumeSession(
   const anchor = scope === 'thread' ? session.rootMessageId : session.chatId;
   const key = sessionKey(anchor, larkAppId);
 
+  // In-memory occupant check. A daemon-command scratch (e.g. an unconfirmed
+  // `/relay` picker, a bare `/help`) parks a worker:null placeholder at this
+  // anchor; daemon.ts creates one for ANY DAEMON_COMMAND in a session-less
+  // chat. It's not a real conversation, so it must NOT block resume — but it
+  // also can't just be ignored: leaving it in the Map while we re-register
+  // the resumed session at the same key would orphan its still-active store
+  // row (the exact ghost-active bug we fixed elsewhere). So: close it (evicts
+  // Map + marks store closed + dashboard event), then fall through to resume.
+  //
+  // We keep blocking on a real session (isRelayableRealSession) AND on a
+  // pendingRepo session — the latter is a worker:null placeholder too, but it
+  // represents deliberate in-progress setup (user is picking a repo), not a
+  // throwaway command container, so clobbering it would lose real intent.
   const existing = activeSessions.get(key);
   if (existing) {
-    return { ok: false, error: 'anchor_occupied', activeSessionId: existing.session.sessionId };
+    if (isRelayableRealSession(existing) || existing.pendingRepo) {
+      return { ok: false, error: 'anchor_occupied', activeSessionId: existing.session.sessionId };
+    }
+    await closeSession(existing.session.sessionId);
   }
 
   // Belt-and-suspenders: also scan persisted sessions for any *other* active
@@ -723,17 +739,25 @@ export function resumeSession(
   // and partial-load situations (e.g. another bot's daemon writes a session
   // file but our Map hasn't caught up, or a closed session was orphaned by a
   // crash that left a sibling session active in the same anchor) can leave a
-  // store-level conflict invisible to the Map check above. Refuse instead of
-  // overwriting the routing key.
-  const conflict = sessionStore.listSessions().find(s =>
+  // store-level conflict invisible to the Map check above.
+  //
+  // Same scratch carve-out applies on disk: a persisted scratch has neither
+  // `cliId` nor `lastCliInput` (those are only written once a real CLI ran).
+  // A real conflict (either marker present) still blocks; scratch-only
+  // conflicts get closed so they stop occupying the anchor on disk.
+  const conflicts = sessionStore.listSessions().filter(s =>
     s.sessionId !== sessionId
     && s.status === 'active'
     && (s.larkAppId ?? '') === larkAppId
     && (s.scope === 'chat' ? 'chat' : 'thread') === scope
     && (scope === 'thread' ? s.rootMessageId === anchor : s.chatId === anchor),
   );
-  if (conflict) {
-    return { ok: false, error: 'anchor_occupied', activeSessionId: conflict.sessionId };
+  const realConflict = conflicts.find(s => !!s.cliId || !!s.lastCliInput);
+  if (realConflict) {
+    return { ok: false, error: 'anchor_occupied', activeSessionId: realConflict.sessionId };
+  }
+  for (const scratch of conflicts) {
+    await closeSession(scratch.sessionId);
   }
 
   // Reactivate in store — clear closedAt so dashboard rows don't keep showing
@@ -770,7 +794,10 @@ export function resumeSession(
   };
 
   messageQueue.ensureQueue(anchor);
-  activeSessions.set(key, ds);
+  // setActiveSessionSafe over a bare Map.set: the scratch-eviction above
+  // should already have freed `key`, but if any occupant remains it closes
+  // it rather than silently orphaning it (consistent with restore/transfer).
+  await setActiveSessionSafe(activeSessions, key, ds);
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
   return { ok: true, ds };
 }

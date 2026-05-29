@@ -563,7 +563,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (!targetSessionId) {
         await sessionReply(rootId, t('card.action.resume_missing_session_id', undefined, locDsResume));
       } else {
-        const result = resumeSession(targetSessionId, activeSessions);
+        const result = await resumeSession(targetSessionId, activeSessions);
         if (result.ok) {
           const cliName = getCliDisplayName(result.ds.session.cliId ?? getBot(result.ds.larkAppId).config.cliId);
           await sessionReply(rootId, t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId)));

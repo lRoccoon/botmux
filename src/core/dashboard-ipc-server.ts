@@ -137,7 +137,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (_req, res, params) =>
   const sessionId = params.sessionId;
   const reg = getActiveSessionsRegistry();
   if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
-  const result = resumeSession(sessionId, reg);
+  const result = await resumeSession(sessionId, reg);
   if (!result.ok) {
     const status = result.error === 'not_found' ? 404 : 409;
     return jsonRes(res, status, { ok: false, error: result.error, activeSessionId: result.activeSessionId });

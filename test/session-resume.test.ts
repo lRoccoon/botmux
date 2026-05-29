@@ -44,6 +44,19 @@ vi.mock('../src/core/worker-pool.js', () => ({
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     map.set(key, ds);
   }),
+  // Real predicate (same logic as production): worker OR persisted CLI markers.
+  isRelayableRealSession: (ds: any) =>
+    !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
+  // closeSession is invoked by resumeSession to evict a scratch occupant.
+  // Stub it to mark the store row closed + drop from the passed-in map is
+  // not possible here (no map ref), so just mark the store record closed via
+  // sessionStore — tests assert on the store / resume outcome.
+  closeSession: vi.fn(async (sid: string) => {
+    const store = await import('../src/services/session-store.js');
+    const s = store.getSession(sid);
+    if (s && s.status !== 'closed') store.closeSession(sid);
+    return { ok: true, alreadyClosed: false };
+  }),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -121,47 +134,49 @@ function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.cre
 
 describe('resumeSession', () => {
   describe('error branches', () => {
-    it('returns not_found for an unknown session id', () => {
-      const r = resumeSession('no-such-id', new Map());
+    it('returns not_found for an unknown session id', async () => {
+      const r = await resumeSession('no-such-id', new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('not_found');
     });
 
-    it('returns not_closed when the session is still active', () => {
+    it('returns not_closed when the session is still active', async () => {
       const s = sessionStore.createSession('oc_chat', 'om_root', 'active topic');
-      const r = resumeSession(s.sessionId, new Map());
+      const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('not_closed');
     });
 
-    it('returns adopt_unsupported for adopt-titled sessions', () => {
+    it('returns adopt_unsupported for adopt-titled sessions', async () => {
       const s = sessionStore.createSession('oc_chat', 'om_root', 'Adopt: my-pane');
       sessionStore.closeSession(s.sessionId);
-      const r = resumeSession(s.sessionId, new Map());
+      const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
     });
 
-    it('returns adopt_unsupported when adoptedFrom metadata is set', () => {
+    it('returns adopt_unsupported when adoptedFrom metadata is set', async () => {
       const s = sessionStore.createSession('oc_chat', 'om_root', 'normal title');
       s.adoptedFrom = { tmuxTarget: 'foo', originalCliPid: 1, cwd: '/tmp' };
       sessionStore.updateSession(s);
       sessionStore.closeSession(s.sessionId);
-      const r = resumeSession(s.sessionId, new Map());
+      const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
     });
 
-    it('returns anchor_occupied when the in-memory Map already owns the anchor', () => {
+    it('returns anchor_occupied when a REAL in-memory session owns the anchor', async () => {
       const closed = makeClosedSession({ rootMessageId: 'om_thread_X' });
       const map = new Map<string, DaemonSession>();
+      // Occupant must look real (persisted cliId) — otherwise the scratch
+      // carve-out below would treat it as a throwaway and evict it.
       const occupant: any = {
-        session: { sessionId: 'occupant-id' },
-        chatId: 'oc_chat1', scope: 'thread', larkAppId: 'app_test',
+        session: { sessionId: 'occupant-id', cliId: 'claude-code' },
+        worker: {} /* live */, chatId: 'oc_chat1', scope: 'thread', larkAppId: 'app_test',
       };
       map.set(sessionKey('om_thread_X', 'app_test'), occupant);
 
-      const r = resumeSession(closed.sessionId, map);
+      const r = await resumeSession(closed.sessionId, map);
       expect(r.ok).toBe(false);
       if (!r.ok) {
         expect(r.error).toBe('anchor_occupied');
@@ -169,18 +184,19 @@ describe('resumeSession', () => {
       }
     });
 
-    it('returns anchor_occupied when persisted store has an active sibling at the same anchor', () => {
+    it('returns anchor_occupied when a REAL persisted sibling owns the same anchor', async () => {
       // A second active session pinned to the same (larkAppId, scope, anchor)
       // — simulates "user kept typing after /close, a fresh session was created
       // and persisted, but our in-memory Map didn't catch up" (cross-process or
-      // partial-restore scenarios).
+      // partial-restore scenarios). cliId marks it as a real CLI-backed session.
       const closed = makeClosedSession({ rootMessageId: 'om_thread_Y' });
       const sibling = sessionStore.createSession('oc_chat1', 'om_thread_Y', 'New session');
       sibling.larkAppId = 'app_test';
       sibling.scope = 'thread';
+      sibling.cliId = 'claude-code';
       sessionStore.updateSession(sibling);
 
-      const r = resumeSession(closed.sessionId, new Map());
+      const r = await resumeSession(closed.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) {
         expect(r.error).toBe('anchor_occupied');
@@ -188,7 +204,7 @@ describe('resumeSession', () => {
       }
     });
 
-    it('does NOT flag conflict when persisted sibling is at a different scope', () => {
+    it('does NOT flag conflict when persisted sibling is at a different scope', async () => {
       // chat-scope sibling at anchor=chatId shouldn't block thread-scope
       // resume at anchor=rootMessageId, even when chatId would coincidentally
       // match rootMessageId in some odd dataset.
@@ -196,10 +212,68 @@ describe('resumeSession', () => {
       const chatSibling = sessionStore.createSession('oc_chat1', 'msg_other', 'chat-scope peer');
       chatSibling.larkAppId = 'app_test';
       chatSibling.scope = 'chat';
+      chatSibling.cliId = 'claude-code';
       sessionStore.updateSession(chatSibling);
 
-      const r = resumeSession(closed.sessionId, new Map());
+      const r = await resumeSession(closed.sessionId, new Map());
       expect(r.ok).toBe(true);
+    });
+
+    // ── Scratch carve-out (王皓's resume-after-/relay bug) ────────────────────
+
+    it('does NOT block on an in-memory daemon-command scratch — evicts it and resumes', async () => {
+      // Repro: chat has bot's session → /close → /relay (picker, daemon parks
+      // a worker:null scratch at the chat anchor) → never confirm → click
+      // resume. Before the fix the scratch was reported as anchor_occupied.
+      const closed = makeClosedSession({ chatId: 'oc_scratch_chat', scope: 'chat' });
+      const map = new Map<string, DaemonSession>();
+      const key = sessionKey('oc_scratch_chat', 'app_test');
+      // Scratch: no worker, no persisted CLI markers, not pendingRepo.
+      const scratch: any = {
+        session: { sessionId: 'scratch-2716f0f8', cliId: undefined, lastCliInput: undefined },
+        worker: null, pendingRepo: false, chatId: 'oc_scratch_chat', scope: 'chat', larkAppId: 'app_test',
+      };
+      map.set(key, scratch);
+
+      const r = await resumeSession(closed.sessionId, map);
+      expect(r.ok).toBe(true);
+      // The resumed session now owns the anchor (scratch was evicted + replaced).
+      if (r.ok) expect(map.get(key)!.session.sessionId).toBe(closed.sessionId);
+    });
+
+    it('STILL blocks on a pendingRepo occupant (deliberate setup, not a throwaway)', async () => {
+      // A pendingRepo session is worker:null too, but represents real intent
+      // (user picking a repo). Resuming the old session must not clobber it.
+      const closed = makeClosedSession({ chatId: 'oc_pending_chat', scope: 'chat' });
+      const map = new Map<string, DaemonSession>();
+      const pending: any = {
+        session: { sessionId: 'pending-id', cliId: undefined, lastCliInput: undefined },
+        worker: null, pendingRepo: true, chatId: 'oc_pending_chat', scope: 'chat', larkAppId: 'app_test',
+      };
+      map.set(sessionKey('oc_pending_chat', 'app_test'), pending);
+
+      const r = await resumeSession(closed.sessionId, map);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error).toBe('anchor_occupied');
+        expect(r.activeSessionId).toBe('pending-id');
+      }
+    });
+
+    it('does NOT block on a persisted scratch sibling (no cliId / lastCliInput) — closes it and resumes', async () => {
+      const closed = makeClosedSession({ rootMessageId: 'om_scratch_thread' });
+      // Store-only scratch sibling: active, same anchor, but never ran a CLI.
+      const scratch = sessionStore.createSession('oc_chat1', 'om_scratch_thread', '/relay');
+      scratch.larkAppId = 'app_test';
+      scratch.scope = 'thread';
+      scratch.cliId = undefined as any;
+      scratch.lastCliInput = undefined as any;
+      sessionStore.updateSession(scratch);
+
+      const r = await resumeSession(closed.sessionId, new Map());
+      expect(r.ok).toBe(true);
+      // Scratch store row should now be closed.
+      expect(sessionStore.getSession(scratch.sessionId)!.status).toBe('closed');
     });
   });
 
@@ -228,7 +302,7 @@ describe('resumeSession', () => {
       expect(restoreUsageLimitRuntimeState).toHaveBeenCalledWith(ds);
     });
 
-    it('flips status back to active, clears closedAt, and registers in the Map (thread-scope)', () => {
+    it('flips status back to active, clears closedAt, and registers in the Map (thread-scope)', async () => {
       const closed = makeClosedSession({ rootMessageId: 'om_threadA' });
       (closed as any).lastUserPrompt = '继续修复限额后的任务';
       (closed as any).lastCliInput = '<user_message>继续修复限额后的任务</user_message>';
@@ -236,7 +310,7 @@ describe('resumeSession', () => {
       sessionStore.closeSession(closed.sessionId);
       const map = new Map<string, DaemonSession>();
 
-      const r = resumeSession(closed.sessionId, map);
+      const r = await resumeSession(closed.sessionId, map);
       expect(r.ok).toBe(true);
       if (!r.ok) return;
 
@@ -257,18 +331,18 @@ describe('resumeSession', () => {
       expect(ds.lastCliInput).toBe('<user_message>继续修复限额后的任务</user_message>');
     });
 
-    it('uses chatId as the routing anchor for chat-scope sessions', () => {
+    it('uses chatId as the routing anchor for chat-scope sessions', async () => {
       const closed = makeClosedSession({ chatId: 'oc_chatB', scope: 'chat' });
       const map = new Map<string, DaemonSession>();
 
-      const r = resumeSession(closed.sessionId, map);
+      const r = await resumeSession(closed.sessionId, map);
       expect(r.ok).toBe(true);
       const ds = map.get(sessionKey('oc_chatB', 'app_test'));
       expect(ds).toBeDefined();
       expect(ds!.scope).toBe('chat');
     });
 
-    it('preserves cliId / workingDir / ownerOpenId from the persisted record', () => {
+    it('preserves cliId / workingDir / ownerOpenId from the persisted record', async () => {
       const closed = makeClosedSession({ cliId: 'codex', workingDir: '/srv/app' });
       closed.ownerOpenId = 'ou_owner';
       sessionStore.updateSession(closed);
@@ -276,7 +350,7 @@ describe('resumeSession', () => {
       sessionStore.closeSession(closed.sessionId);
 
       const map = new Map<string, DaemonSession>();
-      const r = resumeSession(closed.sessionId, map);
+      const r = await resumeSession(closed.sessionId, map);
       expect(r.ok).toBe(true);
       if (!r.ok) return;
       expect(r.ds.session.cliId).toBe('codex');
