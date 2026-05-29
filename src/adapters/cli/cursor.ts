@@ -12,12 +12,12 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     id: 'cursor',
     resolvedBin: bin,
 
-    buildArgs({ resume, resumeSessionId }) {
+    buildArgs({ resume, resumeSessionId, requireApproval }) {
       // --force skips approvals so the model can act inside the topic without
       // every shell/edit bouncing back to Lark for confirmation — same posture
       // as codex's --dangerously-bypass-approvals-and-sandbox and claude-code's
       // --dangerously-skip-permissions.
-      const base = ['--force'];
+      const base = requireApproval ? [] : ['--force'];
       if (!resume) return base;
       if (resumeSessionId) return [...base, '--resume', resumeSessionId];
       // No id on hand — fall back to "last chat" so we at least don't drop

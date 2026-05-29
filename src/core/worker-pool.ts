@@ -657,6 +657,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     workingDir: cwd,
     cliId: botCfg.cliId,
     cliPathOverride: botCfg.cliPathOverride,
+    requireApproval: botCfg.requireApproval === true,
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,

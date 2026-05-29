@@ -425,6 +425,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
     "larkAppSecret": "secret_1",
     "name": "claude-main",
     "cliId": "claude-code",
+    "requireApproval": true,
     "workingDir": "~/projects",
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"]
@@ -445,6 +446,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
 | `name` | No | Process name suffix shown by `botmux status`; e.g. `claude-main` appears as `botmux-claude-main`, defaults to `botmux-<index>` |
 | `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `cursor`, `gemini`, `opencode`, `antigravity`) |
 | `cliPathOverride` | No | Absolute path to the CLI entry, for wrappers / routers; typical use: `ccr`, `claude-w`, `aiden-x-claude`, etc. |
+| `requireApproval` | No | Whether to require the CLI's own approval/sandbox flow. Missing or `false` keeps the legacy behavior: botmux still adds bypass / weak-sandbox flags such as `--yolo`, `--dangerously-*`, `--force`, or `--permission-mode agentFull`. When `true`, botmux stops adding those flags. If you need a fixed approval/sandbox policy, point `cliPathOverride` at a wrapper script that appends the desired CLI-specific arguments |
 | `backendType` | No | Session backend: `pty` or `tmux` (auto-detected by default) |
 | `workingDir` | No | Default working directory, supports comma-separated. The new-topic repo-select card scans for git repos **from this directory downward** (recursive, up to 3 levels), no longer climbing to the parent: point it at a repos root (e.g. `~/projects`) to list every repo beneath it, or at a single repo to list just that repo (and its linked worktrees) |
 | `defaultWorkingDir` | No | Single-repo default: new topics with no oncall binding and no peer-session inheritance spawn directly here, skipping the repo-select card. `/cd <path>` still switches mid-session; the next new topic falls back to this default. **Difference from `defaultOncall`:** does NOT write `oncallChats` and does NOT change the `canTalk` / `canOperate` permission model |

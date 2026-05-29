@@ -91,6 +91,13 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
+  it('omits dangerous permission flags/settings when requireApproval is true', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, requireApproval: true });
+    expect(args).not.toContain('--dangerously-skip-permissions');
+    expect(args).not.toContain('--settings');
+    expect(args).toContain('--disallowed-tools');
+  });
+
   it('ignores initialPrompt (not passed via args)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, initialPrompt: 'hello' });
     expect(args).not.toContain('hello');
@@ -126,6 +133,12 @@ describe('aiden buildArgs', () => {
     expect(args).toContain('--resume');
     expect(args).toContain('sess-2');
   });
+
+  it('omits agentFull permission mode when requireApproval is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-2', resume: false, requireApproval: true });
+    expect(args).not.toContain('--permission-mode');
+    expect(args).not.toContain('agentFull');
+  });
 });
 
 describe('coco buildArgs', () => {
@@ -152,6 +165,12 @@ describe('coco buildArgs', () => {
     expect(indices.length).toBe(2);
     expect(args[indices[0] + 1]).toBe('EnterPlanMode');
     expect(args[indices[1] + 1]).toBe('ExitPlanMode');
+  });
+
+  it('omits --yolo when requireApproval is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-3', resume: false, requireApproval: true });
+    expect(args).toContain('--session-id');
+    expect(args).not.toContain('--yolo');
   });
 });
 
@@ -180,6 +199,11 @@ describe('codex buildArgs', () => {
       '/repo/root',
     ]);
   });
+
+  it('omits approval/sandbox bypass flag when requireApproval is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', requireApproval: true });
+    expect(args).toEqual(['--no-alt-screen', '-C', '/repo/root']);
+  });
 });
 
 describe('gemini buildArgs', () => {
@@ -205,6 +229,12 @@ describe('gemini buildArgs', () => {
   it('does not include session id', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false });
     expect(args).not.toContain('sess-5');
+  });
+
+  it('omits --yolo when requireApproval is true while preserving initial prompt', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, initialPrompt: 'do something', requireApproval: true });
+    expect(args).not.toContain('--yolo');
+    expect(args).toEqual(['-i', 'do something']);
   });
 });
 
@@ -293,6 +323,11 @@ describe('antigravity buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
     expect(args).not.toContain('sess-7');
     expect(args).not.toContain('--session-id');
+  });
+
+  it('omits dangerous permission flag when requireApproval is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, requireApproval: true });
+    expect(args).toEqual([]);
   });
 });
 
