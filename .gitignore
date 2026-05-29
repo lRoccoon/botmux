@@ -8,6 +8,7 @@ log/
 .env
 .npmrc
 docs/superpowers/
+docs/specs/
 storageState.json
 midscene_run/
 .codex
