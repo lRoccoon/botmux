@@ -41,7 +41,7 @@ export interface BotConfig {
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
    */
-  requireApproval?: boolean;
+  disableCliBypass?: boolean;
   backendType?: 'pty' | 'tmux';
   workingDir?: string;
   workingDirs?: string[];
@@ -342,7 +342,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
-      requireApproval: entry.requireApproval === true,
+      disableCliBypass: entry.disableCliBypass === true,
       backendType: entry.backendType,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,

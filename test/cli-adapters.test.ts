@@ -91,8 +91,8 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
-  it('omits dangerous permission flags/settings when requireApproval is true', () => {
-    const args = adapter.buildArgs({ sessionId: 's', resume: false, requireApproval: true });
+  it('omits dangerous permission flags/settings when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--dangerously-skip-permissions');
     expect(args).not.toContain('--settings');
     expect(args).toContain('--disallowed-tools');
@@ -134,8 +134,8 @@ describe('aiden buildArgs', () => {
     expect(args).toContain('sess-2');
   });
 
-  it('omits agentFull permission mode when requireApproval is true', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-2', resume: false, requireApproval: true });
+  it('omits agentFull permission mode when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-2', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--permission-mode');
     expect(args).not.toContain('agentFull');
   });
@@ -167,8 +167,8 @@ describe('coco buildArgs', () => {
     expect(args[indices[1] + 1]).toBe('ExitPlanMode');
   });
 
-  it('omits --yolo when requireApproval is true', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-3', resume: false, requireApproval: true });
+  it('omits --yolo when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-3', resume: false, disableCliBypass: true });
     expect(args).toContain('--session-id');
     expect(args).not.toContain('--yolo');
   });
@@ -200,8 +200,8 @@ describe('codex buildArgs', () => {
     ]);
   });
 
-  it('omits approval/sandbox bypass flag when requireApproval is true', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', requireApproval: true });
+  it('omits approval/sandbox bypass flag when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', disableCliBypass: true });
     expect(args).toEqual(['--no-alt-screen', '-C', '/repo/root']);
   });
 });
@@ -231,8 +231,8 @@ describe('gemini buildArgs', () => {
     expect(args).not.toContain('sess-5');
   });
 
-  it('omits --yolo when requireApproval is true while preserving initial prompt', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, initialPrompt: 'do something', requireApproval: true });
+  it('omits --yolo when disableCliBypass is true while preserving initial prompt', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, initialPrompt: 'do something', disableCliBypass: true });
     expect(args).not.toContain('--yolo');
     expect(args).toEqual(['-i', 'do something']);
   });
@@ -325,8 +325,8 @@ describe('antigravity buildArgs', () => {
     expect(args).not.toContain('--session-id');
   });
 
-  it('omits dangerous permission flag when requireApproval is true', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, requireApproval: true });
+  it('omits dangerous permission flag when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true });
     expect(args).toEqual([]);
   });
 });

@@ -45,10 +45,9 @@ export interface CliAdapter {
     locale?: import('../../i18n/index.js').Locale;
     /**
      * When true, do not add adapter-default flags that bypass CLI approvals or
-     * disable sandboxing. Bot owners can still provide explicit approval /
-     * sandbox policy through a cliPathOverride wrapper if desired.
+     * disable sandboxing.
      */
-    requireApproval?: boolean;
+    disableCliBypass?: boolean;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).

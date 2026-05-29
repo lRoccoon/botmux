@@ -12,10 +12,10 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     id: 'gemini',
     resolvedBin: bin,
 
-    buildArgs({ initialPrompt, requireApproval }) {
+    buildArgs({ initialPrompt, disableCliBypass }) {
       // Gemini CLI manages sessions internally (--resume takes "latest" or
       // an index/UUID, not our daemon session IDs).  We always start fresh.
-      const args = requireApproval ? [] : ['--yolo'];
+      const args = disableCliBypass ? [] : ['--yolo'];
       // Use -i (prompt-interactive) for the initial prompt.  Gemini's Ink TUI
       // has a startup phase where the TextInput component isn't mounted yet
       // (auth, model loading, extensions).  Writing to stdin during this phase

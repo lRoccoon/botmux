@@ -3,7 +3,7 @@
     "larkAppId": "cli_xxx_bot1",
     "larkAppSecret": "your_secret_1",
     "cliId": "claude-code",
-    "requireApproval": true,
+    "disableCliBypass": true,
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"],
     "workingDir": "~/projects"

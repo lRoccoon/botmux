@@ -529,7 +529,7 @@ botmux setup
     "larkAppSecret": "secret_1",
     "name": "claude-main",
     "cliId": "claude-code",
-    "requireApproval": true,
+    "disableCliBypass": true,
     "workingDir": "~/projects",
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"]
@@ -550,7 +550,7 @@ botmux setup
 | `name` | 否 | `botmux status` 中的进程名后缀；例如 `claude-main` 会显示为 `botmux-claude-main`，留空默认 `botmux-<序号>` |
 | `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`cursor`、`gemini`、`opencode`、`antigravity`） |
 | `cliPathOverride` | 否 | CLI 入口的绝对路径，用于套 wrapper / router；典型场景：ccr、claude-w、aiden-x-claude 等自定义入口 |
-| `requireApproval` | 否 | 是否要求 CLI 自身审批/沙箱机制。未配置或 `false` 时保持兼容旧逻辑，botmux 会继续添加 `--yolo`、`--dangerously-*`、`--force`、`--permission-mode agentFull` 等免审批/弱沙箱参数；设为 `true` 时不再自动添加这些参数。如需固定 approval/sandbox 策略，可通过 `cliPathOverride` 指向自定义 wrapper 脚本自行追加对应 CLI 参数 |
+| `disableCliBypass` | 否 | 是否禁用 botmux 默认注入的 CLI bypass / 弱沙箱参数。未配置或 `false` 时保持兼容旧逻辑，botmux 会继续添加 `--yolo`、`--dangerously-*`、`--force`、`--permission-mode agentFull` 等参数；设为 `true` 时不再自动添加这些参数 |
 | `backendType` | 否 | 会话后端：`pty` 或 `tmux`（默认自动检测） |
 | `workingDir` | 否 | 默认工作目录，支持逗号分隔多个目录。新话题的 repo 选择卡片会**从该目录自身向下**递归查找 git 仓库（最多 3 层），不再向上扫父目录：指向仓库集合根目录（如 `~/projects`）即列出其下所有仓库，指向单个仓库则只列该仓库（及其 linked worktrees） |
 | `defaultWorkingDir` | 否 | 单仓库默认目录：新话题在无 oncall 绑定 / 无同群兄弟 session 时直接进入该目录，跳过 repo 选择卡片。`/cd <path>` 仍可临时切换；下一个新话题回到该默认值。**与 `defaultOncall` 的区别**：不写 `oncallChats`、不修改 `canTalk`/`canOperate` 权限模型 |

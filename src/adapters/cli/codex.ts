@@ -110,9 +110,9 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     id: 'codex',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, requireApproval }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, disableCliBypass }) {
       const baseArgs = [
-        ...(!requireApproval ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
         '--no-alt-screen',
       ];
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.

@@ -380,14 +380,14 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       return `claude --resume ${cliSessionId ?? sessionId}`;
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, requireApproval }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
-      if (!requireApproval) {
+      if (!disableCliBypass) {
         args.push('--dangerously-skip-permissions');
         // Suppress the first-run "--dangerously-skip-permissions" risk-acceptance
         // screen for this spawn only. In a fresh $HOME that has never accepted it,

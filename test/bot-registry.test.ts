@@ -351,7 +351,7 @@ describe('loadBotConfigs', () => {
       name: 'codex-main',
       cliId: 'gemini',
       cliPathOverride: '/usr/local/bin/gemini',
-      requireApproval: true,
+      disableCliBypass: true,
       backendType: 'tmux',
       workingDir: '/home/user/project',
       allowedUsers: ['alice', 'bob'],
@@ -364,14 +364,14 @@ describe('loadBotConfigs', () => {
     expect(c.name).toBe('codex-main');
     expect(c.cliId).toBe('gemini');
     expect(c.cliPathOverride).toBe('/usr/local/bin/gemini');
-    expect(c.requireApproval).toBe(true);
+    expect(c.disableCliBypass).toBe(true);
     expect(c.backendType).toBe('tmux');
     expect(c.workingDir).toBe('/home/user/project');
     expect(c.allowedUsers).toEqual(['alice', 'bob']);
     expect(c.allowedChatGroups).toEqual(['oc_team', 'oc_project']);
   });
 
-  it('defaults requireApproval to false when omitted', () => {
+  it('defaults disableCliBypass to false when omitted', () => {
     process.env.BOTS_CONFIG = '/tmp/no-require-approval.json';
     fsMock.existsSync.mockReturnValue(true);
     fsMock.readFileSync.mockReturnValue(JSON.stringify([{
@@ -380,7 +380,7 @@ describe('loadBotConfigs', () => {
     }]));
 
     const configs = mod.loadBotConfigs();
-    expect(configs[0].requireApproval).toBe(false);
+    expect(configs[0].disableCliBypass).toBe(false);
   });
 
   it('should split comma-separated workingDir into workingDirs', () => {

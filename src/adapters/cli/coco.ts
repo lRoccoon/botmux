@@ -119,14 +119,14 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     id: 'coco',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume, requireApproval }) {
+    buildArgs({ sessionId, resume, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
-      if (!requireApproval) args.push('--yolo');
+      if (!disableCliBypass) args.push('--yolo');
       args.push('--disallowed-tool', 'EnterPlanMode', '--disallowed-tool', 'ExitPlanMode');
       return args;
     },

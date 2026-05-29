@@ -2621,7 +2621,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
-    requireApproval: cfg.requireApproval === true,
+    disableCliBypass: cfg.disableCliBypass === true,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
