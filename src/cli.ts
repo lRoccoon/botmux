@@ -26,7 +26,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
-import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText } from './core/dispatch.js';
+import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent } from './core/dispatch.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -3244,6 +3244,17 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     brief = readFileSync(briefFile, 'utf-8');
   }
 
+  // Append the report-back protocol so the dispatched sub-bot reports via
+  // `botmux report` (which routes to the orchestrator's OWN session) rather than
+  // @-ing the orchestrator in its sub-topic — which has no orchestrator session
+  // and would spawn a fresh, context-less one. Skipped for --standby (no brief).
+  if (brief.trim()) {
+    brief = brief.trimEnd() +
+      '\n\n— 完成回报 —\n' +
+      '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` 把结果回报给主编排会话；' +
+      '不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+  }
+
   // ── Flag validation ──
   if (botSpecs.length === 0) {
     console.error('至少要用 --bot 指派一个 bot。用法见 botmux dispatch --help');
@@ -3316,6 +3327,27 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     // 1. Seed (thread root) — top-level header; gives the thread something to hang off.
     const seedId = await sendMessage(appId, targetChatId, built.seedText, 'text');
 
+    // Record the orchestrator's coords for this sub-topic, keyed by the seed
+    // (which becomes every dispatched sub-bot's session.rootMessageId). The
+    // sub-bot's `botmux report` looks this up to route its report back into the
+    // orchestrator's OWN session. Lives in the shared data dir so every bot's
+    // daemon (one-per-bot) can read it. Best-effort — report-back degrades to a
+    // clear error if absent.
+    try {
+      const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+      let reg: Record<string, unknown> = {};
+      try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* corrupt → reset */ }
+      reg[seedId] = {
+        orchRoot: s.rootMessageId ?? '',
+        orchChatId: s.chatId,
+        orchScope: s.scope ?? 'thread',
+        orchAppId: s.larkAppId,
+        title: title.trim(),
+        bots: built.mentionedOpenIds,
+      };
+      writeFileSync(regPath, JSON.stringify(reg, null, 2));
+    } catch { /* registry is best-effort */ }
+
     // 2. Optional repo prime — a plain TEXT message "@bot /repo <path>" (like a
     //    human types) so each sub-bot spawns idle in that dir (no repo-select
     //    card). Text goes through resolveMentions cleanly; a structured post
@@ -3347,6 +3379,110 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }));
   } catch (err: any) {
     console.error(`dispatch 失败: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * `botmux report` — a dispatched sub-bot reports progress/completion back to the
+ * orchestrator that dispatched it.
+ *
+ * In 多话题协作模式 the sub-bot lives in its own sub-topic, where the orchestrator
+ * has no session; @-ing the orchestrator there would spawn a fresh, context-less
+ * one (申晗's #1 bug). Instead this routes the report INTO the orchestrator's own
+ * thread (recorded by `botmux dispatch` in orchestrate-dispatch.json) and @-s the
+ * orchestrator there, so its existing, context-rich session is the one that wakes.
+ *
+ * Coords: orchestrator open_id = the sub-bot session's quoteTargetSenderOpenId
+ * (the dispatcher of the turn that opened this sub-topic); orchestrator thread =
+ * the registry entry keyed by this sub-bot's session.rootMessageId (== the seed).
+ */
+async function cmdReport(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux report — 把子项目进展/完成回报给派活的主编排会话
+
+用法:
+  botmux report "子项目X 完成，产出在 …"
+  botmux report --content-file <path>
+
+说明:
+  「多话题协作模式」里你（子 bot）干完后不要在本话题 @ 主bot——本话题没有主bot的会话，
+  @ 会另起一个无上下文的新会话。本命令把回报发回主编排会话所在的话题、并 @ 主编排 bot，
+  使其带完整上下文继续聚合。仅在被 botmux dispatch 派活的子项目会话里可用。
+
+选项:
+  --content-file <path>  从文件读取回报内容
+  --session-id <id>      指定来源会话（默认自动推断）`);
+    return;
+  }
+
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const sessionIdArg = argValue(rest, '--session-id');
+
+  let content = '';
+  const contentFile = argValue(rest, '--content-file');
+  if (contentFile) {
+    if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
+    content = readFileSync(contentFile, 'utf-8');
+  } else {
+    const pos = positionals(rest);
+    content = pos.length ? pos.join(' ') : await readStdin();
+  }
+  if (!content.trim()) {
+    console.error('没有回报内容。用法: botmux report "子项目X 完成 + 产出位置"');
+    process.exit(1);
+  }
+
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断 session-id。请在被 dispatch 派活的会话里运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+  const sessions = loadSessions();
+  const s = sessions.get(sid);
+  if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
+  if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+
+  // Resolve the orchestrator coords: its thread from the dispatch registry
+  // (keyed by this sub-bot's thread root), its open_id from this session.
+  const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+  let reg: Record<string, any> = {};
+  try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* */ }
+  const entry = s.rootMessageId ? reg[s.rootMessageId] : undefined;
+  const orchOpenId = s.quoteTargetSenderOpenId;
+  if (!entry || !orchOpenId) {
+    console.error(
+      '当前会话不是被 botmux dispatch 派活的子项目会话（缺少主编排坐标）。\n' +
+      '若确需回报，请改用 `botmux send` 或显式 @ 对应的人/ bot。');
+    process.exit(1);
+  }
+
+  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  const { sendMessage, replyMessage } = await import('./im/lark/client.js');
+  const appId = s.larkAppId!;
+
+  const paras = buildReportContent({ orchOpenId, content });
+  const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });
+
+  try {
+    let msgId: string;
+    if (entry.orchScope === 'chat' || !entry.orchRoot) {
+      // Orchestrator runs at chat scope (普通群整群一个会话) → post to the chat.
+      msgId = await sendMessage(appId, entry.orchChatId, postJson, 'post');
+    } else {
+      // Orchestrator lives in its own thread → reply into it so its existing
+      // session (anchored on orchRoot) is the one that receives the report.
+      msgId = await replyMessage(appId, entry.orchRoot, postJson, 'post', true);
+    }
+    console.log(JSON.stringify({
+      success: true,
+      reportedTo: entry.orchRoot || entry.orchChatId,
+      orchestrator: orchOpenId,
+      messageId: msgId,
+    }));
+  } catch (err: any) {
+    console.error(`report 失败: ${err.message}`);
     process.exit(1);
   }
 }
@@ -4108,6 +4244,7 @@ switch (command) {
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
+  case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;

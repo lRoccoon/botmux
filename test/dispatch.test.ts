@@ -14,6 +14,7 @@ import {
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
+  buildReportContent,
 } from '../src/core/dispatch.js';
 
 describe('parseDispatchBotSpec', () => {
@@ -114,5 +115,33 @@ describe('buildRepoPrimeText', () => {
 
   it('throws when no bots are given', () => {
     expect(() => buildRepoPrimeText({ path: '/x', bots: [] })).toThrow();
+  });
+});
+
+describe('buildReportContent', () => {
+  it('@-mentions the orchestrator then carries the report on the first line', () => {
+    const paras = buildReportContent({ orchOpenId: 'ou_orch', content: '子项目X 完成' });
+    expect(paras).toHaveLength(1);
+    expect(paras[0]).toEqual([
+      { tag: 'at', user_id: 'ou_orch' },
+      { tag: 'text', text: ' ' },
+      { tag: 'text', text: '子项目X 完成' },
+    ]);
+  });
+
+  it('keeps the @ on the first line and puts later lines in their own paragraphs', () => {
+    const paras = buildReportContent({ orchOpenId: 'ou_orch', content: '完成\n产出在 /tmp/out' });
+    expect(paras).toHaveLength(2);
+    expect(paras[0][0]).toEqual({ tag: 'at', user_id: 'ou_orch' });
+    expect(paras[0][2]).toEqual({ tag: 'text', text: '完成' });
+    expect(paras[1]).toEqual([{ tag: 'text', text: '产出在 /tmp/out' }]);
+  });
+
+  it('throws on empty content', () => {
+    expect(() => buildReportContent({ orchOpenId: 'ou_orch', content: '   ' })).toThrow();
+  });
+
+  it('throws on empty orchestrator open_id', () => {
+    expect(() => buildReportContent({ orchOpenId: '  ', content: 'x' })).toThrow();
   });
 });

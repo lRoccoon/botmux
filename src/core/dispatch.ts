@@ -130,3 +130,36 @@ export function buildRepoPrimeText(input: {
   const ats = input.bots.map(b => `<at user_id="${b.openId}"></at>`).join(' ');
   return { text: `${ats} /repo ${path}`, mentionedOpenIds: input.bots.map(b => b.openId) };
 }
+
+/**
+ * Build the report-back message a dispatched sub-bot sends to its orchestrator.
+ *
+ * In 多话题协作模式 a sub-bot must NOT @ the orchestrator in its own sub-topic —
+ * that thread has no orchestrator session, so the orchestrator's daemon would
+ * spawn a fresh, context-less one. Instead `botmux report` sends this content
+ * **into the orchestrator's own thread** (recorded by `botmux dispatch`),
+ * @-mentioning the orchestrator so its existing, context-rich session is the one
+ * that wakes up. This is the pure content builder; cli.ts resolves the coords
+ * and performs the reply.
+ *
+ * The @ stays on the first line so the mention renders next to the headline;
+ * any further lines become their own paragraphs (Lark 'post' shape).
+ */
+export function buildReportContent(input: {
+  orchOpenId: string;
+  content: string;
+}): PostParagraph[] {
+  const openId = input.orchOpenId.trim();
+  if (!openId) throw new Error('report requires the orchestrator open_id');
+  const text = input.content.trim();
+  if (!text) throw new Error('report requires content');
+
+  const lines = text.split('\n');
+  const paras: PostParagraph[] = [
+    [{ tag: 'at', user_id: openId }, { tag: 'text', text: ' ' }, { tag: 'text', text: lines[0] }],
+  ];
+  for (let i = 1; i < lines.length; i++) {
+    paras.push([{ tag: 'text', text: lines[i] }]);
+  }
+  return paras;
+}
