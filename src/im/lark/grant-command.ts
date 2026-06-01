@@ -4,7 +4,7 @@
  * 与 /introduce 不同：必须确认本 bot 被 @（多 bot 群防重复处理），
  * 且解析 target 时排除 bot 自身。
  */
-import { getOwnerOpenId, getBotOpenId } from '../../bot-registry.js';
+import { getOwnerOpenId, getBotOpenId, getBot } from '../../bot-registry.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
@@ -32,6 +32,32 @@ export function parseGrantTargets(message: any, botOpenId: string | undefined): 
 /** 取第一个非本 bot 的目标（单目标场景的便捷封装）。 */
 export function parseGrantTarget(message: any, botOpenId: string | undefined): { openId: string; name: string } | undefined {
   return parseGrantTargets(message, botOpenId)[0];
+}
+
+/** 把文本里所有 `@<name>` mention token 去掉（split/join，防正则注入），归一空白后 trim。 */
+export function stripAllMentions(text: string, mentions: any[]): string {
+  let s = text;
+  for (const m of mentions ?? []) {
+    const name = m?.name;
+    if (typeof name === 'string' && name.length) s = s.split(`@${name}`).join(' ');
+  }
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 解析 `/grant @x [N]` 里可选的消息额度 N。`text` 已 stripLeadingMentions（去开头 @bot），
+ * 这里把剩余所有 `@<name>` mention 也剥掉，剩下应只是 `/grant` 或 `/grant <token>`。
+ * N 必须是唯一尾部正整数 token；0 / 负数 / 小数 / 多余尾巴 → { ok:false }（调用方回 usage）。
+ */
+export function parseGrantQuota(text: string, mentions: any[]): { ok: true; quota?: number } | { ok: false } {
+  const mm = /^\/grant(?:\s+(\S+))?$/i.exec(stripAllMentions(text, mentions));
+  if (!mm) return { ok: false };                 // 多余尾巴 / 解析不出
+  const tok = mm[1];
+  if (tok === undefined) return { ok: true, quota: undefined };  // 无数字
+  if (!/^\d+$/.test(tok)) return { ok: false };  // 负号 / 小数 / 非数字
+  const n = parseInt(tok, 10);
+  if (n <= 0) return { ok: false };              // \d+ 已保证整数，仅需挡 0
+  return { ok: true, quota: n };
 }
 
 /** 返回 true 表示已拦截（不再进入路由/spawn）。 */
@@ -70,6 +96,15 @@ export async function tryHandleGrantCommand(
     if (!chatId) {
       await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc))
         .catch(err => logger.debug(`grant usage reply failed: ${err}`));
+      return true;
+    }
+    // 无 @目标时只接受"整群"意图：精确 `/grant`（空尾巴）或 `/grant all`。带其它 token
+    // （尤其 `/grant 5` —— owner 漏 @ 人却写了额度数字）绝不当成整群授权打开 talk，回 usage，
+    // 避免把"给某人 5 条额度"误执行成"对全群开放对话"。
+    const rest = stripAllMentions(text, message?.mentions ?? []).replace(/^\/(grant|revoke)\b/i, '').trim();
+    if (rest !== '' && rest.toLowerCase() !== 'all') {
+      await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.bad_quota' : 'cmd.revoke.usage', undefined, loc))
+        .catch(err => logger.debug(`grant no-target guard reply failed: ${err}`));
       return true;
     }
     let txt: string;
@@ -122,8 +157,17 @@ export async function tryHandleGrantCommand(
     return true;
   }
 
-  // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。
-  const nonce = openPendingMulti(larkAppId, chatId, targets.map(tgt => tgt.openId));
+  // 解析可选额度：`/grant @x 5`（多目标时对每人各 N 条）。显式数字恒生效；无数字取 messageQuota.defaultLimit（未配=无限）。
+  const pq = parseGrantQuota(text, message?.mentions ?? []);
+  if (!pq.ok) {
+    await replyMessage(larkAppId, messageId, t('cmd.grant.bad_quota', undefined, loc))
+      .catch(err => logger.debug(`grant bad_quota reply failed: ${err}`));
+    return true;
+  }
+  const quota = pq.quota ?? getBot(larkAppId).config.messageQuota?.defaultLimit;
+
+  // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。额度（若有）对每个目标各自挂在 pending 上。
+  const nonce = openPendingMulti(larkAppId, chatId, targets.map(tgt => tgt.openId), quota);
   const card = buildGrantCard(
     { ownerOpenId: owner!, targets, chatId, nonce, mode: 'owner' },
     loc,
