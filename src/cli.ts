@@ -2867,40 +2867,46 @@ async function cmdSend(rest: string[]): Promise<void> {
   const isChatScope = s.scope === 'chat';
 
   // ── Footgun guard: orchestrator → sub-bot ──
-  // A dispatched sub-bot's session lives inside its sub-topic. @-ing it from the
-  // main chat (this send) doesn't reach that session — it spawns a fresh,
-  // context-less one (the mirror of the report-back problem). Block and point to
-  // the right command; `--anyway` overrides for a genuinely new session.
-  if (mentions.length > 0 && !rest.includes('--anyway')) {
-    let reg: Record<string, { orchChatId?: string; bots?: string[] }> = {};
-    try {
-      const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
-      if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8'));
-    } catch { /* no/!corrupt registry → no guard */ }
-    if (Object.keys(reg).length > 0) {
-      const activeSeeds = new Set<string>();
-      for (const sess of loadSessions().values()) {
-        if (sess.status === 'active' && sess.scope !== 'chat' && sess.rootMessageId) {
-          activeSeeds.add(sess.rootMessageId);
-        }
+  // A dispatched sub-bot's session lives in its sub-topic; @-ing it from the main
+  // chat spawns a fresh, context-less one. The check is computed ONCE and applied
+  // at BOTH mention sources: explicit --mention/--mention-back (blocked here) AND
+  // the prose @Name auto-injection further down (dropped there) — so a prose
+  // `@OtherSubBot` can't slip past after this explicit guard already ran.
+  let dispatchReg: Record<string, { orchChatId?: string; bots?: string[] }> = {};
+  try {
+    const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+    if (existsSync(regPath)) dispatchReg = JSON.parse(readFileSync(regPath, 'utf-8'));
+  } catch { /* no/!corrupt registry → no guard */ }
+  const dispatchActiveSeeds = new Set<string>();
+  if (Object.keys(dispatchReg).length > 0) {
+    for (const sess of loadSessions().values()) {
+      if (sess.status === 'active' && sess.scope !== 'chat' && sess.rootMessageId) {
+        dispatchActiveSeeds.add(sess.rootMessageId);
       }
-      for (const m of mentions) {
-        // Clear boundary for the false-positive: the bot I'm replying to in THIS
-        // conversation (its message set quoteTargetSenderOpenId) is reachable
-        // right here — @-ing it back doesn't spawn a new session — so don't block
-        // it, even if it's ALSO a dispatched sub-bot in some other topic. The
-        // guard still fires for @-ing OTHER dispatched sub-bots not conversing here.
-        if (m.open_id === s.quoteTargetSenderOpenId) continue;
-        const seed = findSubBotTopic({ mentionOpenId: m.open_id, chatId: targetChatId, registry: reg, activeSeeds });
-        if (seed) {
-          console.error(
-            `⚠️ ${m.open_id}${m.name ? `（${m.name}）` : ''} 是 botmux dispatch 派进子话题 ${seed} 的子 bot——\n` +
-            `它的会话在那条子话题里：在主群 @ 它收不到，反而会另起一个无上下文的新会话。\n` +
-            `要跟它说，把消息发进它的子话题：\n` +
-            `  botmux dispatch --into ${seed} --bot ${m.open_id} --brief "..."\n` +
-            `（确属新会话/有意为之，加 --anyway 强发。）`);
-          process.exit(2);
-        }
+    }
+  }
+  // Sub-topic seed if `openId` is a dispatched sub-bot in an active topic that is
+  // NOT reachable in the current conversation; else null. The bot I'm replying to
+  // here (quoteTargetSenderOpenId) is reachable, so it's never treated as off-topic.
+  const offTopicSubBotSeed = (openId: string): string | null => {
+    if (!openId || openId === s.quoteTargetSenderOpenId) return null;
+    if (Object.keys(dispatchReg).length === 0) return null;
+    return findSubBotTopic({ mentionOpenId: openId, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
+  };
+  // Explicit --mention / --mention-back of an off-topic sub-bot → block + point to
+  // the right command (--anyway overrides). Prose @Name injection is filtered
+  // (dropped, not blocked) at its own site below.
+  if (!rest.includes('--anyway')) {
+    for (const m of mentions) {
+      const seed = offTopicSubBotSeed(m.open_id);
+      if (seed) {
+        console.error(
+          `⚠️ ${m.open_id}${m.name ? `（${m.name}）` : ''} 是 botmux dispatch 派进子话题 ${seed} 的子 bot——\n` +
+          `它的会话在那条子话题里：在主群 @ 它收不到，反而会另起一个无上下文的新会话。\n` +
+          `要跟它说，把消息发进它的子话题：\n` +
+          `  botmux dispatch --into ${seed} --bot ${m.open_id} --brief "..."\n` +
+          `（确属新会话/有意为之，加 --anyway 强发。）`);
+        process.exit(2);
       }
     }
   }
@@ -3047,6 +3053,16 @@ async function cmdSend(rest: string[]): Promise<void> {
             break;
           }
           if (alreadyMentioned.has(senderScopedId)) break;
+          // Footgun guard at the auto-injection source: don't turn a prose
+          // `@OtherSubBot` into a real @ for a dispatched sub-bot that's off-topic
+          // here — that would spawn a context-less session in the main chat (the
+          // explicit guard above only saw --mention/--mention-back). Drop the
+          // injection (don't block the whole send); --anyway forces it through.
+          const injOffSeed = rest.includes('--anyway') ? null : offTopicSubBotSeed(senderScopedId);
+          if (injOffSeed) {
+            console.error(`[botmux send] 跳过正文 @${entry.botName} 自动注入：它是 dispatch 派进子话题 ${injOffSeed} 的子 bot、不在本会话——避免在主群另起无上下文会话（要强发加 --anyway）。`);
+            break;
+          }
           mentions.push({ open_id: senderScopedId, name: entry.botName });
           alreadyMentioned.add(senderScopedId);
           break;
