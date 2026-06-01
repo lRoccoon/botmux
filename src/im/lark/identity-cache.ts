@@ -31,13 +31,19 @@ export interface IdentityRecord {
   openId: string;
   type: IdentityType;
   name?: string;
-  source: 'sender' | 'mention' | 'contact_api' | 'bot_cross_ref' | 'bot_info';
+  source: 'sender' | 'mention' | 'contact_api' | 'bot_cross_ref' | 'bot_info' | 'chat_member' | 'introduce_probe';
   updatedAt: number;
 }
 
 const stores = new Map<string, Map<string, IdentityRecord>>();
 const inflight = new Map<string, Promise<void>>();
 const scopeUnavailable = new Set<string>();
+// Per-`${larkAppId}:${openId}` negative cache for contact.v3.user.get code
+// 41050 "no user authority error" — that specific user sits outside the app's
+// 通讯录可见范围. Unlike 99991672 (whole-app scope missing → app-wide breaker),
+// 41050 is per-user, so we mark just that open_id. Without this, every inbound
+// message from an out-of-scope user re-burns the 800ms-budgeted contact call.
+const unresolvableUsers = new Set<string>();
 const dirty = new Set<string>();
 let flushTimer: NodeJS.Timeout | null = null;
 
@@ -175,6 +181,7 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
   if (cached?.name) return cached.name;
   if (cached?.type === 'bot' || cached?.type === 'app') return undefined;
   if (scopeUnavailable.has(larkAppId)) return undefined;
+  if (unresolvableUsers.has(`${larkAppId}:${openId}`)) return undefined;
 
   const key = `${larkAppId}:${openId}`;
   let pending = inflight.get(key);
@@ -233,6 +240,13 @@ async function fetchUserName(larkAppId: string, openId: string): Promise<void> {
           `[identity] [${larkAppId}] contact:user.base:readonly 未开通，sender name 解析将降级到 open_id (code=99991672)`,
         );
       }
+      return;
+    }
+    // 41050 = no user authority：该 user 不在 app 通讯录可见范围。per-user 负缓存
+    // （区别于 99991672 的 app 级熔断），避免每条消息重打 contact API。后续的群成员
+    // API / 主动 @ 兜底层仍可拿到这个人的名字，所以这里降级不影响最终解析结果。
+    if (res?.code === 41050) {
+      unresolvableUsers.add(`${larkAppId}:${openId}`);
       return;
     }
     logger.debug(
