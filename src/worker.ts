@@ -55,8 +55,9 @@ import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
-import { ZellijBackend } from './adapters/backend/zellij-backend.js';
+import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
+import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
 import type { SessionBackend } from './adapters/backend/types.js';
@@ -93,9 +94,21 @@ let httpServer: ReturnType<typeof createHttpServer> | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
 const authedClients = new WeakSet<WebSocket>();
-/** Per-WS-client tmux attach PTYs (tmux mode only). */
+/** Per-WS-client tmux/zellij attach PTYs. */
 const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
+
+/** Lazily-written locked-mode zellij config for per-WS web-terminal attach
+ *  clients: cleared keybinds + locked mode so every keystroke passes straight
+ *  to the focused (codex) pane, never intercepted as a zellij shortcut. */
+let zellijAttachCfgPath: string | null = null;
+function ensureZellijAttachConfig(): string {
+  if (zellijAttachCfgPath) return zellijAttachCfgPath;
+  const p = join(process.env.SESSION_DATA_DIR ?? '/tmp', '.zellij-web-attach.kdl');
+  try { writeFileSync(p, ZELLIJ_CONFIG_KDL); } catch { /* best effort */ }
+  zellijAttachCfgPath = p;
+  return p;
+}
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
@@ -3258,6 +3271,71 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 // Read-only: allow mouse events through (scroll/click are
                 // non-destructive in tmux — just views history / selects text).
                 // SGR mouse: \x1b[<...  X10 mouse: \x1b[M...
+                if (!/^\x1b\[([<M])/.test(msg.data)) return;
+              }
+              if (cp) cp.write(msg.data);
+              else pendingInput.push(msg.data);
+            }
+          } catch { /* ignore non-JSON or bad messages */ }
+        });
+
+        ws.on('close', () => {
+          clearTimeout(spawnTimer);
+          wsClients.delete(ws);
+          const existing = clientPtys.get(ws);
+          if (existing) {
+            try { existing.kill(); } catch { /* already dead */ }
+            clientPtys.delete(ws);
+          }
+        });
+      } else if (lastInitConfig?.adoptMode && lastInitConfig?.adoptZellijPaneId) {
+        // ── Zellij-adopt per-WS attach ──
+        // Each WS client gets its own `zellij attach` PTY sized to the browser.
+        // zellij sizes the (shared) pane to the SMALLEST attached client, so
+        // when the user's terminal is detached the web client governs the size
+        // → fully browser-responsive (申晗's insight, verified), never resizing
+        // the user's terminal beyond min(theirs, browser). Locked-mode config
+        // (cleared keybinds) makes every keystroke reach the codex pane instead
+        // of being swallowed as a zellij shortcut. Bonus: raw byte stream — none
+        // of the dump-screen snapshot / \r\n / fixed-width machinery the relay
+        // needs. (The Lark screenshot card still uses the dump-screen
+        // ObserveBackend; unaffected.) Deferred until first resize, same as tmux.
+        const zSession = lastInitConfig.adoptZellijSession ?? '';
+        const cfgPath = ensureZellijAttachConfig();
+        let cp: pty.IPty | null = null;
+        const pendingInput: string[] = [];
+
+        const startAttach = (cols: number, rows: number) => {
+          if (cp) return;
+          cp = pty.spawn('zellij', ['--config', cfgPath, 'attach', zSession], {
+            name: 'xterm-256color',
+            cols,
+            rows,
+            env: zellijEnv() as { [key: string]: string },
+          });
+          clientPtys.set(ws, cp);
+          cp.onData((d: string) => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(d);
+          });
+          cp.onExit(() => {
+            clientPtys.delete(ws);
+            if (ws.readyState === WebSocket.OPEN) ws.close();
+          });
+          for (const data of pendingInput) cp.write(data);
+          pendingInput.length = 0;
+        };
+
+        const spawnTimer = setTimeout(() => startAttach(150, 40), 500);
+
+        ws.on('message', (raw) => {
+          try {
+            const msg = JSON.parse(String(raw));
+            if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
+              if (!cp) { clearTimeout(spawnTimer); startAttach(msg.cols, msg.rows); }
+              else cp.resize(msg.cols, msg.rows);
+            } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!authedClients.has(ws)) {
+                // Read-only: only let mouse events (scroll/select) through.
                 if (!/^\x1b\[([<M])/.test(msg.data)) return;
               }
               if (cp) cp.write(msg.data);
