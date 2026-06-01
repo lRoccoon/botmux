@@ -35,7 +35,7 @@ const SETTLED_STATUSES = ['done', 'blocked', 'idle'] as const;
 
 type JsonCommandResult = { ok: true; value: any | undefined } | { ok: false };
 
-function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: string }): JsonCommandResult {
+function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): JsonCommandResult {
   try {
     const out = execFileSync('herdr', args, {
       encoding: 'utf-8',
@@ -43,6 +43,7 @@ function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: strin
       stdio: opts?.input === undefined ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
       timeout: opts?.timeout ?? 5000,
       maxBuffer: 16 * 1024 * 1024,
+      env: opts?.env,
     }).trim();
     return { ok: true, value: out ? JSON.parse(out) : undefined };
   } catch {
@@ -50,7 +51,7 @@ function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: strin
   }
 }
 
-function jsonCommand(args: string[], opts?: { timeout?: number; input?: string }): any | undefined {
+function jsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): any | undefined {
   const result = tryJsonCommand(args, opts);
   return result.ok ? result.value : undefined;
 }
@@ -108,6 +109,8 @@ export class HerdrBackend implements SessionBackend {
   private rows = 50;
   private agentProbeFailures = 0;
 
+  private childEnv: Record<string, string> | undefined;
+
   claudeJsonlPath?: string;
   cliPid?: number;
   cliCwd?: string;
@@ -156,6 +159,17 @@ export class HerdrBackend implements SessionBackend {
     this.cols = opts.cols;
     this.rows = opts.rows;
     this.cliCwd = opts.cwd;
+    // worker.ts builds opts.env via redactChildEnv() (drops bare LARK_APP_*)
+    // and injects BOTMUX_SESSION_ID/CHAT_ID/LARK_APP_ID/ROOT_MESSAGE_ID. We
+    // must thread this env into the herdr daemon spawn AND the agent-start
+    // call so the CLI inside herdr sees the same env the PTY/tmux backends
+    // would have given it. Otherwise:
+    //   - botmux send/ask in the CLI see no BOTMUX_* and exit 2
+    //   - the worker's bare LARK_APP_SECRET (still in process.env) leaks
+    //     into the CLI process via plain process.env inheritance
+    // Skip on externalTarget: that's the user's own pre-existing herdr
+    // session; we can't (and shouldn't) re-env an already-running CLI.
+    this.childEnv = this.opts.externalTarget ? undefined : { ...opts.env };
     this.ensureServer();
 
     const external = this.opts.externalTarget;
@@ -170,7 +184,7 @@ export class HerdrBackend implements SessionBackend {
           'agent', 'start', this.agentName,
           '--cwd', opts.cwd,
           '--', bin, ...args,
-        ]), { timeout: 10_000 });
+        ]), { timeout: 10_000, env: this.childEnv });
         const agent = extractAgent(started);
         if (!agent) throw new Error(`failed to start herdr agent ${this.agentName} in ${this.sessionName}`);
         this.paneId = agent.pane_id;
@@ -265,9 +279,14 @@ export class HerdrBackend implements SessionBackend {
   private ensureServer(): void {
     if (HerdrBackend.hasSession(this.sessionName)) return;
     if (this.opts.externalTarget) throw new Error(`herdr session ${this.sessionName} is not running`);
+    // Pass childEnv to the herdr daemon: the daemon forks the agent CLI as
+    // its own child, so the daemon's env is what the CLI ultimately
+    // inherits. Without this, the CLI would see worker.ts process.env (bare
+    // LARK_APP_SECRET, no BOTMUX_*).
     this.serverProcess = spawn('herdr', ['--session', this.sessionName, 'server'], {
       stdio: 'ignore',
       detached: true,
+      env: this.childEnv,
     });
     this.serverProcess.unref();
 
@@ -334,9 +353,18 @@ export class HerdrBackend implements SessionBackend {
       return;
     }
     this.agentProbeFailures = 0;
-    const agentAlive = agents.some(agent => agent?.name === this.agentName || agent?.pane_id === this.paneId);
-    if (this.started && !agentAlive) {
-      this.handleExit(0, null);
+    // herdr v0.6.6+ keeps exited agents in `agent list` with running:false /
+    // status:"exited" instead of dropping them, so name-presence alone isn't
+    // a liveness signal — we'd never see the CLI exit, the worker would
+    // never emit `claude_exit`, and the session would hang. Match against
+    // BOTH the historical "row vanished" case AND the new sentinel fields.
+    const matchingAgent = agents.find(agent => agent?.name === this.agentName || agent?.pane_id === this.paneId);
+    const agentExited = matchingAgent
+      ? matchingAgent.running === false || matchingAgent.status === 'exited'
+      : true;
+    if (this.started && agentExited) {
+      const exitCode = typeof matchingAgent?.exit_code === 'number' ? matchingAgent.exit_code : 0;
+      this.handleExit(exitCode, null);
       return;
     }
 
@@ -405,9 +433,19 @@ export class HerdrBackend implements SessionBackend {
         // Anything else suggests target vanished; verify before re-arming.
         if (code !== 0 && code !== 1) {
           const agents = this.listAgents();
-          if (agents !== null && !agents.some(a => a?.pane_id === this.paneId || a?.name === this.agentName)) {
-            this.handleExit(0, null);
-            return;
+          if (agents !== null) {
+            const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
+            // Treat the v0.6.6+ tombstone (running:false / status:exited) the
+            // same as a vanished row — otherwise the watcher would re-arm
+            // forever against a dead agent.
+            const exited = matching
+              ? matching.running === false || matching.status === 'exited'
+              : true;
+            if (exited) {
+              const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
+              this.handleExit(exitCode, null);
+              return;
+            }
           }
         }
         this.startStatusWatcher();

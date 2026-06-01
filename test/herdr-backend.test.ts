@@ -47,6 +47,14 @@ function findCall(predicate: (args: string[]) => boolean): string[] | undefined 
   return undefined;
 }
 
+function findCallOpts(predicate: (args: string[]) => boolean): any | undefined {
+  for (const call of mockedExecFileSync.mock.calls) {
+    const args = (call[1] as string[]) ?? [];
+    if (predicate(args)) return call[2];
+  }
+  return undefined;
+}
+
 function herdrCall(...needles: string[]): string[] | undefined {
   return findCall(args => needles.every(n => args.includes(n)));
 }
@@ -238,6 +246,92 @@ describe('HerdrBackend.destroySession ownership', () => {
   });
 });
 
+// ─── Env propagation ───────────────────────────────────────────────────────
+
+describe('HerdrBackend env propagation', () => {
+  // Regression: worker.ts hands us a redacted+injected env (BOTMUX_* added,
+  // bare LARK_APP_SECRET deleted). If we don't thread that env through the
+  // herdr daemon spawn AND the agent-start call, the CLI inside herdr sees
+  // raw process.env: missing BOTMUX_* (botmux send/ask exits 2) AND leaks
+  // LARK_APP_SECRET. Both are blocking bugs from PR #81 review.
+  const cliEnv = {
+    BOTMUX_SESSION_ID: 'sess-1',
+    BOTMUX_CHAT_ID: 'chat-1',
+    BOTMUX_LARK_APP_ID: 'app-1',
+    BOTMUX_ROOT_MESSAGE_ID: 'msg-1',
+    PATH: '/usr/bin',
+    // Intentionally NOT including LARK_APP_SECRET — redactChildEnv would
+    // have already dropped it before reaching the backend.
+  };
+
+  it('fresh server boot: spawns `herdr server` with the worker-supplied env', () => {
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => { listCount++; return listCount >= 2 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY; },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '2-3' } } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    const be = new HerdrBackend(SESSION);
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: cliEnv });
+
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn).toBeDefined();
+    const serverOpts = serverSpawn![2] as { env?: Record<string, string> };
+    expect(serverOpts.env).toBeDefined();
+    expect(serverOpts.env!.BOTMUX_SESSION_ID).toBe('sess-1');
+    expect(serverOpts.env!.BOTMUX_LARK_APP_ID).toBe('app-1');
+    // Ensure we didn't accidentally pass through the test runner's env
+    // (which would re-introduce whatever the parent shell exported).
+    expect('LARK_APP_SECRET' in serverOpts.env!).toBe(false);
+    be.kill();
+  });
+
+  it('agent start: passes the worker-supplied env to execFileSync', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '2-3' } } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    const be = new HerdrBackend(SESSION);
+    be.spawn('claude', ['--resume', 'abc'], { cwd: '/work', cols: 80, rows: 24, env: cliEnv });
+
+    const opts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(opts).toBeDefined();
+    expect(opts!.env).toBeDefined();
+    expect(opts!.env.BOTMUX_SESSION_ID).toBe('sess-1');
+    expect(opts!.env.BOTMUX_CHAT_ID).toBe('chat-1');
+    be.kill();
+  });
+
+  it('external target adopt: skips env injection (user owns the running CLI)', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: '1-1', paneId: '1-1' },
+    });
+    be.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: cliEnv });
+    // Adopt path doesn't run `herdr server` or `agent start`, so there's
+    // no env to assert — just verify no agent-start was issued.
+    expect(herdrCall('agent', 'start', 'botmux')).toBeUndefined();
+    be.kill();
+  });
+});
+
 // ─── Message writing ───────────────────────────────────────────────────────
 
 describe('HerdrBackend message writing', () => {
@@ -377,6 +471,37 @@ describe('HerdrBackend callbacks', () => {
     agentAlive = false;
     vi.advanceTimersByTime(600);
     expect(exits).toEqual([[0, null]]);
+  });
+
+  it('onExit fires when the agent stays in list with running:false (v0.6.6 tombstone)', () => {
+    // herdr v0.6.6+ does NOT drop exited agents from `agent list` — they
+    // stick around with running:false / status:"exited". Without this
+    // detection the worker never sees the CLI exit → claude_exit never
+    // fires → session hangs (the bug deepcoldy reported in PR #81).
+    let agentRunning = true;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => agentRunning
+          ? AGENT_LIST_REPLY('1-1')
+          : JSON.stringify({ result: { agents: [{ name: 'botmux', pane_id: '1-1', running: false, status: 'exited', exit_code: 7 }] } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION);
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    agentRunning = false;
+    vi.advanceTimersByTime(600);
+    // exit_code surfaces from the tombstone row so callers can distinguish
+    // clean exits from crashes (mirrors the PTY backend's exit code path).
+    expect(exits).toEqual([[7, null]]);
   });
 
   it('status watcher: one wait child per settled status (done/blocked/idle), first exit wins', () => {
