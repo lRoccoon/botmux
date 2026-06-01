@@ -13,7 +13,7 @@
  * project dir). If a pane matches zero or >1 process, we REFUSE it (skip) —
  * better no-adopt than adopting the wrong pane (Codex's guidance).
  */
-import { realpathSync } from 'node:fs';
+import { realpathSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
 import {
@@ -49,26 +49,82 @@ function canonPath(p: string | undefined): string | undefined {
   return out.length > 1 && out.endsWith('/') ? out.slice(0, -1) : out;
 }
 
+/** Interpreters that launch a CLI as a script argument (fnm/npx shims, etc.),
+ *  so the CLI identity lives in argv, not in comm. */
+const INTERPRETERS = new Set(['node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'ruby', 'npx', 'tsx']);
+
+/** /proc/<pid>/cmdline → argv (Linux fast path; ps fallback for macOS). */
+function readCmdline(pid: number): string[] {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').split('\0').filter(Boolean);
+  } catch {
+    try {
+      const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+      return out.trim().split(/\s+/).filter(Boolean);
+    } catch { return []; }
+  }
+}
+
+/**
+ * Resolve a CliId from a process's comm + argv (pure — unit testable). Checks
+ * comm first (renamed binary, e.g. `codex`/`claude`); if comm is a bare
+ * interpreter (e.g. an fnm shim launches `node …/bin/codex`, so /proc/comm is
+ * "node"), scan argv for the CLI script basename. Without this, node-wrapped
+ * CLIs are invisible to discovery.
+ */
+export function cliIdFromCommArgv(comm: string | undefined, argv: string[], filterCliId?: CliId): CliId | undefined {
+  if (!comm) return undefined;
+  // cliIdForComm only special-cases mtr/opencode for filterCliId; it does NOT
+  // otherwise filter — so apply the filter explicitly at the end.
+  let detected = cliIdForComm(comm, filterCliId);
+  if (!detected && INTERPRETERS.has(comm)) {
+    for (const arg of argv.slice(1)) {
+      if (arg.startsWith('-')) continue; // skip flags
+      const id = cliIdForComm(basename(arg), filterCliId);
+      if (id) { detected = id; break; }
+    }
+  }
+  if (!detected) return undefined;
+  if (filterCliId && detected !== filterCliId) return undefined;
+  return detected;
+}
+
+function cliIdForProc(pid: number, filterCliId?: CliId): CliId | undefined {
+  return cliIdFromCommArgv(readComm(pid), readCmdline(pid), filterCliId);
+}
+
 /** BFS the process tree under rootPid collecting every known CLI process with
- *  its cwd, for matching against dump-layout panes. */
+ *  its cwd, for matching against dump-layout panes. Interpreter-wrapper chains
+ *  (e.g. an fnm shim `node …/bin/codex` whose child is the native `codex`
+ *  binary) are collapsed to ONE entry — the deepest match — so a single CLI
+ *  doesn't look like two same-cwd candidates (which would trip the ambiguity
+ *  guard). The deepest process is also the one holding the transcript fds,
+ *  matching tmux's findCliProcess. */
 function findAllClisUnder(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,
 ): Array<{ pid: number; cliId: CliId; cwd?: string }> {
   const found: Array<{ pid: number; cliId: CliId; cwd?: string }> = [];
+  const parentOf = new Map<number, number>();
   let current = [rootPid];
   for (let depth = 0; depth <= maxDepth && current.length > 0; depth++) {
     const next: number[] = [];
     for (const pid of current) {
-      const comm = readComm(pid);
-      const cliId = comm ? cliIdForComm(comm, filterCliId) : undefined;
+      const cliId = cliIdForProc(pid, filterCliId);
       if (cliId) found.push({ pid, cliId, cwd: canonPath(readCwd(pid)) });
-      next.push(...getChildPids(pid));
+      for (const ch of getChildPids(pid)) { parentOf.set(ch, pid); next.push(ch); }
     }
     current = next;
   }
-  return found;
+  // Drop a match that is an ancestor of another same-cliId match (the wrapper);
+  // keep the deepest (native) process.
+  const isAncestor = (anc: number, desc: number): boolean => {
+    let p: number | undefined = desc;
+    while (p !== undefined && parentOf.has(p)) { p = parentOf.get(p); if (p === anc) return true; }
+    return false;
+  };
+  return found.filter(m => !found.some(n => n.pid !== m.pid && n.cliId === m.cliId && isAncestor(m.pid, n.pid)));
 }
 
 /** Run a read-only `zellij --session S action …`, returning stdout or null. */
@@ -161,12 +217,13 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
       const term = terminals[i]!;
       if (!leaf.command) continue; // bare shell pane — not adoptable
 
-      const expectedCliId = cliIdForComm(basename(leaf.command), filterCliId);
-      if (!expectedCliId) continue;
-      if (filterCliId && expectedCliId !== filterCliId) continue;
-
+      // The cliId comes from the actual PROCESS (cliIdForProc handles
+      // node-wrapped CLIs where dump-layout's command is just "node"); we only
+      // need leaf.command to know the pane is running something. Bind by cwd:
+      // each running pane's cwd should match exactly one process-tree CLI of
+      // the (already filtered) cliId. `clis` is pre-filtered by filterCliId.
       const paneCwd = canonPath(leaf.cwd);
-      const matches = clis.filter(c => c.cliId === expectedCliId && c.cwd && c.cwd === paneCwd);
+      const matches = clis.filter(c => c.cwd && c.cwd === paneCwd);
       // Refuse ambiguous (>1) or unresolved (0) — never adopt the wrong pane.
       if (matches.length !== 1) continue;
       const cli = matches[0]!;
@@ -174,12 +231,12 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
       const dims = paneDimensions(session, term.paneId);
       if (!dims) continue;
 
-      const { sessionId, startedAt } = resolveSessionId(expectedCliId, cli.pid);
+      const { sessionId, startedAt } = resolveSessionId(cli.cliId, cli.pid);
       results.push({
         zellijSession: session,
         zellijPaneId: term.paneId,
         cliPid: cli.pid,
-        cliId: expectedCliId,
+        cliId: cli.cliId,
         sessionId,
         cwd: cli.cwd ?? leaf.cwd ?? '',
         startedAt,

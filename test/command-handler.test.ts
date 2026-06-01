@@ -234,6 +234,13 @@ vi.mock('../src/core/session-discovery.js', () => ({
   validateAdoptTarget: vi.fn(() => true),
 }));
 
+// /adopt now merges tmux + zellij discovery; mock zellij so tests don't shell
+// out to a real `zellij` on the host (would surface live sessions and flake).
+vi.mock('../src/core/zellij-adopt-discovery.js', () => ({
+  discoverAdoptableZellijSessions: vi.fn(() => []),
+  validateZellijAdoptTarget: vi.fn(() => true),
+}));
+
 vi.mock('../src/services/codex-app-threads.js', () => ({
   listCodexAppThreads: vi.fn(async () => []),
 }));
