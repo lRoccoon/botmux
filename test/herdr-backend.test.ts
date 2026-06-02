@@ -124,7 +124,9 @@ describe('HerdrBackend connection surface', () => {
       { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
       { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
     ]);
-    const be = new HerdrBackend(SESSION);
+    // Session already exists ⇒ this is the reattach path (resolves paneId via
+    // `agent get`, no `agent start`).
+    const be = new HerdrBackend(SESSION, { isReattach: true });
     be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
     // Only the bg status watcher should be spawned. No `herdr ... server`, no
     // sleep child_process call.
@@ -146,10 +148,16 @@ describe('HerdrBackend connection surface', () => {
           return listCount >= 4 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY;
         },
       },
-      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '1-1' } } }),
+      },
       { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
     ]);
-    const be = new HerdrBackend(SESSION);
+    // No pre-existing session ⇒ fresh start: boots `herdr server`, then
+    // `agent start`s the CLI.
+    const be = new HerdrBackend(SESSION, { createSession: true });
     be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
     const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
     expect(serverSpawn).toBeDefined();
@@ -184,15 +192,37 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
-  it('reuses an existing agent without re-running `agent start`', () => {
+  it('reattach reuses an existing agent without re-running `agent start`', () => {
+    // Reuse is gated on isReattach: only a genuine daemon-restart reattach to a
+    // still-alive session adopts the existing `botmux` row. A fresh spawn (incl.
+    // the /restart respawn) always `agent start`s — see the restart test below.
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
       { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('9-9') },
       { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
     ]);
-    const be = new HerdrBackend(SESSION);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
     be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
     expect(herdrCall('agent', 'start', 'botmux')).toBeUndefined();
+    be.kill();
+  });
+
+  it('fresh spawn does NOT reuse a residual agent row — always `agent start`s (restart fix)', () => {
+    // Regression for the /restart no-op: after destroySession, herdr can
+    // resurrect a dead `botmux` row. A non-reattach spawn must ignore it and
+    // start the new CLI, or the resume:true respawn silently runs nothing.
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('9-9') },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: 'fresh-1' } } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', ['--resume', 'x'], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(herdrCall('agent', 'start', 'botmux')).toBeDefined();
     be.kill();
   });
 
@@ -341,7 +371,9 @@ describe('HerdrBackend message writing', () => {
       { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(paneId) },
       { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
     ]);
-    const be = new HerdrBackend(SESSION);
+    // isReattach so the mocked `agent get` row resolves paneId without needing
+    // an `agent start` reply (reuse is now gated on the reattach path).
+    const be = new HerdrBackend(SESSION, { isReattach: true });
     be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
     mockedExecFileSync.mockClear();
     // re-install the response handlers since mockClear wipes them
@@ -463,7 +495,7 @@ describe('HerdrBackend callbacks', () => {
     ]);
 
     vi.useFakeTimers();
-    const be = new HerdrBackend(SESSION);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
     const exits: Array<[number | null, string | null]> = [];
     be.onExit((code, signal) => exits.push([code, signal]));
     be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
@@ -492,7 +524,7 @@ describe('HerdrBackend callbacks', () => {
     ]);
 
     vi.useFakeTimers();
-    const be = new HerdrBackend(SESSION);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
     const exits: Array<[number | null, string | null]> = [];
     be.onExit((code, signal) => exits.push([code, signal]));
     be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });

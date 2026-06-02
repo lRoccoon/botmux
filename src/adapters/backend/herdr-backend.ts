@@ -154,7 +154,16 @@ export class HerdrBackend implements SessionBackend {
   }
 
   static killSession(name: string): void {
+    // stop AND delete. `session stop` alone leaves the session dir + agent
+    // metadata on disk (verified on herdr v0.6.6: the session lingers with
+    // running:false). When the server is later rebooted for the same name —
+    // e.g. the resume:true respawn after a /restart — herdr AUTO-RESTORES the
+    // old `botmux` agent row pointing at a DEAD pane. spawn()'s reuse branch
+    // would then treat that zombie as a live agent, skip `agent start`, and the
+    // new CLI would never run (the pane shows only a shell prompt). Deleting
+    // the session clears that metadata so the next spawn starts clean.
     runHerdr(['session', 'stop', name, '--json'], { timeout: 5000 });
+    runHerdr(['session', 'delete', name, '--json'], { timeout: 5000 });
   }
 
   static listBotmuxSessions(): string[] {
@@ -189,7 +198,15 @@ export class HerdrBackend implements SessionBackend {
     if (external) {
       this.paneId = external.paneId ?? external.target;
     } else {
-      const existing = this.getAgent();
+      // Reuse an existing `botmux` agent ONLY when we're genuinely re-attaching
+      // to a still-alive session (daemon restart while the herdr server kept
+      // running). On a fresh start — including the resume:true respawn after a
+      // /restart — we must always `agent start` the new CLI. Reusing here is
+      // what made /restart silently no-op: herdr can resurrect a dead `botmux`
+      // row from persisted metadata, and reuse would skip `agent start` so the
+      // new command never ran. killSession() now deletes that metadata, but we
+      // also gate reuse on isReattach so a stale row can never be adopted.
+      const existing = this.isReattach ? this.getAgent() : undefined;
       if (existing) {
         this.paneId = existing.pane_id;
       } else {

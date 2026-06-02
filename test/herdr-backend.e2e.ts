@@ -113,6 +113,36 @@ describe('HerdrBackend (e2e)', () => {
     await waitFor(() => !HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session torn down');
   }, TEST_TIMEOUT);
 
+  it.skipIf(!HerdrBackend.isAvailable())('restart: destroySession() then a fresh spawn on the same name runs the NEW CLI', async () => {
+    // Regression for the /restart no-op: destroySession() does `session stop`,
+    // but herdr persists the session dir and resurrects a dead `botmux` agent
+    // row when the server reboots. The old code reused that zombie row and
+    // skipped `agent start`, so the resume:true respawn never ran the new CLI
+    // (the pane showed only a shell prompt). Fix: killSession() now deletes the
+    // session, and a NON-reattach spawn always `agent start`s.
+    const be1 = new HerdrBackend(TEST_SESSION);
+    be1.spawn('/bin/bash', ['-lc', 'echo FIRST_CLI; sleep 30'], spawnOpts());
+    await waitFor(() => be1.captureCurrentScreen().includes('FIRST_CLI'), 10_000, 'FIRST_CLI ran');
+
+    // /restart: tear the session down, then a fresh (non-reattach) spawn.
+    be1.destroySession();
+    await waitFor(() => !HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session destroyed');
+
+    const be2 = new HerdrBackend(TEST_SESSION, { createSession: true });
+    be2.spawn('/bin/bash', ['-lc', 'echo SECOND_CLI; sleep 30'], spawnOpts());
+    expect(be2.isReattach).toBe(false);
+
+    // The new CLI must actually run: its marker appears, and the stale one is
+    // gone (we started a brand-new pane, not the resurrected dead row).
+    await waitFor(() => {
+      const screen = be2.captureCurrentScreen();
+      return screen.includes('SECOND_CLI') && !screen.includes('FIRST_CLI');
+    }, 12_000, 'SECOND_CLI ran on a fresh pane (not the resurrected FIRST row)');
+
+    be2.destroySession();
+    await waitFor(() => !HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session torn down');
+  }, TEST_TIMEOUT);
+
   it.skipIf(!HerdrBackend.isAvailable())('write() routes input to the pane and the shell echoes it back', async () => {
     const backend = new HerdrBackend(TEST_SESSION);
     backend.spawn('/bin/bash', ['-lc', 'cat'], spawnOpts());
