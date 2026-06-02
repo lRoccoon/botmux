@@ -44,7 +44,7 @@ import {
   hasOwnerEntry,
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
-import { buildPreset, serializePreset } from './setup/agent-preset.js';
+import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { logger } from './utils/logger.js';
@@ -2409,6 +2409,23 @@ function argFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+/**
+ * True when `flag` is present but lacks a usable value — i.e. it's the last
+ * token, is followed by another flag, or was given as `--flag=` (empty). Lets
+ * callers surface a friendly error instead of silently falling back to a
+ * default (e.g. treating a value-less `--from-chat` as "no chat"). `allowDash`
+ * permits a bare `-` value (used by `--out -` to mean stdout).
+ */
+function flagPresentButValueMissing(args: string[], flag: string, allowDash = false): boolean {
+  const i = args.findIndex(a => a === flag || a.startsWith(flag + '='));
+  if (i < 0) return false; // absent entirely — not "missing a value"
+  if (args[i].startsWith(flag + '=')) return args[i].slice(flag.length + 1) === '';
+  const next = args[i + 1];
+  if (next === undefined) return true;
+  if (next.startsWith('-')) return !(allowDash && next === '-');
+  return false;
+}
+
 /** Extract positional args, skipping --flag and the value that follows it
  *  (for --flag <value> style).  --flag=value style is self-contained.
  *  `booleanFlags` lists flags that take no value — without this hint the
@@ -4380,8 +4397,10 @@ async function cmdPreset(sub: string, rest: string[]): Promise<void> {
  *
  * Role source: team-level by default; `--from-chat <chatId>` exports that
  * group's role content instead (the chatId itself is dropped). Both role and
- * capability resolve under `config.session.dataDir`; inside an agent session the
- * daemon injects SESSION_DATA_DIR so that points at the live ~/.botmux data dir.
+ * capability resolve under the effective data dir: this fn sets
+ * `SESSION_DATA_DIR ??= resolveDataDir()` (SESSION_DATA_DIR → ~/.botmux
+ * breadcrumb → default), and reads it via config.session.dataDir's lazy getter —
+ * correct in agent sessions and bare-shell runs alike.
  */
 async function cmdPresetExport(rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
@@ -4426,11 +4445,30 @@ async function cmdPresetExport(rest: string[]): Promise<void> {
     return;
   }
 
+  // Fail loudly when a flag was given without a value, instead of silently
+  // exporting as if it weren't passed (e.g. a value-less `--from-chat` would
+  // otherwise quietly fall back to the team role).
+  if (flagPresentButValueMissing(rest, '--from-chat')) {
+    console.error('❌ --from-chat 需要一个 chatId（如 oc_xxx）。');
+    console.error(USAGE);
+    process.exit(1);
+    return;
+  }
+  if (flagPresentButValueMissing(rest, '--out', true)) {
+    console.error('❌ --out 需要一个文件路径，或用 `--out -` 输出到 stdout。');
+    console.error(USAGE);
+    process.exit(1);
+    return;
+  }
+
   const fromChat = argValue(rest, '--from-chat');
   const out = argValue(rest, '--out');
   const skipConfirm = argFlag(rest, '--yes') || argFlag(rest, '-y');
 
-  // capability + role read the SAME data dir so they never diverge.
+  // capability + role read the SAME data dir. config.session.dataDir is a lazy
+  // getter, so the SESSION_DATA_DIR set at the top of this fn (= resolveDataDir())
+  // is honored — correct for both agent sessions AND bare-shell runs (no longer
+  // the frozen packaged default).
   const dataDir = config.session.dataDir;
   const { resolveTeamRoleFile, resolveRoleFile } = await import('./core/role-resolver.js');
   const { getBotCapability } = await import('./services/bot-profile-store.js');
@@ -4493,7 +4531,7 @@ async function cmdPresetExport(rest: string[]): Promise<void> {
     return;
   }
 
-  const outPath = out ?? `./${sourceName ?? appId}.botmux-preset.json`;
+  const outPath = out ?? `./${presetFilename(sourceName, appId)}`;
   try {
     writeFileSync(outPath, json, 'utf-8');
   } catch (err: any) {

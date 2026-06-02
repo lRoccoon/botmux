@@ -109,6 +109,32 @@ export function serializePreset(preset: AgentPreset): string {
   return JSON.stringify(preset, null, 2) + '\n';
 }
 
+/**
+ * Slugify a string into a safe filename component: keep Unicode letters / digits
+ * / `_` / `.` / `-`, replace every other run with a single `-`, then trim
+ * leading/trailing separators. Returns '' if nothing usable remains (e.g. the
+ * input was only spaces or slashes). CJK names are preserved (they're \p{L}).
+ */
+export function slugifyForFilename(raw: string): string {
+  return raw
+    .trim()
+    .replace(/[^\p{L}\p{N}_.-]+/gu, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[.\-]+|[.\-]+$/g, '');
+}
+
+/**
+ * Derive the default preset filename (no directory). Prefers the bot's human
+ * name, falls back to its larkAppId, and ALWAYS slugifies so the path stays
+ * valid/stable even when `name` carries spaces, slashes, etc. Never uses the
+ * `botmux-<n>` process name. Final 'bot' fallback guards the degenerate case
+ * where both name and appId slug to empty.
+ */
+export function presetFilename(sourceName: string | undefined, appId: string): string {
+  const base = slugifyForFilename(sourceName ?? '') || slugifyForFilename(appId) || 'bot';
+  return `${base}.botmux-preset.json`;
+}
+
 const presetSchema = z.object({
   botmuxPreset: z.literal(PRESET_VERSION),
   cliId: z.string().min(1),
