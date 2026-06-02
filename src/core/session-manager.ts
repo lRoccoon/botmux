@@ -742,6 +742,50 @@ function killPersistentSession(backendType: Exclude<BackendType, 'pty'>, name: s
 }
 
 /**
+ * Resolve a session's live web-terminal worker port, WAKING the worker on demand
+ * if needed.
+ *
+ * After a quiet restart (`BOTMUX_QUIET_RESTART=1`) workers are registered but not
+ * eagerly re-forked — they re-attach lazily on the next message. The terminal
+ * reverse-proxy, however, needs the worker's HTTP port to serve `/s/{id}`, so a
+ * surviving-but-worker-less session would otherwise 502 ("session not running")
+ * even though its tmux/zellij pane is alive. This bridges that gap: if the
+ * session is active and its persistent backing pane still exists, re-fork the
+ * worker to re-attach (empty prompt = no new turn, same as restart reattach) and
+ * wait for it to report its port.
+ *
+ * Returns the port, or undefined when there's nothing serveable (no live worker
+ * possible: not active, non-persistent backend, or the pane is gone). The
+ * `forkWorker` double-fork guard plus its synchronous `ds.worker` assignment make
+ * concurrent calls (the terminal's HTML GET + WS upgrade arrive together) safe —
+ * only the first forks; the rest just await the same `ds.workerPort`.
+ */
+export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<number | undefined> {
+  if (ds.workerPort) return ds.workerPort;
+  if (ds.session.status !== 'active') return undefined;
+
+  const backendType = getSessionPersistentBackendType(ds);
+  if (!backendType) return undefined;
+  if (!persistentSessionExists(backendType, persistentSessionName(backendType, ds.session.sessionId))) {
+    return undefined;
+  }
+
+  if (!ds.worker) {
+    logger.info(`[${ds.session.sessionId.substring(0, 8)}] terminal accessed with no live worker — waking to re-attach`);
+    forkWorker(ds, '', true);
+  }
+
+  // Wait (bounded) for the re-forked worker to report its HTTP port via `ready`.
+  // Re-attach is fast (~1-2s in practice); 10s covers a slow CLI restart.
+  const deadlineMs = Date.now() + 10_000;
+  while (Date.now() < deadlineMs) {
+    if (ds.workerPort) return ds.workerPort;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return ds.workerPort ?? undefined;
+}
+
+/**
  * Reactivate a single closed session — used by the "▶️ 恢复会话" card button
  * and the `botmux resume <id>` CLI command. Mirrors the per-session branch
  * of `restoreActiveSessions` but operates on one record by id and without

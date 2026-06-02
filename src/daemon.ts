@@ -75,6 +75,7 @@ import {
   executeScheduledTask,
   persistStreamCardState,
   rememberLastCliInput,
+  ensureTerminalWorkerPort,
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
@@ -2965,6 +2966,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       resolvePort: (sessionId) => {
         for (const ds of activeSessions.values()) {
           if (ds.session.sessionId === sessionId && ds.workerPort) return ds.workerPort;
+        }
+        return undefined;
+      },
+      // Quiet-restart leaves sessions registered but worker-less until messaged.
+      // Wake the worker on terminal access so links open without a manual ping.
+      ensureWorkerPort: async (sessionId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId === sessionId) return ensureTerminalWorkerPort(ds);
         }
         return undefined;
       },
