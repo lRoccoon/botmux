@@ -7,6 +7,7 @@ import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
@@ -35,6 +36,15 @@ export interface BotDefaultOncall {
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
+  /**
+   * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
+   * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
+   * （见 {@link normalizeBrand}），向后兼容。决定 SDK Client / WSClient 的
+   * domain、所有裸 fetch 的 host、OAuth / applink 深链等——全部从这一个字段
+   * 派生（见 im/lark/lark-hosts.ts）。setup 时自动识别后落盘；brand 绑定到
+   * 具体 app/租户，不在运行时切换（要换平台 = 重新配/加一个 bot）。
+   */
+  brand?: Brand;
   /** Optional process-name suffix; the daemon's process name is rendered as `botmux-<name>` (defaults to `botmux-<index>`). */
   name?: string;
   cliId: CliId;
@@ -239,6 +249,9 @@ export function registerBot(cfg: BotConfig): BotState {
   const client = new Lark.Client({
     appId: cfg.larkAppId,
     appSecret: cfg.larkAppSecret,
+    // brand → SDK domain。缺省走 feishu，国际版租户走 larksuite.com。
+    // 这一行同时修好了所有经由 SDK 的调用（发消息 / 文件 / contact 等）。
+    domain: sdkDomain(normalizeBrand(cfg.brand)),
     logger: larkLogger,
   });
   const state: BotState = {
@@ -271,6 +284,14 @@ export function getOwnerOpenId(larkAppId: string): string | undefined {
 /** Bot 自身的 open_id（用于在 mention 解析时排除自己）。 */
 export function getBotOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.botOpenId;
+}
+
+/**
+ * 安全地按 appId 取 brand。未注册（如跨进程 dashboard 聚合到别的 daemon 的
+ * 会话）→ 归一为 'feishu'。仅用于派生 applink 等 host，缺省 feishu 安全。
+ */
+export function getBotBrand(larkAppId: string | undefined): Brand {
+  return normalizeBrand(larkAppId ? bots.get(larkAppId)?.config.brand : undefined);
 }
 
 export function getAllBots(): BotState[] {
@@ -568,6 +589,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
+      // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
+      // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
+      brand: entry.brand === 'lark' ? 'lark' : undefined,
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,

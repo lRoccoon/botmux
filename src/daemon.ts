@@ -95,6 +95,7 @@ import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation } from './im/lark/event-dispatcher.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
+import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
@@ -3109,7 +3110,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const evicted = activeSessions.delete(key);
         logger.info(`[chat-mode-converted] ${chatId.substring(0, 12)} evicted=${evicted}; worker (if any) keeps running until /close`);
       },
-    });
+    }, normalizeBrand(cfg.brand));
   }
 
   // Restore active sessions from previous run

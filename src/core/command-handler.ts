@@ -14,6 +14,7 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage, sendMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
+import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply } from './worker-pool.js';
@@ -961,7 +962,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
           break;
         }
-        const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret);
+        const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret, normalizeBrand(botCfg2.brand));
         await sessionReply(rootId, [
           t('cmd.login.title', undefined, loc),
           '',
@@ -1252,7 +1253,7 @@ export async function handleCommand(
           });
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
-          const applink = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(result.chatId)}`;
+          const applink = chatAppLink(result.chatId, normalizeBrand(getBot(creatorAppId).config.brand));
           const link = result.shareLink ?? applink;
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
@@ -1557,7 +1558,7 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
           });
           newChatId = result.chatId;
-          const applink = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(result.chatId)}`;
+          const applink = chatAppLink(result.chatId, normalizeBrand(getBot(creatorAppId).config.brand));
           inviteLink = result.shareLink ?? applink;
         } catch (err: any) {
           logger.error(`[${logTag}] /relay --create: createGroup failed: ${err?.message ?? err}`);

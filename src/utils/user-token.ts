@@ -13,6 +13,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { logger } from './logger.js';
+import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
 
 // ─── Token paths ──────────────────────────────────────────────────────────────
 
@@ -48,6 +49,8 @@ interface PendingLogin {
   redirectUri: string;
   appId: string;
   appSecret: string;
+  /** 租户品牌——决定回调换 token 时打哪个域名。缺省 feishu。 */
+  brand: Brand;
   createdAt: number;
 }
 
@@ -83,9 +86,9 @@ function loadToken(): { token: TokenStore; source: string } | null {
 
 // ─── Token refresh ────────────────────────────────────────────────────────────
 
-async function refreshToken(token: TokenStore, appId: string, appSecret: string): Promise<TokenStore | null> {
+async function refreshToken(token: TokenStore, appId: string, appSecret: string, brand: Brand = 'feishu'): Promise<TokenStore | null> {
   try {
-    const res = await fetch('https://open.feishu.cn/open-apis/authen/v2/oauth/token', {
+    const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v2/oauth/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -127,7 +130,7 @@ async function refreshToken(token: TokenStore, appId: string, appSecret: string)
  * Resolve a valid User Access Token.
  * Returns access_token string, or null if unavailable.
  */
-export async function resolveUserToken(appId: string, appSecret: string): Promise<string | null> {
+export async function resolveUserToken(appId: string, appSecret: string, brand: Brand = 'feishu'): Promise<string | null> {
   // 1. Environment variable
   const envToken = process.env.FEISHU_USER_ACCESS_TOKEN;
   if (envToken) return envToken;
@@ -144,7 +147,7 @@ export async function resolveUserToken(appId: string, appSecret: string): Promis
 
   // access_token expired — try refresh
   if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
-    const refreshed = await refreshToken(token, appId, appSecret);
+    const refreshed = await refreshToken(token, appId, appSecret, brand);
     if (refreshed) return refreshed.access_token;
   }
 
@@ -154,7 +157,6 @@ export async function resolveUserToken(appId: string, appSecret: string): Promis
 
 // ─── Public API: OAuth login flow ─────────────────────────────────────────────
 
-const FEISHU_AUTH_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
 const DEFAULT_PORT = 9768;
 const DEFAULT_SCOPES = [
   'im:message:readonly',
@@ -166,7 +168,7 @@ const DEFAULT_SCOPES = [
  * Generate an OAuth authorization URL. Returns the URL and stores pending state.
  * Called by /login command handler.
  */
-export function generateAuthUrl(appId: string, appSecret: string): { authUrl: string; state: string } {
+export function generateAuthUrl(appId: string, appSecret: string, brand: Brand = 'feishu'): { authUrl: string; state: string } {
   const state = randomBytes(32).toString('hex');
   const redirectUri = `http://127.0.0.1:${DEFAULT_PORT}/callback`;
 
@@ -178,7 +180,8 @@ export function generateAuthUrl(appId: string, appSecret: string): { authUrl: st
     scope: DEFAULT_SCOPES,
   });
 
-  const authUrl = `${FEISHU_AUTH_URL}?${params.toString()}`;
+  // authorize 走 accounts host（feishu: accounts.feishu.cn / lark: accounts.larksuite.com）
+  const authUrl = `${larkHosts(brand).accounts}/open-apis/authen/v1/authorize?${params.toString()}`;
 
   // Store pending state for verification (expires in 5 minutes)
   pendingLogins.set(state, {
@@ -186,6 +189,7 @@ export function generateAuthUrl(appId: string, appSecret: string): { authUrl: st
     redirectUri,
     appId,
     appSecret,
+    brand,
     createdAt: Date.now(),
   });
 
@@ -219,7 +223,7 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
 
   // Exchange code for token
   try {
-    const res = await fetch('https://open.feishu.cn/open-apis/authen/v2/oauth/token', {
+    const res = await fetch(`${larkHosts(pending.brand).openApi}/open-apis/authen/v2/oauth/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

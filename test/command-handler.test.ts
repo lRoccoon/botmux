@@ -1221,7 +1221,8 @@ describe('handleCommand', () => {
 
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
 
-      expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1');
+      // brand 第三参：测试 bot 未配 brand → normalizeBrand → 'feishu'
+      expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu');
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('飞书用户授权');
       expect(replyContent).toContain('https://open.feishu.cn/auth/v1/test');
