@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildDetouredPendingResponseCard, buildPendingResponseCard } from '../src/im/lark/card-builder.js';
+import { buildMentionedPendingResponseCard, buildDetouredPendingResponseCard, buildPendingResponseCard } from '../src/im/lark/card-builder.js';
 
 describe('pending response card', () => {
   it('builds a processing card without manual quote text', () => {
@@ -32,5 +32,19 @@ describe('pending response card', () => {
 
     expect(card.header.title.content).toBe('Sent');
     expect(JSON.stringify(card)).toContain('sent to another target');
+  });
+
+  it('builds a mentioned-send card for replies sent as a new mention message', () => {
+    const card = JSON.parse(buildMentionedPendingResponseCard());
+
+    expect(card.header.title.content).toBe('已发送');
+    expect(JSON.stringify(card)).toContain('最终回复已通过新消息发送');
+  });
+
+  it('builds English mentioned-send card text', () => {
+    const card = JSON.parse(buildMentionedPendingResponseCard('en'));
+
+    expect(card.header.title.content).toBe('Sent');
+    expect(JSON.stringify(card)).toContain('sent as a new message');
   });
 });

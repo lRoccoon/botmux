@@ -1,6 +1,6 @@
 import type { Session } from '../types.js';
 
-export const COMPLETED_REACTION_EMOJI_TYPE = 'DONE';
+export const COMPLETED_REACTION_EMOJI_TYPE = 'GoGoGo';
 
 type PendingResponseSession = Pick<Session, 'pendingResponseCardId' | 'pendingResponseCardState' | 'lastPatchedResponseCardId'>;
 
@@ -41,6 +41,36 @@ export function mergePendingResponseState<T extends PendingResponseSession>(inco
     pendingResponseCardState: existing.pendingResponseCardState,
     lastPatchedResponseCardId: existing.lastPatchedResponseCardId,
   };
+}
+
+export function shouldPatchPendingOnExplicitSend(
+  session: Pick<Session, 'pendingResponseCardId' | 'pendingResponseCardState'>,
+  opts: { msgType: string; sendTopLevel: boolean; overrideChatId: boolean; sendInto: boolean; hasNotificationMentions: boolean },
+): boolean {
+  return opts.msgType === 'interactive'
+    && !opts.sendTopLevel
+    && !opts.overrideChatId
+    && !opts.sendInto
+    && !opts.hasNotificationMentions
+    && isPendingResponseCardOpen(session);
+}
+
+export function shouldReplyPendingInThread(scope: 'thread' | 'chat'): boolean {
+  return scope === 'thread';
+}
+
+export function shouldMarkPendingAsMentionedSend(opts: {
+  msgType: string;
+  sendTopLevel: boolean;
+  overrideChatId: boolean;
+  sendInto: boolean;
+  hasNotificationMentions: boolean;
+}): boolean {
+  return opts.msgType === 'interactive'
+    && !opts.sendTopLevel
+    && !opts.overrideChatId
+    && !opts.sendInto
+    && opts.hasNotificationMentions;
 }
 
 export function shouldWithdrawPreviousPendingOnNewTurn(_session: Pick<Session, 'pendingResponseCardId' | 'pendingResponseCardState'>): boolean {

@@ -37,6 +37,7 @@ export const messages: Record<string, string> = {
   'card.pending.body': '🔄 Processing your request...',
   'card.pending.detoured_title': 'Sent',
   'card.pending.detoured_body': 'The final reply was sent to another target.',
+  'card.pending.mentioned_body': 'The final reply was sent as a new message.',
 
   // ─── Card body text ──────────────────────────────────────────────────────
   'card.body.cli_terminated': '{cliName} process has exited.',

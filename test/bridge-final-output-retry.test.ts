@@ -262,7 +262,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_pending', expect.any(String));
     expect(ds.session.pendingResponseCardId).toBeUndefined();
     expect(ds.session.pendingResponseCardState).toBe('patched');
-    expect(addReactionMock).toHaveBeenCalledWith('app_test', 'om_user', 'DONE');
+    expect(addReactionMock).toHaveBeenCalledWith('app_test', 'om_user', 'GoGoGo');
     expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
   });
 

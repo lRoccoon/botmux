@@ -7,14 +7,17 @@ import {
   isPendingResponseCardOpen,
   markPendingResponseCardPatched,
   markPendingResponseCardPatchedIfCurrent,
+  shouldMarkPendingAsMentionedSend,
+  shouldPatchPendingOnExplicitSend,
   shouldWithdrawPreviousPendingOnNewTurn,
+  shouldReplyPendingInThread,
   startPendingResponseTurn,
   syncPendingResponseState,
 } from '../src/core/pending-response.js';
 
 describe('pending response state', () => {
-  it('uses the Feishu completed emoji for completion notification', () => {
-    expect(COMPLETED_REACTION_EMOJI_TYPE).toBe('DONE');
+  it('uses the Feishu GoGoGo emoji for completion notification', () => {
+    expect(COMPLETED_REACTION_EMOJI_TYPE).toBe('GoGoGo');
   });
 
   it('starts and patches pending response state explicitly', () => {
@@ -30,6 +33,30 @@ describe('pending response state', () => {
     expect(session.lastPatchedResponseCardId).toBe('om_processing');
     expect(session.pendingResponseCardState).toBe('patched');
     expect(isPendingResponseCardOpen(session)).toBe(false);
+  });
+
+  it('patches an open pending card for explicit botmux send responses', () => {
+    const session = { pendingResponseCardId: 'om_processing', pendingResponseCardState: 'open' as const };
+
+    expect(shouldPatchPendingOnExplicitSend(session, { msgType: 'interactive', sendTopLevel: false, overrideChatId: false, sendInto: false, hasNotificationMentions: false })).toBe(true);
+    expect(shouldPatchPendingOnExplicitSend(session, { msgType: 'post', sendTopLevel: false, overrideChatId: false, sendInto: false, hasNotificationMentions: false })).toBe(false);
+    expect(shouldPatchPendingOnExplicitSend(session, { msgType: 'interactive', sendTopLevel: true, overrideChatId: false, sendInto: false, hasNotificationMentions: false })).toBe(false);
+    expect(shouldPatchPendingOnExplicitSend(session, { msgType: 'interactive', sendTopLevel: false, overrideChatId: true, sendInto: false, hasNotificationMentions: false })).toBe(false);
+    expect(shouldPatchPendingOnExplicitSend(session, { msgType: 'interactive', sendTopLevel: false, overrideChatId: false, sendInto: true, hasNotificationMentions: false })).toBe(false);
+    expect(shouldPatchPendingOnExplicitSend(session, { msgType: 'interactive', sendTopLevel: false, overrideChatId: false, sendInto: false, hasNotificationMentions: true })).toBe(false);
+  });
+
+  it('replies pending cards in thread-scope to seed private chat topics', () => {
+    expect(shouldReplyPendingInThread('thread')).toBe(true);
+    expect(shouldReplyPendingInThread('chat')).toBe(false);
+  });
+
+  it('marks mentioned sends only for same-thread replies, not detours', () => {
+    expect(shouldMarkPendingAsMentionedSend({ msgType: 'interactive', sendTopLevel: false, overrideChatId: false, sendInto: false, hasNotificationMentions: true })).toBe(true);
+    expect(shouldMarkPendingAsMentionedSend({ msgType: 'interactive', sendTopLevel: true, overrideChatId: false, sendInto: false, hasNotificationMentions: true })).toBe(false);
+    expect(shouldMarkPendingAsMentionedSend({ msgType: 'interactive', sendTopLevel: false, overrideChatId: true, sendInto: false, hasNotificationMentions: true })).toBe(false);
+    expect(shouldMarkPendingAsMentionedSend({ msgType: 'interactive', sendTopLevel: false, overrideChatId: false, sendInto: true, hasNotificationMentions: true })).toBe(false);
+    expect(shouldMarkPendingAsMentionedSend({ msgType: 'interactive', sendTopLevel: false, overrideChatId: false, sendInto: false, hasNotificationMentions: false })).toBe(false);
   });
 
   it('syncs daemon in-memory pending state from persisted patched state', () => {

@@ -40,6 +40,7 @@ export const messages: Record<string, string> = {
   'card.pending.body': '🔄 正在处理你的请求...',
   'card.pending.detoured_title': '已发送',
   'card.pending.detoured_body': '最终回复已发送到其他目标。',
+  'card.pending.mentioned_body': '最终回复已通过新消息发送。',
 
   // ─── Card body text ──────────────────────────────────────────────────────
   'card.body.cli_terminated': '{cliName} 进程已终止。',

@@ -200,6 +200,23 @@ export function buildDetouredPendingResponseCard(locale?: Locale): string {
   });
 }
 
+export function buildMentionedPendingResponseCard(locale?: Locale): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      template: 'grey',
+      title: { tag: 'plain_text', content: t('card.pending.detoured_title', undefined, locale) },
+    },
+    body: {
+      direction: 'vertical',
+      elements: [
+        { tag: 'markdown', content: t('card.pending.mentioned_body', undefined, locale) },
+      ],
+    },
+  });
+}
+
 /**
  * Build a frozen-snapshot card to PATCH onto the source-chat streaming card
  * after `/relay` moves the session elsewhere.

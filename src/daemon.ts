@@ -33,7 +33,7 @@ import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildPendingResponseCard, buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { createPendingResponseQueue, markPendingResponseCardPatched, shouldTreatPendingCardAsPatchedByMarker, startPendingResponseTurn, syncPendingResponseState } from './core/pending-response.js';
+import { createPendingResponseQueue, markPendingResponseCardPatched, shouldReplyPendingInThread, shouldTreatPendingCardAsPatchedByMarker, startPendingResponseTurn, syncPendingResponseState } from './core/pending-response.js';
 import { readPendingResponsePatchMarker } from './services/pending-response-transaction-store.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
@@ -315,7 +315,7 @@ async function postPendingResponseCard(ds: DaemonSession, replyToMessageId: stri
     syncPendingResponseState(ds.session, ds);
     const card = buildPendingResponseCard(localeForBot(ds.larkAppId));
     try {
-      const messageId = await replyMessage(ds.larkAppId, replyToMessageId, card, 'interactive', false);
+      const messageId = await replyMessage(ds.larkAppId, replyToMessageId, card, 'interactive', shouldReplyPendingInThread(ds.scope));
       startPendingResponseTurn(ds, messageId);
       startPendingResponseTurn(ds.session, messageId);
       sessionStore.updateSession(ds.session);
