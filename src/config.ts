@@ -51,6 +51,10 @@ export const config = {
   },
   session: {
     get dataDir() { return process.env.SESSION_DATA_DIR ?? packagedDataDir; },
+    // Writable for back-compat: callers/tests historically assigned
+    // `config.session.dataDir = ...`. Map writes onto SESSION_DATA_DIR so the
+    // getter reflects them and the old assignable contract is preserved.
+    set dataDir(value: string) { process.env.SESSION_DATA_DIR = value; },
   },
   send: {
     /** @ hard-gate: every model-initiated `botmux send` reply must explicitly
