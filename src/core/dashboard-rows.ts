@@ -9,6 +9,8 @@ import type { DaemonSession } from './types.js';
 import type { Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { getTerminalProxyPort } from './terminal-url.js';
+import { getBotBrand } from '../bot-registry.js';
+import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -35,8 +37,8 @@ export interface SessionRow {
   feishuChatLink: string;
 }
 
-export function feishuChatLink(chatId: string): string {
-  return `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
+  return chatAppLink(chatId, brand);
 }
 
 let cachedBotName = '';
@@ -81,7 +83,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     proxyPort: getTerminalProxyPort() || undefined,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
-    feishuChatLink: feishuChatLink(ds.chatId),
+    feishuChatLink: feishuChatLink(ds.chatId, getBotBrand(ds.larkAppId)),
   };
 }
 
@@ -102,6 +104,6 @@ export function composeRowFromClosed(s: Session): SessionRow {
     title: s.title,
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
-    feishuChatLink: feishuChatLink(s.chatId),
+    feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
   };
 }
