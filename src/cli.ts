@@ -63,6 +63,7 @@ import {
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
 import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+import { makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -3016,11 +3017,17 @@ async function cmdSend(rest: string[]): Promise<void> {
     sendTarget.mode === 'plain'
       ? sendMessage(appId, sendTarget.chatId, content, msgType)
       : replyMessage(appId, sendTarget.root, content, msgType, true);
-  const recordBridgeSendMarker = (sentAtMs: number, messageId: string): void => {
+  const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
       if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-      const line = JSON.stringify({ sentAtMs, messageId }) + '\n';
+      const contentFingerprint = makeFingerprint(sentContent);
+      const marker: Record<string, unknown> = { sentAtMs, messageId };
+      if (contentFingerprint) {
+        marker.contentFingerprint = contentFingerprint;
+        marker.contentLength = normaliseForFingerprint(sentContent).length;
+      }
+      const line = JSON.stringify(marker) + '\n';
       appendFileSync(join(markerDir, `${sid}.jsonl`), line);
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
@@ -3364,9 +3371,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
 
     // Bridge fallback marker — append-only jsonl per session. Same-thread
-    // sends always suppress transcript fallback; detoured sends suppress only
-    // when they closed a pending response card for this turn.
-    if (shouldRecordBridgeMarker) recordBridgeSendMarker(sentAtMs, messageId);
+    // sends can suppress transcript fallback when their content appears to
+    // cover the same final answer; detoured sends suppress only when they
+    // closed a pending response card for this turn.
+    if (shouldRecordBridgeMarker) recordBridgeSendMarker(sentAtMs, messageId, text);
 
     // Send file attachments as separate messages
     const fileIds: string[] = [];

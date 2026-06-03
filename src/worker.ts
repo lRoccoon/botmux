@@ -334,12 +334,14 @@ function formatHeadlessLocalTurnContent(assistantText: string): string | null {
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
 //
-// `botmux send` (cli.ts cmdSend) appends a line `{sentAtMs, messageId}\n` to
+// `botmux send` (cli.ts cmdSend) appends a line
+// `{sentAtMs, messageId, contentFingerprint?, contentLength?}\n` to
 // `<DATA_DIR>/turn-sends/<sid>.jsonl` every time the model successfully posts
 // a reply to its OWN session thread. The worker reads these markers at idle
-// and suppresses transcript-driven final_output for any turn whose time
-// window already contains a send — i.e. the model didn't forget, no fallback
-// needed. Append-only over a shared file (instead of a per-turn marker) is
+// and suppresses transcript-driven final_output for any turn whose time window
+// already contains a send that appears to cover the same final answer — i.e.
+// the model didn't forget, no fallback needed. Append-only over a shared file
+// (instead of a per-turn marker) is
 // type-ahead safe: type-ahead'd turns each have their own [markTimeMs,
 // nextTurn.markTimeMs) window, and a stray send only fills its own bucket.
 // This relies on each turn's markTimeMs reflecting when it ACTUALLY started
@@ -1709,7 +1711,7 @@ function emitReadyCodexTurns(): void {
     const turn = ready[i];
     if (!turn.finalText) continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
+    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       continue;
     }

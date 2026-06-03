@@ -26,6 +26,26 @@ describe('shouldSuppressBridgeEmit', () => {
     expect(shouldSuppressBridgeEmit(turn(100), 200, markers, false)).toBe(true);
   });
 
+  it('non-adopt: structured marker suppresses when sent content matches the transcript final', () => {
+    const markers: BridgeSendMarker[] = [{ sentAtMs: 150, contentFingerprint: 'final answer body', contentLength: 42 }];
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: 'final answer body with extra formatting' },
+      200,
+      markers,
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: structured progress marker does not suppress an uncovered longer transcript final', () => {
+    const markers: BridgeSendMarker[] = [{ sentAtMs: 150, contentFingerprint: 'checking repository state', contentLength: 25 }];
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: 'The final answer contains a full implementation plan that was never explicitly sent through botmux send.' },
+      200,
+      markers,
+      false,
+    )).toBe(false);
+  });
+
   it('non-adopt: marker exactly at lower bound suppresses (>= boundary)', () => {
     const markers: BridgeSendMarker[] = [{ sentAtMs: 100 }];
     expect(shouldSuppressBridgeEmit(turn(100), 200, markers, false)).toBe(true);

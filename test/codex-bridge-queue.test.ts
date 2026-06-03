@@ -34,7 +34,7 @@ function emitDecisions(
     out.push({
       turnId: turn.turnId,
       suppressed: shouldSuppressBridgeEmit(
-        { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode,
+        { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode,
       ),
     });
   }
@@ -390,6 +390,25 @@ describe('CodexBridgeQueue', () => {
 });
 
 describe('CodexBridgeQueue + bridge-fallback gate (type-ahead suppression windows)', () => {
+  it('does not let explicit progress sends suppress a later transcript final answer', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'please design the sync plan', 1_000);
+    q.ingest([
+      userEv('please design the sync plan', 'u1', 5_000),
+      asstEv(
+        'I recommend a three-layer design: keep the repository-owned scripts, install them through a setup skill, and let a user-level systemd timer own the runtime synchronization loop.',
+        'a1',
+        15_000,
+      ),
+    ]);
+
+    const markers: BridgeSendMarker[] = [
+      { sentAtMs: 7_000, contentFingerprint: 'I am checking the current repo', contentLength: 30 },
+      { sentAtMs: 10_000, contentFingerprint: 'I found the existing scripts', contentLength: 28 },
+    ];
+    expect(emitDecisions(q, markers)).toEqual([{ turnId: 't1', suppressed: false }]);
+  });
+
   it('turn1 send no longer escapes its window when turn2 was type-ahead-marked early', () => {
     // The exact P1 regression: without the dequeue-time markTimeMs override +
     // started-only boundary, turn1's window would be the bunched [1000, 1001)
