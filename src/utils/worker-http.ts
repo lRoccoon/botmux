@@ -9,16 +9,8 @@ export function getConfiguredWorkerHttpHost(env: EnvLike = process.env): string 
 }
 
 export function resolveWorkerHttpHost(env: EnvLike = process.env): string {
-  return getConfiguredWorkerHttpHost(env) ?? '127.0.0.1';
-}
-
-export function resolveWorkerHttpHostForFork(opts: {
-  env?: EnvLike;
-  terminalProxyPort: number;
-  webHost: string;
-}): string {
-  return getConfiguredWorkerHttpHost(opts.env ?? process.env)
-    ?? (opts.terminalProxyPort > 0 ? '127.0.0.1' : opts.webHost);
+  const webHost = env.WEB_HOST?.trim();
+  return (getConfiguredWorkerHttpHost(env) ?? webHost) || '0.0.0.0';
 }
 
 export function parseWorkerRequestUrl(req: Pick<IncomingMessage, 'url' | 'headers'>): URL | null {
