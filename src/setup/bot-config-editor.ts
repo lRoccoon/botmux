@@ -16,6 +16,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '13': 'seed',
   '14': 'traex',
   '15': 'pi',
+  '16': 'copilot',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -41,11 +42,12 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'seed': 'Seed',
   'traex': 'TRAE',
   'pi': 'Pi',
+  'copilot': 'Copilot',
 };
 
 /**
  * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号
- * 1..15) 一致. dashboard "添加机器人" 的 CLI 下拉直接读这里, 避免再抄一份
+ * 1..16) 一致. dashboard "添加机器人" 的 CLI 下拉直接读这里, 避免再抄一份
  * 列表. 单一事实源: CLI_ID_CHOICES 的值序.
  */
 export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
@@ -54,7 +56,7 @@ export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
  *   - 空 → undefined (调用方决定 "preserve current" 还是套默认 'claude-code')
- *   - "1".."15" → CLI_ID_CHOICES 映射
+ *   - "1".."16" → CLI_ID_CHOICES 映射
  *   - 已是合法 cliId 字面值 → 原样返回
  *   - 其它 → throw (typo 不该静默落盘成 cliId)
  */
@@ -65,7 +67,7 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
   throw new Error(
-    `Unknown CLI 适配器 "${raw}"。请输入序号 1-15 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
+    `Unknown CLI 适配器 "${raw}"。请输入序号 1-16 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
 }
 
