@@ -1541,6 +1541,54 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  it('话题群新话题由其他机器人发送且带自指 root/thread_id → 自动开工', async () => {
+    // Lark may deliver a bot-created topic seed with root_id/thread_id already
+    // pointing to the seed itself. This is still a new topic, not a reply.
+    setupAutoTopicBot(true, { fromBots: true });
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '机器人创建的新话题' }),
+      messageId: 'msg-bot-topic-self-root',
+      rootId: 'msg-bot-topic-self-root',
+      threadId: 'msg-bot-topic-self-root',
+      chatId: 'chat-topic-bot-self-root',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-topic-self-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('话题群其他机器人在已有话题内回复（未 @）→ 不自动开工', async () => {
+    setupAutoTopicBot(true, { fromBots: true });
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '机器人在已有话题内回复' }),
+      messageId: 'msg-bot-topic-reply',
+      rootId: 'root-existing-topic',
+      threadId: 'root-existing-topic',
+      chatId: 'chat-topic-bot-reply',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('话题群新话题由其他机器人发送，扩展开关关 → 不触发', async () => {
     setupAutoTopicBot(true, { fromBots: false });
     mockGetChatMode.mockResolvedValue('topic');

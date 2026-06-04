@@ -820,11 +820,22 @@ export async function decideRouting(
 ): Promise<{ scope: 'thread' | 'chat'; anchor: string }> {
   const rootId: string | undefined = message.root_id;
   const threadId: string | undefined = message.thread_id;
-  if (rootId && threadId) return { scope: 'thread', anchor: rootId };
 
   const chatType: string = message.chat_type ?? 'group';
   const messageId: string = message.message_id;
   const chatId: string = message.chat_id;
+
+  // In some Lark topic-group deliveries (observed especially for messages sent
+  // by another bot), the top-level topic seed already carries root_id/thread_id
+  // pointing back to the same message. Treat that as the seed itself rather
+  // than as a reply to an existing root; otherwise auto-start-on-new-topic would
+  // miss it because the routing anchor would not be the seed message_id.
+  if (rootId && threadId) {
+    if (rootId === messageId || threadId === messageId || message.parent_id === messageId) {
+      return { scope: 'thread', anchor: messageId };
+    }
+    return { scope: 'thread', anchor: rootId };
+  }
 
   // 私聊：每条 top-level DM 都视为新话题 — 跟话题群同款，匹配 Lark DM 的话题
   // 化默认行为，避免无限把 1:1 对话塞进同一个 CLI 进程里。
