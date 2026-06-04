@@ -16,7 +16,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage, sendMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
@@ -617,7 +617,16 @@ export async function handleCommand(
             cliResumeCommand,
             loc,
           );
-          await sessionReply(rootId, card, 'interactive');
+          // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
+          // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
+          // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
+          await deliverEphemeralOrReply(
+            ds,
+            message.senderId,
+            card,
+            'interactive',
+            () => sessionReply(rootId, card, 'interactive'),
+          );
           logger.info(`[${logTag}] Session closed by /close command`);
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));

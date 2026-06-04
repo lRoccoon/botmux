@@ -195,6 +195,11 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
+  // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
+  // when the chat supports it, else the visible reply fallback. The stub just
+  // invokes the fallback so the existing card-shape assertions (on sessionReply)
+  // still hold — topic-group behaviour, where ephemeral is unavailable.
+  deliverEphemeralOrReply: vi.fn(async (_ds: any, _op: any, _content: string, _type: string, reply: () => Promise<unknown>) => { await reply(); }),
   transferSession: vi.fn(async () => ({ ok: true })),
   // /relay --create empty-leader path closes the scratch via this; default
   // resolves as idempotent close so unrelated tests don't need to think
@@ -308,7 +313,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, forkWorker, getCurrentCliVersion } from '../src/core/worker-pool.js';
+import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply } from '../src/core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
@@ -602,9 +607,20 @@ describe('handleCommand', () => {
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-001');
       expect(deps.activeSessions.has(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(false);
+      // The「会话已关闭」card is delivered「仅自己可见」-first: it routes through
+      // deliverEphemeralOrReply targeting the user who ran /close (message.senderId),
+      // so plain groups get an ephemeral (visible-to-you) card and topic groups
+      // (ephemeral unsupported → 18053) fall back to the normal visible reply.
+      expect(deliverEphemeralOrReply).toHaveBeenCalledWith(
+        ds,
+        'ou_sender',
+        expect.stringContaining('会话已关闭'),
+        'interactive',
+        expect.any(Function),
+      );
       // /close now replies with an interactive card carrying a Resume button
       // and a copyable `botmux resume <id>` command — assert on the card shape
-      // rather than the legacy plain text.
+      // rather than the legacy plain text. (Here via the visible-reply fallback.)
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('会话已关闭'),
