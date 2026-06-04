@@ -826,12 +826,21 @@ export async function decideRouting(
   const chatId: string = message.chat_id;
 
   // In some Lark topic-group deliveries (observed especially for messages sent
-  // by another bot), the top-level topic seed already carries root_id/thread_id
-  // pointing back to the same message. Treat that as the seed itself rather
-  // than as a reply to an existing root; otherwise auto-start-on-new-topic would
-  // miss it because the routing anchor would not be the seed message_id.
+  // by another bot), the top-level topic seed already carries root_id/thread_id.
+  // Two seed shapes have been seen/returned by Lark APIs:
+  //   1. root_id/thread_id point back to message_id;
+  //   2. root_id/thread_id are the same `omt_...` topic id, while message_id is
+  //      the actual seed message id (`om_...`).
+  // Treat both as the seed itself rather than as a reply to an existing root;
+  // otherwise auto-start-on-new-topic would miss it because the routing anchor
+  // would not be the seed message_id.
   if (rootId && threadId) {
-    if (rootId === messageId || threadId === messageId || message.parent_id === messageId) {
+    if (
+      rootId === messageId ||
+      threadId === messageId ||
+      message.parent_id === messageId ||
+      (rootId === threadId && rootId.startsWith('omt_'))
+    ) {
       return { scope: 'thread', anchor: messageId };
     }
     return { scope: 'thread', anchor: rootId };

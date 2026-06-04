@@ -1568,6 +1568,33 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  it('话题群新话题由其他机器人发送且 root/thread_id 为 omt 话题 id → 自动开工', async () => {
+    // Lark may also deliver a bot-created topic seed with root_id/thread_id set
+    // to the `omt_...` topic id rather than to the `om_...` seed message id.
+    setupAutoTopicBot(true, { fromBots: true });
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '机器人创建的新话题' }),
+      messageId: 'om_bot_topic_seed_with_omt',
+      rootId: 'omt_bot_topic_seed_with_omt',
+      threadId: 'omt_bot_topic_seed_with_omt',
+      chatId: 'chat-topic-bot-omt-root',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'om_bot_topic_seed_with_omt',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('话题群其他机器人在已有话题内回复（未 @）→ 不自动开工', async () => {
     setupAutoTopicBot(true, { fromBots: true });
     mockGetChatMode.mockResolvedValue('topic');
