@@ -56,11 +56,9 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
   }
 
   const sessionName = TmuxBackend.sessionName(opts.sessionId);
-  const groupSessionName = TmuxBackend.groupSessionName();
-  const paneTarget = groupSessionName ? `${groupSessionName}:${sessionName}` : sessionName;
-  if (groupSessionName ? TmuxBackend.hasWindow(paneTarget) : TmuxBackend.hasSession(sessionName)) {
+  if (TmuxBackend.hasSession(sessionName)) {
     return {
-      backend: new TmuxPipeBackend(paneTarget, { ownsSession: true, isReattach: true, groupSessionName }),
+      backend: new TmuxPipeBackend(sessionName, { ownsSession: true, isReattach: true }),
       isTmuxMode: true,
       isPipeMode: true,
       isZellijMode: false,
@@ -68,7 +66,7 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
   }
 
   return {
-    backend: new TmuxPipeBackend(paneTarget, { createSession: true, ownsSession: true, groupSessionName }),
+    backend: new TmuxPipeBackend(sessionName, { createSession: true, ownsSession: true }),
     isTmuxMode: true,
     isPipeMode: true,
     isZellijMode: false,

@@ -975,7 +975,7 @@ export async function setActiveSessionSafe(
  * process keeps running inside its tmux session — only the routing fields
  * (chatId, rootMessageId, scope) and activeSessions key are rewritten. After
  * the rewrite, forkWorker spawns a new worker that re-attaches to the same
- * managed botmux tmux target, so the AI's transcript continues without break.
+ * `bmx-<sessionId>` tmux, so the AI's transcript continues without break.
  *
  * Visible side effects:
  *   - Lark messages in the *source* chat remain where they were — we have no
@@ -1179,7 +1179,7 @@ export async function transferSession(
   });
 
   // forkWorker with resume=true — TmuxBackend.spawn detects the surviving
-  // managed botmux tmux target and re-attaches instead of creating a new one.
+  // `bmx-<sessionId>` session and re-attaches instead of creating a new one.
   fkw(ds, '', /*resume*/true);
 
   logger.info(
@@ -2225,21 +2225,19 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
     for (const name of backend.listBotmuxSessions()) {
-      if (backendType === 'tmux' && TmuxBackend.groupSessionName()) TmuxBackend.killWindow(name);
-      else backend.killSession(name);
+      backend.killSession(name);
     }
   } else {
     const activeNames = new Set(
-      activeSessions_.map(s => backendType === 'tmux' ? TmuxBackend.managedTarget(s.sessionId) : backend.sessionName(s.sessionId)),
+      activeSessions_.map(s => backend.sessionName(s.sessionId)),
     );
     const ownedNames = new Set(
-      sessionStore.listSessions().map(s => backendType === 'tmux' ? TmuxBackend.managedTarget(s.sessionId) : backend.sessionName(s.sessionId)),
+      sessionStore.listSessions().map(s => backend.sessionName(s.sessionId)),
     );
     for (const name of backend.listBotmuxSessions()) {
       if (ownedNames.has(name) && !activeNames.has(name)) {
         logger.info(`Killing orphaned ${backendType} session: ${name}`);
-        if (backendType === 'tmux' && TmuxBackend.groupSessionName()) TmuxBackend.killWindow(name);
-        else backend.killSession(name);
+        backend.killSession(name);
       }
     }
     for (const session of activeSessions_) {
@@ -2248,10 +2246,9 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
       let botCliId: CliId | undefined;
       try { botCliId = getBot(session.larkAppId).config.cliId; } catch { continue; }
       if (botCliId && sessionCliId !== botCliId) {
-        const name = backendType === 'tmux' ? TmuxBackend.managedTarget(session.sessionId) : backend.sessionName(session.sessionId);
+        const name = backend.sessionName(session.sessionId);
         logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing ${backendType} ${name}`);
-        if (backendType === 'tmux' && TmuxBackend.groupSessionName()) TmuxBackend.killWindow(name);
-        else backend.killSession(name);
+        backend.killSession(name);
       }
     }
   }
