@@ -69,6 +69,30 @@ describe('CodexBridgeQueue', () => {
     expect(q.drainEmittable()).toEqual([]);
   });
 
+  it('replays recently buffered unmatched events when a matching mark arrives later', () => {
+    const q = new CodexBridgeQueue();
+    q.ingest([
+      userEv('say hi please', 'u-early', 1_000),
+      asstEv('Hi，收到。', 'a-early', 1_100),
+    ]);
+    q.mark('t1', 'say hi please', 4_000);
+    const ready = q.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].turnId).toBe('t1');
+    expect(ready[0].finalText).toBe('Hi，收到。');
+  });
+
+  it('does not replay buffered events older than the 5s skew window', () => {
+    const q = new CodexBridgeQueue();
+    q.ingest([
+      userEv('old prompt', 'u-old-buffered', 1_000),
+      asstEv('old answer', 'a-old-buffered', 1_100),
+    ]);
+    q.mark('t1', 'old prompt', 8_000);
+    expect(q.peek()[0].started).toBe(false);
+    expect(q.drainEmittable()).toEqual([]);
+  });
+
   it('absorb registers events as seen so they cannot start a turn later', () => {
     const q = new CodexBridgeQueue();
     const ev = userEv('historical message', 'u-hist');

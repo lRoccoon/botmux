@@ -2079,6 +2079,9 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //     to re-probe via session.log / traces.jsonl fds).
   //   - mtr: worker tails MTR's sqlite transcript, resolving by native sid
   //     when discovery has one or by adopted cwd as a fallback.
+  //   - cursor: worker maps the adopt pid → its open store.db fd → chatId →
+  //     the append-only agent-transcript JSONL, then harvests final replies
+  //     from there (cursor-agent never calls `botmux send`).
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   if (adopted.source === 'herdr' && adoptedCliId === 'claude-code' && !adopted.sessionId) {
@@ -2097,7 +2100,11 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     adoptedCliId === 'claude-code' && adopted.sessionId
       ? claudeJsonlPathForSession(adopted.sessionId, adopted.cwd)
       : undefined;
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr';
+  // cursor: worker resolves the agent-transcript JSONL from the adopt pid's
+  // open store.db fd (chatId), or from cliSessionId (= chatId) when discovery
+  // captured it — so adopt must forward the pid + cwd like the other
+  // transcript-backed CLIs.
+  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
   const initMsg: DaemonToWorker = {
