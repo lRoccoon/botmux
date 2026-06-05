@@ -6,6 +6,7 @@ import { escapeHtml } from './ui.js';
 
 interface Connector {
   id: string; name: string; enabled: boolean;
+  verify?: { type: 'token' | 'hmac-sha256' };
   target: { mode: 'dynamic' | 'fixed' | 'new-group'; kind: 'turn' | 'workflow'; botId: string; chatId?: string; allowChats?: string[]; workflowId?: string };
   promptEnvelope: { sourceName: string };
 }
@@ -50,7 +51,12 @@ function pageHtml(): string {
     <input class="cn-allow" id="cn-allow" placeholder="oc_xxx,oc_yyy（逗号分隔，留空=不限）">
     <label class="cn-life" style="display:none">去重字段</label><input class="cn-life" id="cn-dedup" style="display:none" placeholder="如 payload.alert.id">
     <label class="cn-life" style="display:none">状态字段</label><input class="cn-life" id="cn-status" style="display:none" placeholder="如 payload.status">
-    <label>签名密钥</label><input id="cn-secret" placeholder="留空自动生成（只显示一次）">
+    <label>校验方式</label>
+    <select id="cn-verify">
+      <option value="token">令牌（简单：密钥放进 URL，一条 curl 就能触发）</option>
+      <option value="hmac-sha256">HMAC 签名（高级：更安全，需自行对请求签名）</option>
+    </select>
+    <label>密钥 / 令牌</label><input id="cn-secret" placeholder="留空自动生成（只显示一次）">
   </div>
   <div style="margin-top:14px"><button id="cn-create" class="primary">创建</button>
     <span class="muted" id="cn-create-out" style="margin-left:10px;font-size:13px"></span></div>
@@ -85,20 +91,22 @@ function renderList(connectors: Connector[]): void {
   el.innerHTML = connectors.map(c => {
     const bot = bots.find(b => b.larkAppId === c.target.botId);
     const url = webhookUrl(c.id);
+    const isToken = (c.verify?.type ?? 'token') === 'token';
+    const verifyBadge = isToken ? '令牌' : '签名';
     return `<div class="card" style="margin:0 0 10px;padding:12px 14px;background:var(--bg-soft,#f6f7f9)">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <b style="font-size:15px">${escapeHtml(c.name)}</b>
         <span class="${c.enabled ? 'ok' : 'muted'}" style="font-size:12px">${c.enabled ? '已启用' : '已停用'}</span>
-        <span class="muted" style="font-size:12px">· ${escapeHtml(bot?.botName || c.target.botId)} · ${kindLabel(c.target.kind)} · ${modeLabel(c.target.mode)}</span>
+        <span class="muted" style="font-size:12px">· ${escapeHtml(bot?.botName || c.target.botId)} · ${kindLabel(c.target.kind)} · ${modeLabel(c.target.mode)} · ${verifyBadge}</span>
         <span style="margin-left:auto;display:flex;gap:6px">
           <button class="cn-toggle ghost" data-id="${escapeHtml(c.id)}" data-on="${c.enabled}" style="font-size:12px">${c.enabled ? '停用' : '启用'}</button>
           <button class="cn-del ghost" data-id="${escapeHtml(c.id)}" style="font-size:12px">删除</button>
         </span>
       </div>
       <div style="margin-top:6px;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <span class="muted">Webhook URL：</span><code style="font-size:12px;word-break:break-all">${escapeHtml(url)}</code>
+        <span class="muted">Webhook URL：</span><code style="font-size:12px;word-break:break-all">${escapeHtml(url)}${isToken ? '/&lt;令牌&gt;' : ''}</code>
         <button class="cn-copy ghost" data-url="${escapeHtml(url)}" style="font-size:12px">复制</button>
-      </div></div>`;
+      </div>${isToken ? '<div class="muted" style="font-size:12px;margin-top:4px">令牌模式：调用时在 URL 末尾追加 <code>/&lt;令牌&gt;</code>（令牌仅创建/轮换时显示一次）。</div>' : ''}</div>`;
   }).join('');
 
   el.querySelectorAll<HTMLButtonElement>('.cn-copy').forEach(b => { b.onclick = () => { navigator.clipboard?.writeText(b.dataset.url!); b.textContent = '已复制'; setTimeout(() => b.textContent = '复制', 1200); }; });
@@ -145,6 +153,7 @@ export function renderConnectorsPage(root: HTMLElement): void {
       if (!val('cn-dedup') || !val('cn-status')) { out.innerHTML = '<span class="err">「每次新建群」需要填去重字段和状态字段</span>'; return; }
       body.lifecycleExtractors = { dedupKey: val('cn-dedup'), status: val('cn-status') };
     }
+    body.verify = { type: ($('cn-verify') as HTMLSelectElement).value };
     const secret = val('cn-secret'); if (secret) body.secret = secret;
     out.innerHTML = '<span class="muted">创建中…</span>';
     const r = await jsend('POST', '/api/connectors', body);
@@ -153,11 +162,17 @@ export function renderConnectorsPage(root: HTMLElement): void {
       const created = $('cn-created'); created.style.display = '';
       const url = r.body.webhookUrl || webhookUrl(r.body.connector.id);
       const sec = r.body.secret;
+      const isToken = (r.body.connector?.verify?.type ?? 'token') === 'token';
+      const usage = isToken
+        ? `<p class="muted" style="font-size:12px;margin:6px 0 0">此 URL 已含令牌，外部系统直接 POST 即可触发：</p>
+        <pre style="margin:6px 0 0;font-size:12px;white-space:pre-wrap;word-break:break-all"><code>curl -X POST '${escapeHtml(url)}' -H 'content-type: application/json' -d '{}'</code></pre>
+        <p class="muted" style="font-size:12px;margin:6px 0 0">⚠️ URL 即凭证，请勿公开泄漏；可在下方列表删除或轮换。</p>`
+        : `<p class="muted" style="font-size:12px;margin:6px 0 0">外部系统需对 <code>timestamp.body</code> 做 HMAC-SHA256 签名，并带上 <code>x-botmux-timestamp</code> / <code>x-botmux-nonce</code> / <code>x-botmux-signature</code> 头调用。</p>`;
       created.innerHTML = `<div class="card" style="padding:12px 14px;background:var(--bg-soft,#f6f7f9)">
         <p class="ok" style="margin:0 0 6px">已创建「${escapeHtml(name)}」</p>
         <p style="margin:4px 0;font-size:13px"><span class="muted">Webhook URL：</span><code style="word-break:break-all">${escapeHtml(url)}</code></p>
-        ${sec ? `<p style="margin:4px 0;font-size:13px"><span class="muted">签名密钥（只显示这一次，请保存）：</span><code>${escapeHtml(sec)}</code></p>` : ''}
-        <p class="muted" style="font-size:12px;margin:6px 0 0">外部系统用此 URL + 密钥（HMAC-SHA256 签名）调用即可触发。</p></div>`;
+        ${sec ? `<p style="margin:4px 0;font-size:13px"><span class="muted">${isToken ? '访问令牌' : '签名密钥'}（只显示这一次，请保存）：</span><code>${escapeHtml(sec)}</code></p>` : ''}
+        ${usage}</div>`;
       (['cn-name', 'cn-wf', 'cn-chat', 'cn-allow', 'cn-dedup', 'cn-status', 'cn-secret'] as const).forEach(id => { ($(id) as HTMLInputElement).value = ''; });
       load();
     } else {

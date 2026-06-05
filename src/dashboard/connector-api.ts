@@ -126,13 +126,19 @@ function normalizeConnectorInput(
     (typeof verify.secretRef === 'string' && verify.secretRef.trim() ? verify.secretRef.trim() : prior?.verify.secretRef);
   if (!secretRef) return { ok: false, error: 'secret_required' };
 
+  // Default new connectors to the easy `token` mode; HMAC is the advanced opt-in.
+  const verifyType: ConnectorDefinition['verify']['type'] =
+    verify.type === 'hmac-sha256' || verify.type === 'token'
+      ? verify.type
+      : prior?.verify.type ?? 'token';
+
   const now = new Date().toISOString();
   const next: ConnectorDefinition = {
     id,
     name,
     enabled: bool(c.enabled, prior?.enabled ?? true),
     verify: {
-      type: 'hmac-sha256',
+      type: verifyType,
       secretRef,
       signatureHeader: typeof verify.signatureHeader === 'string' && verify.signatureHeader.trim()
         ? verify.signatureHeader.trim().toLowerCase()
@@ -182,10 +188,12 @@ function normalizeConnectorInput(
   return { ok: true, connector: next };
 }
 
-function publicWebhookUrl(req: IncomingMessage, connectorId: string): string {
+function publicWebhookUrl(req: IncomingMessage, connectorId: string, token?: string): string {
   const proto = typeof req.headers['x-forwarded-proto'] === 'string' ? req.headers['x-forwarded-proto'] : 'http';
   const host = req.headers.host ?? 'localhost';
-  return `${proto}://${host}/webhook/${encodeURIComponent(connectorId)}`;
+  const base = `${proto}://${host}/webhook/${encodeURIComponent(connectorId)}`;
+  // token mode: bake the secret into the path so the whole URL is the credential.
+  return token ? `${base}/${encodeURIComponent(token)}` : base;
 }
 
 export async function handleConnectorApi(
@@ -267,12 +275,13 @@ export async function handleConnectorApi(
         return true;
       }
       const connector = upsertConnector(normalized.connector);
+      const plaintext = providedSecret ?? generatedSecret;
       jsonRes(res, 201, {
         ok: true,
         connector,
         secretRef: record.ref,
         ...(generatedSecret ? { secret: generatedSecret } : {}),
-        webhookUrl: publicWebhookUrl(req, connector.id),
+        webhookUrl: publicWebhookUrl(req, connector.id, connector.verify.type === 'token' ? plaintext : undefined),
       });
     } catch (e: any) {
       jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
@@ -293,13 +302,16 @@ export async function handleConnectorApi(
         const body = await readJsonBody<any>(req);
         let generatedSecret: string | undefined;
         let secretRef: string | undefined;
+        let plaintextForUrl: string | undefined;
         if (typeof body.secret === 'string' && body.secret) {
           secretRef = prior.verify.secretRef || createWebhookSecret(body.secret).ref;
           setWebhookSecret(secretRef, body.secret);
+          plaintextForUrl = body.secret;
         } else if (body.rotateSecret === true) {
           generatedSecret = generateWebhookSecretPlaintext();
           secretRef = prior.verify.secretRef || createWebhookSecret(generatedSecret).ref;
           setWebhookSecret(secretRef, generatedSecret);
+          plaintextForUrl = generatedSecret;
         }
         const normalized = normalizeConnectorInput({ ...body, id }, { id, prior, secretRef });
         if (!normalized.ok) {
@@ -312,7 +324,7 @@ export async function handleConnectorApi(
           connector,
           ...(secretRef ? { secretRef } : {}),
           ...(generatedSecret ? { secret: generatedSecret } : {}),
-          webhookUrl: publicWebhookUrl(req, connector.id),
+          webhookUrl: publicWebhookUrl(req, connector.id, connector.verify.type === 'token' ? plaintextForUrl : undefined),
         });
       } catch (e: any) {
         jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });

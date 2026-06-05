@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { getConnector, type ConnectorDefinition } from '../services/connector-store.js';
 import { getWebhookSecret } from '../services/webhook-key.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
@@ -67,6 +67,32 @@ export function verifyWebhookSignature(secret: string, ts: string, rawBody: Buff
     .digest();
   const got = parseSignature(sig);
   return !!got && got.length === expected.length && timingSafeEqual(got, expected);
+}
+
+// Bearer-token mode: the presented token IS the secret. Constant-time compare,
+// no body integrity / replay protection (that's the usability/security trade —
+// see `token` verify mode). Empty presented token never matches.
+export function verifyWebhookToken(secret: string, presented: string): boolean {
+  if (!secret || !presented) return false;
+  const a = Buffer.from(secret, 'utf-8');
+  const b = Buffer.from(presented, 'utf-8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// Token carriers, in priority order: path segment > ?token= query > Authorization
+// Bearer > x-botmux-token header. Path is the default (whole URL = credential).
+function extractWebhookToken(req: IncomingMessage, url: URL, pathToken: string | undefined): string | undefined {
+  if (pathToken) return pathToken;
+  const fromQuery = url.searchParams.get('token');
+  if (fromQuery) return fromQuery;
+  const auth = headerValue(req, 'authorization');
+  if (auth) {
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    if (m) return m[1].trim();
+  }
+  const fromHeader = headerValue(req, 'x-botmux-token');
+  if (fromHeader) return fromHeader;
+  return undefined;
 }
 
 function timestampOk(ts: string, toleranceSeconds: number): boolean {
@@ -171,7 +197,10 @@ export async function handleWebhookRoute(
   url: URL,
   deps: WebhookRouteDeps,
 ): Promise<boolean> {
-  const m = url.pathname.match(/^\/webhook\/([^/]+)$/);
+  // Second path segment (optional) carries the bearer token for `token` mode:
+  //   /webhook/<connectorId>            → token via query / Authorization header
+  //   /webhook/<connectorId>/<token>    → token baked into the URL (default)
+  const m = url.pathname.match(/^\/webhook\/([^/]+)(?:\/([^/]+))?$/);
   if (!m) return false;
   if (req.method !== 'POST') {
     jsonRes(res, 405, { ok: false, errorCode: 'bad_request', error: 'method not allowed' });
@@ -179,6 +208,7 @@ export async function handleWebhookRoute(
   }
 
   const connectorId = decodeURIComponent(m[1]);
+  const pathToken = m[2] ? decodeURIComponent(m[2]) : undefined;
   const connector = getConnector(connectorId);
   if (!connector || !connector.enabled) {
     webhookError(res, 404, connectorId, 'bad_request', 'unknown or disabled connector');
@@ -198,26 +228,40 @@ export async function handleWebhookRoute(
     return true;
   }
 
+  // `requestId` becomes source.requestId on the trigger. HMAC mode reuses the
+  // caller's nonce; token mode has no nonce so we mint one.
   const verify = connector.verify;
-  const ts = headerValue(req, verify.timestampHeader);
-  const nonce = headerValue(req, verify.nonceHeader);
-  const sig = headerValue(req, verify.signatureHeader);
-  if (!ts || !nonce || !sig) {
-    webhookError(res, 401, connectorId, 'invalid_signature', 'missing signature, timestamp, or nonce header');
-    return true;
-  }
-  if (!timestampOk(ts, verify.toleranceSeconds)) {
-    webhookError(res, 401, connectorId, 'replay', 'timestamp outside tolerance window');
-    return true;
-  }
-  if (!claimNonce(connector.id, nonce, verify.toleranceSeconds)) {
-    webhookError(res, 409, connectorId, 'replay', 'nonce replay detected');
-    return true;
-  }
-  const secret = getWebhookSecret(verify.secretRef);
-  if (!secret || !verifyWebhookSignature(secret, ts, rawBody, sig)) {
-    webhookError(res, 401, connectorId, 'invalid_signature', 'signature verification failed');
-    return true;
+  let requestId: string;
+  if (verify.type === 'token') {
+    const presented = extractWebhookToken(req, url, pathToken);
+    const secret = getWebhookSecret(verify.secretRef);
+    if (!presented || !secret || !verifyWebhookToken(secret, presented)) {
+      webhookError(res, 401, connectorId, 'invalid_signature', 'token verification failed');
+      return true;
+    }
+    requestId = `whk_${randomUUID()}`;
+  } else {
+    const ts = headerValue(req, verify.timestampHeader);
+    const nonce = headerValue(req, verify.nonceHeader);
+    const sig = headerValue(req, verify.signatureHeader);
+    if (!ts || !nonce || !sig) {
+      webhookError(res, 401, connectorId, 'invalid_signature', 'missing signature, timestamp, or nonce header');
+      return true;
+    }
+    if (!timestampOk(ts, verify.toleranceSeconds)) {
+      webhookError(res, 401, connectorId, 'replay', 'timestamp outside tolerance window');
+      return true;
+    }
+    if (!claimNonce(connector.id, nonce, verify.toleranceSeconds)) {
+      webhookError(res, 409, connectorId, 'replay', 'nonce replay detected');
+      return true;
+    }
+    const secret = getWebhookSecret(verify.secretRef);
+    if (!secret || !verifyWebhookSignature(secret, ts, rawBody, sig)) {
+      webhookError(res, 401, connectorId, 'invalid_signature', 'signature verification failed');
+      return true;
+    }
+    requestId = nonce;
   }
 
   const parsed = parsePayload(rawBody);
@@ -304,7 +348,7 @@ export async function handleWebhookRoute(
       source: {
         type: 'webhook',
         connectorId: connector.id,
-        requestId: nonce,
+        requestId,
         receivedAt: new Date().toISOString(),
       },
       target: {
@@ -346,7 +390,7 @@ export async function handleWebhookRoute(
     source: {
       type: 'webhook',
       connectorId: connector.id,
-      requestId: nonce,
+      requestId,
       receivedAt: new Date().toISOString(),
     },
     target: {

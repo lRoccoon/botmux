@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { verifyWebhookSignature } from '../src/dashboard/webhook-routes.js';
+import { verifyWebhookSignature, verifyWebhookToken } from '../src/dashboard/webhook-routes.js';
 import type { ConnectorDefinition } from '../src/services/connector-store.js';
 
 let server: Server | null = null;
@@ -84,6 +84,31 @@ async function seedNewGroupConnector(): Promise<ConnectorDefinition> {
   });
 }
 
+async function seedTokenConnector(): Promise<ConnectorDefinition> {
+  const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+  const { upsertConnector } = await import('../src/services/connector-store.js');
+  const secret = createWebhookSecret('tok_plain_value');
+  return upsertConnector({
+    id: 'conn_token',
+    name: 'Simple',
+    enabled: true,
+    verify: {
+      type: 'token',
+      secretRef: secret.ref,
+      signatureHeader: 'x-botmux-signature',
+      timestampHeader: 'x-botmux-timestamp',
+      nonceHeader: 'x-botmux-nonce',
+      toleranceSeconds: 300,
+    },
+    target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_fixed' },
+    promptEnvelope: { sourceName: 'simple', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+    loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+    lifecycleExtractors: null,
+    createdAt: '2026-06-05T00:00:00.000Z',
+    updatedAt: '2026-06-05T00:00:00.000Z',
+  });
+}
+
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-webhook-route-'));
   prevDataDir = process.env.SESSION_DATA_DIR;
@@ -106,6 +131,66 @@ describe('webhook route verification helpers', () => {
     expect(verifyWebhookSignature('secret', ts, raw, `sha256=${mac.toString('hex')}`)).toBe(true);
     expect(verifyWebhookSignature('secret', ts, raw, mac.toString('base64url'))).toBe(true);
     expect(verifyWebhookSignature('wrong', ts, raw, mac.toString('base64url'))).toBe(false);
+  });
+
+  it('verifies a bearer token with constant-time comparison', () => {
+    expect(verifyWebhookToken('s3cret', 's3cret')).toBe(true);
+    expect(verifyWebhookToken('s3cret', 'wrong')).toBe(false);
+    expect(verifyWebhookToken('s3cret', '')).toBe(false);
+    expect(verifyWebhookToken('s3cret', 's3cret-longer')).toBe(false);
+  });
+});
+
+describe('webhook token mode', () => {
+  it('accepts the token embedded in the path and dispatches', async () => {
+    await startWebhookServer();
+    await seedTokenConnector();
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ hello: 'world' }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
+  });
+
+  it('rejects a wrong path token with 401', async () => {
+    await startWebhookServer();
+    await seedTokenConnector();
+    const res = await fetch(`${baseUrl}/webhook/conn_token/wrong-token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('accepts the token via query param or Authorization bearer header', async () => {
+    await startWebhookServer();
+    await seedTokenConnector();
+    const q = await fetch(`${baseUrl}/webhook/conn_token?token=tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(q.status).toBe(200);
+    const h = await fetch(`${baseUrl}/webhook/conn_token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer tok_plain_value' },
+      body: '{}',
+    });
+    expect(h.status).toBe(200);
+  });
+
+  it('rejects when no token is presented at all', async () => {
+    await startWebhookServer();
+    await seedTokenConnector();
+    const res = await fetch(`${baseUrl}/webhook/conn_token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(401);
   });
 });
 

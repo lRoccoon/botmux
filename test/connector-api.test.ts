@@ -71,6 +71,34 @@ describe('connector-api write routes', () => {
     expect(raw).toContain(created.connector.verify.secretRef);
   });
 
+  it('defaults to token mode and bakes the secret into the webhook URL path', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Easy alerts',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(created.connector.verify.type).toBe('token');
+    expect(created.webhookUrl).toContain(`/webhook/${created.connector.id}/${created.secret}`);
+  });
+
+  it('keeps HMAC mode when explicitly requested and omits the token from the URL', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Signed alerts',
+        verify: { type: 'hmac-sha256' },
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(created.connector.verify.type).toBe('hmac-sha256');
+    expect(created.webhookUrl).toMatch(new RegExp(`/webhook/${created.connector.id}$`));
+    expect(created.webhookUrl).not.toContain(created.secret);
+  });
+
   it('updates enabled state and rotates an existing connector secret', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
