@@ -1440,41 +1440,6 @@ function structuredBridgeIngestPath(path: string, offset: number) {
   return drainCocoEvents(path, offset);
 }
 
-function codexBridgeProbeEnabled(): boolean {
-  // Cursor is the only current transcript bridge without per-event timestamps,
-  // so keep the high-cardinality attribution probe scoped there by default.
-  return codexBridgeIsCursor();
-}
-
-function codexBridgeEventPreview(events: CodexBridgeEvent[]): string {
-  return events.map(ev => {
-    const uuid = ev.uuid.length > 24 ? `...${ev.uuid.slice(-24)}` : ev.uuid;
-    return `${ev.kind}:${uuid}:${ev.text.replace(/\s+/g, ' ').slice(0, 60)}`;
-  }).join(' | ');
-}
-
-function codexBridgeQueueSnapshot(): string {
-  const snap = codexBridgeQueue.debugSnapshot();
-  return JSON.stringify({
-    localTurnsEnabled: snap.localTurnsEnabled,
-    collectingTurnId: snap.collectingTurnId,
-    queued: snap.queued.map(t => ({
-      turnId: t.turnId.slice(0, 8),
-      started: t.started,
-      hasFinalText: t.hasFinalText,
-      isLocal: t.isLocal,
-      markTimeMs: t.markTimeMs,
-      fp: t.contentFingerprint,
-    })),
-    buffered: snap.buffered.map(ev => ({
-      kind: ev.kind,
-      uuid: ev.uuid.length > 18 ? `...${ev.uuid.slice(-18)}` : ev.uuid,
-      timestampMs: ev.timestampMs,
-      text: ev.textPreview.replace(/\s+/g, ' '),
-    })),
-  });
-}
-
 function codexBridgeStartTimer(): void {
   if (codexBridgeTimer) return;
   // Single 1s ticker that handles three jobs: late-attach (poll for the
@@ -1808,16 +1773,11 @@ function codexBridgeIngest(): void {
     return;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
-  const oldOffset = codexBridgeOffset;
-  const before = codexBridgeProbeEnabled() ? codexBridgeQueueSnapshot() : '';
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
-  if (codexBridgeProbeEnabled() && (result.events.length > 0 || oldOffset !== result.newOffset)) {
-    log(`Codex bridge probe ingest: offset=${oldOffset}->${result.newOffset}, events=${result.events.length}, tail=${result.pendingTail.length}, eventPreview="${codexBridgeEventPreview(result.events)}", before=${before}, after=${codexBridgeQueueSnapshot()}`);
-  }
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
   // end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
@@ -1835,13 +1795,7 @@ function codexBridgeIngest(): void {
 function codexBridgeMarkPendingTurn(messageText: string): boolean {
   if (!codexBridgeFallbackActive()) return false;
   const turnId = `codex-${randomBytes(8).toString('hex')}`;
-  if (codexBridgeProbeEnabled()) {
-    log(`Codex bridge probe mark: turn=${turnId.slice(0, 8)}, preview="${messageText.replace(/\s+/g, ' ').slice(0, 80)}", before=${codexBridgeQueueSnapshot()}`);
-  }
   codexBridgeQueue.mark(turnId, messageText);
-  if (codexBridgeProbeEnabled()) {
-    log(`Codex bridge probe mark done: turn=${turnId.slice(0, 8)}, after=${codexBridgeQueueSnapshot()}`);
-  }
   return true;
 }
 
@@ -1854,20 +1808,8 @@ function codexBridgeDrainAndMaybeEmit(): void {
 }
 
 function emitReadyCodexTurns(): void {
-  const probe = codexBridgeProbeEnabled();
-  const before = probe ? codexBridgeQueueSnapshot() : '';
   const ready = codexBridgeQueue.drainEmittable();
-  if (ready.length === 0) {
-    if (probe && before !== codexBridgeQueueSnapshot()) {
-      log(`Codex bridge probe drain: ready=0, before=${before}, after=${codexBridgeQueueSnapshot()}`);
-    } else if (probe && before.includes('"queued":[{')) {
-      log(`Codex bridge probe drain: ready=0, state=${before}`);
-    }
-    return;
-  }
-  if (probe) {
-    log(`Codex bridge probe drain: ready=${ready.length}, readyTurns=${JSON.stringify(ready.map(t => ({ turnId: t.turnId.slice(0, 8), isLocal: t.isLocal === true, finalLen: t.finalText?.length ?? 0, markTimeMs: t.markTimeMs })))}, before=${before}, after=${codexBridgeQueueSnapshot()}`);
-  }
+  if (ready.length === 0) return;
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
@@ -1908,15 +1850,9 @@ function emitReadyCodexTurns(): void {
         kind: 'local-turn',
         userText: fields.userText,
       });
-      if (probe) {
-        log(`Codex bridge probe send local final_output: turn=${turn.turnId.slice(0, 8)}, len=${fields.content.length}`);
-      }
       continue;
     }
     send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
-    if (probe) {
-      log(`Codex bridge probe send final_output: turn=${turn.turnId.slice(0, 8)}, len=${turn.finalText.length}`);
-    }
   }
 }
 

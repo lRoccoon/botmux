@@ -140,39 +140,6 @@ export class CodexBridgeQueue {
     }
   }
 
-  debugSnapshot(): {
-    localTurnsEnabled: boolean;
-    queued: Array<{
-      turnId: string;
-      started: boolean;
-      hasFinalText: boolean;
-      isLocal: boolean;
-      markTimeMs?: number;
-      contentFingerprint?: string;
-    }>;
-    collectingTurnId?: string;
-    buffered: Array<{ kind: CodexBridgeEvent['kind']; uuid: string; timestampMs: number; textPreview: string }>;
-  } {
-    return {
-      localTurnsEnabled: this.localTurnsEnabled,
-      queued: this.queue.map(t => ({
-        turnId: t.turnId,
-        started: t.started,
-        hasFinalText: t.finalText !== undefined,
-        isLocal: t.isLocal === true,
-        markTimeMs: t.markTimeMs,
-        contentFingerprint: t.contentFingerprint,
-      })),
-      collectingTurnId: this.collecting?.turnId,
-      buffered: this.bufferedUnmatched.map(ev => ({
-        kind: ev.kind,
-        uuid: ev.uuid,
-        timestampMs: ev.timestampMs,
-        textPreview: ev.text.slice(0, 60),
-      })),
-    };
-  }
-
   private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
     if (ev.kind === 'user') {
       // First decide whether this user event is a REAL turn-start: either it
