@@ -1426,13 +1426,13 @@ function structuredBridgeIsMtr(): boolean {
   return lastInitConfig?.cliId === 'mtr';
 }
 
-function structuredBridgeIsCursor(): boolean {
+function codexBridgeIsCursor(): boolean {
   return lastInitConfig?.cliId === 'cursor';
 }
 
 function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
-  if (structuredBridgeIsCursor()) return drainCursorTranscript(path, offset);
+  if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsHermes()) {
     const result = drainHermesStateDb(offset);
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
@@ -1440,20 +1440,20 @@ function structuredBridgeIngestPath(path: string, offset: number) {
   return drainCocoEvents(path, offset);
 }
 
-function structuredBridgeProbeEnabled(): boolean {
-  // Cursor is the only current structured bridge without per-event timestamps,
+function codexBridgeProbeEnabled(): boolean {
+  // Cursor is the only current transcript bridge without per-event timestamps,
   // so keep the high-cardinality attribution probe scoped there by default.
-  return structuredBridgeIsCursor();
+  return codexBridgeIsCursor();
 }
 
-function structuredBridgeEventPreview(events: CodexBridgeEvent[]): string {
+function codexBridgeEventPreview(events: CodexBridgeEvent[]): string {
   return events.map(ev => {
     const uuid = ev.uuid.length > 24 ? `...${ev.uuid.slice(-24)}` : ev.uuid;
     return `${ev.kind}:${uuid}:${ev.text.replace(/\s+/g, ' ').slice(0, 60)}`;
   }).join(' | ');
 }
 
-function structuredBridgeQueueSnapshot(): string {
+function codexBridgeQueueSnapshot(): string {
   const snap = codexBridgeQueue.debugSnapshot();
   return JSON.stringify({
     localTurnsEnabled: snap.localTurnsEnabled,
@@ -1513,7 +1513,7 @@ function codexBridgeStartTimer(): void {
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
-      if (structuredBridgeIsCursor()) {
+      if (codexBridgeIsCursor()) {
         // Late-attach: the transcript usually exists at adopt time (the
         // session is already running), so cursorBridgeAttach in setup wins.
         // This covers the rare race where pid→chatId resolved but the JSONL
@@ -1773,7 +1773,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
-  if (structuredBridgeIsCursor()) {
+  if (codexBridgeIsCursor()) {
     // Cursor's cliSessionId is the chatId — the same UUID naming the
     // agent-transcript JSONL, so it resolves the path directly.
     const cursorPath = findCursorTranscriptByChatId(cliSessionId);
@@ -1809,14 +1809,14 @@ function codexBridgeIngest(): void {
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
   const oldOffset = codexBridgeOffset;
-  const before = structuredBridgeProbeEnabled() ? structuredBridgeQueueSnapshot() : '';
+  const before = codexBridgeProbeEnabled() ? codexBridgeQueueSnapshot() : '';
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
-  if (structuredBridgeProbeEnabled() && (result.events.length > 0 || oldOffset !== result.newOffset)) {
-    log(`Structured bridge probe ingest: offset=${oldOffset}->${result.newOffset}, events=${result.events.length}, tail=${result.pendingTail.length}, eventPreview="${structuredBridgeEventPreview(result.events)}", before=${before}, after=${structuredBridgeQueueSnapshot()}`);
+  if (codexBridgeProbeEnabled() && (result.events.length > 0 || oldOffset !== result.newOffset)) {
+    log(`Codex bridge probe ingest: offset=${oldOffset}->${result.newOffset}, events=${result.events.length}, tail=${result.pendingTail.length}, eventPreview="${codexBridgeEventPreview(result.events)}", before=${before}, after=${codexBridgeQueueSnapshot()}`);
   }
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
   // end-of-turn, far more reliable than the screen-pattern heuristic
@@ -1835,12 +1835,12 @@ function codexBridgeIngest(): void {
 function codexBridgeMarkPendingTurn(messageText: string): boolean {
   if (!codexBridgeFallbackActive()) return false;
   const turnId = `codex-${randomBytes(8).toString('hex')}`;
-  if (structuredBridgeProbeEnabled()) {
-    log(`Structured bridge probe mark: turn=${turnId.slice(0, 8)}, preview="${messageText.replace(/\s+/g, ' ').slice(0, 80)}", before=${structuredBridgeQueueSnapshot()}`);
+  if (codexBridgeProbeEnabled()) {
+    log(`Codex bridge probe mark: turn=${turnId.slice(0, 8)}, preview="${messageText.replace(/\s+/g, ' ').slice(0, 80)}", before=${codexBridgeQueueSnapshot()}`);
   }
   codexBridgeQueue.mark(turnId, messageText);
-  if (structuredBridgeProbeEnabled()) {
-    log(`Structured bridge probe mark done: turn=${turnId.slice(0, 8)}, after=${structuredBridgeQueueSnapshot()}`);
+  if (codexBridgeProbeEnabled()) {
+    log(`Codex bridge probe mark done: turn=${turnId.slice(0, 8)}, after=${codexBridgeQueueSnapshot()}`);
   }
   return true;
 }
@@ -1854,19 +1854,19 @@ function codexBridgeDrainAndMaybeEmit(): void {
 }
 
 function emitReadyCodexTurns(): void {
-  const probe = structuredBridgeProbeEnabled();
-  const before = probe ? structuredBridgeQueueSnapshot() : '';
+  const probe = codexBridgeProbeEnabled();
+  const before = probe ? codexBridgeQueueSnapshot() : '';
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) {
-    if (probe && before !== structuredBridgeQueueSnapshot()) {
-      log(`Structured bridge probe drain: ready=0, before=${before}, after=${structuredBridgeQueueSnapshot()}`);
+    if (probe && before !== codexBridgeQueueSnapshot()) {
+      log(`Codex bridge probe drain: ready=0, before=${before}, after=${codexBridgeQueueSnapshot()}`);
     } else if (probe && before.includes('"queued":[{')) {
-      log(`Structured bridge probe drain: ready=0, state=${before}`);
+      log(`Codex bridge probe drain: ready=0, state=${before}`);
     }
     return;
   }
   if (probe) {
-    log(`Structured bridge probe drain: ready=${ready.length}, readyTurns=${JSON.stringify(ready.map(t => ({ turnId: t.turnId.slice(0, 8), isLocal: t.isLocal === true, finalLen: t.finalText?.length ?? 0, markTimeMs: t.markTimeMs })))}, before=${before}, after=${structuredBridgeQueueSnapshot()}`);
+    log(`Codex bridge probe drain: ready=${ready.length}, readyTurns=${JSON.stringify(ready.map(t => ({ turnId: t.turnId.slice(0, 8), isLocal: t.isLocal === true, finalLen: t.finalText?.length ?? 0, markTimeMs: t.markTimeMs })))}, before=${before}, after=${codexBridgeQueueSnapshot()}`);
   }
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Adopt mode: model is the user's external Codex, no botmux send to
@@ -1909,13 +1909,13 @@ function emitReadyCodexTurns(): void {
         userText: fields.userText,
       });
       if (probe) {
-        log(`Structured bridge probe send local final_output: turn=${turn.turnId.slice(0, 8)}, len=${fields.content.length}`);
+        log(`Codex bridge probe send local final_output: turn=${turn.turnId.slice(0, 8)}, len=${fields.content.length}`);
       }
       continue;
     }
     send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
     if (probe) {
-      log(`Structured bridge probe send final_output: turn=${turn.turnId.slice(0, 8)}, len=${turn.finalText.length}`);
+      log(`Codex bridge probe send final_output: turn=${turn.turnId.slice(0, 8)}, len=${turn.finalText.length}`);
     }
   }
 }
@@ -3045,7 +3045,7 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     const adoptStartMs = Date.now();
     codexAdoptStartMs = adoptStartMs;
     // Cursor JSONL lacks per-event timestamps, but adopt still needs parity
-    // with other structured bridges: direct terminal input should be surfaced
+    // with other transcript bridges: direct terminal input should be surfaced
     // as a local-turn card in Lark. Baseline/offset handling above keeps
     // pre-adopt history out of the queue; worst-case mirror replay is a
     // duplicate local-turn message rather than lost local input.
@@ -4176,7 +4176,7 @@ process.on('message', async (raw: unknown) => {
           // in-flight events from a local-typed prior turn close before
           // this Lark turn's fingerprint window opens. Mark works even
           // pre-attach (queue is path-agnostic).
-          if (structuredBridgeIsCursor()) {
+          if (codexBridgeIsCursor()) {
             // Cursor may append the current Lark/user line to its transcript
             // before this IPC message is handled. Mark first so that preexisting
             // current-line can still fingerprint-match instead of being marked
