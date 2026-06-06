@@ -20,7 +20,7 @@ import { join } from 'node:path';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
-import { loadDag } from './dag.js';
+import { isLoopNode, loadDag } from './dag.js';
 import {
   runWorkflow,
   nextAttemptIdFor,
@@ -84,6 +84,29 @@ export function blockedInfoFor(events: StoredEvent[], nodeId: string): V3Blocked
   return found ?? { nodeId, attemptId: latestAttemptIdFor(events, nodeId) ?? `${nodeId}/attempts/001` };
 }
 
+/** What the daemon needs to render an exhausted-loop grant card. */
+export interface V3LoopExhaustedInfo {
+  loopId: string;
+  /** The iteration the loop exhausted at (= the grant card's freshness key). */
+  iteration: number;
+  /** Authored bound — filled when the dag is loadable (display only). */
+  maxIterations?: number;
+  /** Extra iterations already granted. */
+  granted: number;
+  /** Last decision detail (e.g. `result.passed=false (iteration 3/3)`). */
+  detail?: string;
+}
+
+/** Fold the exhausted-loop card content from the journal.  Pure. */
+export function loopExhaustedInfoFor(events: StoredEvent[], loopId: string): V3LoopExhaustedInfo {
+  const ls = materialize(events).loops.get(loopId);
+  let detail: string | undefined;
+  for (const e of events) {
+    if (e.type === 'loopIterationDecision' && e.loopId === loopId) detail = e.detail;
+  }
+  return { loopId, iteration: ls?.iteration ?? 0, granted: ls?.granted ?? 0, detail };
+}
+
 export interface V3DaemonRunDeps {
   /** runs root (default ~/.botmux/v3-runs). */
   baseDir?: string;
@@ -98,6 +121,9 @@ export interface V3DaemonRunDeps {
   /** Post a blocked-node retry card.  Optional — when absent (or no binding),
    *  a blocked outcome falls through to `onTerminal` like failed/succeeded. */
   postBlockedCard?: (binding: RunChatBinding, info: V3BlockedInfo, runId: string) => Promise<void>;
+  /** Post an exhausted-loop grant card (+1 iteration).  Optional — same
+   *  fallthrough semantics as postBlockedCard. */
+  postLoopGrantCard?: (binding: RunChatBinding, info: V3LoopExhaustedInfo, runId: string) => Promise<void>;
   /** Report a terminal run (final card / message).  Optional. */
   onTerminal?: (runId: string, outcome: V3TerminalOutcome, binding?: RunChatBinding) => Promise<void>;
   maxParallel?: number;
@@ -160,11 +186,23 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     for (const gate of outcome.pendingWaits) {
       await deps.postGateCard(binding, gate, runId);
     }
-  } else if (outcome.runStatus === 'blocked' && outcome.blockedNodeId && binding && deps.postBlockedCard) {
-    // Blocked = terminal-for-now: post the retry card instead of a final
-    // notification.  A click appends `nodeRetryRequested` + re-drives.
+  } else if (outcome.runStatus === 'blocked' && outcome.blockedNodeId && binding) {
+    // Blocked = terminal-for-now.  Two distinct causes, two distinct cards:
+    //   - exhausted LOOP (blockedNodeId is a loop id; nothing "failed", the
+    //     work just didn't converge) → grant card (+1 iteration);
+    //   - blocked node/instance (contract failure) → retry card (new attempt).
     const events = readJournal(join(runDir, 'journal.ndjson'));
-    await deps.postBlockedCard(binding, blockedInfoFor(events, outcome.blockedNodeId), runId);
+    const isLoop = materialize(events).loops.has(outcome.blockedNodeId);
+    if (isLoop && deps.postLoopGrantCard) {
+      const info = loopExhaustedInfoFor(events, outcome.blockedNodeId);
+      const loopNode = dag.nodes.find((n) => n.id === outcome.blockedNodeId);
+      if (loopNode && isLoopNode(loopNode)) info.maxIterations = loopNode.maxIterations;
+      await deps.postLoopGrantCard(binding, info, runId);
+    } else if (!isLoop && deps.postBlockedCard) {
+      await deps.postBlockedCard(binding, blockedInfoFor(events, outcome.blockedNodeId), runId);
+    } else {
+      await deps.onTerminal?.(runId, outcome, binding);
+    }
   } else {
     await deps.onTerminal?.(runId, outcome, binding);
   }
@@ -232,7 +270,7 @@ export function resolveV3GateClick(
 export type V3RetryOutcome =
   | { kind: 'requested'; nodeId: string; previousAttemptId: string; nextAttemptId: string }
   | { kind: 'already-requested'; nodeId: string }
-  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' };
+  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' };
 
 /**
  * Append a retry intent for a blocked node (the resume entrypoint — daemon
@@ -272,6 +310,9 @@ export function requestV3Retry(
     snap.blockedNodeId ??
     [...snap.nodes.keys()].find((id) => unconsumedRetryEvent(events, id) !== undefined);
   if (!nodeId) return { kind: 'stale-run', reason: 'not-blocked' };
+  // An exhausted LOOP blocks the run too, but "retry an attempt" is the wrong
+  // verb for it — the recovery is a grant (+1 iteration).  Route loudly.
+  if (snap.loops.has(nodeId)) return { kind: 'stale-run', reason: 'loop-node' };
 
   const status = snap.nodes.get(nodeId)?.status;
   if (status === 'pending') {
@@ -312,6 +353,61 @@ export function requestV3Retry(
   return { kind: 'requested', nodeId, previousAttemptId, nextAttemptId };
 }
 
+export type V3LoopGrantOutcome =
+  | { kind: 'granted'; loopId: string; fromIteration: number; nextIteration: number }
+  | { kind: 'already-granted'; loopId: string }
+  | { kind: 'stale-run'; reason: 'missing' | 'not-exhausted' | 'stale-iteration' };
+
+/**
+ * Grant ONE extra iteration to an exhausted-blocked loop (the loop analogue
+ * of `requestV3Retry` — daemon grant-card click and `botmux workflow grant`
+ * both land here).  Same recovery-first discipline:
+ *   1. fresh `materialize(readJournal)` — the journal is the only truth.
+ *   2. the target loop must STILL be exhausted-blocked.  An unconsumed grant
+ *      (`pendingGrant`) → already-granted (idempotent, no second append).
+ *   3. `expectedIteration` (card clicks pass the card's iteration): the grant
+ *      is only valid for the iteration the loop exhausted at — a stale card
+ *      from an earlier exhaustion must not grant a second silent round
+ *      (expectedAttemptId's lesson, ported).  CLI omits it.
+ *   4. append `loopIterationGranted`; the caller re-drives (materialize folds
+ *      the grant into a running loop → orchestrator starts iteration N+1).
+ */
+export function requestV3LoopGrant(
+  baseDir: string,
+  runId: string,
+  input: { loopId?: string; expectedIteration?: number; by?: string } = {},
+): V3LoopGrantOutcome {
+  const runDir = safeRunDir(baseDir, runId);
+  const journalPath = join(runDir, 'journal.ndjson');
+  if (!existsSync(journalPath)) return { kind: 'stale-run', reason: 'missing' };
+
+  const events = readJournal(journalPath);
+  const snap = materialize(events);
+  // Target: explicit loopId > the run's blocked pointer when it IS a loop >
+  // a loop with an unconsumed grant (the idempotent repeat-call path).
+  const loopId =
+    input.loopId ??
+    (snap.blockedNodeId && snap.loops.has(snap.blockedNodeId) ? snap.blockedNodeId : undefined) ??
+    [...snap.loops.entries()].find(([, ls]) => ls.pendingGrant)?.[0];
+  const ls = loopId ? snap.loops.get(loopId) : undefined;
+  if (!loopId || !ls) return { kind: 'stale-run', reason: 'not-exhausted' };
+
+  if (input.expectedIteration !== undefined && input.expectedIteration !== ls.iteration) {
+    // Freshness gate: the card was rendered for the iteration the loop
+    // exhausted at; a newer exhaustion (or a consumed grant) invalidates it.
+    return { kind: 'stale-run', reason: 'stale-iteration' };
+  }
+  if (ls.pendingGrant) return { kind: 'already-granted', loopId };
+  if (snap.nodes.get(loopId)?.status !== 'blocked' || ls.lastDecision !== 'exhausted') {
+    return { kind: 'stale-run', reason: 'not-exhausted' };
+  }
+
+  appendEvent(journalPath, {
+    type: 'loopIterationGranted', loopId, fromIteration: ls.iteration, by: input.by,
+  });
+  return { kind: 'granted', loopId, fromIteration: ls.iteration, nextIteration: ls.iteration + 1 };
+}
+
 /** The node's `nodeRetryRequested` whose reserved attempt has not yet been
  *  consumed by a matching `nodeDispatched` (undefined when none pending). */
 function unconsumedRetryEvent(
@@ -337,6 +433,9 @@ export interface V3GateRecovery {
   /** blocked node whose retry card the daemon should (re)post — covers the
    *  crash window between the `runBlocked` append and the card send. */
   repostBlocked?: V3BlockedInfo;
+  /** exhausted loop whose grant card the daemon should (re)post — the loop
+   *  flavor of the same crash window. */
+  repostLoopGrant?: V3LoopExhaustedInfo;
   /** true when a resolved-but-unjournaled gate was healed → daemon should driveV3Run. */
   resume: boolean;
 }
@@ -348,6 +447,8 @@ export interface V3GateRunnerDeps {
   postCard: (binding: RunChatBinding, gate: V3PendingGate, runId: string) => Promise<void>;
   /** Post (or re-post) a blocked node's retry card. */
   postBlockedCard?: (binding: RunChatBinding, info: V3BlockedInfo, runId: string) => Promise<void>;
+  /** Post (or re-post) an exhausted loop's grant card. */
+  postLoopGrantCard?: (binding: RunChatBinding, info: V3LoopExhaustedInfo, runId: string) => Promise<void>;
   /** Notify a terminal run (optional, daemon-supplied). */
   notifyTerminal?: (binding: RunChatBinding | undefined, runId: string, outcome: V3TerminalOutcome) => Promise<void>;
   /** runtime deps passthrough (tests inject; daemon uses real pool). */
@@ -391,6 +492,7 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
           maxParallel: deps.maxParallel,
           postGateCard: (binding, gate, rid) => deps.postCard(binding, gate, rid),
           postBlockedCard: deps.postBlockedCard,
+          postLoopGrantCard: deps.postLoopGrantCard,
           onTerminal: (rid, outcome, binding) =>
             deps.notifyTerminal ? deps.notifyTerminal(binding, rid, outcome) : Promise.resolve(),
         });
@@ -432,6 +534,13 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
             deps.onError?.(rec.runId, err);
           }
         }
+        if (rec.repostLoopGrant && deps.postLoopGrantCard) {
+          try {
+            await deps.postLoopGrantCard(rec.binding, rec.repostLoopGrant, rec.runId);
+          } catch (err) {
+            deps.onError?.(rec.runId, err);
+          }
+        }
       }
       if (rec.resume) driveDetached(rec.runId);
     }
@@ -469,19 +578,31 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
       if (snap.runStatus === 'succeeded' || snap.runStatus === 'failed') continue;
 
       if (snap.runStatus === 'blocked') {
-        // Blocked run: repost the retry card (covers the crash window between
-        // the runBlocked append and the original card send).  Owner-filtered
-        // like gates; binding-less (CLI/dev) runs are left alone.
+        // Blocked run: repost the recovery card (covers the crash window
+        // between the runBlocked append and the original card send) — grant
+        // card for an exhausted loop, retry card for a blocked node.  Owner-
+        // filtered like gates; binding-less (CLI/dev) runs are left alone.
         const grill = readGrillState(runDir);
         const binding = grill?.chatBinding;
         if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
         if (!binding || !snap.blockedNodeId) continue;
-        out.push({
-          runId, runDir, binding,
-          repost: [],
-          repostBlocked: blockedInfoFor(events, snap.blockedNodeId),
-          resume: false,
-        });
+        if (snap.loops.has(snap.blockedNodeId)) {
+          const info = loopExhaustedInfoFor(events, snap.blockedNodeId);
+          if (grill?.dagPath && existsSync(grill.dagPath)) {
+            try {
+              const loopNode = loadDag(grill.dagPath).nodes.find((n) => n.id === snap.blockedNodeId);
+              if (loopNode && isLoopNode(loopNode)) info.maxIterations = loopNode.maxIterations;
+            } catch { /* display-only enrichment — card renders without it */ }
+          }
+          out.push({ runId, runDir, binding, repost: [], repostLoopGrant: info, resume: false });
+        } else {
+          out.push({
+            runId, runDir, binding,
+            repost: [],
+            repostBlocked: blockedInfoFor(events, snap.blockedNodeId),
+            resume: false,
+          });
+        }
         continue;
       }
 
@@ -496,7 +617,17 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
       // (before the redrive) or right after start — so re-drive it.  Runs with
       // phantom `running` nodes are the dangling-attempt recovery gap (worker
       // fencing backlog) and are deliberately left alone.
-      const hasRunning = [...snap.nodes.values()].some((s) => s.status === 'running');
+      //
+      // Composite LOOP nodes are excluded from the phantom check (codex loop
+      // review blocker): a loop is 'running' in PURE CONTROL states with no
+      // worker behind it — right after loopStarted / a continue-decision / a
+      // grant, the runtime's next tick derives the follow-up from the journal.
+      // A crash in those windows must resume, or the run sticks forever (most
+      // reproducible: grant click → loopIterationGranted appended → crash
+      // before redrive).  Body INSTANCES still count as real in-flight.
+      const hasRunning = [...snap.nodes.entries()].some(
+        ([id, s]) => s.status === 'running' && !snap.loops.has(id),
+      );
       if (!hasRunning) {
         const grill = readGrillState(runDir);
         const binding = grill?.chatBinding;

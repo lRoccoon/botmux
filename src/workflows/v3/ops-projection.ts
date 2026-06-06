@@ -68,6 +68,22 @@ export interface RunNodeView {
    *  containing absolute paths, and this view is link-shareable public-read. */
   errorClass?: string;
   errorCode?: string;
+  /** True for composite loop nodes (from dag.json). */
+  isLoop?: boolean;
+  /** Composite loop progress (loop nodes only, once started).  `lastDecision`
+   *  is the coarse enum; the free-text decision `detail` is deliberately NOT
+   *  projected (it can quote agent-written result strings) — same public-read
+   *  rationale as `message`. */
+  loopState?: {
+    iteration: number;
+    maxIterations?: number;
+    granted: number;
+    lastDecision?: 'exit' | 'continue' | 'exhausted';
+  };
+  /** For loop BODY INSTANCE nodes (`repairLoop.i001.code`): the structured
+   *  membership ref from the dispatch event.  The id stays opaque — group by
+   *  THIS, never parse the id string. */
+  loop?: { loopId: string; iteration: number; bodyNodeId: string };
 }
 
 export interface RunView {
@@ -82,6 +98,8 @@ interface DagNodeLite {
   id: string;
   depends: string[];
   goal?: string;
+  isLoop?: boolean;
+  maxIterations?: number;
 }
 
 function readDagNodes(runDir: string): DagNodeLite[] {
@@ -91,11 +109,13 @@ function readDagNodes(runDir: string): DagNodeLite[] {
     const dag = JSON.parse(readFileSync(p, 'utf-8')) as { nodes?: unknown };
     if (!dag || !Array.isArray(dag.nodes)) return [];
     return dag.nodes.map((raw): DagNodeLite => {
-      const n = raw as { id?: unknown; depends?: unknown; goal?: unknown };
+      const n = raw as { id?: unknown; depends?: unknown; goal?: unknown; type?: unknown; maxIterations?: unknown };
       return {
         id: String(n.id),
         depends: Array.isArray(n.depends) ? n.depends.map(String) : [],
         goal: typeof n.goal === 'string' ? n.goal : undefined,
+        isLoop: n.type === 'loop' || undefined,
+        maxIterations: typeof n.maxIterations === 'number' ? n.maxIterations : undefined,
       };
     });
   } catch {
@@ -117,6 +137,7 @@ export function projectRun(runId: string, runDir: string): RunView {
   const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
   const manifests = new Map<string, string>();
   const errors = new Map<string, { errorClass: string; errorCode?: string }>();
+  const loopRefs = new Map<string, { loopId: string; iteration: number; bodyNodeId: string }>();
   for (const e of events) {
     if (e.type === 'nodeSessionReady') {
       sessions.set(e.nodeId, { ...e.sessionInfo, ptyLogPath: e.ptyLogPath });
@@ -125,13 +146,20 @@ export function projectRun(runId: string, runDir: string): RunView {
       errors.delete(e.nodeId); // a later successful attempt clears the error
     } else if (e.type === 'nodeFailed' || e.type === 'nodeBlocked') {
       errors.set(e.nodeId, { errorClass: e.errorClass, errorCode: e.errorCode });
+    } else if (e.type === 'nodeDispatched' && e.loop) {
+      loopRefs.set(e.nodeId, e.loop);
     }
   }
 
   // Prefer the dag's node order (covers not-yet-dispatched nodes); fall back to
-  // whatever the journal has seen if dag.json is missing.
-  const ids = dagNodes.length ? dagNodes.map((n) => n.id) : [...snap.nodes.keys()];
+  // whatever the journal has seen if dag.json is missing.  Loop body INSTANCES
+  // exist only in the journal (dag.json holds the body template) — append them
+  // after the dag order, in first-dispatch order.
   const dagById = new Map(dagNodes.map((n) => [n.id, n]));
+  const instanceIds = [...loopRefs.keys()].filter((id) => !dagById.has(id));
+  const ids = dagNodes.length
+    ? [...dagNodes.map((n) => n.id), ...instanceIds]
+    : [...snap.nodes.keys()];
 
   const nodes: RunNodeView[] = ids.map((id) => {
     const status = (snap.nodes.get(id)?.status ?? 'pending') as V3NodeStatus;
@@ -157,6 +185,20 @@ export function projectRun(runId: string, runDir: string): RunView {
       view.errorClass = err.errorClass;
       view.errorCode = err.errorCode;
     }
+    const dagNode = dagById.get(id);
+    if (dagNode?.isLoop) view.isLoop = true;
+    const ls = snap.loops.get(id);
+    if (ls) {
+      view.isLoop = true;
+      view.loopState = {
+        iteration: ls.iteration,
+        maxIterations: dagNode?.maxIterations,
+        granted: ls.granted,
+        lastDecision: ls.lastDecision,
+      };
+    }
+    const ref = loopRefs.get(id);
+    if (ref) view.loop = ref;
     return view;
   });
 

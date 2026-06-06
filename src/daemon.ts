@@ -90,9 +90,10 @@ import {
   type WorkflowCommandResult,
 } from './im/lark/workflow-slash-command.js';
 import { workflowRunDetailUrl } from './im/lark/workflow-cards.js';
-import { createV3GateRunner, requestV3Retry } from './workflows/v3/daemon-run.js';
+import { createV3GateRunner, requestV3Retry, requestV3LoopGrant } from './workflows/v3/daemon-run.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3BlockedCard } from './im/lark/v3-blocked-card.js';
+import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
 import { isValidRunId as isValidV3RunId } from './workflows/v3/ops-projection.js';
 import { readRunChatBinding as readV3RunChatBinding, defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.js';
 
@@ -1513,13 +1514,28 @@ const v3GateRunner = createV3GateRunner({
       await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
     }
   },
+  postLoopGrantCard: async (binding, info, runId) => {
+    const card = buildV3LoopGrantCard({
+      runId,
+      loopId: info.loopId,
+      iteration: info.iteration,
+      maxIterations: info.maxIterations,
+      granted: info.granted,
+      detail: info.detail,
+    });
+    if (binding.rootMessageId) {
+      await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
+    } else {
+      await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+    }
+  },
   notifyTerminal: async (binding, runId, outcome) => {
     if (!binding?.rootMessageId) return;
     const msg = outcome.runStatus === 'succeeded'
       ? `✅ v3 workflow \`${runId}\` 跑完了`
       : outcome.runStatus === 'blocked'
-        // Fallback only — the blocked path normally posts a retry card instead.
-        ? `⏸️ v3 workflow \`${runId}\` 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''}，可 \`botmux workflow retry ${runId}\` 重试`
+        // Fallback only — the blocked path normally posts a retry/grant card instead.
+        ? `⏸️ v3 workflow \`${runId}\` 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''}，可 \`botmux workflow retry ${runId}\` 重试（loop 耗尽则 \`botmux workflow grant ${runId}\` 追加一轮）`
         : `❌ v3 workflow \`${runId}\` 失败${outcome.failedNodeId ? `（节点 ${outcome.failedNodeId}）` : ''}`;
     await sessionReply(binding.rootMessageId, msg, 'text', binding.larkAppId).catch(() => {});
   },
@@ -1545,6 +1561,11 @@ const cardDeps: CardHandlerDeps = {
       binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
   },
   v3BlockedDeps: {
+    driveRun: (runId) => v3GateRunner.driveDetached(runId),
+    canResolve: (binding, operatorOpenId) =>
+      binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
+  },
+  v3LoopGrantDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     canResolve: (binding, operatorOpenId) =>
       binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
@@ -1628,9 +1649,47 @@ ipcRoute('POST', '/api/v3/runs/:runId/retry', async (req, res, params) => {
     return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
   }
   if (outcome.kind === 'stale-run') {
-    return jsonRes(res, 409, { ok: false, error: outcome.reason === 'missing' ? 'unknown_run' : 'not_blocked' });
+    return jsonRes(res, 409, {
+      ok: false,
+      error:
+        outcome.reason === 'missing' ? 'unknown_run'
+        : outcome.reason === 'loop-node' ? 'loop_node_use_grant'
+        : 'not_blocked',
+    });
   }
   // requested / already-requested → make sure the run is moving.
+  v3GateRunner.driveDetached(runId);
+  return jsonRes(res, 202, { ok: true, runId, ...outcome });
+});
+
+// v3 loop grant: append one extra iteration for an exhausted loop + re-drive.
+// Same owner posture as /retry.  Body: { loopId? } (defaults to the run's
+// blocked loop).
+ipcRoute('POST', '/api/v3/runs/:runId/grant', async (req, res, params) => {
+  const runId = params.runId;
+  if (!isValidV3RunId(runId)) return jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
+  const binding = readV3RunChatBinding(join(v3DefaultBaseDir(), runId));
+  if (!binding) return jsonRes(res, 404, { ok: false, error: 'unknown_run_or_no_binding' });
+  if (selfV3LarkAppId && binding.larkAppId !== selfV3LarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+  }
+  let body: { loopId?: unknown } = {};
+  try {
+    body = await readJsonBody<{ loopId?: unknown }>(req);
+  } catch {
+    /* empty body is fine — grant the blocked loop */
+  }
+  const loopId = typeof body.loopId === 'string' && body.loopId ? body.loopId : undefined;
+  let outcome;
+  try {
+    outcome = requestV3LoopGrant(v3DefaultBaseDir(), runId, { loopId, by: 'cli' });
+  } catch (err) {
+    return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+  if (outcome.kind === 'stale-run') {
+    return jsonRes(res, 409, { ok: false, error: outcome.reason === 'missing' ? 'unknown_run' : 'not_exhausted' });
+  }
+  // granted / already-granted → make sure the run is moving.
   v3GateRunner.driveDetached(runId);
   return jsonRes(res, 202, { ok: true, runId, ...outcome });
 });

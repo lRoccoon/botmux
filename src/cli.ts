@@ -2256,10 +2256,48 @@ async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Prom
   }
   const txt = await res.text();
   if (!res.ok) {
-    console.error(`❌ retry 失败 (HTTP ${res.status}): ${txt}`);
+    if (txt.includes('loop_node_use_grant')) {
+      console.error(`❌ 该受阻的是一个 loop（轮数耗尽），不是节点 attempt——用 \`botmux workflow grant ${runId}\` 追加一轮。`);
+    } else {
+      console.error(`❌ retry 失败 (HTTP ${res.status}): ${txt}`);
+    }
     process.exit(1);
   }
   console.log(`🔄 v3 run "${runId}" 重试已受理，节点将以新 attempt 重跑。`);
+}
+
+/** `botmux workflow grant <runId> [--loop <id>]` — 耗尽 loop 追加一轮入口（CLI 侧）。
+ *  与 retry 同构：走 daemon 的 grant IPC（单写者），daemon append
+ *  `loopIterationGranted` 后重驱动，loop 带上一轮反馈再跑一轮。 */
+async function cmdWorkflowGrant(runId: string | undefined, rest: string[]): Promise<void> {
+  if (!runId) {
+    console.error('用法: botmux workflow grant <runId> [--loop <loopId>] [--bot <larkAppId>]');
+    process.exit(1);
+  }
+  const larkAppId = argValue(rest, '--bot') ?? process.env.BOTMUX_LARK_APP_ID;
+  const loopId = argValue(rest, '--loop');
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) {
+    console.error('❌ 没有在线 daemon；loop 追加需要 daemon 驱动。');
+    process.exit(1);
+  }
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/v3/runs/${encodeURIComponent(runId)}/grant`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(loopId ? { loopId } : {}),
+    });
+  } catch (err: any) {
+    console.error(`❌ 无法连接 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    process.exit(1);
+  }
+  const txt = await res.text();
+  if (!res.ok) {
+    console.error(`❌ grant 失败 (HTTP ${res.status}): ${txt}`);
+    process.exit(1);
+  }
+  console.log(`➕ v3 run "${runId}" 已追加一轮，loop 将带上一轮反馈重跑。`);
 }
 
 async function cmdResume(): Promise<void> {
@@ -4823,6 +4861,11 @@ switch (command) {
     if (wfSub === 'retry') {
       // v3 blocked-node retry (the `resume` verb belongs to v0.2).
       await cmdWorkflowRetry(process.argv[4], process.argv.slice(5));
+      break;
+    }
+    if (wfSub === 'grant') {
+      // v3 exhausted-loop grant (+1 iteration).
+      await cmdWorkflowGrant(process.argv[4], process.argv.slice(5));
       break;
     }
     const { cmdWorkflow } = await import('./cli/workflow.js');

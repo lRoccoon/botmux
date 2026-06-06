@@ -29,6 +29,12 @@ import {
   type V3BlockedCardHandlerDeps,
 } from './v3-blocked-card-handler.js';
 import type { V3BlockedActionValue } from './v3-blocked-card.js';
+import {
+  handleV3LoopGrantAction,
+  isV3LoopGrantAction,
+  type V3LoopGrantCardHandlerDeps,
+} from './v3-loop-grant-card-handler.js';
+import type { V3LoopGrantActionValue } from './v3-loop-grant-card.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
@@ -56,6 +62,8 @@ export interface CardHandlerDeps {
   v3GateDeps?: V3GateCardHandlerDeps;
   /** v3 blocked 重试卡点击处理（同一个 runner 的 driveRun）. */
   v3BlockedDeps?: V3BlockedCardHandlerDeps;
+  /** v3 loop 追加一轮卡点击处理（同一个 runner 的 driveRun）. */
+  v3LoopGrantDeps?: V3LoopGrantCardHandlerDeps;
 }
 
 interface CardActionData {
@@ -510,6 +518,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   if (isV3BlockedAction(value?.action)) {
     if (!deps.v3BlockedDeps) return;
     return await handleV3BlockedAction(value as unknown as V3BlockedActionValue, operatorOpenId, deps.v3BlockedDeps);
+  }
+  if (isV3LoopGrantAction(value?.action)) {
+    if (!deps.v3LoopGrantDeps) return;
+    return await handleV3LoopGrantAction(value as unknown as V3LoopGrantActionValue, operatorOpenId, deps.v3LoopGrantDeps);
   }
 
   const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);

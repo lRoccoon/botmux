@@ -264,9 +264,10 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
     console.log(`\n✅ run 成功 — 产物在 ${outcome.runDir}`);
     process.exit(0);
   } else if (outcome.runStatus === 'blocked') {
-    // Blocked ≠ failed: a contract/semantic failure that a retry can fix.
+    // Blocked ≠ failed: a contract/semantic failure that a retry can fix —
+    // or an exhausted loop that a grant (+1 iteration) can re-open.
     console.error(
-      `\n⏸️  run 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''} — 可处理后用 \`botmux workflow retry ${dag.runId}\` 重试该节点；详见 ${join(outcome.runDir, 'journal.ndjson')}`,
+      `\n⏸️  run 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''} — 节点受阻用 \`botmux workflow retry ${dag.runId}\` 重试；loop 轮数耗尽用 \`botmux workflow grant ${dag.runId}\` 追加一轮；详见 ${join(outcome.runDir, 'journal.ndjson')}`,
     );
     process.exit(1);
   } else {

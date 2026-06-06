@@ -16,7 +16,7 @@
 import { writeFileSync, renameSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { StoredEvent } from './journal.js';
-import type { V3NodeState, V3NodeStatus, V3RunState } from './orchestrator.js';
+import type { V3LoopRunState, V3LoopState, V3NodeState, V3NodeStatus, V3RunState } from './orchestrator.js';
 
 export type V3RunStatus = 'running' | 'succeeded' | 'failed' | 'blocked';
 
@@ -32,6 +32,8 @@ export interface V3RunSnapshot {
   /** nodeId → the attemptId of its latest dispatch — or, after a
    *  `nodeRetryRequested`, the reserved `nextAttemptId` the retry will use. */
   attempts: Map<string, string>;
+  /** loopId → composite loop state (iteration cursor / decision / grants). */
+  loops: V3LoopRunState;
 }
 
 // ─── Materialize (replay) ────────────────────────────────────────────────
@@ -53,6 +55,7 @@ export interface V3RunSnapshot {
 export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const nodes: V3RunState = new Map();
   const attempts = new Map<string, string>();
+  const loops: V3LoopRunState = new Map();
   let runStatus: V3RunStatus = 'running';
   let failedNodeId: string | undefined;
   let blockedNodeId: string | undefined;
@@ -64,6 +67,15 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     const carried = gateCleared ?? prev?.gateCleared;
     if (carried) next.gateCleared = true;
     nodes.set(id, next);
+  };
+
+  const loop = (id: string): V3LoopState => {
+    let ls = loops.get(id);
+    if (!ls) {
+      ls = { iteration: 0, decided: false, granted: 0, pendingGrant: false };
+      loops.set(id, ls);
+    }
+    return ls;
   };
 
   for (const e of events) {
@@ -113,10 +125,47 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         runStatus = 'blocked';
         blockedNodeId = e.blockedNodeId;
         break;
+      // ── structured loop lifecycle ──
+      case 'loopStarted':
+        loop(e.loopId);
+        set(e.loopId, 'running');
+        break;
+      case 'loopIterationStarted': {
+        const ls = loop(e.loopId);
+        ls.iteration = e.iteration;
+        ls.decided = false;
+        ls.pendingGrant = false; // an unconsumed grant is consumed here
+        set(e.loopId, 'running');
+        break;
+      }
+      case 'loopIterationDecision': {
+        const ls = loop(e.loopId);
+        ls.decided = true;
+        ls.lastDecision = e.decision;
+        // 'exhausted' blocks the LOOP node (the run-level runBlocked is
+        // appended by the orchestrator's blocked sweep on the next tick).
+        // 'exit' keeps the node 'running' until the orchestrator seals it
+        // with a nodeSucceeded on the loop id (output projection manifest).
+        if (e.decision === 'exhausted') set(e.loopId, 'blocked');
+        break;
+      }
+      case 'loopIterationGranted': {
+        // Replay-correct unblock — the loop analogue of nodeRetryRequested:
+        // a journal event, so a fresh materialize() yields a running loop.
+        const ls = loop(e.loopId);
+        ls.granted += 1;
+        ls.pendingGrant = true;
+        set(e.loopId, 'running');
+        if (runStatus === 'blocked') {
+          runStatus = 'running';
+          blockedNodeId = undefined;
+        }
+        break;
+      }
     }
   }
 
-  return { runStatus, failedNodeId, blockedNodeId, nodes, attempts };
+  return { runStatus, failedNodeId, blockedNodeId, nodes, attempts, loops };
 }
 
 // ─── STATE checkpoint (atomic write / read) ────────────────────────────────
@@ -129,6 +178,7 @@ interface StateFile {
   blockedNodeId?: string;
   nodes: Record<string, V3NodeState>;
   attempts: Record<string, string>;
+  loops?: Record<string, V3LoopState>;
   updatedAt: number;
 }
 
@@ -147,6 +197,7 @@ export function writeState(statePath: string, snap: V3RunSnapshot): void {
     blockedNodeId: snap.blockedNodeId,
     nodes: Object.fromEntries(snap.nodes),
     attempts: Object.fromEntries(snap.attempts),
+    loops: snap.loops.size > 0 ? Object.fromEntries(snap.loops) : undefined,
     updatedAt: Date.now(),
   };
   const tmp = `${statePath}.tmp`;
@@ -166,5 +217,6 @@ export function readState(statePath: string): V3RunSnapshot | undefined {
     blockedNodeId: file.blockedNodeId,
     nodes: new Map(Object.entries(file.nodes)),
     attempts: new Map(Object.entries(file.attempts)),
+    loops: new Map(Object.entries(file.loops ?? {})),
   };
 }

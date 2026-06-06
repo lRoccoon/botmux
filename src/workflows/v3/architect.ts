@@ -88,8 +88,17 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     '- Keep node ids path-safe: [A-Za-z0-9._-].',
     '- Ensure the graph is acyclic and every inputs.from also appears in depends.',
     '',
+    'Structured rework loops (type:"loop"):',
+    '- When the spec means "rework until verification passes" (fix→test, implement→review, generate→critique→revise), model it as ONE composite loop node — NEVER as a back-edge (the outer graph must stay acyclic; the validator rejects cycles).',
+    '- Loop shape: { id, type:"loop", depends, inputs, maxIterations, body:{ nodes:[ <goal nodes> ] }, exit:{ node:"<verifier>", when:{ path:"result.<key>", equals:true } }, feedback:[ "<verifier>.result", "<verifier>.files" ], output:{ from:"<worker>" } }.',
+    '- The exit node MUST declare a resultSchema covering the exit key (flat object subset; the key must be in `required`). When the predicate does not match, the loop continues automatically until maxIterations, then blocks for a human (who can grant +1 rounds).',
+    '- `output.from` is what downstream consumes — usually the WORKER node\'s product (the fixed code/report), not the verifier\'s.',
+    '- Pick maxIterations honestly from how many rework rounds are plausibly useful (typical 3; ceiling 20). Do NOT use a loop when the verification result IS the final product (a one-shot audit/report) — a plain node chain is correct there.',
+    '- Cost note: a loop costs up to maxIterations × body-node-count worker runs. State this estimate in architect-notes.md for the Gate-2 reviewer.',
+    '',
     'architect-notes.md requirements:',
     '- Summarize the DAG structure and the reasoning for dependencies/gates.',
+    '- For each loop: why a loop, the exit condition, and the worst-case cost estimate (maxIterations × body nodes).',
     '- List any assumptions or unresolved risks for human review.',
   ].join('\n');
 }

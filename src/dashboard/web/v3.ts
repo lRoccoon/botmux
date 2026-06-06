@@ -153,11 +153,49 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
           node.status === 'blocked' ? ' — 处理后可在飞书卡片或 `botmux workflow retry` 重试' : ''
         }</p>`
       : '';
+    // Composite loop: iteration cursor + per-iteration instance chips (the
+    // instances live OUTSIDE the graph — this panel is how you reach them).
+    let loopHtml = '';
+    if (node.isLoop) {
+      const ls = node.loopState;
+      const budget = ls?.maxIterations !== undefined ? ` / ${ls.maxIterations + ls.granted}` : '';
+      const lsLine = ls
+        ? `<p class="muted">轮次：第 ${ls.iteration}${budget} 轮${ls.lastDecision ? ` · 上轮判定 ${esc(ls.lastDecision)}` : ''}${
+            node.status === 'blocked' ? ' — 飞书卡片或 `botmux workflow grant` 可追加一轮' : ''
+          }</p>`
+        : '<p class="muted">loop 未开始</p>';
+      const insts = (lastView?.nodes ?? []).filter((x) => x.loop?.loopId === node.id);
+      const byIter = new Map<number, RunNodeView[]>();
+      for (const inst of insts) {
+        const k = inst.loop!.iteration;
+        (byIter.get(k) ?? byIter.set(k, []).get(k)!).push(inst);
+      }
+      const rows = [...byIter.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([iter, ns]) =>
+          `<p class="muted">第${iter}轮：${ns
+            .map((x) =>
+              `<span data-sel="${esc(x.id)}" style="cursor:pointer;color:${NODE_COLOR[x.status]}">${esc(x.loop!.bodyNodeId)}·${NODE_LABEL[x.status]}</span>`)
+            .join(' &nbsp; ')}</p>`)
+        .join('');
+      loopHtml = lsLine + rows;
+    } else if (node.loop) {
+      // A body instance: link back to its owning loop (structured ref — the
+      // instance id itself stays opaque).
+      loopHtml = `<p class="muted">loop 成员：<span data-sel="${esc(node.loop.loopId)}" style="cursor:pointer;text-decoration:underline">${esc(node.loop.loopId)}</span> · 第${node.loop.iteration}轮 · ${esc(node.loop.bodyNodeId)}</p>`;
+    }
     panelEl.querySelector<HTMLElement>('#v3-node-meta')!.innerHTML = `
       <p><span class="badge" style="background:${NODE_COLOR[node.status]};color:#fff">${NODE_LABEL[node.status]}</span></p>
       ${node.goal ? `<p class="muted">${esc(node.goal)}</p>` : ''}
       ${node.depends.length ? `<p class="muted">依赖：${node.depends.map(esc).join(', ')}</p>` : ''}
-      ${errLine}`;
+      ${errLine}${loopHtml}`;
+    for (const el of panelEl.querySelectorAll<HTMLElement>('[data-sel]')) {
+      el.addEventListener('click', () => {
+        selected = el.getAttribute('data-sel');
+        if (lastView) renderGraph(lastView);
+        renderPanel();
+      });
+    }
     // Only (re)mount the terminal when its inputs changed (status / webPort /
     // hasPtyLog) — otherwise leave codex's live iframe untouched (no flicker).
     const sig = termSig(node);
@@ -168,9 +206,13 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
   }
 
   function renderGraph(view: RunView): void {
-    const depthOf = computeDepth(view.nodes);
+    // Loop body INSTANCES stay out of the graph (the loop node represents
+    // them; the panel's iteration list reaches them).  Group by the structured
+    // `loop` ref — never by parsing the id.
+    const graphNodes = view.nodes.filter((n) => !n.loop);
+    const depthOf = computeDepth(graphNodes);
     const byDepth = new Map<number, RunNodeView[]>();
-    for (const n of view.nodes) {
+    for (const n of graphNodes) {
       const d = depthOf.get(n.id) ?? 0;
       (byDepth.get(d) ?? byDepth.set(d, []).get(d)!).push(n);
     }
@@ -185,7 +227,7 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
     const height = PAD * 2 + Math.max(0, maxRows - 1) * ROW + NH;
 
     const edges: string[] = [];
-    for (const n of view.nodes) {
+    for (const n of graphNodes) {
       const to = pos.get(n.id);
       if (!to) continue;
       for (const dep of n.depends) {
@@ -196,15 +238,25 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
         edges.push(`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#v3arrow)"/>`);
       }
     }
-    const boxes = view.nodes.map((n) => {
+    const boxes = graphNodes.map((n) => {
       const p = pos.get(n.id)!;
       const sel = n.id === selected;
+      const ls = n.loopState;
+      const statusLine = n.isLoop
+        ? `${NODE_LABEL[n.status]}${ls ? ` · 第${ls.iteration}${ls.maxIterations !== undefined ? `/${ls.maxIterations + ls.granted}` : ''}轮` : ' · loop'}`
+        : NODE_LABEL[n.status];
+      // Selection = solid white outline; unselected loop = dashed outline
+      // (composite-node affordance); plain unselected = no outline.
+      const outline = sel
+        ? ' stroke="#fff" stroke-width="2"'
+        : n.isLoop
+          ? ' stroke="#fff" stroke-opacity="0.5" stroke-width="1.5" stroke-dasharray="4 2"'
+          : '';
       return `<g class="v3-node" data-node="${esc(n.id)}" style="cursor:pointer">
         <rect x="${p.x}" y="${p.y}" width="${NW}" height="${NH}" rx="8"
-              fill="${NODE_COLOR[n.status]}" fill-opacity="${sel ? '1' : '0.85'}"
-              stroke="${sel ? '#fff' : 'none'}" stroke-width="2"/>
-        <text x="${p.x + NW / 2}" y="${p.y + 19}" fill="#fff" font-size="12" font-weight="600" text-anchor="middle">${esc(trunc(n.id, 18))}</text>
-        <text x="${p.x + NW / 2}" y="${p.y + 36}" fill="#fff" font-size="10" text-anchor="middle" fill-opacity="0.85">${NODE_LABEL[n.status]}</text>
+              fill="${NODE_COLOR[n.status]}" fill-opacity="${sel ? '1' : '0.85'}"${outline}/>
+        <text x="${p.x + NW / 2}" y="${p.y + 19}" fill="#fff" font-size="12" font-weight="600" text-anchor="middle">${n.isLoop ? '⟳ ' : ''}${esc(trunc(n.id, 18))}</text>
+        <text x="${p.x + NW / 2}" y="${p.y + 36}" fill="#fff" font-size="10" text-anchor="middle" fill-opacity="0.85">${statusLine}</text>
       </g>`;
     });
 

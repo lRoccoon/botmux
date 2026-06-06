@@ -13,7 +13,8 @@
  * the orchestrator never invents or skips a gate (design Q10).
  */
 
-import { topologicalOrder, type V3Dag } from './dag.js';
+import { isLoopNode, loopInstanceId, topologicalOrder, type V3Dag, type V3Node } from './dag.js';
+import type { V3LoopRef } from './journal.js';
 
 // ─── Run state (materialized from the journal by state.ts) ──────────────────
 
@@ -37,13 +38,54 @@ export interface V3NodeState {
 /** nodeId → state.  A node absent from the map is treated as `pending`. */
 export type V3RunState = Map<string, V3NodeState>;
 
+/**
+ * Per-loop composite state, folded from the loop lifecycle events.  A loop
+ * absent from the map has not started.  The loop's coarse status (running /
+ * blocked / done) lives in the regular node-state map under the loop's id;
+ * this struct carries what that one enum can't: where the iteration cursor is
+ * and what the last decision said.
+ */
+export interface V3LoopState {
+  /** Current iteration, 1-based; 0 between loopStarted and the first
+   *  loopIterationStarted. */
+  iteration: number;
+  /** True once the CURRENT iteration's decision event is recorded (reset by
+   *  the next loopIterationStarted). */
+  decided: boolean;
+  /** The latest decision — drives what the orchestrator does next. */
+  lastDecision?: 'exit' | 'continue' | 'exhausted';
+  /** Extra iterations granted (each loopIterationGranted adds one); the
+   *  effective budget is maxIterations + granted. */
+  granted: number;
+  /** An appended-but-unconsumed grant (cleared by the next
+   *  loopIterationStarted) — the idempotency key for "already granted". */
+  pendingGrant: boolean;
+}
+
+/** loopId → loop state. */
+export type V3LoopRunState = Map<string, V3LoopState>;
+
 // ─── Actions (runtime translates each into journal writes + side effects) ───
 
 export type V3Action =
   /** Post the humanGate approval card + persist a `waits/<id>.json` (Q10). */
   | { kind: 'dispatchGate'; nodeId: string }
-  /** Spawn an ephemeral worker via `runNode` for this node's goal. */
-  | { kind: 'dispatchWork'; nodeId: string }
+  /** Spawn an ephemeral worker via `runNode` for this node's goal.  `loop` is
+   *  set for body-instance dispatches (the runtime synthesizes the instance
+   *  node from the loop's body definition). */
+  | { kind: 'dispatchWork'; nodeId: string; loop?: V3LoopRef }
+  // ── loop control (the runtime translates each into ONE journal append) ──
+  /** Outer deps of a loop are done → append loopStarted. */
+  | { kind: 'startLoop'; loopId: string }
+  /** Begin iteration N (first, after a continue-decision, or after a grant). */
+  | { kind: 'startLoopIteration'; loopId: string; iteration: number }
+  /** Current iteration's body is fully done and undecided → the runtime reads
+   *  the exit node's result.json, evaluates exit.when, appends the decision. */
+  | { kind: 'evaluateLoopIteration'; loopId: string; iteration: number }
+  /** Decision was 'exit' → seal the loop with a nodeSucceeded on the LOOP id
+   *  carrying the output projection's manifest (downstream inputs/deps then
+   *  treat the loop like any done node — zero special-casing). */
+  | { kind: 'completeLoop'; loopId: string; iteration: number }
   /** Terminal: every node done; the run's product is the sink set. */
   | { kind: 'completeRunSucceeded' }
   /** Terminal (fail-fast): a node failed, so the run cannot proceed. */
@@ -65,22 +107,34 @@ export type V3Action =
  * `completeRunFailed` (in-flight peers are torn down by the runtime / cancel).
  * When no dispatch is possible and nothing is pending, the run is complete.
  */
-export function decideNext(dag: V3Dag, state: V3RunState): V3Action[] {
+export function decideNext(
+  dag: V3Dag,
+  state: V3RunState,
+  loops: V3LoopRunState = new Map(),
+): V3Action[] {
   const order = topologicalOrder(dag);
   const nodes = new Map(dag.nodes.map((n) => [n.id, n]));
 
   // Fail-fast sweep first: a single failed node ends the run.  Pick the
   // earliest in topo order for a deterministic `failedNodeId`.  `failed`
   // (infrastructure, needs intervention) takes priority over `blocked`
-  // (contract failure, retryable) when both exist.
+  // (contract failure, retryable) when both exist.  Loop body instances are
+  // swept too — only the CURRENT iteration can be non-done (a decision is
+  // only ever recorded once the whole iteration completed).
   for (const id of order) {
-    if (st(state, id).status === 'failed') {
-      return [{ kind: 'completeRunFailed', failedNodeId: id }];
+    const node = nodes.get(id)!;
+    for (const sweepId of [id, ...currentInstanceIds(node, loops)]) {
+      if (st(state, sweepId).status === 'failed') {
+        return [{ kind: 'completeRunFailed', failedNodeId: sweepId }];
+      }
     }
   }
   for (const id of order) {
-    if (st(state, id).status === 'blocked') {
-      return [{ kind: 'completeRunBlocked', blockedNodeId: id }];
+    const node = nodes.get(id)!;
+    for (const sweepId of [id, ...currentInstanceIds(node, loops)]) {
+      if (st(state, sweepId).status === 'blocked') {
+        return [{ kind: 'completeRunBlocked', blockedNodeId: sweepId }];
+      }
     }
   }
 
@@ -92,6 +146,61 @@ export function decideNext(dag: V3Dag, state: V3RunState): V3Action[] {
     const s = st(state, id);
 
     if (s.status === 'done') continue;
+
+    if (isLoopNode(node)) {
+      pending++;
+      const ls = loops.get(id);
+      if (!ls) {
+        // Not started: like a plain node, wait for outer deps.
+        const depsOk = node.depends.every((dep) => st(state, dep).status === 'done');
+        if (depsOk) actions.push({ kind: 'startLoop', loopId: id });
+        continue;
+      }
+      if (ls.iteration === 0) {
+        actions.push({ kind: 'startLoopIteration', loopId: id, iteration: 1 });
+        continue;
+      }
+      if (ls.decided) {
+        if (ls.lastDecision === 'exit') {
+          actions.push({ kind: 'completeLoop', loopId: id, iteration: ls.iteration });
+        } else if (
+          ls.lastDecision === 'continue' ||
+          // After an exhausted-block, a grant re-opens exactly one round.  An
+          // exhausted loop WITHOUT a pending grant never reaches here — its
+          // node status is 'blocked' and the sweep above already returned.
+          (ls.lastDecision === 'exhausted' && ls.pendingGrant)
+        ) {
+          actions.push({ kind: 'startLoopIteration', loopId: id, iteration: ls.iteration + 1 });
+        }
+        continue;
+      }
+      // Undecided current iteration: schedule the body like a mini-DAG over
+      // instance ids; once every body instance is done, ask for the decision.
+      const bodyOrder = topologicalOrder({ runId: id, nodes: node.body.nodes });
+      const bodyById = new Map(node.body.nodes.map((b) => [b.id, b]));
+      let allDone = true;
+      for (const bodyId of bodyOrder) {
+        const instId = loopInstanceId(id, ls.iteration, bodyId);
+        const bs = st(state, instId);
+        if (bs.status === 'done') continue;
+        allDone = false;
+        if (bs.status === 'running' || bs.status === 'gateWaiting') continue;
+        const bodyDef = bodyById.get(bodyId)!;
+        const depsOk = bodyDef.depends.every(
+          (dep) => st(state, loopInstanceId(id, ls.iteration, dep)).status === 'done',
+        );
+        if (!depsOk) continue;
+        actions.push({
+          kind: 'dispatchWork',
+          nodeId: instId,
+          loop: { loopId: id, iteration: ls.iteration, bodyNodeId: bodyId },
+        });
+      }
+      if (allDone) {
+        actions.push({ kind: 'evaluateLoopIteration', loopId: id, iteration: ls.iteration });
+      }
+      continue;
+    }
 
     // In-flight: a dispatched worker or an open gate. Nothing to emit; the
     // node is still pending completion.
@@ -116,6 +225,15 @@ export function decideNext(dag: V3Dag, state: V3RunState): V3Action[] {
     return [{ kind: 'completeRunSucceeded' }];
   }
   return actions;
+}
+
+/** The CURRENT iteration's expanded instance ids of a loop node (empty for
+ *  plain nodes / unstarted loops) — the sweep surface for failed/blocked. */
+function currentInstanceIds(node: V3Node, loops: V3LoopRunState): string[] {
+  if (!isLoopNode(node)) return [];
+  const ls = loops.get(node.id);
+  if (!ls || ls.iteration === 0) return [];
+  return node.body.nodes.map((b) => loopInstanceId(node.id, ls.iteration, b.id));
 }
 
 /** Sink nodes — no other node depends on them.  Their products are the run's

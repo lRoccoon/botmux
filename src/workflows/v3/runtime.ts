@@ -20,9 +20,19 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
-import { DEFAULT_NODE_TIMEOUT_SEC, isGoalNode, type V3Dag, type V3Node, type V3ResultSchema } from './dag.js';
-import { decideNext } from './orchestrator.js';
-import { appendEvent, readJournal, type StoredEvent, type V3ErrorClass } from './journal.js';
+import {
+  DEFAULT_NODE_TIMEOUT_SEC,
+  isGoalNode,
+  isLoopNode,
+  loopInstanceId,
+  type V3Dag,
+  type V3LoopExitWhen,
+  type V3LoopNode,
+  type V3Node,
+  type V3ResultSchema,
+} from './dag.js';
+import { decideNext, type V3Action } from './orchestrator.js';
+import { appendEvent, readJournal, type StoredEvent, type V3ErrorClass, type V3LoopRef } from './journal.js';
 import { materialize, writeState } from './state.js';
 import { writePendingWait } from './human-gate.js';
 import {
@@ -54,7 +64,11 @@ import {
  * Rendered from `contract.ts` constants so the manifest shape stays a single
  * source of truth shared with codex's validator.
  */
-export function renderGoalFile(goal: string, resultSchema?: V3ResultSchema): string {
+export function renderGoalFile(
+  goal: string,
+  resultSchema?: V3ResultSchema,
+  loopCtx?: { loopId: string; iteration: number; maxIterations: number },
+): string {
   const E = GOAL_ENV;
   const kinds = MANIFEST_FILE_KINDS.join(' | ');
   const [okStatus, failStatus] = MANIFEST_STATUSES;
@@ -69,12 +83,26 @@ export function renderGoalFile(goal: string, resultSchema?: V3ResultSchema): str
         '',
       ]
     : [];
+  const loopSection = loopCtx
+    ? [
+        '## Loop context',
+        `This node runs inside loop "${loopCtx.loopId}", iteration ${loopCtx.iteration} of at most ${loopCtx.maxIterations}.`,
+        ...(loopCtx.iteration > 1
+          ? [
+              'Inputs labeled `previous.<node>` are products of the PREVIOUS iteration (e.g. the last test report). Read them FIRST and fix what they describe — do not redo work that already passed, and do not guess what happened last round.',
+            ]
+          : []),
+        'Report results honestly — a truthful "not passed" routes the rework correctly; a wishful "passed" ships a broken result.',
+        '',
+      ]
+    : [];
   return [
     '# botmux v3 节点任务 / botmux v3 node task',
     '',
     '## Goal',
     goal,
     '',
+    ...loopSection,
     '## How to complete this node',
     'You are an autonomous agent completing exactly ONE botmux v3 workflow node.',
     'Work toward the goal above until it is done, then stop. Do not ask the user any questions.',
@@ -173,6 +201,24 @@ export function validateResult(filePath: string, schema: V3ResultSchema): Result
     if (!okType) problems.push(`field "${name}" must be of type ${spec.type}`);
   }
   return problems.length > 0 ? { ok: false, problems } : { ok: true };
+}
+
+/**
+ * Evaluate a (dag-validated) loop exit predicate against the observed result
+ * field.  Pure + exported for tests.  Type mismatches simply don't match —
+ * validateDag already guarantees the field is declared/required with a
+ * compatible type, so a mismatch here means the result was tampered with
+ * post-validation; not-matching (→ continue/exhausted) is the safe answer.
+ */
+export function matchLoopExitWhen(when: V3LoopExitWhen, value: unknown): boolean {
+  if (when.equals !== undefined) return value === when.equals;
+  if (when.notEquals !== undefined) return value !== when.notEquals;
+  if (typeof value !== 'number') return false;
+  if (when.gt !== undefined) return value > when.gt;
+  if (when.gte !== undefined) return value >= when.gte;
+  if (when.lt !== undefined) return value < when.lt;
+  if (when.lte !== undefined) return value <= when.lte;
+  return false;
 }
 
 // ─── Attempt numbering (journal-derived — no hardcoded 001) ──────────────────
@@ -302,10 +348,18 @@ export async function runWorkflow(
   // Freeze bot snapshots once, keyed by the node's `bot` field (''=default),
   // and persist for audit / resume.  Re-resolving mid-run would let a drifted
   // bots.json change cliId/model/workingDir under a retry (codex point 1).
+  // Loop body nodes are frozen too (a body node inherits the loop's bot when
+  // it has none of its own — mirror instanceNodeFor's resolution).
   const botSnapshots = new Map<string, BotSnapshot>();
+  const freezeBot = (bot: string | undefined): void => {
+    const key = bot ?? '';
+    if (!botSnapshots.has(key)) botSnapshots.set(key, deps.resolveBotSnapshot(bot));
+  };
   for (const node of dag.nodes) {
-    const key = node.bot ?? '';
-    if (!botSnapshots.has(key)) botSnapshots.set(key, deps.resolveBotSnapshot(node.bot));
+    freezeBot(node.bot);
+    if (isLoopNode(node)) {
+      for (const b of node.body.nodes) freezeBot(b.bot ?? node.bot);
+    }
   }
 
   // CLI-scope guard (老滕 directive): goal-mode rides the native `/goal`
@@ -348,7 +402,7 @@ export async function runWorkflow(
     writeState(statePath, snap);
     if (snap.runStatus !== 'running') break;
 
-    const actions = decideNext(dag, snap.nodes);
+    const actions = decideNext(dag, snap.nodes, snap.loops);
 
     // Terminal sweep: write the run terminal event, then re-tick so the top of
     // the loop observes it and breaks (single exit path).
@@ -369,6 +423,22 @@ export async function runWorkflow(
       continue;
     }
 
+    // Loop-control sweep: each control action is one cheap journal append (no
+    // worker involved), applied together and re-ticked — same single-exit
+    // shape as the terminal sweep.  Work dispatches in the same action list
+    // simply re-emerge next tick.
+    const loopControls = actions.filter(
+      (a): a is Extract<V3Action, { loopId: string }> =>
+        a.kind === 'startLoop' ||
+        a.kind === 'startLoopIteration' ||
+        a.kind === 'evaluateLoopIteration' ||
+        a.kind === 'completeLoop',
+    );
+    if (loopControls.length > 0) {
+      for (const a of loopControls) applyLoopControl(a);
+      continue;
+    }
+
     // Dispatch the ready set under the three-layer cap.  Anything not started
     // this tick (cap hit) is retried next tick.
     let startedThisTick = 0;
@@ -377,12 +447,14 @@ export async function runWorkflow(
       for (const a of actions) {
         if (inFlight.size >= globalCap) break;
         if (a.kind === 'dispatchWork') {
-          const node = nodesById.get(a.nodeId)!;
+          // Loop body instances are synthesized from the body definition; the
+          // instance id is theirs alone (attempt dirs, journal events, retry).
+          const node = a.loop ? instanceNodeFor(a.loop) : nodesById.get(a.nodeId)!;
           const botKey = node.bot ?? '';
           const botSnap = botSnapshots.get(botKey)!;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
           if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
-          startWork(node, botSnap, botKey, events);
+          startWork(node, botSnap, botKey, events, a.loop);
           startedThisTick++;
         } else if (a.kind === 'dispatchGate') {
           startGate(nodesById.get(a.nodeId)!);
@@ -430,6 +502,7 @@ export async function runWorkflow(
     botSnap: BotSnapshot,
     botKey: string,
     events: StoredEvent[],
+    loopRef?: V3LoopRef,
   ): void {
     // Attempt number derived from the journal: 001 on first dispatch, the
     // reserved nextAttemptId after a blocked retry (no hardcoded 001 — a retry
@@ -441,10 +514,17 @@ export async function runWorkflow(
     mkdirSync(outputDir, { recursive: true });
 
     const goalPath = join(attemptDir, 'goal.txt');
-    writeFileSync(goalPath, renderGoalFile(node.goal ?? '', node.resultSchema));
+    const loopCtx = loopRef
+      ? {
+          loopId: loopRef.loopId,
+          iteration: loopRef.iteration,
+          maxIterations: (nodesById.get(loopRef.loopId) as V3LoopNode).maxIterations,
+        }
+      : undefined;
+    writeFileSync(goalPath, renderGoalFile(node.goal ?? '', node.resultSchema, loopCtx));
 
     const inputsPath = join(attemptDir, 'inputs.json');
-    writeFileSync(inputsPath, JSON.stringify(buildInputs(node, events), null, 2));
+    writeFileSync(inputsPath, JSON.stringify(buildInputs(node, events, loopRef), null, 2));
 
     const manifestPath = join(attemptDir, 'manifest.json');
     const env: Record<string, string> = {
@@ -456,7 +536,7 @@ export async function runWorkflow(
       [GOAL_ENV.V3_MARKER]: '1',
     };
 
-    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: node.id, attemptId });
+    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: node.id, attemptId, loop: loopRef });
     botInFlight.set(botKey, (botInFlight.get(botKey) ?? 0) + 1);
     cliInFlight.set(botSnap.cliId, (cliInFlight.get(botSnap.cliId) ?? 0) + 1);
 
@@ -623,6 +703,98 @@ export async function runWorkflow(
     inFlight.set(key, p);
   }
 
+  /** Synthesize the effective node a body instance runs as: the body
+   *  definition re-id'd into the iteration namespace, with internal deps /
+   *  inputs mapped to instance ids and the bot inherited from the loop. */
+  function instanceNodeFor(ref: V3LoopRef): V3Node {
+    const loopNode = nodesById.get(ref.loopId) as V3LoopNode;
+    const bodyDef = loopNode.body.nodes.find((b) => b.id === ref.bodyNodeId)!;
+    return {
+      ...bodyDef,
+      id: loopInstanceId(ref.loopId, ref.iteration, ref.bodyNodeId),
+      bot: bodyDef.bot ?? loopNode.bot,
+      depends: bodyDef.depends.map((d) => loopInstanceId(ref.loopId, ref.iteration, d)),
+      inputs: bodyDef.inputs.map((r) => ({ from: loopInstanceId(ref.loopId, ref.iteration, r.from) })),
+    };
+  }
+
+  /** Translate one loop-control action into its single journal append. */
+  function applyLoopControl(a: Extract<V3Action, { loopId: string }>): void {
+    if (a.kind === 'startLoop') {
+      appendEvent(journalPath, { type: 'loopStarted', loopId: a.loopId });
+      return;
+    }
+    if (a.kind === 'startLoopIteration') {
+      appendEvent(journalPath, { type: 'loopIterationStarted', loopId: a.loopId, iteration: a.iteration });
+      return;
+    }
+    const loopNode = nodesById.get(a.loopId) as V3LoopNode;
+    if (a.kind === 'completeLoop') {
+      // Seal the loop with a nodeSucceeded on the LOOP id carrying the output
+      // projection's manifest — downstream deps gating + buildInputs then
+      // treat the loop exactly like any done node.
+      const events = readJournal(journalPath);
+      const outInstId = loopInstanceId(a.loopId, a.iteration, loopNode.output.from);
+      const succ = [...events]
+        .reverse()
+        .find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
+          e.type === 'nodeSucceeded' && e.nodeId === outInstId);
+      if (!succ) {
+        // Engine anomaly — the decision said exit but the output instance has
+        // no success record.  Fail loudly rather than fabricate a product.
+        appendEvent(journalPath, {
+          type: 'nodeFailed', nodeId: a.loopId, attemptId: `${a.loopId}/iterations/${String(a.iteration).padStart(3, '0')}`,
+          errorClass: 'workerError',
+          message: `loop "${a.loopId}" decided exit but output node "${outInstId}" has no nodeSucceeded`,
+        });
+        return;
+      }
+      appendEvent(journalPath, {
+        type: 'nodeSucceeded', nodeId: a.loopId, attemptId: succ.attemptId, manifestPath: succ.manifestPath,
+      });
+      return;
+    }
+    // evaluateLoopIteration: read the exit instance's structured result and
+    // record the decision.  Every input here was already validated when the
+    // exit node succeeded (resultSchema is mandatory on the exit node), so an
+    // unreadable result is an engine anomaly → 'exhausted' (blocks for a
+    // human) rather than a silent extra round.
+    const events = readJournal(journalPath);
+    const exitInstId = loopInstanceId(a.loopId, a.iteration, loopNode.exit.node);
+    const succ = [...events]
+      .reverse()
+      .find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
+        e.type === 'nodeSucceeded' && e.nodeId === exitInstId);
+    const key = loopNode.exit.when.path.slice('result.'.length);
+    let matched = false;
+    let observed = `${loopNode.exit.when.path}=<unreadable>`;
+    if (succ) {
+      try {
+        const manifest = JSON.parse(readFileSync(succ.manifestPath, 'utf-8')) as Manifest;
+        const entry = manifest.files.find((f) => f.path === 'result.json');
+        if (entry) {
+          const result = JSON.parse(
+            readFileSync(join(dirname(succ.manifestPath), 'work', entry.path), 'utf-8'),
+          ) as Record<string, unknown>;
+          observed = `${loopNode.exit.when.path}=${JSON.stringify(result[key])}`;
+          matched = matchLoopExitWhen(loopNode.exit.when, result[key]);
+        }
+      } catch {
+        // fall through with matched=false, observed=<unreadable>
+      }
+    }
+    const granted = events.filter(
+      (e) => e.type === 'loopIterationGranted' && e.loopId === a.loopId,
+    ).length;
+    const effectiveMax = loopNode.maxIterations + granted;
+    const anomalous = observed.endsWith('<unreadable>');
+    const decision = matched ? 'exit' : !anomalous && a.iteration < effectiveMax ? 'continue' : 'exhausted';
+    appendEvent(journalPath, {
+      type: 'loopIterationDecision', loopId: a.loopId, iteration: a.iteration, decision,
+      detail: `${observed} (iteration ${a.iteration}/${effectiveMax})`,
+    });
+  }
+
   function pendingGateWaits(state: Map<string, { status: string }>): V3PendingGate[] {
     const waits: V3PendingGate[] = [];
     for (const node of dag.nodes) {
@@ -643,27 +815,80 @@ export async function runWorkflow(
    *  Reads each upstream's already-validated manifest from the latest
    *  `nodeSucceeded` event; the manifest's relative `path` is joined onto the
    *  upstream outputDir (`<manifestDir>/work`) to produce an absolute path the
-   *  downstream agent can Read directly. */
-  function buildInputs(node: V3Node, events: StoredEvent[]): GoalInputs {
+   *  downstream agent can Read directly.
+   *
+   *  Loop body instances additionally receive (a) the LOOP's outer inputs —
+   *  every body node may read what the loop consumes — and (b) from iteration
+   *  2 on, the previous iteration's `feedback` products, labeled
+   *  `previous.<bodyId>` so the agent can tell rework context from fresh
+   *  upstream input. */
+  function buildInputs(node: V3Node, events: StoredEvent[], loopRef?: V3LoopRef): GoalInputs {
     const inputs: GoalInputs['inputs'] = [];
-    for (const ref of node.inputs) {
-      const succ = [...events]
+
+    const latestSuccess = (nodeId: string) =>
+      [...events]
         .reverse()
         .find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
-          e.type === 'nodeSucceeded' && e.nodeId === ref.from);
-      if (!succ) continue; // deps are gated upstream — defensive skip
+          e.type === 'nodeSucceeded' && e.nodeId === nodeId);
+
+    const pushFrom = (
+      label: string,
+      nodeId: string,
+      filter?: (f: Manifest['files'][number]) => boolean,
+    ): void => {
+      const succ = latestSuccess(nodeId);
+      if (!succ) return; // deps are gated upstream — defensive skip
       const upstreamOutputDir = join(dirname(succ.manifestPath), 'work');
       const manifest = JSON.parse(readFileSync(succ.manifestPath, 'utf-8')) as Manifest;
       for (const f of manifest.files) {
+        if (filter && !filter(f)) continue;
         inputs.push({
-          from: ref.from,
+          from: label,
           name: f.name,
           path: join(upstreamOutputDir, f.path),
           kind: f.kind,
           preview: f.preview,
         });
       }
+    };
+
+    for (const ref of node.inputs) pushFrom(ref.from, ref.from);
+
+    if (loopRef) {
+      const loopNode = nodesById.get(loopRef.loopId) as V3LoopNode;
+      // (a) The loop's outer inputs (e.g. `prepare`'s products) flow into
+      // every body instance of every iteration.
+      for (const ref of loopNode.inputs) pushFrom(ref.from, ref.from);
+      // (b) Declared previous-iteration feedback.
+      if (loopRef.iteration > 1) {
+        for (const fb of loopNode.feedback) {
+          const dot = fb.lastIndexOf('.');
+          const bodyId = fb.slice(0, dot);
+          const kind = fb.slice(dot + 1);
+          const prevInstId = loopInstanceId(loopRef.loopId, loopRef.iteration - 1, bodyId);
+          const label = `previous.${bodyId}`;
+          if (kind === 'manifest') {
+            const succ = latestSuccess(prevInstId);
+            if (succ) {
+              inputs.push({ from: label, name: 'manifest', path: succ.manifestPath, kind: 'json' });
+            }
+          } else {
+            // 'result' → just result.json; 'files' → the whole product set.
+            pushFrom(label, prevInstId, kind === 'result' ? (f) => f.path === 'result.json' : undefined);
+          }
+        }
+      }
     }
-    return { inputs };
+    // Dedupe by (label, path) — `feedback: ["test.result", "test.files"]`
+    // legitimately overlaps on result.json; one entry is enough.
+    const seen = new Set<string>();
+    return {
+      inputs: inputs.filter((i) => {
+        const key = JSON.stringify([i.from, i.path]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }),
+    };
   }
 }

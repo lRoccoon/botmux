@@ -36,9 +36,21 @@ export type V3ErrorClass =
  * (`attempts/NNN`) is modeled by `attemptId` on dispatch/settle events — a new
  * attempt is just another `nodeDispatched` with a fresh `attemptId`.
  */
+/**
+ * Structured loop reference carried on body-instance dispatches.  The expanded
+ * nodeId (`repairLoop.i001.code`) is an OPAQUE key — projections/dashboards
+ * group by THIS field and never parse the id string (body ids may themselves
+ * contain dots).
+ */
+export interface V3LoopRef {
+  loopId: string;
+  iteration: number;
+  bodyNodeId: string;
+}
+
 export type V3Event =
   | { type: 'runStarted'; runId: string }
-  | { type: 'nodeDispatched'; nodeId: string; attemptId: string }
+  | { type: 'nodeDispatched'; nodeId: string; attemptId: string; loop?: V3LoopRef }
   // Written when the node's worker web terminal is ready (mid-run) so the
   // dashboard can attach to an in-flight node's LIVE terminal instead of waiting
   // for completion.  Kept even if the node later fails (terminal info survives).
@@ -71,6 +83,31 @@ export type V3Event =
     }
   | { type: 'gateDispatched'; nodeId: string; waitId: string }
   | { type: 'gateResolved'; nodeId: string; waitId: string; resolution: 'approved' | 'rejected'; by: string }
+  // ── structured loop lifecycle ──
+  // A loop is a composite node: its body expands into REAL journal-level nodes
+  // per iteration (instance ids via loopInstanceId), so dispatch/settle/retry
+  // reuse the node events above.  These events only mark the loop's own state
+  // machine: started → (iterationStarted → [body runs] → iterationDecision)* →
+  // done (decision 'exit', sealed by a nodeSucceeded on the LOOP id carrying
+  // the output projection's manifest) | blocked (decision 'exhausted').
+  | { type: 'loopStarted'; loopId: string }
+  | { type: 'loopIterationStarted'; loopId: string; iteration: number }
+  // The runtime's verdict after an iteration's body completed: evaluate
+  // exit.when on the exit node's result.json.  `exit` ends the loop, `continue`
+  // schedules the next iteration, `exhausted` (predicate unmatched at the
+  // iteration budget) blocks the loop — recoverable via loopIterationGranted.
+  | {
+      type: 'loopIterationDecision';
+      loopId: string;
+      iteration: number;
+      decision: 'exit' | 'continue' | 'exhausted';
+      /** Human-readable why (e.g. `result.passed=false (2/3 iterations used)`). */
+      detail?: string;
+    }
+  // A human granted ONE extra iteration to an exhausted-blocked loop (the
+  // loop analogue of nodeRetryRequested — journal event, never an in-memory
+  // patch).  Consumed by the next loopIterationStarted.
+  | { type: 'loopIterationGranted'; loopId: string; fromIteration: number; by?: string }
   | { type: 'runSucceeded' }
   | { type: 'runFailed'; failedNodeId: string }
   // Terminal-for-now: every non-done path is blocked (recoverable).  A retry
