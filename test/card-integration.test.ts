@@ -163,6 +163,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
 import { scheduleCardPatch } from '../src/core/worker-pool.js';
 import { killWorker, forkWorker } from '../src/core/worker-pool.js';
+import { sendEphemeralCard } from '../src/im/lark/client.js';
+import { closeSession } from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
@@ -465,11 +467,11 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
       expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('重启'),
-        undefined,
+      expect(sendEphemeralCard).toHaveBeenCalledWith(
         APP_ID,
+        ds.chatId,
+        'ou_user',
+        expect.stringContaining('重启'),
       );
     });
 
@@ -485,24 +487,77 @@ describe('Card integration: full event flow', () => {
     });
 
     it('close should kill worker and remove session', async () => {
-      const ds = makeDaemonSession();
+      const ds = makeDaemonSession({ scope: 'chat' });
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = sessionKey(ds.chatId, APP_ID);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+      await handleCardAction(makeCloseEvent(ds.chatId), deps, APP_ID);
 
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(sessions.has(sKey)).toBe(false);
-      // Closed reply is now an interactive card with a Resume button; the
-      // mocked builder embeds the type marker so we assert on that shape.
+      // Chat-scoped group sessions keep the operator-only close confirmation.
+      expect(sendEphemeralCard).toHaveBeenCalledWith(
+        APP_ID,
+        ds.chatId,
+        'ou_user',
+        expect.stringContaining('"type":"closed"'),
+      );
+      expect(vi.mocked(sendEphemeralCard).mock.invocationCallOrder[0])
+        .toBeLessThan(vi.mocked(killWorker).mock.invocationCallOrder[0]);
+      // Persist close before showing the terminal card; only the worker/active
+      // session teardown is delayed so routing can still use the live session.
+      expect(vi.mocked(closeSession).mock.invocationCallOrder[0])
+        .toBeLessThan(vi.mocked(sendEphemeralCard).mock.invocationCallOrder[0]);
+    });
+
+    it('close for thread-scoped sessions replies in the original thread instead of sending an ephemeral card', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', chatType: 'group' });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
+
+      expect(sendEphemeralCard).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('"type":"closed"'),
         'interactive',
         APP_ID,
       );
+      expect((deps.sessionReply as Mock).mock.invocationCallOrder[0])
+        .toBeLessThan(vi.mocked(killWorker).mock.invocationCallOrder[0]);
+      expect(vi.mocked(closeSession).mock.invocationCallOrder[0])
+        .toBeLessThan((deps.sessionReply as Mock).mock.invocationCallOrder[0]);
+    });
+
+    it('close for chat-scoped sessions keeps operator-only ephemeral confirmation', async () => {
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        session: {
+          ...makeDaemonSession().session,
+          rootMessageId: 'om_seed_for_audit',
+        },
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ds.chatId, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeCloseEvent(ds.chatId, 'ou_user'), deps, APP_ID);
+
+      expect(sendEphemeralCard).toHaveBeenCalledWith(
+        APP_ID,
+        ds.chatId,
+        'ou_user',
+        expect.stringContaining('"type":"closed"'),
+      );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+      expect(vi.mocked(sendEphemeralCard).mock.invocationCallOrder[0])
+        .toBeLessThan(vi.mocked(killWorker).mock.invocationCallOrder[0]);
+      expect(vi.mocked(closeSession).mock.invocationCallOrder[0])
+        .toBeLessThan(vi.mocked(sendEphemeralCard).mock.invocationCallOrder[0]);
     });
 
     it('close in private mode sends the closed card ephemeral to owners, not the group', async () => {
@@ -585,6 +640,7 @@ describe('Card integration: full event flow', () => {
     });
 
     it('resume should call resumeSession and reply with success notice', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const sessionId = 'closed-uuid-1';
       const sessions = new Map<string, DaemonSession>();
       const deps = makeDeps(sessions);
@@ -602,17 +658,18 @@ describe('Card integration: full event flow', () => {
       const fakeDs: any = {
         session: { sessionId, cliId: 'claude-code' },
         larkAppId: APP_ID,
+        chatId: 'oc_chat',
       };
       vi.mocked(sm.resumeSession).mockReturnValue({ ok: true, ds: fakeDs } as any);
 
       await handleCardAction(makeResumeEvent(ROOT_ID, sessionId), deps, APP_ID);
 
       expect(sm.resumeSession).toHaveBeenCalledWith(sessionId, sessions);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('已恢复'),
-        undefined,
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
         APP_ID,
+        'oc_chat',
+        'ou_user',
+        expect.stringContaining('已恢复'),
       );
     });
 

@@ -656,9 +656,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           }) ?? null;
         } catch { return null; }
       })();
-      killWorker(ds);
-      sessionStore.closeSession(closedSessionId);
-      activeSessions.delete(sKey);
       const card = buildSessionClosedCard(
         closedSessionId,
         closedAnchor,
@@ -668,23 +665,53 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         cliResumeCommand,
         localeForBot(ds.larkAppId),
       );
-      // The closed card carries session title / CLI name / workingDir / resume
-      // command. In private-card mode those must not leak to the group — send the
-      // closed card ephemeral to the same owner audience instead. No group
-      // fallback on failure (privacy wins; the session is already closed).
-      // `value.visibility === 'private'` pins the decision to the card that was
-      // clicked, so a card built in private mode stays ephemeral even if the
-      // bot's `privateCard` config was turned off in the meantime.
-      if (value?.visibility === 'private' || botCfg.privateCard) {
-        const audience = resolvePrivateCardAudience(ds);
-        for (const openId of audience) {
-          await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, card).catch(err =>
-            logger.warn(`[${tag(ds)}] private close card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`));
+      // First persist the Botmux session as closed. This is local state only
+      // (no Feishu topic is closed here), so keeping the daemon session in
+      // activeSessions still lets the close card route back to the original
+      // thread. If this persistence step fails, do not show a terminal
+      // "closed" card that would disagree with the actual session state.
+      sessionStore.closeSession(closedSessionId);
+      try {
+        // Send the terminal close card before tearing down the daemon session.
+        // In regular groups using topic mode, the reply path relies on the
+        // active session to keep the card anchored in the original topic; if we
+        // delete the active session first, the confirmation can be detached or
+        // fail to post. The finally below still guarantees the in-memory worker
+        // state is torn down even if the notification cannot be delivered.
+        //
+        // The closed card carries session title / CLI name / workingDir / resume
+        // command. In private-card mode those must not leak to the group — send
+        // the closed card ephemeral to the same owner audience instead. No group
+        // fallback on failure (privacy wins).
+        // `value.visibility === 'private'` pins the decision to the card that was
+        // clicked, so a card built in private mode stays ephemeral even if the
+        // bot's `privateCard` config was turned off in the meantime.
+        if (value?.visibility === 'private' || botCfg.privateCard) {
+          const audience = resolvePrivateCardAudience(ds);
+          for (const openId of audience) {
+            await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, card).catch(err =>
+              logger.warn(`[${tag(ds)}] private close card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`));
+          }
+          logger.info(`[${tag(ds)}] Closed via card button (private close card → ${audience.length} owner(s))`);
+        } else if (ds.scope === 'thread') {
+          // Thread-scoped sessions (including regular groups using topic mode)
+          // must post the close card back under the original thread root.  The
+          // ephemeral API only accepts chat_id + open_id, not a thread/root id;
+          // in regular-group topic mode it can therefore succeed as a detached
+          // visible-to-one card instead of failing over to the thread reply.
+          await sessionReply(closedAnchor, card, 'interactive');
+          logger.info(`[${tag(ds)}] Closed via card button (thread reply)`);
+        } else {
+          await deliverEphemeralOrReply(ds, operatorOpenId, card, 'interactive', () => sessionReply(closedAnchor, card, 'interactive'));
+          logger.info(`[${tag(ds)}] Closed via card button`);
         }
-        logger.info(`[${tag(ds)}] Closed via card button (private close card → ${audience.length} owner(s))`);
-      } else {
-        await deliverEphemeralOrReply(ds, operatorOpenId, card, 'interactive', () => sessionReply(rootId, card, 'interactive'));
-        logger.info(`[${tag(ds)}] Closed via card button`);
+      } finally {
+        try {
+          killWorker(ds);
+        } catch (err) {
+          logger.warn(`[${tag(ds)}] close-session worker teardown failed after persisted close: ${err}`);
+        }
+        activeSessions.delete(sKey);
       }
     }
 
