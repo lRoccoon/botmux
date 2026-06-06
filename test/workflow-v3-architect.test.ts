@@ -53,6 +53,25 @@ describe('buildArchitectGoal', () => {
     expect(goal).toContain('Do not start or run the workflow');
     expect(goal).toContain('The host will validate dag.json');
   });
+
+  it('teaches edge activation: conditional edges, judge enum, triggerRule, sink coverage', () => {
+    const goal = buildArchitectGoal('/r/spec.md', '/r/spec.json');
+    // 条件边语法 + 与 loop 的分工（向前分叉 vs 返工）
+    expect(goal).toContain('Conditional branching (edge activation)');
+    expect(goal).toContain('"when": { "path": "result.<key>"');
+    expect(goal).toContain('NOT a loop');
+    // judge 模式：enum 决策词典
+    expect(goal).toContain('"enum": ["pass", "fail"]');
+    // 源节点约束 + loop 后接 verifier 的替代方案
+    expect(goal).toContain('verifier goal node AFTER the loop');
+    // triggerRule 三种语义 + 部分输入容忍
+    expect(goal).toContain('one_success');
+    expect(goal).toContain('"quorum": N');
+    // sink 覆盖规则（防 allSinksSkipped 授权错误）
+    expect(goal).toContain('allSinksSkipped');
+    // notes 要求覆盖分支审查
+    expect(goal).toContain('every value reaches some sink');
+  });
 });
 
 describe('runArchitect', () => {
