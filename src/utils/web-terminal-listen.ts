@@ -70,6 +70,12 @@ export function listenWebTerminalWithFallback(opts: ListenWebTerminalOpts): Prom
     // Register before listen(): bind failures are asynchronous 'error' events,
     // and the recovery handler must be present before the first listen attempt.
     httpServer.on('error', (err: NodeJS.ErrnoException) => {
+      // This handler outlives the Promise (we never detach it). Once we've
+      // resolved/rejected, a late 'error' must be inert — otherwise an
+      // EADDRINUSE arriving after a no-fallback resolve would re-enter listen()
+      // on an already-listening server (ERR_SERVER_ALREADY_LISTEN, thrown
+      // synchronously from the emit → unhandled → crash). Defense in depth.
+      if (settled) return;
       if (err.code === 'EADDRINUSE' && !fallbackAttempted) {
         fallbackAttempted = true;
         if (preferredPort) {
