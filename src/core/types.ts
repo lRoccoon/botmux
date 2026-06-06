@@ -77,6 +77,8 @@ export interface DaemonSession {
   usageLimitRetryTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
+  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   pendingResponseCardId?: string; // placeholder card patched by the first botmux send when streaming cards are disabled
   pendingResponseCardState?: 'open' | 'patched';
   lastPatchedResponseCardId?: string;

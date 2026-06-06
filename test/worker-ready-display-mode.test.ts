@@ -175,6 +175,18 @@ describe('Worker ready: set_display_mode re-sync', () => {
     });
   });
 
+  it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc', turnId: 'om_turn_ready' });
+    await flush();
+
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_turn_ready');
+  });
+
   it('POST path sends set_display_mode when displayMode is screenshot', async () => {
     const fakeWorker = makeFakeWorker();
     // streamCardPending = true forces POST path (no existing card to PATCH)

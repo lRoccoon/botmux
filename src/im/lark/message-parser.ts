@@ -17,6 +17,7 @@ interface RawEventData {
   message: {
     message_id: string;
     root_id?: string;
+    thread_id?: string;
     parent_id?: string;
     message_type: string; // NOT msg_type
     content: string;
@@ -277,6 +278,7 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
   const parsed: LarkMessage = {
     messageId: message.message_id,
     rootId: message.root_id ?? '',
+    threadId: message.thread_id || undefined,
     parentId: message.parent_id || undefined,
     senderId: sender.sender_id?.open_id ?? '',
     senderUnionId: sender.sender_id?.union_id,

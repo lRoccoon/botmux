@@ -184,6 +184,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // First attempt is delayed 0ms; flush microtasks + timers
     await vi.advanceTimersByTimeAsync(10);
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][4]).toBe('turn-1');
     expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
   });
 

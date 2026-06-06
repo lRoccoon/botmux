@@ -21,6 +21,7 @@ import { expandMergeForward } from './im/lark/merge-forward.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
+import type { Session } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
@@ -32,9 +33,8 @@ import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-pr
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildPendingResponseCard, buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { createPendingResponseQueue, markPendingResponseCardPatched, shouldReplyPendingInThread, shouldTreatPendingCardAsPatchedByMarker, startPendingResponseTurn, syncPendingResponseState } from './core/pending-response.js';
-import { readPendingResponsePatchMarker } from './services/pending-response-transaction-store.js';
+import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { createPendingResponseQueue, markPendingResponseCardPatched, syncPendingResponseState } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
@@ -77,6 +77,7 @@ import {
   rememberLastCliInput,
   ensureTerminalWorkerPort,
 } from './core/session-manager.js';
+import { beginReplyTargetTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -136,6 +137,25 @@ import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 
 const activeSessions = new Map<string, DaemonSession>();
 const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
+
+function sessionHasReplyThreadAlias(s: Pick<Session, 'scope' | 'replyThreadAliases'>, rootId: string): boolean {
+  return s.scope === 'chat' && !!s.replyThreadAliases?.[rootId];
+}
+
+function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string } | null {
+  // A real thread-scope session at this root wins over any historical alias.
+  if (activeSessions.get(sessionKey(rootId, larkAppId))?.scope === 'thread') return null;
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== larkAppId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
+    if (sessionHasReplyThreadAlias(ds.session, rootId)) return { chatId: ds.chatId, sessionId: ds.session.sessionId };
+  }
+  const diskSessions = sessionStore.listSessions();
+  if (diskSessions.some(s => s.status === 'active' && s.larkAppId === larkAppId && s.scope !== 'chat' && s.rootMessageId === rootId)) {
+    return null;
+  }
+  const hit = diskSessions.find(s => s.status === 'active' && s.larkAppId === larkAppId && s.chatId === chatId && sessionHasReplyThreadAlias(s, rootId));
+  return hit ? { chatId: hit.chatId, sessionId: hit.sessionId } : null;
+}
 /**
  * Per-run state for active workflow loops.
  *
@@ -310,28 +330,24 @@ function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import(
   return undefined;
 }
 
-async function postPendingResponseCard(ds: DaemonSession, replyToMessageId: string, prompt: string, sender?: { name?: string }): Promise<void> {
-  if (!streamingCardDisabledFor(ds)) return;
+async function postPendingResponseCard(ds: DaemonSession, replyToMessageId: string, prompt: string, sender?: { name?: string }, turnId?: string): Promise<void> {
+  // Card-off means no visible botmux cards at all. If a prior build left an
+  // open pending-response placeholder on this session, clear its state so a
+  // later `botmux send --mention...` cannot patch it to “final reply sent via
+  // new message”. Do not call any Lark send/update API here.
   await pendingResponseQueue.run(ds.session.sessionId, async () => {
-    syncPendingResponseState(ds, readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId));
-    const marker = readPendingResponsePatchMarker(ds.session.sessionId);
-    if (shouldTreatPendingCardAsPatchedByMarker(ds.pendingResponseCardId, marker)) {
+    const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
+    syncPendingResponseState(ds, fresh);
+    if (fresh) syncReplyTargetState(ds, fresh);
+    if (ds.pendingResponseCardId || ds.session.pendingResponseCardId) {
       markPendingResponseCardPatched(ds);
-    }
-    syncPendingResponseState(ds.session, ds);
-    const card = buildPendingResponseCard(localeForBot(ds.larkAppId));
-    try {
-      const messageId = await replyMessage(ds.larkAppId, replyToMessageId, card, 'interactive', shouldReplyPendingInThread(ds.scope));
-      startPendingResponseTurn(ds, messageId);
-      startPendingResponseTurn(ds.session, messageId);
+      markPendingResponseCardPatched(ds.session);
       sessionStore.updateSession(ds.session);
-    } catch (err) {
-      logger.warn(`[${tag(ds)}] failed to post pending response card: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
 }
 
-async function sessionReply(anchor: string, content: string, msgType: string = 'text', larkAppId?: string): Promise<string> {
+async function sessionReply(anchor: string, content: string, msgType: string = 'text', larkAppId?: string, turnId?: string): Promise<string> {
   let ds: DaemonSession | undefined;
   if (larkAppId) {
     ds = activeSessions.get(sessionKey(anchor, larkAppId));
@@ -359,11 +375,17 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
   // to know we should sendMessage, not reply_in_thread to a non-message-id.
   if (ds?.scope === 'chat' || anchor.startsWith('oc_')) {
     const chatId = ds?.chatId ?? anchor;
-    if (ds?.scope === 'chat' && ds.session.rootMessageId) {
-      const mode = await getChatMode(appId, chatId, { forceRefresh: true });
-      if (mode === 'topic') {
-        logger.warn(`[routing] Chat-scope session ${ds.session.sessionId.substring(0, 8)} is now topic-mode; replying in original thread ${ds.session.rootMessageId.substring(0, 12)}`);
-        return replyMessage(appId, ds.session.rootMessageId, content, msgType, true);
+    if (ds?.scope === 'chat') {
+      const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
+      if (fresh) syncReplyTargetState(ds, fresh);
+      const target = resolveSessionReplyTarget(ds, turnId);
+      if (target.mode === 'thread') return replyMessage(appId, target.rootMessageId, content, msgType, true);
+      if (ds.session.rootMessageId) {
+        const mode = await getChatMode(appId, chatId, { forceRefresh: true });
+        if (mode === 'topic') {
+          logger.warn(`[routing] Chat-scope session ${ds.session.sessionId.substring(0, 8)} is now topic-mode; replying in original thread ${ds.session.rootMessageId.substring(0, 12)}`);
+          return replyMessage(appId, ds.session.rootMessageId, content, msgType, true);
+        }
       }
     }
     return sendMessage(appId, chatId, content, msgType);
@@ -1849,7 +1871,7 @@ async function replyInvalidWorkingDirs(
 }
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId, messageId, chatType, larkAppId } = ctx;
+  const { chatId, messageId, chatType, larkAppId, replyRootId } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -2096,6 +2118,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
+  beginReplyTargetTurn(ds, replyRootId, messageId);
+  sessionStore.updateSession(ds.session);
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
@@ -2104,7 +2128,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId });
     rememberLastCliInput(ds, promptContent, prompt);
-    await postPendingResponseCard(ds, messageId, content, newTopicSender);
+    await postPendingResponseCard(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -2135,7 +2159,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId });
     rememberLastCliInput(ds, promptContent, prompt);
-    await postPendingResponseCard(ds, messageId, content, newTopicSender);
+    await postPendingResponseCard(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -2368,7 +2392,7 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
 }
 
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId } = ctx;
+  const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId } = ctx;
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 
@@ -2622,6 +2646,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     ds.session.quoteTargetId = parsed.messageId;
     ds.session.quoteTargetSenderOpenId = callerOpenId;
     ds.session.quoteTargetSenderIsBot = isForeignBot;
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId);
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -2770,6 +2795,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       newDs.session.workingDir = pinnedWorkingDir;
       sessionStore.updateSession(newDs.session);
     }
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId);
+    sessionStore.updateSession(newDs.session);
     activeSessions.set(sessionKey(anchor, larkAppId), newDs);
 
     // Pinned (oncall binding or inherited from peer bot in same thread):
@@ -2779,7 +2806,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId });
       rememberLastCliInput(newDs, promptContent, prompt);
-      await postPendingResponseCard(newDs, parsed.messageId, parsed.content, autoCreateSender);
+      await postPendingResponseCard(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -2810,7 +2837,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId });
       rememberLastCliInput(newDs, promptContent, prompt);
-      await postPendingResponseCard(newDs, parsed.messageId, parsed.content, autoCreateSender);
+      await postPendingResponseCard(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
     }
 
@@ -2848,8 +2875,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         });
     beginNewTurn(ds, parsed.content);
     rememberLastCliInput(ds, promptContent, msgContent);
-    await postPendingResponseCard(ds, parsed.messageId, parsed.content, await getThreadSender());
-    ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
+    await postPendingResponseCard(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
+    ds.worker.send({ type: 'message', content: msgContent, turnId: parsed.messageId } as DaemonToWorker);
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
@@ -2896,7 +2923,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       sender: await getThreadSender(),
     });
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
-    await postPendingResponseCard(ds, parsed.messageId, parsed.content, await getThreadSender());
+    await postPendingResponseCard(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
+    sessionStore.updateSession(ds.session);
     forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }
 }
@@ -3119,6 +3147,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
       handleBotAdded: (chatId, operatorOpenId, appId) => handleBotAdded(chatId, operatorOpenId, appId),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
+      resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
       // Evict it from the routing map so subsequent inbound messages can land
       // on a fresh thread-scope session (dispatcher already rerouted this turn

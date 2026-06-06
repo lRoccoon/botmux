@@ -461,6 +461,12 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
   }
 }
 
+export function getCachedChatMode(larkAppId: string, chatId: string): ChatMode | undefined {
+  const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
+  if (cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
+  return undefined;
+}
+
 export async function getChatMode(
   larkAppId: string,
   chatId: string,

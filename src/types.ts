@@ -55,6 +55,19 @@ export interface Session {
    *  Lark's 引用 chain. Updated on every inbound message routed into the
    *  session. */
   quoteTargetId?: string;
+  /**
+   * Chat-scope reply-thread aliases. In `/reply-mode topic`, a regular-group
+   * @mention can ask the SAME chat-scope session/worker to answer inside the
+   * @message's Lark thread. Later replies in that thread are folded back to this
+   * chat session when their rootMessageId is listed here.
+   */
+  replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
+  /**
+   * Current turn's reply destination for chat-scope topic aliases. `turnId` is
+   * the inbound message_id that opened/updated this turn, preventing a stale
+   * topic target from being confused with a later group-top-level turn.
+   */
+  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   /** open_id of the quote-target message's sender — used by --mention-back. */
   quoteTargetSenderOpenId?: string;
   /** Whether the quote-target sender is a bot (vs a human) — drives the
@@ -121,6 +134,8 @@ export interface LarkMention {
 export interface LarkMessage {
   messageId: string;
   rootId: string;
+  /** Lark thread_id; present only for real topic/thread replies. */
+  threadId?: string;
   /** Source chat the message came from. Populated for commands that run
    *  without a session (e.g. `/group`) so the handler can reach the chat
    *  roster without an active session to read `ds.chatId` from. */
@@ -214,8 +229,8 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; model?: string; disableCliBypass?: boolean; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
-  | { type: 'message'; content: string }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; model?: string; disableCliBypass?: boolean; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'message'; content: string; turnId?: string }
   | { type: 'raw_input'; content: string }
   | { type: 'close' }
   | { type: 'restart' }
@@ -227,16 +242,16 @@ export type DaemonToWorker =
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
-  | { type: 'ready'; port: number; token: string }
+  | { type: 'ready'; port: number; token: string; turnId?: string }
   | { type: 'cli_session_id'; cliSessionId: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null }
   | { type: 'prompt_ready' }
-  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
+  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string }
   | { type: 'error'; message: string }
-  | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean }
+  | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string }
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
-  | { type: 'user_notify'; message: string }
+  | { type: 'user_notify'; message: string; turnId?: string }
   | {
       type: 'final_output';
       content: string;
@@ -251,4 +266,4 @@ export type WorkerToDaemon =
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
       userText?: string;
     }
-  | { type: 'adopt_preamble'; userText: string; assistantText: string };
+  | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string };

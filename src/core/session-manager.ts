@@ -549,6 +549,8 @@ export function persistStreamCardState(ds: DaemonSession): void {
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
+    JSON.stringify(s.replyThreadAliases ?? {}) === JSON.stringify(ds.replyThreadAliases ?? {}) &&
+    JSON.stringify(s.currentReplyTarget ?? null) === JSON.stringify(ds.currentReplyTarget ?? null) &&
     s.pendingResponseCardId === ds.pendingResponseCardId &&
     s.pendingResponseCardState === ds.pendingResponseCardState &&
     s.lastPatchedResponseCardId === ds.lastPatchedResponseCardId
@@ -561,6 +563,8 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.usageLimit = ds.usageLimit;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
+  s.replyThreadAliases = ds.replyThreadAliases;
+  s.currentReplyTarget = ds.currentReplyTarget;
   s.pendingResponseCardId = ds.pendingResponseCardId;
   s.pendingResponseCardState = ds.pendingResponseCardState;
   s.lastPatchedResponseCardId = ds.lastPatchedResponseCardId;
@@ -574,6 +578,8 @@ export function rememberLastCliInput(ds: DaemonSession, userPrompt: string, cliI
   ds.lastCliInput = cliInput;
   ds.session.lastUserPrompt = userPrompt;
   ds.session.lastCliInput = cliInput;
+  ds.session.replyThreadAliases = ds.replyThreadAliases;
+  ds.session.currentReplyTarget = ds.currentReplyTarget;
   sessionStore.updateSession(ds.session);
 }
 
@@ -656,6 +662,8 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         usageLimit: session.usageLimit,
         lastUserPrompt: session.lastUserPrompt,
         lastCliInput: session.lastCliInput,
+        replyThreadAliases: session.replyThreadAliases,
+        currentReplyTarget: session.currentReplyTarget,
         pendingResponseCardId: session.pendingResponseCardId,
         pendingResponseCardState: session.pendingResponseCardState,
         lastPatchedResponseCardId: session.lastPatchedResponseCardId,
@@ -708,6 +716,8 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       usageLimit: session.usageLimit,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
+      replyThreadAliases: session.replyThreadAliases,
+      currentReplyTarget: session.currentReplyTarget,
       pendingResponseCardId: session.pendingResponseCardId,
       pendingResponseCardState: session.pendingResponseCardState,
       lastPatchedResponseCardId: session.lastPatchedResponseCardId,
@@ -982,6 +992,8 @@ export async function resumeSession(
     usageLimit: session.usageLimit,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,
+    replyThreadAliases: session.replyThreadAliases,
+    currentReplyTarget: session.currentReplyTarget,
     pendingResponseCardId: session.pendingResponseCardId,
     pendingResponseCardState: session.pendingResponseCardState,
     lastPatchedResponseCardId: session.lastPatchedResponseCardId,

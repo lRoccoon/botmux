@@ -26,6 +26,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
+import { findAncestorSessionContext as findAncestorSessionContextFromMarkers } from './core/session-marker.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -1481,6 +1482,7 @@ interface SessionData {
   lastCallerOpenId?: string;
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
+  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   pendingResponseCardId?: string;
@@ -2377,24 +2379,12 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
  * subcommands invoked from inside an agent session can auto-detect which
  * session they belong to.
  */
-function findAncestorSessionId(): string | null {
-  const dataDir = resolveDataDir();
-  const markersDir = join(dataDir, '.botmux-cli-pids');
-  if (!existsSync(markersDir)) return null;
+function findAncestorSessionContext(): { sessionId: string; turnId?: string } | null {
+  return findAncestorSessionContextFromMarkers(resolveDataDir());
+}
 
-  let pid = process.ppid;
-  for (let depth = 0; depth < 8 && pid > 1; depth++) {
-    const markerPath = join(markersDir, String(pid));
-    if (existsSync(markerPath)) {
-      try { return readFileSync(markerPath, 'utf-8').trim(); } catch { return ''; }
-    }
-    try {
-      const out = execSync(`ps -o ppid= -p ${pid}`, { encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-      pid = parseInt(out, 10);
-      if (isNaN(pid)) break;
-    } catch { break; }
-  }
-  return null;
+function findAncestorSessionId(): string | null {
+  return findAncestorSessionContext()?.sessionId ?? null;
 }
 
 interface CurrentSession {
@@ -2861,13 +2851,15 @@ async function cmdSend(rest: string[]): Promise<void> {
   const mentionBack = rest.includes('--mention-back');
   const noMention = rest.includes('--no-mention');
 
-  const sid = sessionIdArg ?? findAncestorSessionId();
+  const ancestorCtx = findAncestorSessionContext();
+  const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? null;
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
   }
 
   const sessions = loadSessions();
+  const currentTurnId = ancestorCtx?.turnId ?? process.env.BOTMUX_TURN_ID;
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
@@ -2905,11 +2897,11 @@ async function cmdSend(rest: string[]): Promise<void> {
     const { rmSync } = await import('node:fs');
     const appId = s.larkAppId!;
     const targetChatId = overrideChatId ?? s.chatId;
-    const target = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: s.scope === 'chat', chatId: targetChatId, rootMessageId: s.rootMessageId });
+    const target = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: s.scope === 'chat', chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: s.currentReplyTarget?.rootMessageId, replyTargetTurnId: s.currentReplyTarget?.turnId, currentTurnId });
     const sendAudio = (fileKey: string): Promise<string> =>
       target.mode === 'plain'
         ? sendMessage(appId, target.chatId, JSON.stringify({ file_key: fileKey }), 'audio')
-        : replyMessage(appId, target.root, JSON.stringify({ file_key: fileKey }), 'audio', true);
+        : replyMessage(appId, target.rootMessageId, JSON.stringify({ file_key: fileKey }), 'audio', true);
     let dir: string | undefined;
     try {
       const out = await synthesizeVoiceOpus(appId, content);
@@ -3038,11 +3030,11 @@ async function cmdSend(rest: string[]): Promise<void> {
     ? findOncallChatForAnyBot(s.chatId) : undefined;
   // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
   // decision point. Used for file attachments (always plain in chat scope).
-  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId });
+  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: s.currentReplyTarget?.rootMessageId, replyTargetTurnId: s.currentReplyTarget?.turnId, currentTurnId });
   const dispatch = (content: string, msgType: string): Promise<string> =>
     sendTarget.mode === 'plain'
       ? sendMessage(appId, sendTarget.chatId, content, msgType)
-      : replyMessage(appId, sendTarget.root, content, msgType, true);
+      : replyMessage(appId, sendTarget.rootMessageId, content, msgType, true);
   const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
@@ -3104,7 +3096,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
   // scope and --top-level never quote. Withdrawn target → fall back to plain.
-  const quoteTargetId = sendInto ? undefined : resolveQuoteTarget({
+  const quoteTargetId = sendInto || sendTarget.mode === 'thread' ? undefined : resolveQuoteTarget({
     isChatScope, sendTopLevel, noQuote, explicitQuote,
     sessionQuoteTargetId: s.quoteTargetId,
   });

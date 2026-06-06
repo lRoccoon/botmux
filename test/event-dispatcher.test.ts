@@ -41,6 +41,7 @@ vi.mock('../src/bot-registry.js', () => ({
 
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
+const mockGetCachedChatMode = vi.fn(() => undefined as 'group' | 'topic' | 'p2p' | undefined);
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
 const mockUpdateMessage = vi.fn(async () => true);
@@ -50,6 +51,7 @@ const mockIsHumanOpenId = vi.fn(async () => false);
 vi.mock('../src/im/lark/client.js', () => ({
   getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
+  getCachedChatMode: (...args: any[]) => mockGetCachedChatMode(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
@@ -112,6 +114,7 @@ function setupBotState(opts?: {
   restrictGrantCommands?: boolean;
   regularGroupReplyInThread?: boolean;
   autoStartOnNewTopic?: boolean;
+  chatReplyModes?: Record<string, 'chat' | 'topic_alias'>;
 }) {
   mockGetBot.mockReturnValue({
     config: {
@@ -123,6 +126,7 @@ function setupBotState(opts?: {
       restrictGrantCommands: opts?.restrictGrantCommands,
       regularGroupReplyInThread: opts?.regularGroupReplyInThread,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
+      chatReplyModes: opts?.chatReplyModes,
     },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
@@ -135,12 +139,14 @@ function makeHandlers(): EventHandlers & {
   handleCardAction: ReturnType<typeof vi.fn>;
   isSessionOwner: ReturnType<typeof vi.fn>;
   onChatModeConverted: ReturnType<typeof vi.fn>;
+  resolveReplyThreadAlias: ReturnType<typeof vi.fn>;
 } {
   return {
     handleCardAction: vi.fn(async () => undefined),
     handleNewTopic: vi.fn(async () => {}),
     handleThreadReply: vi.fn(async () => {}),
     isSessionOwner: vi.fn(() => false),
+    resolveReplyThreadAlias: vi.fn(() => null),
     onChatModeConverted: vi.fn(),
   };
 }
@@ -270,6 +276,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     mockReplyMessage.mockClear();
+    mockGetCachedChatMode.mockReset();
+    mockGetCachedChatMode.mockReturnValue(undefined);
     mockRecordObservedBots.mockClear();
     setupBotState();
     handlers = makeHandlers();
@@ -929,6 +937,145 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     await flushEventWork();
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('topic_alias top-level @ routes through chat session with replyRootId=current message', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'topic_alias' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA please answer in a topic' }),
+      messageId: 'msg-topic-alias-1',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+      replyRootId: 'msg-topic-alias-1',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('topic_alias thread-contained @ starts a fresh alias on the current message id', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'topic_alias' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA delegated from an existing thread' }),
+      rootId: 'old-discussion-root',
+      messageId: 'msg-topic-alias-delegate',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      threadId: 'old-discussion-root',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+      replyRootId: 'msg-topic-alias-delegate',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('topic_alias explicit @ inside an existing alias thread starts a new alias on current message', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'topic_alias' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-reply-mode', sessionId: 'sess-chat' });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA new delegated task inside existing alias' }),
+      rootId: 'old-alias-root',
+      messageId: 'msg-new-delegate-in-alias',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+      replyRootId: 'msg-new-delegate-in-alias',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('topic_alias bot-sent post inside a thread starts a fresh alias on current message', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'topic_alias' } });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue(JSON.stringify({ BotB: OTHER_BOT_OPEN_ID }));
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[
+        { tag: 'at', user_id: MY_OPEN_ID },
+        { tag: 'text', text: ' delegated from bot inside existing thread' },
+      ]] },
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: postContent,
+      rootId: 'old-thread-root',
+      threadId: 'old-thread-root',
+      messageId: 'msg-bot-delegate',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+      replyRootId: 'msg-bot-delegate',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('topic_alias follow-up thread reply folds back to chat session alias', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-reply-mode', sessionId: 'sess-chat' });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow up in alias topic' }),
+      rootId: 'msg-topic-alias-1',
+      messageId: 'msg-topic-alias-2',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+      replyRootId: 'msg-topic-alias-1',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 });
 
@@ -2230,6 +2377,8 @@ describe('im.message.receive_v1 — botOpenId startup race', () => {
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     mockReplyMessage.mockClear();
+    mockGetCachedChatMode.mockReset();
+    mockGetCachedChatMode.mockReturnValue(undefined);
     mockRecordObservedBots.mockClear();
     setupBotState();
     handlers = makeHandlers();

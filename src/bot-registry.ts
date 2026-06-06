@@ -9,6 +9,8 @@ import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
+export type ChatReplyMode = 'chat' | 'topic_alias';
+
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
   chatId: string;
@@ -92,6 +94,8 @@ export interface BotConfig {
    * Codex flagged in review.
    */
   defaultOncallAutoboundChats?: string[];
+  /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
+  chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
@@ -513,6 +517,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .filter((x: any): x is string => typeof x === 'string');
     }
 
+    // chatReplyModes：只保留每群显式设置，非法值丢弃；`chat` 是默认值但保留解析，
+    // 写入路径会删除 chat 条目以保持 bots.json 干净。
+    let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
+    if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
+      const out: { [chatId: string]: ChatReplyMode } = {};
+      for (const [cid, mode] of Object.entries(entry.chatReplyModes)) {
+        if (typeof cid !== 'string' || !cid.trim()) continue;
+        if (mode === 'chat' || mode === 'topic_alias') out[cid] = mode;
+      }
+      if (Object.keys(out).length > 0) chatReplyModes = out;
+    }
+
     // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
     // 丢弃空列表。未配置或全部非法 → undefined。
     let chatGrants: { [chatId: string]: string[] } | undefined;
@@ -617,6 +633,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
         ? entry.defaultWorkingDir.trim()
         : undefined,
+      chatReplyModes,
       chatGrants,
       globalGrants,
       messageQuota,

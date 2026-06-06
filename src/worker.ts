@@ -124,10 +124,19 @@ function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
-const pendingMessages: string[] = [];
+const pendingMessages: Array<{ content: string; turnId?: string }> = [];
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
+let currentBotmuxTurnId: string | undefined;
+function writeCliPidMarker(): void {
+  if (!cliPidMarker || !sessionId) return;
+  try {
+    writeFileSync(cliPidMarker, JSON.stringify({ sessionId, turnId: currentBotmuxTurnId ?? null }));
+  } catch (err: any) {
+    log(`Failed to update CLI PID marker: ${err?.message ?? err}`);
+  }
+}
 let lastStructuredBridgeActivityAtMs = 0;
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
@@ -414,6 +423,7 @@ function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
   bridgePreambleSent = true;
   send({
     type: 'adopt_preamble',
+    turnId: currentBotmuxTurnId,
     userText: truncatePreambleText(turn.userText, PREAMBLE_USER_MAX),
     assistantText: truncatePreambleText(turn.assistantText, PREAMBLE_ASSISTANT_MAX),
   });
@@ -436,6 +446,7 @@ function maybeEmitCodexAdoptPreamble(
   codexBridgePreambleSent = true;
   send({
     type: 'adopt_preamble',
+    turnId: currentBotmuxTurnId,
     userText: truncatePreambleText(turn.userText, PREAMBLE_USER_MAX),
     assistantText: truncatePreambleText(turn.assistantText, PREAMBLE_ASSISTANT_MAX),
   });
@@ -1266,7 +1277,7 @@ function stopBridgeWatcher(): void {
  * no jsonl line will ever match, and `maybeSwitchBridgeJsonl` burns 99%
  * CPU scanning all sibling jsonls for it on every poll tick.
  */
-function bridgeMarkPendingTurn(messageText: string): string | undefined {
+function bridgeMarkPendingTurn(messageText: string, preferredTurnId?: string): string | undefined {
   if (!bridgeJsonlPath) return undefined;
   if (!bridgeBaselineDone) {
     log('Bridge baseline not ready — this turn will not have transcript-driven final_output');
@@ -1281,7 +1292,7 @@ function bridgeMarkPendingTurn(messageText: string): string | undefined {
   // pane to false-match than the 30-char substring fingerprint.
   const normalised = normaliseForFingerprint(messageText);
   const contentNormalized = normalised.length > 0 ? normalised : undefined;
-  const turnId = randomBytes(8).toString('hex');
+  const turnId = preferredTurnId ?? randomBytes(8).toString('hex');
   bridgeQueue.mark(turnId, fingerprint, Date.now(), contentNormalized);
   return turnId;
 }
@@ -1793,9 +1804,9 @@ function codexBridgeIngest(): void {
 /** Mark a pending Lark turn for Codex. Crucially this works even before a
  *  rollout path is known — the queue is path-agnostic, and ingest after
  *  late-attach picks up the user_message and matches the fingerprint. */
-function codexBridgeMarkPendingTurn(messageText: string): boolean {
+function codexBridgeMarkPendingTurn(messageText: string, preferredTurnId?: string): boolean {
   if (!codexBridgeFallbackActive()) return false;
-  const turnId = `codex-${randomBytes(8).toString('hex')}`;
+  const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   codexBridgeQueue.mark(turnId, messageText);
   return true;
 }
@@ -2044,7 +2055,7 @@ function maybeEmitWorkflowTranscriptOutput(): void {
     type: 'final_output',
     content: workflowTranscript,
     lastUuid: `workflow-pty-${Date.now()}`,
-    turnId: `workflow-pty-${sessionId || 'unknown'}`,
+    turnId: currentBotmuxTurnId ?? `workflow-pty-${sessionId || 'unknown'}`,
   });
   log('Workflow PTY transcript final_output emitted');
 }
@@ -2077,7 +2088,7 @@ function startScreenAnalyzer(): void {
       onAnalyzing: () => { /* no-op: only block when prompt is actually detected */ },
       onTuiPrompt: (description, options, multiSelect) => {
         tuiPromptBlocking = true;
-        send({ type: 'tui_prompt', description, options, multiSelect });
+        send({ type: 'tui_prompt', description, options, multiSelect, turnId: currentBotmuxTurnId });
       },
       onTuiPromptResolved: (selectedText) => {
         tuiPromptBlocking = false;
@@ -2438,7 +2449,7 @@ function handleCodexAppMarker(body: string): void {
         return;
       }
     }
-    const turnId = typeof payload.turnId === 'string' ? payload.turnId : `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`;
+    const turnId = typeof payload.turnId === 'string' ? payload.turnId : (currentBotmuxTurnId ?? `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`);
     send({
       type: 'final_output',
       content: payload.content,
@@ -2561,7 +2572,7 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   if (renderer && pendingMessages.length === 0 && !isFlushing) {
     const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle') });
+    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId });
   }
   flushPending();
 }
@@ -2628,6 +2639,7 @@ function scheduleSubmitFailureNotify(
     log(`writeInput: submit impossible — notifying user immediately. reason="${reason}" preview="${preview}"`);
     send({
       type: 'user_notify',
+      turnId: currentBotmuxTurnId,
       message: `⚠️ 刚才那条消息没有写入 ${cliName()}，因为当前按键配置无法从终端自动提交。\n原因：${reason}\n请调整 Claude Code Chat keybinding 后重发。\n开头：${preview}`,
     });
     return;
@@ -2683,6 +2695,7 @@ function scheduleSubmitFailureNotify(
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
     send({
       type: 'user_notify',
+      turnId: currentBotmuxTurnId,
       message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（重试 Enter 后等了 ${Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000)}s 仍未在${transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
     });
   }, SUBMIT_DEFERRED_RECHECK_MS);
@@ -2735,7 +2748,10 @@ async function flushPending(): Promise<void> {
 
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
-      const msg = pendingMessages.shift()!;
+      const item = pendingMessages.shift()!;
+      const msg = item.content;
+      currentBotmuxTurnId = item.turnId;
+      writeCliPidMarker();
       const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Bridge fallback: mark immediately before writeInput. Doing it here
       // (instead of at enqueue time) means markTimeMs anchors to the
@@ -2747,13 +2763,13 @@ async function flushPending(): Promise<void> {
       let bridgeTurnId: string | undefined;
       if (claudeBridgeActive) {
         try { bridgeIngest(); } catch { /* best-effort */ }
-        bridgeTurnId = bridgeMarkPendingTurn(msg);
+        bridgeTurnId = bridgeMarkPendingTurn(msg, item.turnId);
       } else if (codexBridgeActive) {
         // Codex mark works even before the rollout path is known: the
         // queue is path-agnostic, and the late-attach below will start
         // ingest from offset 0 so the user_message that lands shortly
         // after still fingerprint-matches this turn.
-        codexBridgeMarkPendingTurn(msg);
+        codexBridgeMarkPendingTurn(msg, item.turnId);
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
@@ -2805,9 +2821,9 @@ async function flushPending(): Promise<void> {
   }
 }
 
-function sendToPty(content: string): void {
+function sendToPty(content: string, turnId?: string): void {
   if (!backend || !cliAdapter) return;
-  pendingMessages.push(content);
+  pendingMessages.push({ content, turnId });
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
   // wrong (false positive on a question that has no rendered options) and a
@@ -2885,7 +2901,7 @@ function startScreenUpdates(): void {
       const usageAware = usageLimitTracker.classify(content, status);
       if (changed || usageAware.status !== lastSentStatus) {
         lastSentStatus = usageAware.status;
-        send({ type: 'screen_update', content, ...usageAware });
+        send({ type: 'screen_update', content, ...usageAware, turnId: currentBotmuxTurnId });
       }
     })();
   }, SCREEN_UPDATE_INTERVAL_MS);
@@ -3264,6 +3280,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       const probe = isAbsolute(wantBin) ? `ls -l ${wantBin}` : `which ${wantBin}`;
       send({
         type: 'user_notify',
+        turnId: currentBotmuxTurnId,
         message:
           `无法启动 ${cliName()}：找不到可执行文件「${wantBin}」。\n` +
           `请在运行 botmux daemon 的这台机器上确认它已安装并在 PATH 中（自查：${probe}），然后重发消息重试。\n` +
@@ -3291,6 +3308,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   childEnv.BOTMUX_CHAT_ID = cfg.chatId;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
+  if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
   if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
   if (claudeResumeTokenThreshold) childEnv.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD = claudeResumeTokenThreshold;
   // Adapter-supplied env: points Claude-family forks at their data root (Seed's
@@ -3315,7 +3334,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     try {
       mkdirSync(markersDir, { recursive: true });
       cliPidMarker = join(markersDir, String(cliPid));
-      writeFileSync(cliPidMarker, cfg.sessionId);
+      writeCliPidMarker();
       log(`CLI PID marker written: ${cliPid}`);
     } catch (err: any) {
       log(`Failed to write CLI PID marker: ${err.message}`);
@@ -3353,7 +3372,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
             const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
             mkdirSync(markersDir, { recursive: true });
             cliPidMarker = join(markersDir, String(pid));
-            writeFileSync(cliPidMarker, cfg.sessionId);
+            writeCliPidMarker();
             log(`CLI PID marker written (async): ${pid}`);
           } catch (err: any) {
             log(`Failed to write CLI PID marker (async): ${err.message}`);
@@ -4052,6 +4071,10 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
+        if (msg.turnId) {
+          currentBotmuxTurnId = msg.turnId;
+          writeCliPidMarker();
+        }
         let port = 0;
         if (!isWorkflowWorker()) {
           port = await startWebServer(config.web.workerHost, msg.webPort);
@@ -4073,10 +4096,10 @@ process.on('message', async (raw: unknown) => {
         // Bridge mark is deferred to flushPending — see flushPending
         // comment for why marking at enqueue is wrong.
         if (msg.prompt && !cliAdapter?.passesInitialPromptViaArgs) {
-          pendingMessages.push(msg.prompt);
+          pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
         }
 
-        send({ type: 'ready', port, token: writeToken });
+        send({ type: 'ready', port, token: writeToken, turnId: currentBotmuxTurnId });
       } catch (err: any) {
         send({ type: 'error', message: `init failed: ${err.message}` });
         process.exit(1);
@@ -4091,6 +4114,8 @@ process.on('message', async (raw: unknown) => {
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
+      currentBotmuxTurnId = msg.turnId;
+      writeCliPidMarker();
       if (lastInitConfig?.adoptMode) {
         // Bridge mode: capture transcript baseline BEFORE writing to the pane,
         // so any assistant uuids appended after this point are attributed to
@@ -4099,7 +4124,7 @@ process.on('message', async (raw: unknown) => {
         // user just won't get a final_output for this message.
         if (bridgeJsonlPath) {
           try { bridgeIngest(); } catch { /* best effort */ }
-          bridgeMarkPendingTurn(content);
+          bridgeMarkPendingTurn(content, msg.turnId);
         } else if (codexBridgeFallbackActive()) {
           // Codex adopt: same idea, different bridge. ingest first so any
           // in-flight events from a local-typed prior turn close before
@@ -4110,11 +4135,11 @@ process.on('message', async (raw: unknown) => {
             // before this IPC message is handled. Mark first so that preexisting
             // current-line can still fingerprint-match instead of being marked
             // seen as an unmatched event.
-            codexBridgeMarkPendingTurn(content);
+            codexBridgeMarkPendingTurn(content, msg.turnId);
             try { codexBridgeIngest(); } catch { /* best effort */ }
           } else {
             try { codexBridgeIngest(); } catch { /* best effort */ }
-            codexBridgeMarkPendingTurn(content);
+            codexBridgeMarkPendingTurn(content, msg.turnId);
           }
         }
         // Adopt mode write:
@@ -4169,7 +4194,7 @@ process.on('message', async (raw: unknown) => {
         // arrival. Marking now would race with a still-running previous
         // turn whose `botmux send` could sneak its sentAtMs past this
         // turn's markTimeMs and falsely suppress its fallback.
-        sendToPty(content);
+        sendToPty(content, msg.turnId);
       }
       break;
     }

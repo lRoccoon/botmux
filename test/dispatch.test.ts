@@ -10,6 +10,10 @@
  * Run: pnpm vitest run test/dispatch.test.ts
  */
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { findAncestorSessionContext } from '../src/core/session-marker.js';
 import {
   parseDispatchBotSpec,
   buildDispatchMessages,
@@ -258,7 +262,7 @@ describe('resolveReportTarget', () => {
 describe('resolveSendTarget — destination routing', () => {
   const base = { topLevel: false, chatScope: false, chatId: 'oc_chat', rootMessageId: 'om_root' };
   it('defaults to replying in the session thread (thread scope, no flags)', () => {
-    expect(resolveSendTarget(base)).toEqual({ mode: 'reply', root: 'om_root' });
+    expect(resolveSendTarget(base)).toEqual({ mode: 'thread', rootMessageId: 'om_root' });
   });
   it('chat-scope session posts plain at the chat top', () => {
     expect(resolveSendTarget({ ...base, chatScope: true })).toEqual({ mode: 'plain', chatId: 'oc_chat' });
@@ -267,7 +271,31 @@ describe('resolveSendTarget — destination routing', () => {
     expect(resolveSendTarget({ ...base, topLevel: true })).toEqual({ mode: 'plain', chatId: 'oc_chat' });
   });
   it('--into <root> replies into that topic (overrides everything)', () => {
-    expect(resolveSendTarget({ ...base, into: 'om_topic' })).toEqual({ mode: 'reply', root: 'om_topic' });
-    expect(resolveSendTarget({ ...base, into: 'om_topic', topLevel: true, chatScope: true })).toEqual({ mode: 'reply', root: 'om_topic' });
+    expect(resolveSendTarget({ ...base, into: 'om_topic' })).toEqual({ mode: 'thread', rootMessageId: 'om_topic' });
+    expect(resolveSendTarget({ ...base, into: 'om_topic', topLevel: true, chatScope: true })).toEqual({ mode: 'thread', rootMessageId: 'om_topic' });
+  });
+  it('chat-scope topic alias replies into the current alias thread only when turn ids match', () => {
+    expect(resolveSendTarget({ ...base, chatScope: true, replyTargetRootId: 'om_alias', replyTargetTurnId: 'turn-a', currentTurnId: 'turn-a' })).toEqual({ mode: 'thread', rootMessageId: 'om_alias' });
+    expect(resolveSendTarget({ ...base, chatScope: true, replyTargetRootId: 'om_alias', replyTargetTurnId: 'turn-a', currentTurnId: 'turn-b' })).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+  it('--top-level overrides a chat-scope topic alias target', () => {
+    expect(resolveSendTarget({ ...base, chatScope: true, topLevel: true, replyTargetRootId: 'om_alias', replyTargetTurnId: 'turn-a', currentTurnId: 'turn-a' })).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+});
+
+describe('botmux send turn marker context', () => {
+  it('uses the latest JSON pid marker turnId for a long-lived CLI process', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-marker-'));
+    const pid = 424242;
+    try {
+      mkdirSync(join(dir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dir, '.botmux-cli-pids', String(pid)), JSON.stringify({ sessionId: 'sid-1', turnId: 'turn-a' }));
+      expect(findAncestorSessionContext(dir, pid)).toEqual({ sessionId: 'sid-1', turnId: 'turn-a' });
+
+      writeFileSync(join(dir, '.botmux-cli-pids', String(pid)), JSON.stringify({ sessionId: 'sid-1', turnId: 'turn-b' }));
+      expect(findAncestorSessionContext(dir, pid)).toEqual({ sessionId: 'sid-1', turnId: 'turn-b' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

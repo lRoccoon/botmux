@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
@@ -18,11 +18,13 @@ import { recordObservedBots } from '../../services/observed-bots-store.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
+import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
+import { getChatReplyMode } from '../../services/chat-reply-mode-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -899,6 +901,8 @@ export interface RoutingContext {
    *  thread-scope (an existing rootMessageId, or this messageId when
    *  it's the seed of a brand-new thread). */
   anchor: string;
+  /** Chat-scope topic-alias reply target for this turn, if any. */
+  replyRootId?: string;
   larkAppId: string;
 }
 
@@ -914,6 +918,8 @@ export interface EventHandlers {
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
+  /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
+  resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string } | null;
   /** Fired when the dispatcher detects that a chat with a live chat-scope
    *  session has been converted to topic mode (chat_mode 'group' → 'topic'
    *  via Lark group settings). Daemon should evict the stale chat-scope
@@ -1002,6 +1008,31 @@ export function maybeApplyForceTopicOverride(
   routing.scope = 'thread';
   routing.anchor = messageId;
   return true;
+}
+
+async function maybeApplyTopicAliasSeed(input: {
+  larkAppId: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  message: any;
+  senderOpenId: string | undefined;
+  messageId: string;
+  routing: { scope: 'thread' | 'chat'; anchor: string };
+  forceTopicApplied?: boolean;
+}): Promise<string | undefined> {
+  const { larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied } = input;
+  if (forceTopicApplied) return undefined;
+  if (chatType !== 'group') return undefined;
+  if (getChatReplyMode(larkAppId, chatId) !== 'topic_alias') return undefined;
+  if (!isBotMentioned(larkAppId, message, senderOpenId)) return undefined;
+  const freshMode = routing.scope === 'thread'
+    ? await getChatMode(larkAppId, chatId, { forceRefresh: true })
+    : (getCachedChatMode(larkAppId, chatId) ?? 'group');
+  if (freshMode !== 'group') return undefined;
+  routing.scope = 'chat';
+  routing.anchor = chatId;
+  logger.info(`[reply-mode] topic_alias turn msg=${messageId.substring(0, 12)} routes through chat=${chatId.substring(0, 12)}`);
+  return messageId;
 }
 
 /** Compute the scope + anchor for an inbound message:
@@ -1161,6 +1192,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           if (!isBotMentioned(larkAppId, message, undefined)) return;
           const decision = await decideRoutingWithSource(larkAppId, message);
           const ctx = { scope: decision.scope, anchor: decision.anchor };
+          const replyRootId = await maybeApplyTopicAliasSeed({
+            larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx,
+          });
           // Regular-group foreign-bot @mention without an existing session:
           // gate to vetted botmux peers (registered in our bot-openids cross-ref).
           // This applies both to legacy chat-scope routing and to the
@@ -1197,7 +1231,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
           // back-to-back into this thread must be handled in order, not raced.
           await serializeByAnchor(ctx.anchor, () =>
-            handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId }))
+            handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId }))
             .catch(err => logger.error(`Error handling bot @mention: ${err}`));
           return;
         }
@@ -1216,6 +1250,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // independently records the mentions[] open_ids + names). 无需授权：
         // 任何人都能登记花名册（只记 observed，不授予任何权限）。
         if (await tryHandleIntroduceCommand(larkAppId, message, senderOpenId)) {
+          return;
+        }
+
+        if (await tryHandleReplyModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
           return;
         }
 
@@ -1247,6 +1285,24 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           anchor: decision.anchor,
         };
         let routingSource = decision.source;
+        let replyRootId: string | undefined;
+        const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, senderOpenId);
+
+        // Topic-alias reply: a message in a Lark thread can still belong to the
+        // regular group's chat-scope session when that root was registered by
+        // `/reply-mode`. Fold it back to chatId before ownership / serialize.
+        if (!explicitlyMentionedThisBot && routing.scope === 'thread' && message.root_id && message.thread_id && chatType === 'group') {
+          const alias = handlers.resolveReplyThreadAlias?.(message.root_id, chatId, larkAppId) ?? null;
+          if (alias) {
+            const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+            if (freshMode === 'group') {
+              routing.scope = 'chat';
+              routing.anchor = alias.chatId;
+              replyRootId = message.root_id;
+              logger.info(`[reply-mode] alias root=${message.root_id.substring(0, 12)} → chat=${alias.chatId.substring(0, 12)} session=${alias.sessionId.substring(0, 8)}`);
+            }
+          }
+        }
 
         // 话题群 → 普通群 (reverse conversion). Symmetric to the forward check
         // below: when decideRouting lands on thread-scope purely because the
@@ -1290,11 +1346,20 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // /t / /topic in 普通群: flip routing to thread-scope so the bot's
         // first reply seeds a fresh Lark thread, even if a chat-scope session
         // is currently active in this chat.
-        if (maybeApplyForceTopicOverride(routing, message, messageId)) {
+        const forceTopicApplied = maybeApplyForceTopicOverride(routing, message, messageId);
+        if (forceTopicApplied) {
           logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
 
         let ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+
+        const seedReplyRootId = await maybeApplyTopicAliasSeed({
+          larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
+        });
+        if (seedReplyRootId) {
+          replyRootId = seedReplyRootId;
+          ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+        }
 
         // 普通群 → 话题群 conversion detection. Lark group admins can flip
         // chat_mode at any time; our 30/5-min cache lags. If routing landed on
@@ -1333,8 +1398,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         //   p2p                     → allowlist only
         if (chatType === 'group') {
           let stats: { userCount: number; botCount: number } | null = null;
-          if (ownsSession) stats = await getGroupStats(larkAppId, chatId);
-          const relax = ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1;
+          if (ownsSession && !replyRootId) stats = await getGroupStats(larkAppId, chatId);
+          // replyRootId means this turn has already been explicitly addressed
+          // to the bot by topic_alias logic (possibly from inside an existing
+          // Lark thread). Do not re-run the generic group @ gate, which would
+          // reject multi-bot thread replies simply because `routing.scope` was
+          // folded back to chat-scope.
+          const relax = (!!replyRootId && isAllowed) || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
           if (!relax) {
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
             if (access === 'not_allowed') {
@@ -1369,7 +1439,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           return;
         }
 
-        const ctx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...routing };
+        const ctx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...routing, replyRootId };
         // Serialize per anchor so two messages to the same thread/chat are
         // processed in arrival order — never concurrently. Without this a fast
         // second message interleaves with the first's async session-spawn and is
