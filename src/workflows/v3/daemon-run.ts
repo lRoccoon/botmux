@@ -229,7 +229,7 @@ export type V3GateClickOutcome =
   | { kind: 'resolved'; resolution: 'approved' | 'rejected' }
   | { kind: 'already-settled'; status: GateWaitStatus }
   | { kind: 'unauthorized' }
-  | { kind: 'stale-run'; reason: 'terminal' | 'missing' | 'no-wait' };
+  | { kind: 'stale-run'; reason: 'terminal' | 'missing' | 'no-wait' | 'stale-node' };
 
 /**
  * Resolve a humanGate approval-card click.  Idempotent + terminal-safe (codex
@@ -261,6 +261,9 @@ export function resolveV3GateClick(
   const wait = readWait(runDir, input.waitId);
   if (!wait) return { kind: 'stale-run', reason: 'no-wait' };
   if (wait.status !== 'pending') return { kind: 'already-settled', status: wait.status };
+  if (snap.nodes.get(wait.nodeId)?.status !== 'gateWaiting') {
+    return { kind: 'stale-run', reason: 'stale-node' };
+  }
   if (!canResolveGateWait(wait, input.by)) return { kind: 'unauthorized' };
   const resolution = selectedResolution(wait, input.selected);
   if (!resolution) return { kind: 'stale-run', reason: 'no-wait' };

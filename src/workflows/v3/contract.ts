@@ -99,7 +99,7 @@ export interface GoalInputs {
    *  is known" stops it from hallucinating the missing product. */
   omitted?: Array<{
     from: string;
-    reason: 'edgeInactive' | 'sourceSkipped' | 'selectorMiss';
+    reason: 'edgeInactive' | 'sourceSkipped' | 'sourceCancelled' | 'earlyRelease' | 'selectorMiss';
   }>;
 }
 

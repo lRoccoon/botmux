@@ -321,7 +321,11 @@ describe('decideNext', () => {
       ['a', { status: 'skipped' }],
       ['b', { status: 'skipped' }],
     ]);
-    expect(decideNext(branch, state)).toEqual([{ kind: 'completeRunFailed', reason: 'allSinksSkipped' }]);
+    expect(decideNext(branch, state)).toEqual([{
+      kind: 'completeRunFailed',
+      reason: 'allSinksSkipped',
+      detail: '2 skipped, 0 cancelled',
+    }]);
   });
 });
 

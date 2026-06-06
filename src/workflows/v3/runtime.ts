@@ -364,6 +364,7 @@ export type V3RunOutcome =
       failedNodeId?: string;
       blockedNodeId?: string;
       failureReason?: 'allSinksSkipped';
+      failureDetail?: string;
       runDir: string;
     }
   | { reason: 'awaitingGate'; pendingWaits: V3PendingGate[]; runDir: string };
@@ -442,6 +443,8 @@ export async function runWorkflow(
   const inFlight = new Map<string, Promise<void>>();
   const botInFlight = new Map<string, number>();
   const cliInFlight = new Map<string, number>();
+  const nodeControllers = new Map<string, AbortController>();
+  const nodeAbortCleanups = new Map<string, () => void>();
 
   while (true) {
     const events = readJournal(journalPath);
@@ -467,6 +470,7 @@ export async function runWorkflow(
           type: 'runFailed',
           failedNodeId: terminal.failedNodeId,
           reason: terminal.reason,
+          detail: terminal.detail,
         });
       } else {
         appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: terminal.blockedNodeId });
@@ -530,6 +534,14 @@ export async function runWorkflow(
       }
     }
 
+    const cancels = actions.filter((a): a is Extract<V3Action, { kind: 'cancelNode' }> =>
+      a.kind === 'cancelNode');
+    let cancelledThisTick = false;
+    for (const a of cancels) {
+      cancelledThisTick = applyCancelNode(a) || cancelledThisTick;
+    }
+    if (cancelledThisTick) continue;
+
     if (inFlight.size === 0) {
       if (aborted) break; // cancelled with nothing running → stop
       if (startedThisTick === 0) {
@@ -559,6 +571,7 @@ export async function runWorkflow(
       : 'failed',
     failedNodeId: finalSnap.failedNodeId,
     failureReason: finalSnap.failureReason,
+    failureDetail: finalSnap.failureDetail,
     blockedNodeId: finalSnap.blockedNodeId,
     runDir,
   };
@@ -626,6 +639,13 @@ export async function runWorkflow(
       return;
     }
 
+    const controller = new AbortController();
+    const relayAbort = (): void => controller.abort();
+    if (opts.cancelSignal?.aborted) relayAbort();
+    else opts.cancelSignal?.addEventListener('abort', relayAbort, { once: true });
+    nodeControllers.set(node.id, controller);
+    nodeAbortCleanups.set(node.id, () => opts.cancelSignal?.removeEventListener('abort', relayAbort));
+
     const req: RunNodeRequest = {
       runId: dag.runId,
       attemptId,
@@ -637,7 +657,7 @@ export async function runWorkflow(
       outputDir,
       env,
       timeoutMs: (node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC) * 1000,
-      cancelSignal: opts.cancelSignal,
+      cancelSignal: controller.signal,
       // Worker terminal is ready mid-run → stamp nodeSessionReady so the
       // dashboard can attach to the LIVE terminal.  Sync appendEvent (no await
       // on the pool's fire-and-forget ready path — codex note).
@@ -741,6 +761,11 @@ export async function runWorkflow(
       })
       .finally(() => {
         inFlight.delete(node.id);
+        if (nodeControllers.get(node.id) === controller) {
+          nodeControllers.delete(node.id);
+          nodeAbortCleanups.get(node.id)?.();
+          nodeAbortCleanups.delete(node.id);
+        }
         releaseSlots(botKey, botSnap.cliId);
       });
     inFlight.set(node.id, p);
@@ -925,6 +950,28 @@ export async function runWorkflow(
       active,
       detail,
     });
+  }
+
+  function applyCancelNode(a: Extract<V3Action, { kind: 'cancelNode' }>): boolean {
+    const events = readJournal(journalPath);
+    const snap = materialize(events);
+    const status = snap.nodes.get(a.nodeId)?.status ?? 'pending';
+    if (status !== 'pending' && status !== 'gateWaiting' && status !== 'running') return false;
+
+    const attemptId = latestAttemptIdFor(events, a.nodeId);
+    appendEvent(journalPath, {
+      type: 'nodeCancelled',
+      nodeId: a.nodeId,
+      attemptId,
+      reason: 'earlyReleaseLoser',
+      byNodeId: a.byNodeId,
+      detail: a.detail,
+    });
+
+    nodeControllers.get(a.nodeId)?.abort();
+    const gateKey = `${a.nodeId}::gate`;
+    if (inFlight.has(gateKey)) inFlight.delete(gateKey);
+    return true;
   }
 
   function pendingGateWaits(state: Map<string, { status: string }>): V3PendingGate[] {

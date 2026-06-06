@@ -494,3 +494,229 @@ per-file selector，对位 seedclaw 命名 artifact 的 v3 原生形态——文
 - loop body 实例化（instanceNodeFor）保留 selector；loop 外层 inputs 同样生效；
 - 不做共享 board/KV：跨节点暂存态若未 journal 化会破坏重放确定性（P0 收敛
   结论），有需求等 host/transform node journal 化产物再说。
+
+## 15. P4 附录：early-release + 败者取消
+
+P4 只改变 `one_success` / `quorum` 的 join 调度时序；`all_success` 保持 P0
+语义逐字节不变：必须等全部入边 settled 且全部 active 才运行，任何 inactive
+都会使节点 skipped。
+
+### 15.1 核心语义
+
+对一个节点的每条入边，decideNext 仍先归类成边活动态：
+
+| activity | 含义 | 对 trigger 计票 |
+|----------|------|-----------------|
+| `active` | source 已 `done`，无条件边或条件边已 `edgeResolved(active:true)` | +1 |
+| `inactive` | source `skipped/cancelled`，或条件边 `edgeResolved(active:false)` | +0，已定 |
+| `unresolved` | source 已 `done`，条件边尚未 `edgeResolved` | 未定 |
+| `unsettled` | source 仍 `pending/gateWaiting/running` | 未定 |
+
+`all_success`：
+
+- 遇到 `unsettled/unresolved` 仍等待或 resolveEdge；
+- 只在全部 settled 后判定；
+- active 数不足入边数 → skip。
+
+`one_success` / `{quorum:N}`：
+
+- `active >= required` 时**立即 ready**，不再等待 `unsettled/unresolved`；
+- ready 时只注入已 active 的上游输入；其余声明输入进入 `GoalInputs.omitted`：
+  `inactive → edgeInactive/sourceSkipped/sourceCancelled`，
+  `unsettled/unresolved → earlyRelease`；
+- `active + maybe < required` 时才 skip，其中 `maybe = unsettled + unresolved`
+  （已经不可能凑够票）；
+- 其余情况继续等待 / resolveEdge。
+
+这使三路赛马的典型形状变成：
+
+```
+a,b,c -> merge(triggerRule:"one_success")
+
+a done             -> merge dispatch
+b/c running/pending -> 进入 earlyRelease loser 集合；能取消则取消
+```
+
+### 15.2 新事件与状态
+
+新增 journal 事件，不复用 `nodeFailed(errorClass:'cancelled')`：
+
+```ts
+| {
+    type: 'nodeCancelled';
+    nodeId: string;
+    attemptId?: string;
+    reason: 'earlyReleaseLoser';
+    byNodeId: string;     // 哪个 downstream join 已满足，从而使本节点无关
+    detail?: string;
+  }
+```
+
+新增 node status：
+
+```ts
+type V3NodeStatus = ... | 'cancelled';
+```
+
+`cancelled` 是中性终态，语义接近 `skipped`，但来源不同：
+
+- `skipped`：节点自己的 triggerRule 已不可能满足，未运行；
+- `cancelled`：节点本来可能运行/正在运行，但其产物对剩余 run 已无关。
+
+materialize 规则：
+
+- `nodeCancelled` → `cancelled`，记录该 node 的 cancelled attempt；
+- 同一 `attemptId` 在 `nodeCancelled` 之后出现的
+  `nodeSucceeded/nodeFailed/nodeBlocked` **全部忽略**；
+- 若 settle 事件先于 `nodeCancelled` 已经落 journal，则 settle wins：
+  runtime 的 cancel control 在写 `nodeCancelled` 前必须重新 materialize，发现
+  节点已 terminal 时不写 cancel 事件；
+- `cancelled` source 的出边按纯函数 inactive，reason=`sourceCancelled`，不发
+  `edgeResolved`。
+
+`GoalInputs.omitted.reason` 扩展：
+
+```ts
+'edgeInactive' | 'sourceSkipped' | 'sourceCancelled' | 'earlyRelease' | 'selectorMiss'
+```
+
+### 15.3 cancel action 与 runtime 执行
+
+新增 orchestrator action：
+
+```ts
+| { kind:'cancelNode'; nodeId:string; byNodeId:string; detail?:string }
+```
+
+runtime 将其放入 control phase（与 `skipNode/resolveEdge/loop control` 同相位）：
+
+1. 重新读取 journal 并 materialize，确认目标仍是 `pending/gateWaiting/running`；
+2. append `nodeCancelled`；
+3. 若目标有 in-flight worker，则调用 per-node `AbortController.abort()`；
+4. re-tick，不等待被取消 worker settle。
+
+per-node cancel 需要把当前全局 `opts.cancelSignal` 拆成组合信号：
+
+- startWork 为每个 node/attempt 创建自己的 `AbortController`；
+- 若全局 signal abort，则同步 abort 每个 node controller（保持现有外部取消语义）；
+- `RunNodeRequest.cancelSignal` 改为该 node controller 的 signal；
+- `inFlight` settle finally 清理 controller 和全局 signal listener。
+
+humanGate loser：
+
+- `gateWaiting` 节点可被 `nodeCancelled`；
+- 后续旧审批卡点击时，`resolveV3GateClick` 必须检查 materialized node status
+  仍为 `gateWaiting`，否则返回 stale/toast，不消费 wait、不写 `gateResolved`。
+
+### 15.4 败者集合选择
+
+early-release 后，不是所有未完成上游都能立刻取消。取消必须保守，避免杀掉仍被
+其他 downstream 需要的节点。
+
+一个 candidate source 可被取消，当且仅当：
+
+1. candidate 状态是 `pending/gateWaiting/running`；
+2. candidate 是某个已 early-release 的 join 节点的未计票入边；
+3. 对 candidate 的每个未 terminal downstream：
+   - downstream 就是触发 early-release 的 join；或
+   - downstream 的 triggerRule 已经在不依赖 candidate 的情况下满足；或
+   - downstream 已经不可能运行并将被/已被 skip；
+4. candidate 不是已 `done/failed/blocked/skipped/cancelled`。
+
+实现上可以先做一个保守 helper：
+
+```ts
+canCancelLoser(candidate, byNodeId, dag, state, edges): boolean
+```
+
+`downstream 已经不可能运行` 的评估必须基于**当前 state**，不得把本次取消的
+后果算进去。否则会出现级联误杀：candidate 的下游 D1 是 `all_success`，且还有
+别的活输入，D1 只有在 candidate 被取消后才会 skipped，这不能作为取消
+candidate 的理由。
+
+若判断不确定，返回 false，最多浪费资源，不能破坏正确性。P4 第一版不做跨 loop
+body 的 loser cancel；loop 作为 source 本来不能是条件边源，但 loop 节点可作为
+普通入边参与 join。取消 loop 复合节点需另开设计，本期 `canCancelLoser(loop)=false`。
+
+### 15.5 sweep 新规则
+
+fail-fast / blocked sweep 从“看到 failed/blocked 就全局终止”改为“看到相关的
+failed/blocked 才终止”：
+
+1. `cancelled/skipped` 永远不触发 fail-fast；
+2. `failed/blocked` 节点如果其所有尚未 terminal 的 downstream 都已在不依赖它的
+   情况下满足或终结，则该失败是 irrelevant，sweep 忽略；
+3. 如果失败节点仍可能影响某个未 terminal sink，保持现有行为：
+   `failed → completeRunFailed(failedNodeId)`，
+   `blocked → completeRunBlocked(blockedNodeId)`；
+4. 成功语义同步引入同一个 relevance 谓词：当 `actions.length === 0` 且每个
+   节点都属于 `{done, skipped, cancelled}` 或 `{failed/blocked 且已判
+   irrelevant}`，并且至少一个 sink `done` → succeeded；
+5. 全 sink `skipped/cancelled` 且没有 done → `allSinksSkipped`（可考虑改名为
+   `allSinksOmitted`，但 P4 第一版复用既有 reason，避免 dashboard 再扩一档）。
+   `runFailed.detail` 写清构成，例如 `2 skipped, 1 cancelled`。
+
+注意：sweep suppression 必须由 journal/state 可重放地推出，不能依赖 runtime
+内存里的 AbortController。
+
+这里不能靠“事后补 `nodeCancelled`”处理 irrelevant `failed/blocked`：settle-wins
+规则要求已 terminal 节点不再被取消。节点状态保持 `failed/blocked`（诚实记录），
+run 终态由 `(dag, state, edges)` 纯函数 relevance 判定推进，避免 irrelevant
+失败既不 fail-fast 又卡住 pending 计数。
+
+### 15.6 硬约束追加
+
+- **H9 双保守对称**：cancel 拿不准 → 不取消（浪费换正确）；
+  relevance 拿不准 → 算相关、照常 fail-fast（误停换不误成功）。两个方向的
+  默认值必须永远朝安全侧。
+- **H10 可重放纯函数**：`relevance` / `canCancelLoser` 必须只依赖
+  `(dag, journaled state, edges)`，禁止依赖任何 runtime 内存态，包括
+  AbortController、inFlight promise、当前进程局部变量。
+
+### 15.7 状态表示表
+
+| source 状态 | 下游边 activity | 是否 fail-fast | 下游 omitted reason |
+|-------------|-----------------|----------------|---------------------|
+| `done` + active edge | active | 否 | 无 |
+| `done` + inactive edge | inactive | 否 | `edgeInactive` |
+| `skipped` | inactive | 否 | `sourceSkipped` |
+| `cancelled` | inactive | 否 | `sourceCancelled` |
+| `pending/running/gateWaiting` 且 join 已满足 | maybe loser | 否 | `earlyRelease` |
+| `failed/blocked` 且仍相关 | n/a | 是 | n/a |
+| `failed/blocked` 且已无关 | inactive-ish | 否 | `earlyRelease` 或无输入 |
+
+### 15.8 测试矩阵
+
+**decideNext**
+
+- one_success：三上游中一个 done，两个 running → 立即 dispatch join；
+- quorum 2/3：两个 done，一个 running → 立即 dispatch join；
+- active 不足但 maybe 足够 → 等待，不 skip；
+- active + maybe 不足 → skip；
+- all_success 不 early-release；
+- early-release 的 dispatchWork omitted 包含 `earlyRelease`；
+- 可取消 loser → 返回 cancelNode；仍被其他 downstream 需要的 loser → 不取消；
+- 级联误杀防护：candidate 还有一个带活输入的 `all_success` downstream → 不取消；
+- irrelevant blocked loser 存在时，run 可正常 succeeded，不因 pending 计数死锁；
+- cancelled source 的下游 edge 纯函数 inactive，不 resolveEdge。
+
+**materialize**
+
+- nodeCancelled → status cancelled；
+- nodeCancelled 后同 attempt 的 nodeFailed/nodeBlocked/nodeSucceeded 被忽略；
+- nodeSucceeded 先于 nodeCancelled 时，runtime 不应写 cancel；用 action apply 测试覆盖；
+- 旧 journal 无 nodeCancelled 重放不变。
+
+**runtime**
+
+- 三路赛马 one_success：赢家 done 后 join dispatch，两个 loser 收到 abort；
+- loser worker abort 后若返回 fail/manifestInvalid，不污染 run 终态；
+- gateWaiting loser 被 cancel 后，旧审批卡点击 stale，不消费 wait；
+- restart replay：已有 nodeCancelled journal 时不重新 dispatch loser；
+- global cancelSignal 仍能取消所有 in-flight，不被 per-node controller 破坏。
+
+**端到端**
+
+- winner join succeeded + losers cancelled → run succeeded；
+- loser 先 fail、winner 后 done：若失败仍相关，保持 fail-fast；
+- loser cancel 与 worker settle 竞态：两种事件顺序都确定。

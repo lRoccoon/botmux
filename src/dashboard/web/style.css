@@ -4384,11 +4384,12 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .st-gateWaiting { --ns: var(--v3r-gate); }
 .st-done        { --ns: var(--v3r-done); }
 .st-skipped     { --ns: var(--v3r-skipped); }
+.st-cancelled   { --ns: var(--v3r-skipped); }
 .st-blocked     { --ns: var(--v3r-blocked); }
 .st-failed      { --ns: var(--v3r-failed); }
 /* skipped 整体降透明度 + 虚线盒 — 一眼读出"这条路没走"，与 pending 区分 */
-.v3r-node.st-skipped { opacity: .55; }
-.v3r-node.st-skipped .v3r-box { stroke-dasharray: 4 3; }
+.v3r-node.st-skipped, .v3r-node.st-cancelled { opacity: .55; }
+.v3r-node.st-skipped .v3r-box, .v3r-node.st-cancelled .v3r-box { stroke-dasharray: 4 3; }
 .rs-running   { --ns: var(--v3r-running); }
 .rs-succeeded { --ns: var(--v3r-done); }
 .rs-blocked   { --ns: var(--v3r-blocked); }

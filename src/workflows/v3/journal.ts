@@ -101,6 +101,17 @@ export type V3Event =
   // It is not a failure and does not trigger fail-fast; its outgoing edges
   // become inactive by pure derivation from node state + static DAG.
   | { type: 'nodeSkipped'; nodeId: string; reason: 'triggerRuleUnsatisfied'; detail?: string }
+  // A neutral terminal for early-release losers.  This is deliberately NOT
+  // nodeFailed(errorClass:'cancelled'): cancellation means "no longer needed",
+  // not "requires intervention", and must not trip the fail-fast sweep.
+  | {
+      type: 'nodeCancelled';
+      nodeId: string;
+      attemptId?: string;
+      reason: 'earlyReleaseLoser';
+      byNodeId: string;
+      detail?: string;
+    }
   // ── structured loop lifecycle ──
   // A loop is a composite node: its body expands into REAL journal-level nodes
   // per iteration (instance ids via loopInstanceId), so dispatch/settle/retry
@@ -127,7 +138,7 @@ export type V3Event =
   // patch).  Consumed by the next loopIterationStarted.
   | { type: 'loopIterationGranted'; loopId: string; fromIteration: number; by?: string }
   | { type: 'runSucceeded' }
-  | { type: 'runFailed'; failedNodeId?: string; reason?: V3RunFailureReason }
+  | { type: 'runFailed'; failedNodeId?: string; reason?: V3RunFailureReason; detail?: string }
   // Terminal-for-now: every non-done path is blocked (recoverable).  A retry
   // clears it back to running on replay (see state.ts materialize).
   | { type: 'runBlocked'; blockedNodeId: string };

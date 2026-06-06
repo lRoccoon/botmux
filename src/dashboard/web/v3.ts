@@ -28,6 +28,7 @@ const NODE_LABEL: Record<RunNodeView['status'], string> = {
   running: '运行中',
   done: '完成',
   skipped: '已跳过', // edge-activation: 分支未选中的中性终态（非失败）
+  cancelled: '已取消', // early-release loser：已无关并被收尸的中性终态
   blocked: '受阻',
   failed: '失败',
 };
@@ -136,6 +137,7 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
           <span class="lg st-gateWaiting">等审批</span>
           <span class="lg st-done">完成</span>
           <span class="lg st-skipped">已跳过</span>
+          <span class="lg st-cancelled">已取消</span>
           <span class="lg st-blocked">受阻</span>
           <span class="lg st-failed">失败</span>
           <span class="lg lg-loop">⟳ 循环容器</span>

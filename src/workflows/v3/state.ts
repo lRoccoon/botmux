@@ -34,6 +34,8 @@ export interface V3RunSnapshot {
   /** Workflow-level failure reason; ordinary node failures keep using
    *  `failedNodeId`. */
   failureReason?: V3RunFailureReason;
+  /** Human-readable detail for workflow-level failures. */
+  failureDetail?: string;
   /** Set once `runBlocked` is observed — the blocked node (cleared back to
    *  running by a subsequent `nodeRetryRequested` on replay). */
   blockedNodeId?: string;
@@ -65,6 +67,7 @@ export interface V3RunSnapshot {
  *   gateResolved/no    → failed
  *   edgeResolved       → edges[first `${from}->${to}`] (first-wins)
  *   nodeSkipped        → skipped
+ *   nodeCancelled      → cancelled (settle-wins; late same-attempt settle ignored)
  */
 export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const nodes: V3RunState = new Map();
@@ -74,7 +77,9 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
   let runStatus: V3RunStatus = 'running';
   let failedNodeId: string | undefined;
   let failureReason: V3RunFailureReason | undefined;
+  let failureDetail: string | undefined;
   let blockedNodeId: string | undefined;
+  const cancelledAttempts = new Map<string, string | undefined>();
 
   const set = (id: string, status: V3NodeStatus, gateCleared?: boolean): void => {
     const prev = nodes.get(id);
@@ -94,22 +99,41 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     return ls;
   };
 
+  const terminal = (id: string): boolean => {
+    const status = nodes.get(id)?.status;
+    return status === 'done' ||
+      status === 'skipped' ||
+      status === 'cancelled' ||
+      status === 'failed' ||
+      status === 'blocked';
+  };
+
+  const cancelledCovers = (nodeId: string, attemptId?: string): boolean => {
+    if (!cancelledAttempts.has(nodeId)) return false;
+    const cancelledAttemptId = cancelledAttempts.get(nodeId);
+    return cancelledAttemptId === undefined || cancelledAttemptId === attemptId;
+  };
+
   for (const e of events) {
     switch (e.type) {
       case 'runStarted':
         runStatus = 'running';
         break;
       case 'nodeDispatched':
+        if (nodes.get(e.nodeId)?.status === 'cancelled') break;
         set(e.nodeId, 'running');
         attempts.set(e.nodeId, e.attemptId);
         break;
       case 'nodeSucceeded':
+        if (cancelledCovers(e.nodeId, e.attemptId)) break;
         set(e.nodeId, 'done');
         break;
       case 'nodeFailed':
+        if (cancelledCovers(e.nodeId, e.attemptId)) break;
         set(e.nodeId, 'failed');
         break;
       case 'nodeBlocked':
+        if (cancelledCovers(e.nodeId, e.attemptId)) break;
         set(e.nodeId, 'blocked');
         break;
       case 'nodeRetryRequested':
@@ -124,9 +148,11 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         }
         break;
       case 'gateDispatched':
+        if (nodes.get(e.nodeId)?.status === 'cancelled') break;
         set(e.nodeId, 'gateWaiting');
         break;
       case 'gateResolved':
+        if (nodes.get(e.nodeId)?.status === 'cancelled') break;
         if (e.resolution === 'approved') set(e.nodeId, 'pending', true);
         else set(e.nodeId, 'failed');
         break;
@@ -138,7 +164,13 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         break;
       }
       case 'nodeSkipped':
+        if (terminal(e.nodeId)) break;
         set(e.nodeId, 'skipped');
+        break;
+      case 'nodeCancelled':
+        if (terminal(e.nodeId)) break;
+        cancelledAttempts.set(e.nodeId, e.attemptId);
+        set(e.nodeId, 'cancelled');
         break;
       case 'runSucceeded':
         runStatus = 'succeeded';
@@ -147,6 +179,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         runStatus = 'failed';
         failedNodeId = e.failedNodeId;
         failureReason = e.reason;
+        failureDetail = e.detail;
         break;
       case 'runBlocked':
         runStatus = 'blocked';
@@ -192,7 +225,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     }
   }
 
-  return { runStatus, failedNodeId, failureReason, blockedNodeId, nodes, attempts, loops, edges };
+  return { runStatus, failedNodeId, failureReason, failureDetail, blockedNodeId, nodes, attempts, loops, edges };
 }
 
 // ─── STATE checkpoint (atomic write / read) ────────────────────────────────
@@ -203,6 +236,7 @@ interface StateFile {
   runStatus: V3RunStatus;
   failedNodeId?: string;
   failureReason?: V3RunFailureReason;
+  failureDetail?: string;
   blockedNodeId?: string;
   nodes: Record<string, V3NodeState>;
   attempts: Record<string, string>;
@@ -224,6 +258,7 @@ export function writeState(statePath: string, snap: V3RunSnapshot): void {
     runStatus: snap.runStatus,
     failedNodeId: snap.failedNodeId,
     failureReason: snap.failureReason,
+    failureDetail: snap.failureDetail,
     blockedNodeId: snap.blockedNodeId,
     nodes: Object.fromEntries(snap.nodes),
     attempts: Object.fromEntries(snap.attempts),
@@ -246,6 +281,7 @@ export function readState(statePath: string): V3RunSnapshot | undefined {
     runStatus: file.runStatus,
     failedNodeId: file.failedNodeId,
     failureReason: file.failureReason,
+    failureDetail: file.failureDetail,
     blockedNodeId: file.blockedNodeId,
     nodes: new Map(Object.entries(file.nodes)),
     attempts: new Map(Object.entries(file.attempts)),
