@@ -123,7 +123,7 @@ export function renderGoalFile(
     'You are an autonomous agent completing exactly ONE botmux v3 workflow node.',
     'Work toward the goal above until it is done, then stop. Do NOT ask the user with interactive tools (they are disabled in this mode). If you genuinely need a human DECISION to proceed, use the human-ask escape hatch described below (also available as the `botmux-goal-ask` skill).',
     '',
-    `- Upstream inputs: the file at $${E.INPUTS_PATH} is a JSON object \`{ "inputs": [...] }\` listing upstream products, each with an absolute \`path\`. Read only the ones the goal needs (it may be empty). If an \`omitted\` array is present, those declared inputs were intentionally not produced (their workflow branch was not taken) — treat their absence as by-design, do NOT invent their content.`,
+    `- Upstream inputs: the file at $${E.INPUTS_PATH} is a JSON object \`{ "inputs": [...] }\` listing upstream products, each with an absolute \`path\`. Read only the ones the goal needs (it may be empty). If it includes a \`human/answer\` input, read it before continuing. If an \`omitted\` array is present, those declared inputs were intentionally not produced (their workflow branch was not taken) — treat their absence as by-design, do NOT invent their content.`,
     `- Output: write ALL products under the directory at $${E.OUTPUT_DIR}. Do NOT write anything outside that directory.`,
     `- Manifest (required): before you finish, write a JSON manifest to $${E.MANIFEST_PATH} with exactly this shape:`,
     '',
@@ -148,9 +148,9 @@ export function renderGoalFile(
     '',
     '## Asking a human (only when a DECISION truly needs a person)',
     `If — and ONLY if — you cannot proceed without a human's judgement call (a choice only a person can make; NOT something you can research, infer, or decide yourself), use the runtime human-ask:`,
-    `  1. Write a JSON file to $${E.ATTEMPT_DIR}/${GOAL_ASK_FILE} of the shape \`{ "question": "<one clear question>", "options": ["<2-6 concrete choices>"] }\`.`,
+    `  1. Write a JSON file to $${E.ATTEMPT_DIR}/${GOAL_ASK_FILE}. Use \`{ "question": "<one clear question>", "options": ["<2-6 concrete choices>"] }\` for a choice, or \`{ "question": "<one clear question>", "freeText": true }\` when the human must provide details in their own words.`,
     `  2. Write a failure manifest with \`error.code: "${ASK_HUMAN_ERROR_CODE}"\`, \`error.retryable: true\`, and \`summary\` = your question, then STOP.`,
-    `A human picks one option; this node then RE-RUNS with their choice injected into $${E.INPUTS_PATH} as the \`human/answer\` input (read it and continue from there). Prefer deciding yourself — every ask pauses the whole workflow on a person.`,
+    `A human answers; this node then RE-RUNS with their answer injected into $${E.INPUTS_PATH} as the \`human/answer\` input. Read its \`selected\` or \`text\` field and continue from there. Prefer deciding yourself — every ask pauses the whole workflow on a person.`,
     '',
   ].join('\n');
 }
@@ -189,7 +189,7 @@ export function classifyTerminal(
  * Defensive: a missing / malformed / out-of-bounds file yields `undefined`, so a
  * broken ask degrades to a plain blocked card rather than crashing the drive —
  * the manifest's `error.message` still carries the question text for the human.
- * Needs ≥2 options (a choice) and caps at 6 (card sanity).  Exported for tests.
+ * Accepts either 2–6 concrete options or `freeText:true`.  Exported for tests.
  */
 export function readGoalAsk(askPath: string): GoalAsk | undefined {
   if (!existsSync(askPath)) return undefined;
@@ -203,6 +203,11 @@ export function readGoalAsk(askPath: string): GoalAsk | undefined {
   const o = parsed as Record<string, unknown>;
   const question = typeof o.question === 'string' ? o.question.trim() : '';
   if (!question) return undefined;
+  const hasOptions = Object.prototype.hasOwnProperty.call(o, 'options');
+  if (o.freeText === true) {
+    if (hasOptions) return undefined;
+    return { question, freeText: true };
+  }
   const options = Array.isArray(o.options)
     ? o.options.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
     : [];

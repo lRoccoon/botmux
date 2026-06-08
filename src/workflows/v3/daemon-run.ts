@@ -16,8 +16,8 @@
  * concurrent clicks / start can't double-spawn.
  */
 
-import { join } from 'node:path';
-import { existsSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { isLoopNode, loadDag } from './dag.js';
@@ -50,7 +50,7 @@ import {
 import { readJournal, appendEvent, type StoredEvent, type V3ErrorClass } from './journal.js';
 import { materialize } from './state.js';
 import { isValidRunId } from './ops-projection.js';
-import { GOAL_ANSWER_FILE, type GoalAnswer, type ValidateManifest } from './contract.js';
+import { GOAL_ANSWER_FILE, type GoalAnswer, type GoalAsk, type ValidateManifest } from './contract.js';
 
 /**
  * runId → runDir with a path-traversal guard (codex review #2).  runIds reach
@@ -72,9 +72,9 @@ export interface V3BlockedInfo {
   errorCode?: string;
   message?: string;
   /** Present when the block is a runtime human-ask (errorCode === ASK_HUMAN):
-   *  the agent's question + options → the daemon posts an ask card (option
-   *  buttons) instead of a plain retry card. */
-  ask?: { question: string; options: string[] };
+   *  the agent's question → the daemon posts an ask card instead of a plain
+   *  retry card. */
+  ask?: GoalAsk;
 }
 
 /** Latest `nodeBlocked` details for a node (card content).  Falls back to a
@@ -293,6 +293,25 @@ export type V3RetryOutcome =
   | { kind: 'already-requested'; nodeId: string }
   | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' };
 
+type V3RetryAnswerInput =
+  | { selected: string; by: string }
+  | { text: string; by: string };
+
+function atomicWriteJson(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2));
+  renameSync(tmp, path);
+}
+
+const HUMAN_ANSWER_PREVIEW_MAX_CHARS = 200;
+
+function answerPreview(s: string): string {
+  return s.length <= HUMAN_ANSWER_PREVIEW_MAX_CHARS
+    ? s
+    : `${s.slice(0, HUMAN_ANSWER_PREVIEW_MAX_CHARS)}...`;
+}
+
 /**
  * Append a retry intent for a blocked node (the resume entrypoint — daemon
  * card click and `botmux workflow retry` both land here).  Recovery-first +
@@ -315,7 +334,7 @@ export type V3RetryOutcome =
 export function requestV3Retry(
   baseDir: string,
   runId: string,
-  input: { nodeId?: string; expectedAttemptId?: string; answer?: { selected: string; by: string } } = {},
+  input: { nodeId?: string; expectedAttemptId?: string; answer?: V3RetryAnswerInput } = {},
 ): V3RetryOutcome {
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
@@ -369,9 +388,16 @@ export function requestV3Retry(
   let answer: { path: string; preview: string; by: string } | undefined;
   if (input.answer) {
     const answerPath = join(runDir, previousAttemptId, GOAL_ANSWER_FILE);
-    const payload: GoalAnswer = { selected: input.answer.selected, by: input.answer.by };
-    writeFileSync(answerPath, JSON.stringify(payload, null, 2));
-    answer = { path: answerPath, preview: input.answer.selected, by: input.answer.by };
+    const payload: GoalAnswer =
+      'text' in input.answer
+        ? { text: input.answer.text, by: input.answer.by }
+        : { selected: input.answer.selected, by: input.answer.by };
+    atomicWriteJson(answerPath, payload);
+    answer = {
+      path: answerPath,
+      preview: answerPreview('text' in payload ? payload.text : payload.selected),
+      by: payload.by,
+    };
   }
 
   appendEvent(journalPath, {

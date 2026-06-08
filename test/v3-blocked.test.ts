@@ -23,6 +23,7 @@ import {
   nextAttemptIdFor,
   latestAttemptIdFor,
   renderGoalFile,
+  readGoalAsk,
   type V3RuntimeDeps,
 } from '../src/workflows/v3/runtime.js';
 import { requestV3Retry, reconcileV3PendingGates, blockedInfoFor } from '../src/workflows/v3/daemon-run.js';
@@ -95,6 +96,34 @@ describe('classifyTerminal', () => {
     expect(classifyTerminal('workerError', { selfReportedFail: true, retryable: false })).toBe('failed');
     expect(classifyTerminal('workerError', { selfReportedFail: true, retryable: true })).toBe('blocked');
     expect(classifyTerminal('workerError', { selfReportedFail: true })).toBe('blocked');
+  });
+});
+
+describe('readGoalAsk', () => {
+  it('accepts option asks and free-text asks', () => {
+    const base = freshBase();
+    try {
+      const optionPath = join(base, 'option-ask.json');
+      writeFileSync(optionPath, JSON.stringify({ question: '部署到哪里？', options: ['staging', 'prod'] }));
+      expect(readGoalAsk(optionPath)).toEqual({ question: '部署到哪里？', options: ['staging', 'prod'] });
+
+      const textPath = join(base, 'text-ask.json');
+      writeFileSync(textPath, JSON.stringify({ question: '补充计费规则', freeText: true }));
+      expect(readGoalAsk(textPath)).toEqual({ question: '补充计费规则', freeText: true });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects ambiguous asks', () => {
+    const base = freshBase();
+    try {
+      const badPath = join(base, 'bad-ask.json');
+      writeFileSync(badPath, JSON.stringify({ question: '补充计费规则', freeText: true, options: ['A', 'B'] }));
+      expect(readGoalAsk(badPath)).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 

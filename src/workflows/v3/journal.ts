@@ -16,6 +16,7 @@
 
 import { appendFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { GoalAsk } from './contract.js';
 
 // ─── Event taxonomy ─────────────────────────────────────────────────────────
 
@@ -68,11 +69,10 @@ export type V3Event =
   // retryable) decides blocked-vs-failed; blocked halts the run like failed
   // but is retryable via `nodeRetryRequested` (journal event, NOT in-memory).
   // `ask` is present ONLY when the block is a runtime human-ask (errorCode ===
-  // ASK_HUMAN_ERROR_CODE): the goal worker's question + options, read from the
-  // attempt's ask.json.  The daemon renders an ask card (question + option
-  // buttons) instead of a plain retry card; everything else is identical to a
-  // contract-failure block.
-  | { type: 'nodeBlocked'; nodeId: string; attemptId: string; errorClass: V3ErrorClass; errorCode?: string; message?: string; ask?: { question: string; options: string[] } }
+  // ASK_HUMAN_ERROR_CODE): the goal worker's question, read from the attempt's
+  // ask.json.  The daemon renders an ask card instead of a plain retry card;
+  // everything else is identical to a contract-failure block.
+  | { type: 'nodeBlocked'; nodeId: string; attemptId: string; errorClass: V3ErrorClass; errorCode?: string; message?: string; ask?: GoalAsk }
   // Retry intent for a blocked node.  Appended by the retry entrypoint (CLI /
   // daemon card click).  materialize() resets the node to pending and records
   // `nextAttemptId` as the attempt reservation; the orchestrator then re-
@@ -88,7 +88,7 @@ export type V3Event =
       previousErrorClass?: V3ErrorClass;
       previousErrorCode?: string;
       // Present ONLY when the retry answers a runtime human-ask: the human's
-      // selected option, persisted to `answer.path` (an absolute path, next to
+      // selected option or free-text answer, persisted to `answer.path` (an absolute path, next to
       // the asked attempt).  buildInputs injects it into the retry attempt's
       // GoalInputs as a `human/answer` input so the agent reads the decision and
       // continues.  Absent for an ordinary blocked retry.

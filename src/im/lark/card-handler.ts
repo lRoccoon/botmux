@@ -606,7 +606,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
   if (isV3BlockedAction(value?.action)) {
     if (!deps.v3BlockedDeps) return;
-    return await handleV3BlockedAction(value as unknown as V3BlockedActionValue | V3AskAnswerActionValue, operatorOpenId, deps.v3BlockedDeps);
+    return await handleV3BlockedAction(
+      value as unknown as V3BlockedActionValue | V3AskAnswerActionValue,
+      operatorOpenId,
+      deps.v3BlockedDeps,
+      action?.form_value,
+    );
   }
   if (isV3LoopGrantAction(value?.action)) {
     if (!deps.v3LoopGrantDeps) return;
