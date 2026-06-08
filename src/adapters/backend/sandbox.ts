@@ -206,9 +206,18 @@ function cloneProject(src: string, dst: string): void {
     // corrupt the source repo, even with the shared-checkout setup.
     const r = spawnSync('git', ['clone', '--local', '--no-hardlinks', '--quiet', src, dst], { stdio: 'ignore' });
     if (r.status === 0) {
-      // Record the clone's base commit so `/land` can diff the agent's changes
-      // (committed + uncommitted) against the exact point we cloned from.
       try {
+        // `git clone` only carries committed content. Overlay the source's
+        // WORKING TREE (uncommitted edits + untracked files) so the agent sees
+        // exactly what the owner sees — otherwise an owner's untracked file
+        // looks "new" to the agent and `/land` fails with "already exists".
+        overlayWorkingTree(src, dst);
+        // Baseline-commit the overlaid working tree. `/land` then diffs the
+        // agent's changes against THIS baseline (not the source's last commit),
+        // so landing applies only the agent's delta — not the owner's
+        // pre-existing uncommitted work (which the real repo already has).
+        spawnSync('git', ['-C', dst, 'add', '-A'], { stdio: 'ignore' });
+        spawnSync('git', ['-C', dst, '-c', 'user.email=sandbox@botmux.local', '-c', 'user.name=botmux-sandbox', 'commit', '-q', '--no-verify', '-m', 'botmux sandbox baseline (working tree)'], { stdio: 'ignore' });
         const head = spawnSync('git', ['-C', dst, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout?.trim();
         if (head) writeFileSync(join(dirname(dst), 'clone-base'), head);
       } catch { /* non-fatal: land falls back to HEAD */ }
@@ -217,6 +226,28 @@ function cloneProject(src: string, dst: string): void {
     // fall through to cp on any git failure (non-repo edge, detached, etc.)
   }
   cpSync(src, dst, { recursive: true });
+}
+
+/** Make dst's working tree match src's: apply tracked edits + copy untracked. */
+function overlayWorkingTree(src: string, dst: string): void {
+  // Tracked modifications/deletions vs HEAD → apply onto the fresh checkout.
+  const diff = spawnSync('git', ['-C', src, 'diff', 'HEAD', '--binary'], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+  if (diff.status === 0 && diff.stdout && diff.stdout.trim()) {
+    const tmp = join(dirname(dst), 'wt-overlay.patch');
+    writeFileSync(tmp, diff.stdout);
+    spawnSync('git', ['-C', dst, 'apply', '--whitespace=nowarn', tmp], { stdio: 'ignore' });
+    try { rmSync(tmp); } catch { /* */ }
+  }
+  // Untracked, non-ignored files (skips node_modules/.gitignore'd cruft).
+  const others = spawnSync('git', ['-C', src, 'ls-files', '--others', '--exclude-standard', '-z'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  if (others.status === 0 && others.stdout) {
+    for (const rel of others.stdout.split('\0').filter(Boolean)) {
+      try {
+        mkdirSync(dirname(join(dst, rel)), { recursive: true });
+        cpSync(join(src, rel), join(dst, rel));
+      } catch { /* skip unreadable/vanished */ }
+    }
+  }
 }
 
 /**
