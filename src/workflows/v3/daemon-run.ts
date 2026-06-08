@@ -274,12 +274,14 @@ export function resolveV3GateClick(
   if (!resolution) return { kind: 'stale-run', reason: 'no-wait' };
 
   resolveWait(runDir, input.waitId, resolution, input.by, input.selected);
+  const instanceId = snap.nodes.get(wait.nodeId)?.effectiveInstanceId;
   appendEvent(journalPath, {
     type: 'gateResolved',
     // nodeId from the WAIT FILE, not caller input (codex review #1): the wait is
     // the authoritative state — a wrong/stale caller nodeId must not let us write
     // gateResolved for a different node.
     nodeId: wait.nodeId,
+    ...(instanceId ? { instanceId } : {}),
     waitId: input.waitId,
     resolution,
     by: input.by,
@@ -345,10 +347,11 @@ export function requestV3Retry(
   // Target resolution: explicit nodeId > the run's blocked pointer > a node
   // with an unconsumed retry reservation (a prior retry already cleared the
   // blocked pointer — the idempotent repeat-call path).
+  const retryKeyFor = (id: string): string => snap.nodes.get(id)?.effectiveInstanceId ?? id;
   const nodeId =
     input.nodeId ??
     snap.blockedNodeId ??
-    [...snap.nodes.keys()].find((id) => unconsumedRetryEvent(events, id) !== undefined);
+    [...snap.nodes.keys()].find((id) => unconsumedRetryEvent(events, retryKeyFor(id)) !== undefined);
   if (!nodeId) return { kind: 'stale-run', reason: 'not-blocked' };
   // An exhausted LOOP blocks the run too, but "retry an attempt" is the wrong
   // verb for it — the recovery is a grant (+1 iteration).  Route loudly.
@@ -358,7 +361,7 @@ export function requestV3Retry(
   if (status === 'pending') {
     // An unconsumed retry reservation already reset this node — idempotent
     // no-op (a second click / a CLI retry racing the card must not double-append).
-    const pendingRetry = unconsumedRetryEvent(events, nodeId);
+    const pendingRetry = unconsumedRetryEvent(events, retryKeyFor(nodeId));
     if (pendingRetry) {
       // The repeat-call is only "the same retry" when it references the attempt
       // that retry was FOR — a stale older card is not an idempotent repeat.
@@ -475,16 +478,19 @@ export function requestV3LoopGrant(
   return { kind: 'granted', loopId, fromIteration: ls.iteration, nextIteration: ls.iteration + 1 };
 }
 
-/** The node's `nodeRetryRequested` whose reserved attempt has not yet been
- *  consumed by a matching `nodeDispatched` (undefined when none pending). */
+/** The `nodeRetryRequested` for `key` whose reserved attempt has not yet been
+ *  consumed by a matching `nodeDispatched` (undefined when none pending).  `key`
+ *  matches by `(instanceId ?? nodeId)` so a stale retry on an OLD instance isn't
+ *  mistaken for the current instance's pending retry (constraint 5 / 菲菲 #3). */
 function unconsumedRetryEvent(
   events: StoredEvent[],
-  nodeId: string,
+  key: string,
 ): Extract<StoredEvent, { type: 'nodeRetryRequested' }> | undefined {
+  const matches = (e: { nodeId: string; instanceId?: string }): boolean => (e.instanceId ?? e.nodeId) === key;
   let pending: Extract<StoredEvent, { type: 'nodeRetryRequested' }> | undefined;
   for (const e of events) {
-    if (e.type === 'nodeRetryRequested' && e.nodeId === nodeId) pending = e;
-    else if (e.type === 'nodeDispatched' && e.nodeId === nodeId && e.attemptId === pending?.nextAttemptId) {
+    if (e.type === 'nodeRetryRequested' && matches(e)) pending = e;
+    else if (e.type === 'nodeDispatched' && matches(e) && e.attemptId === pending?.nextAttemptId) {
       pending = undefined;
     }
   }
@@ -768,6 +774,7 @@ function reconcileOneRun(
       appendEvent(journalPath, {
         type: 'gateResolved',
         nodeId: wait.nodeId,
+        ...(snap.nodes.get(wait.nodeId)?.effectiveInstanceId ? { instanceId: snap.nodes.get(wait.nodeId)!.effectiveInstanceId } : {}),
         waitId,
         resolution: wait.status,
         by: wait.by ?? 'system',

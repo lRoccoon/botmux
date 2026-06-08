@@ -166,7 +166,7 @@ describe('decideNext', () => {
       runId: 'g',
       nodes: [{ id: 'a', type: 'goal', goal: 'g', depends: [], inputs: [], humanGate: { prompt: '批？' } }],
     });
-    expect(decideNext(gated, new Map())).toEqual([{ kind: 'dispatchGate', nodeId: 'a' }]);
+    expect(decideNext(gated, new Map())).toEqual([{ kind: 'dispatchGate', nodeId: 'a', instanceId: 'a#001' }]);
     // gate 已批准（gateCleared）→ 派 work
     const cleared: V3RunState = new Map([['a', { status: 'pending', gateCleared: true }]]);
     expect(decideNext(gated, cleared)).toEqual([{ kind: 'dispatchWork', nodeId: 'a', instanceId: 'a#001' }]);

@@ -99,7 +99,7 @@ export type V3Action =
   /** Abort an early-release loser whose remaining products are no longer used. */
   | { kind: 'cancelNode'; nodeId: string; byNodeId: string; detail?: string }
   /** Post the humanGate approval card + persist a `waits/<id>.json` (Q10). */
-  | { kind: 'dispatchGate'; nodeId: string }
+  | { kind: 'dispatchGate'; nodeId: string; instanceId?: string }
   /** Spawn an ephemeral worker via `runNode` for this node's goal.  `loop` is
    *  set for body-instance dispatches (the runtime synthesizes the instance
    *  node from the loop's body definition).  `instanceId` is set when this is a
@@ -275,7 +275,9 @@ export function decideNext(
     }
 
     if (node.humanGate && !s.gateCleared) {
-      actions.push({ kind: 'dispatchGate', nodeId: id });
+      // The gate belongs to the instance that will run on approval — same
+      // id resolution as dispatchWork (constraint 6), so gate + work share it.
+      actions.push({ kind: 'dispatchGate', nodeId: id, instanceId: s.effectiveInstanceId ?? nextInstanceId(id, instances) });
       continue;
     }
     // Every plain-node dispatch runs under a runtime instance (constraint 4 +
@@ -337,7 +339,7 @@ function readinessFor(node: V3Node, state: V3RunState, edges: V3EdgeRunState): N
     const source = st(state, dep.from);
     if (source.status === 'done') {
       if (!dep.when) return { kind: 'active', from: dep.from };
-      const edge = edges.get(edgeKey(dep.from, node.id));
+      const edge = edges.get(currentEdgeKey(dep.from, node.id, state));
       if (!edge) return { kind: 'unresolved', from: dep.from };
       return edge.active
         ? { kind: 'active', from: dep.from }
@@ -398,8 +400,14 @@ function firstUnresolved(activities: EdgeActivity[]): Extract<EdgeActivity, { ki
   return activities.find((a): a is Extract<EdgeActivity, { kind: 'unresolved' }> => a.kind === 'unresolved');
 }
 
-function edgeKey(from: string, to: string): string {
-  return `${from}->${to}`;
+/** The edge key for the CURRENT effective instances of source/target — must
+ *  mirror the key materialize stores edgeResolved under (constraint 1), so a
+ *  revisit's `A#002->B#002` reads its OWN verdict, not `A#001->B#001`'s.
+ *  Falls back to the nodeId pair when a node has no runtime instance. */
+function currentEdgeKey(from: string, to: string, state: V3RunState): string {
+  const fromInst = st(state, from).effectiveInstanceId ?? from;
+  const toInst = st(state, to).effectiveInstanceId ?? to;
+  return `${fromInst}->${toInst}`;
 }
 
 /** The CURRENT iteration's expanded instance ids of a loop node (empty for
@@ -493,7 +501,7 @@ function edgeActivityFor(
   const source = st(state, from);
   if (source.status === 'done') {
     if (!conditional) return { kind: 'active', from };
-    const edge = edges.get(edgeKey(from, to));
+    const edge = edges.get(currentEdgeKey(from, to, state));
     if (!edge) return { kind: 'unresolved', from };
     return edge.active
       ? { kind: 'active', from }

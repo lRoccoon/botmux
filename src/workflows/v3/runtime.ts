@@ -575,7 +575,7 @@ export async function runWorkflow(
           startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId);
           startedThisTick++;
         } else if (a.kind === 'dispatchGate') {
-          startGate(nodesById.get(a.nodeId)!);
+          startGate(nodesById.get(a.nodeId)!, a.instanceId);
           startedThisTick++;
         }
       }
@@ -841,10 +841,10 @@ export async function runWorkflow(
     inFlight.set(node.id, p);
   }
 
-  function startGate(node: V3Node): void {
+  function startGate(node: V3Node, instanceId?: string): void {
     const waitId = `${node.id}-gate`; // MVP: one gate per node
     const gate = normalizeGateWaitInput(node.humanGate!);
-    appendEvent(journalPath, { type: 'gateDispatched', nodeId: node.id, waitId });
+    appendEvent(journalPath, { type: 'gateDispatched', nodeId: node.id, ...(instanceId ? { instanceId } : {}), waitId });
 
     if (gateMode === 'suspend') {
       writePendingWait(runDir, { waitId, nodeId: node.id, ...gate });
@@ -974,6 +974,14 @@ export async function runWorkflow(
     a: Extract<V3Action, { kind: 'resolveEdge' }>,
     events: StoredEvent[],
   ): void {
+    // Scope the verdict to the CURRENT effective instances of source/target so a
+    // revisit's `A#001->B#001` verdict never bleeds onto `A#002->B#002`
+    // (constraint 1).  Legacy/no-instance falls back to the bare nodeId.
+    const snap = materialize(events);
+    const fromInstanceId = snap.nodes.get(a.from)?.effectiveInstanceId;
+    const toInstanceId = snap.nodes.get(a.to)?.effectiveInstanceId;
+    const fromKey = fromInstanceId ?? a.from;
+    const instPair = { ...(fromInstanceId ? { fromInstanceId } : {}), ...(toInstanceId ? { toInstanceId } : {}) };
     const target = nodesById.get(a.to);
     const dep = target?.depends.find((d) => d.from === a.from);
     if (!target || !dep?.when) {
@@ -981,7 +989,8 @@ export async function runWorkflow(
         type: 'edgeResolved',
         from: a.from,
         to: a.to,
-        sourceAttemptId: latestAttemptIdFor(events, a.from) ?? `${a.from}/attempts/unknown`,
+        ...instPair,
+        sourceAttemptId: latestAttemptIdFor(events, fromKey) ?? `${fromKey}/attempts/unknown`,
         active: false,
         detail: 'edge predicate missing at resolution time',
       });
@@ -991,8 +1000,8 @@ export async function runWorkflow(
     const succ = [...events]
       .reverse()
       .find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
-        e.type === 'nodeSucceeded' && e.nodeId === a.from);
-    const sourceAttemptId = succ?.attemptId ?? `${a.from}/attempts/unknown`;
+        e.type === 'nodeSucceeded' && (e.instanceId ?? e.nodeId) === fromKey);
+    const sourceAttemptId = succ?.attemptId ?? `${fromKey}/attempts/unknown`;
     const key = dep.when.path.slice('result.'.length);
     let active = false;
     let detail = `${dep.when.path}=<unreadable>`;
@@ -1016,6 +1025,7 @@ export async function runWorkflow(
       type: 'edgeResolved',
       from: a.from,
       to: a.to,
+      ...instPair,
       sourceAttemptId,
       active,
       detail,

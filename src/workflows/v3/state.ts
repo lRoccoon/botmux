@@ -232,7 +232,11 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         break;
       }
       case 'edgeResolved': {
-        const key = `${e.from}->${e.to}`;
+        // Key by instance pair (constraint 1): `A#001->B#001` and `A#002->B#002`
+        // are distinct verdicts — a revisit's fresh edge is never first-wins-
+        // shadowed by the superseded instance's old verdict.  Legacy/no-instance
+        // events fall back to the nodeId pair.
+        const key = `${e.fromInstanceId ?? e.from}->${e.toInstanceId ?? e.to}`;
         if (!edges.has(key)) {
           edges.set(key, { active: e.active, sourceAttemptId: e.sourceAttemptId });
         }
