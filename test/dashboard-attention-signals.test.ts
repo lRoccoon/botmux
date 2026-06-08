@@ -6,10 +6,15 @@
 //   - announcePendingRepoSession announces card-waiting sessions (which have
 //     no worker yet, so the normal spawn-time announce never fires) and
 //     no-ops for non-pending sessions
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { composeRowFromActive } from '../src/core/dashboard-rows.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import {
+  setTerminalProxyPort,
+  setTerminalExternalPort,
+  resetTerminalProxy,
+} from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
@@ -112,5 +117,29 @@ describe('attention signals', () => {
     announcePendingRepoSession(makeDs({ pendingRepo: false }));
     announcePendingRepoSession(makeDs());
     expect(seen).toHaveLength(0);
+  });
+});
+
+// The dashboard "open terminal" link is built from row.proxyPort (sessions.ts
+// terminalHref), NOT buildTerminalUrl — so the row must carry the SAME advertised
+// port the card links use, or the relay scenario gives a broken dashboard link.
+describe('composeRowFromActive — advertised proxy port (WEB_EXTERNAL_PORT)', () => {
+  afterEach(() => resetTerminalProxy());
+
+  it('advertises WEB_EXTERNAL_PORT (relay port) to the dashboard, not the local proxy port', () => {
+    setTerminalProxyPort(8800);     // local bound proxy port
+    setTerminalExternalPort(9000);  // WEB_EXTERNAL_PORT + botIndex
+    expect(composeRowFromActive(makeDs()).proxyPort).toBe(9000);
+  });
+
+  it('advertises the bound proxy port when WEB_EXTERNAL_PORT is unset', () => {
+    setTerminalProxyPort(8800);
+    expect(composeRowFromActive(makeDs()).proxyPort).toBe(8800);
+  });
+
+  it('omits proxyPort (→ frontend uses direct webPort) when the proxy never bound', () => {
+    resetTerminalProxy();
+    setTerminalExternalPort(9000);
+    expect(composeRowFromActive(makeDs()).proxyPort).toBeUndefined();
   });
 });

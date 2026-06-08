@@ -8,7 +8,7 @@
 import type { DaemonSession } from './types.js';
 import type { Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { getTerminalProxyPort } from './terminal-url.js';
+import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 
@@ -34,8 +34,10 @@ export interface SessionRow {
   title?: string;
   ownerOpenId?: string;
   webPort: number | null;
-  /** Owning daemon's reverse-proxy port (0/undefined if the proxy isn't up).
-   *  When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}. */
+  /** Owning daemon's advertised reverse-proxy port — WEB_EXTERNAL_PORT + botIndex
+   *  when configured, else the bound proxy port (0/undefined if the proxy isn't
+   *  up). When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}.
+   *  Mirrors the port buildTerminalUrl puts in card links so both agree. */
   proxyPort?: number;
   cliVersion?: string;
   hasHistory?: boolean;
@@ -92,7 +94,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     // both fresh and restored sessions.
     ownerOpenId: ds.session.ownerOpenId,
     webPort: ds.workerPort ?? null,
-    proxyPort: getTerminalProxyPort() || undefined,
+    proxyPort: getTerminalAdvertisedPort() || undefined,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
     feishuChatLink: feishuChatLink(ds.chatId, getBotBrand(ds.larkAppId)),

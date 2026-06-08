@@ -33,7 +33,7 @@ import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import { sessionKey, sessionAnchorId } from './core/types.js';
-import { buildTerminalUrl, setTerminalProxyPort } from './core/terminal-url.js';
+import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
@@ -3174,6 +3174,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.info(`[terminal-proxy] listening on ${config.web.host}:${terminalProxy.port} (bot ${idx}) — session terminals at /s/{sessionId}`);
   } catch (err) {
     logger.error(`[terminal-proxy] failed to bind port ${proxyPort} — falling back to direct worker ports for terminal links: ${(err as Error).message}`);
+  }
+
+  // Advertise WEB_EXTERNAL_PORT + idx (mirroring proxyBasePort + idx) in proxy-
+  // mode terminal links so a relay host can forward to the local proxy port
+  // without binding the same port number. No-op (0) when unset → links keep the
+  // local proxy port. Ignored in the direct fallback (per-session worker ports).
+  setTerminalExternalPort(config.web.externalPort ? config.web.externalPort + idx : 0);
+  if (config.web.externalPort) {
+    logger.info(`[terminal-proxy] terminal links advertise external port ${config.web.externalPort + idx} (WEB_EXTERNAL_PORT ${config.web.externalPort} + bot ${idx})`);
   }
 
   // Now that the IPC port is actually listening, publish the descriptor so

@@ -392,7 +392,7 @@ function clipDesc(desc?: string): string {
 /**
  * Build the `/list-slash-command` card (schema 2.0): a coloured header and three
  * sections — ① fixed passthrough allowlist, ② user-configured custom passthrough,
- * ③ auto-discovered .claude commands/skills/plugins rendered as a paginated native
+ * ③ auto-discovered CLI commands/skills/plugins rendered as a paginated native
  * table (command | description). An optional MCP-servers note is appended.
  */
 export function buildSlashListCard(
@@ -403,10 +403,11 @@ export function buildSlashListCard(
     discovered: { name: string; description?: string }[];
     workingDir: string;
     mcpServers: string[];
+    discoverySupported?: boolean;
   },
   locale?: Locale,
 ): string {
-  const { cliName, builtin, custom, discovered, workingDir, mcpServers } = params;
+  const { cliName, builtin, custom, discovered, workingDir, mcpServers, discoverySupported = true } = params;
   const asCode = (cmds: string[]) => cmds.map((c) => `\`${c}\``).join('  ');
   const elements: any[] = [];
 
@@ -428,7 +429,12 @@ export function buildSlashListCard(
 
   // ③ 自动发现（命令 / skill / 插件）
   const discHeading = `**${t('slashlist.part_discovered', { cliName }, locale)}**`;
-  if (discovered.length === 0) {
+  if (!discoverySupported) {
+    elements.push({
+      tag: 'markdown',
+      content: `${discHeading}\n${t('slashlist.part_discovered_unsupported', { cliName }, locale)}`,
+    });
+  } else if (discovered.length === 0) {
     elements.push({
       tag: 'markdown',
       content: `${discHeading}\n${t('slashlist.part_discovered_empty', { dir: workingDir }, locale)}`,
@@ -456,9 +462,10 @@ export function buildSlashListCard(
       rows: shown.map((c) => ({ cmd: `\`${c.name}\``, desc: clipDesc(c.description) })),
     });
     if (discovered.length > MAX) {
+      // schema 2.0 卡片已不支持 note 标签（飞书 ErrCode 200861），改用 markdown 元素
       elements.push({
-        tag: 'note',
-        elements: [{ tag: 'lark_md', content: t('slashlist.more', { n: String(discovered.length - MAX) }, locale) }],
+        tag: 'markdown',
+        content: t('slashlist.more', { n: String(discovered.length - MAX) }, locale),
       });
     }
   }
@@ -466,9 +473,10 @@ export function buildSlashListCard(
   // MCP 提示（server 名，prompt 需运行时握手不在此列）
   if (mcpServers.length > 0) {
     elements.push({ tag: 'hr' });
+    // schema 2.0 卡片已不支持 note 标签（飞书 ErrCode 200861），改用 markdown 元素
     elements.push({
-      tag: 'note',
-      elements: [{ tag: 'lark_md', content: t('slashlist.mcp_note', { servers: mcpServers.join(', ') }, locale) }],
+      tag: 'markdown',
+      content: t('slashlist.mcp_note', { servers: mcpServers.join(', ') }, locale),
     });
   }
 

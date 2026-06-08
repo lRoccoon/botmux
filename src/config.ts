@@ -89,6 +89,14 @@ export const config = {
     // terminal under `/s/{sessionId}`. Lets dev-machine users forward one port
     // (`proxyBasePort + botIndex`) instead of one per topic. See terminal-proxy.ts.
     proxyBasePort: Number(process.env.BOTMUX_WEB_PROXY_BASE_PORT) || 8800,
+    // Port advertised in terminal links, overriding the local proxy port so a
+    // relay/transit host can front the terminal on a DIFFERENT port number than
+    // botmux binds locally (the relay forwards externalPort → local proxy port).
+    // Like proxyBasePort it is a BASE: the daemon advertises `externalPort +
+    // botIndex` (see daemon.ts), keeping each bot distinct since every bot daemon
+    // shares this env and differs only by BOTMUX_BOT_INDEX. 0 = unset → links use
+    // the local proxy port (relay must forward the same port number).
+    externalPort: Number(process.env.WEB_EXTERNAL_PORT) || 0,
   },
   dashboard: {
     host: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
