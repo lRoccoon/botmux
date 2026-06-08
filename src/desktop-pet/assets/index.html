@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Botmux Desktop Pet</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="pet-stage" data-region="stage">
+    <section class="pet-shell" data-region="pet-shell" aria-live="polite">
+      <div class="pet-aura" aria-hidden="true"></div>
+      <div class="pet-shadow" aria-hidden="true"></div>
+      <div class="pet-sprite" data-region="sprite" aria-hidden="true"></div>
+      <div class="pet-bubble" data-region="bubble">
+        <strong data-bind="name">Robo Buddy</strong>
+        <span data-bind="title">Botmux desktop pet</span>
+        <em data-bind="message"></em>
+      </div>
+      <div class="pet-actions" data-region="actions"></div>
+    </section>
+  </main>
+  <script src="./app.js?v=20260607-desk-work-no-occlusion"></script>
+</body>
+</html>

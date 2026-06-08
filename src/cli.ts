@@ -17,6 +17,7 @@
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd)
  *   botmux worker-budget status|set|unset — inspect/override idle worker suspension budget
+ *   botmux desktop-pet start|snapshot — run the local Robo Buddy desktop pet
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
@@ -2328,6 +2329,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        set --max-live-workers N [--idle-minutes N]
                          覆盖全局 worker 预算，写入 ~/.botmux/config.json（agent 推荐用命令改，不手写 JSON）
        unset             清除 worker 预算覆盖，恢复按机器 CPU/内存自动推导
+  desktop-pet start      启动本地桌面宠物（macOS 透明浮窗，无需 Apple 账号）
+       snapshot          输出桌面宠物当前状态 JSON
   lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
        --bot N         仅改 bots.json 中第 N 个 bot 的 lang
        --unset         清除（global 或 --bot N 配合）
@@ -4860,6 +4863,11 @@ switch (command) {
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'lang':     cmdLang(process.argv.slice(3)); break;
   case 'voice':    await cmdVoiceSetup(process.argv.slice(3)); break;
+  case 'desktop-pet': {
+    const { runDesktopPetCommand } = await import('./desktop-pet/command.js');
+    await runDesktopPetCommand(process.argv.slice(3));
+    break;
+  }
   case 'worker-budget': cmdWorkerBudget(process.argv.slice(3)); break;
   case 'thread':   {
     // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
