@@ -3817,14 +3817,16 @@ botmux create-group — 用一组机器人新建飞书群
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   let botConfigs: Array<{ larkAppId: string; cliId: string }>;
   try {
-    botConfigs = loadBotConfigs().map(c => ({ larkAppId: c.larkAppId, cliId: c.cliId }));
+    botConfigs = loadBotConfigs()
+      .filter(c => c.handler !== 'control-plane')
+      .map(c => ({ larkAppId: c.larkAppId, cliId: c.cliId }));
   } catch (err: any) {
     console.error(`加载 bots.json 失败: ${err?.message ?? err}`);
     process.exit(1);
   }
   const dataDir = resolveDataDir();
   const botInfoPath = join(dataDir, 'bots-info.json');
-  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string; handler?: string };
   let botInfoEntries: BotInfoEntry[] = [];
   try { if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
 
@@ -3832,7 +3834,7 @@ botmux create-group — 用一组机器人新建飞书群
   const resolved = resolveBotRefs(
     botRefs,
     botConfigs,
-    botInfoEntries.map(b => ({ larkAppId: b.larkAppId, botName: b.botName })),
+    botInfoEntries.filter(b => b.handler !== 'control-plane').map(b => ({ larkAppId: b.larkAppId, botName: b.botName })),
   );
 
   for (const w of resolved.ambiguousWarnings) console.error(`⚠️  ${w}`);
@@ -4307,7 +4309,7 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   const dataDir = resolveDataDir();
   const botInfoPath = join(dataDir, 'bots-info.json');
 
-  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string; handler?: string };
   let botEntries: BotInfoEntry[] = [];
   try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
 
@@ -4848,6 +4850,11 @@ switch (command) {
   case 'workflow': {
     const { cmdWorkflow } = await import('./cli/workflow.js');
     await cmdWorkflow(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
+  case 'collab': {
+    const { cmdCollab } = await import('./collab/cli.js');
+    await cmdCollab(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;

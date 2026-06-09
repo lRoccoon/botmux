@@ -10,6 +10,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
+export type BotHandler = 'cli' | 'control-plane';
 
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
@@ -38,6 +39,12 @@ export interface BotDefaultOncall {
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
+  /**
+   * Runtime handler for inbound Lark events.
+   *   - cli (default): existing botmux CLI worker bridge.
+   *   - control-plane: deterministic collab supervisor; no CLI worker is forked.
+   */
+  handler?: BotHandler;
   /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
@@ -641,6 +648,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
+      handler: entry.handler === 'control-plane' ? 'control-plane' : undefined,
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,

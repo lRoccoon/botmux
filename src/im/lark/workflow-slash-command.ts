@@ -234,14 +234,18 @@ export function createWorkflowRunId(workflowId: string, nowMs = Date.now()): str
 
 export function resolveBotSnapshot(botName: string): BotSnapshot | undefined {
   const registered = getAllBots().find((bot) =>
-    botMatches(bot.config.name, botName) ||
-    botMatches(bot.botName, botName) ||
-    botMatches(bot.config.larkAppId, botName)
+    bot.config.handler !== 'control-plane' &&
+    (botMatches(bot.config.name, botName) ||
+      botMatches(bot.botName, botName) ||
+      botMatches(bot.config.larkAppId, botName))
   );
   if (registered) return snapshotFromConfig(botName, registered.config);
 
   try {
-    const cfg = loadBotConfigs().find((bot) => botMatches(bot.name, botName) || botMatches(bot.larkAppId, botName));
+    const cfg = loadBotConfigs().find((bot) =>
+      bot.handler !== 'control-plane' &&
+      (botMatches(bot.name, botName) || botMatches(bot.larkAppId, botName))
+    );
     return cfg ? snapshotFromConfig(botName, cfg) : undefined;
   } catch {
     return undefined;

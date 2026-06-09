@@ -141,6 +141,15 @@ describe('parseBotConfigsFromText — brand', () => {
     ]));
     expect(cfg.brand).toBeUndefined();
   });
+
+  it('parses control-plane handler and defaults other values to cli', () => {
+    const [control, cli] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'control', larkAppSecret: 's', handler: 'control-plane' },
+      { larkAppId: 'worker', larkAppSecret: 's', handler: 'bogus' },
+    ]));
+    expect(control.handler).toBe('control-plane');
+    expect(cli.handler).toBeUndefined();
+  });
 });
 
 // ─── getBot / getBotClient ────────────────────────────────────────────────

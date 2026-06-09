@@ -41,7 +41,7 @@ export function writeBotInfoFile(dataDir: string): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
 
   // Read existing entries from other daemon processes
-  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; botAvatarUrl: string | null; cliId: string };
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; botAvatarUrl: string | null; cliId: string; handler?: string };
   let existing: BotInfoEntry[] = [];
   try {
     if (existsSync(filePath)) {
@@ -63,6 +63,7 @@ export function writeBotInfoFile(dataDir: string): void {
       botName: b.botName ?? null,
       botAvatarUrl: b.botAvatarUrl ?? null,
       cliId: b.config.cliId,
+      handler: b.config.handler,
     });
   }
 

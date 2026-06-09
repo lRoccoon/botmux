@@ -101,6 +101,13 @@ describe('botmux bots list CLI output mapping', () => {
         botName: 'Missing',
         cliId: 'codex',
       },
+      {
+        larkAppId: 'control',
+        botOpenId: 'ou_control',
+        botName: 'Control Plane',
+        cliId: 'claude',
+        handler: 'control-plane',
+      },
     ], 'cli_self');
 
     expect(rows).toEqual([

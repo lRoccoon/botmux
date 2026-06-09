@@ -128,6 +128,8 @@ export interface DaemonSession {
     paneCols?: number;        // pane width at adopt time
     paneRows?: number;        // pane height at adopt time
   };
+  /** P0 collab worker context; mirrored from Session.collab for in-memory access. */
+  collab?: { runId: string; workerId: string; taskId: string; baseDir?: string };
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent

@@ -38,11 +38,13 @@ export async function larkGet(c: any, url: string, params: LarkRequestParams = {
 let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<typeof Client> }> | null = null;
 function getAllBotClients() {
   if (!allBotClients) {
-    allBotClients = loadBotConfigs().map((cfg) => ({
-      appId: cfg.larkAppId,
-      cliId: cfg.cliId,
-      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand)), loggerLevel: LoggerLevel.error }),
-    }));
+    allBotClients = loadBotConfigs()
+      .filter((cfg) => cfg.handler !== 'control-plane')
+      .map((cfg) => ({
+        appId: cfg.larkAppId,
+        cliId: cfg.cliId,
+        client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand)), loggerLevel: LoggerLevel.error }),
+      }));
   }
   return allBotClients;
 }

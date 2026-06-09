@@ -8,6 +8,7 @@ import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
+import type { BoardSnapshot } from '../../collab/contract.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -198,6 +199,82 @@ export function getCliDisplayName(cliId: CliId): string {
 /** Escape Lark markdown special characters in user-controlled strings. */
 function escapeMd(s: string): string {
   return s.replace(/[*_~`\[\]\\]/g, c => `\\${c}`);
+}
+
+export function buildCollabControlCard(snapshot: BoardSnapshot, locale?: Locale): string {
+  const budget = snapshot.budget
+    ? `${snapshot.budget.remaining}/${snapshot.budget.limit} ${snapshot.budget.unit}`
+    : 'n/a';
+  const worker = snapshot.worker
+    ? `${snapshot.worker.workerId} · ${snapshot.worker.phase}`
+    : 'unassigned';
+  const task = snapshot.task
+    ? `${snapshot.task.title} · ${snapshot.task.status}`
+    : 'no task';
+  const lastProgress = snapshot.progressLog.at(-1);
+  const progress = lastProgress
+    ? `${lastProgress.verdict}${lastProgress.summary ? ` · ${lastProgress.summary}` : ''}`
+    : 'no verdict';
+  const pendingInterventions = snapshot.interventions
+    .filter(i => i.receipt !== 'applied' && i.receipt !== 'superseded')
+    .map(i => `- ${i.kind}: ${i.receipt ?? 'requested'} (${i.interventionId})`)
+    .join('\n');
+  const body =
+    `**Run** \`${escapeMd(snapshot.runId)}\` · rev ${snapshot.revision} · ${snapshot.status}\n` +
+    `**Goal** ${escapeMd(snapshot.goal || '(empty)')}\n` +
+    `**Task** ${escapeMd(task)}\n` +
+    `**Worker** ${escapeMd(worker)}\n` +
+    `**Budget** ${escapeMd(budget)}\n` +
+    `**Progress** ${escapeMd(progress)}` +
+    (pendingInterventions ? `\n\n**Interventions**\n${escapeMd(pendingInterventions)}` : '');
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true, update_multi: true },
+    header: {
+      template: snapshot.status === 'running' || snapshot.status === 'pending' ? 'blue' : 'grey',
+      title: { tag: 'plain_text', content: 'Collab control' },
+    },
+    elements: [
+      { tag: 'markdown', content: body },
+      {
+        tag: 'form',
+        name: 'collab_goal_form',
+        elements: [
+          {
+            tag: 'input',
+            name: 'goal',
+            default_value: snapshot.goal,
+            placeholder: { tag: 'plain_text', content: 'Goal' },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: 'Update goal' },
+            type: 'primary',
+            name: 'collab_goal_submit',
+            action_type: 'form_submit',
+            value: { action: 'collab_goal_change', run_id: snapshot.runId },
+          },
+        ],
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: 'Refresh' },
+            type: 'default',
+            value: { action: 'collab_refresh', run_id: snapshot.runId },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: 'Stop' },
+            type: 'danger',
+            value: { action: 'collab_stop', run_id: snapshot.runId },
+          },
+        ],
+      },
+    ],
+  });
 }
 
 function sidebarUrl(url: string): string {

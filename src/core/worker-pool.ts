@@ -40,6 +40,7 @@ import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { openCollabBoard, runReferee } from '../collab/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1330,6 +1331,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     turnId: ds.currentReplyTarget?.turnId,
+    collab: ds.collab ?? ds.session.collab,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -1923,6 +1925,9 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
         deliverFinalOutput(ds, msg, t, 0);
+        handleCollabTurnFinished(ds, msg, t).catch((err) => {
+          logger.warn(`[${t}] collab turn-finished/referee failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
         break;
       }
 
@@ -1987,6 +1992,39 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 // ─── Bridge final-output delivery (with retry) ──────────────────────────────
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
+
+async function handleCollabTurnFinished(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  tag: string,
+): Promise<void> {
+  const collab = ds.collab ?? ds.session.collab;
+  if (!collab) return;
+  const board = openCollabBoard(collab.runId, collab.baseDir ? { baseDir: collab.baseDir } : {});
+  const idem = `turn-finished:${msg.turnId || msg.lastUuid || Date.now()}`;
+  await board.append({
+    type: 'WorkerTurnFinished',
+    runId: collab.runId,
+    actor: 'worker',
+    idempotencyKey: idem,
+    affectedPaths: ['worker', 'budget'],
+    taskId: collab.taskId,
+    workerId: collab.workerId,
+    budgetDelta: -1,
+    payload: {
+      workerId: collab.workerId,
+      reason: 'completed',
+    },
+  });
+  const cwd = ds.workingDir ?? requireCallbacks().getSessionWorkingDir(ds);
+  const result = await runReferee(board, { cwd, idemSuffix: idem });
+  logger.info(`[${tag}] collab referee verdict=${result.verdict}${result.exitCode !== undefined ? ` exit=${result.exitCode}` : ''}`);
+  const snapshot = await board.snapshot();
+  if (snapshot.status !== 'running' && snapshot.status !== 'pending') {
+    await closeSession(ds.session.sessionId);
+    logger.info(`[${tag}] collab run terminal (${snapshot.status}); session closed`);
+  }
+}
 
 /** Deliver a bridge `final_output` to Lark. The worker emits each turn
  *  exactly once (it pops the turn off its queue at emit time), so the

@@ -140,6 +140,7 @@ import {
 } from './core/ask-broker.js';
 import { parseAskBody, resolveAskApprovers } from './core/ask-api.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
+import { configureCollabControlPlane, handleCollabControlMessage, type PushCollabWorkerInput, type SpawnCollabWorkerInput } from './core/control-plane.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -1651,6 +1652,81 @@ function workflowTriggerDeps() {
   };
 }
 
+async function spawnCollabWorker(input: SpawnCollabWorkerInput): Promise<void> {
+  const bot = getBot(input.larkAppId);
+  const botCfg = bot.config;
+  const key = sessionKey(input.topicId, input.larkAppId);
+  const collab = { runId: input.runId, workerId: input.workerId, taskId: input.taskId, baseDir: input.baseDir };
+  const existing = activeSessions.get(key);
+  if (existing) {
+    existing.collab = collab;
+    existing.session.collab = collab;
+    existing.workingDir = existing.workingDir ?? expandHome(botCfg.workingDir ?? config.daemon.workingDir ?? '~');
+    existing.session.workingDir = existing.workingDir;
+    sessionStore.updateSession(existing.session);
+    if (existing.worker && !existing.worker.killed) return;
+    forkWorker(existing, input.prompt, existing.hasHistory);
+    return;
+  }
+
+  const scope: 'thread' | 'chat' = input.topicId.startsWith('oc_') ? 'chat' : 'thread';
+  const workingDir = expandHome(botCfg.workingDir ?? config.daemon.workingDir ?? '~');
+  const session = sessionStore.createSession(input.chatId, input.topicId, input.goal.substring(0, 50), 'group');
+  const now = Date.now();
+  session.larkAppId = input.larkAppId;
+  session.ownerOpenId = input.ownerOpenId;
+  session.lastCallerOpenId = input.ownerOpenId;
+  session.lastMessageAt = new Date(now).toISOString();
+  session.scope = scope;
+  session.workingDir = workingDir;
+  session.collab = collab;
+  sessionStore.updateSession(session);
+
+  const ds: DaemonSession = {
+    session,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId: input.larkAppId,
+    chatId: input.chatId,
+    chatType: 'group',
+    scope,
+    spawnedAt: Date.parse(session.createdAt) || now,
+    cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+    lastMessageAt: now,
+    hasHistory: false,
+    ownerOpenId: input.ownerOpenId,
+    currentTurnTitle: input.goal.substring(0, 50),
+    workingDir,
+    collab,
+  };
+  activeSessions.set(key, ds);
+  rememberLastCliInput(ds, input.goal, input.prompt);
+  forkWorker(ds, input.prompt);
+}
+
+async function pushCollabWorker(input: PushCollabWorkerInput): Promise<void> {
+  const ds = activeSessions.get(sessionKey(input.topicId, input.larkAppId));
+  if (!ds) {
+    logger.warn(`[collab:${input.runId}] push skipped: no active worker session at ${input.topicId.substring(0, 12)}`);
+    return;
+  }
+  ds.collab = {
+    runId: input.runId,
+    workerId: input.workerId ?? ds.collab?.workerId ?? ds.session.collab?.workerId ?? `${input.runId}-worker-1`,
+    taskId: input.taskId ?? ds.collab?.taskId ?? ds.session.collab?.taskId ?? 'task-1',
+    baseDir: ds.collab?.baseDir ?? ds.session.collab?.baseDir,
+  };
+  ds.session.collab = ds.collab;
+  sessionStore.updateSession(ds.session);
+  if (!ds.worker || ds.worker.killed) {
+    forkWorker(ds, input.content, ds.hasHistory);
+    return;
+  }
+  ds.worker.send({ type: 'message', content: input.content } as DaemonToWorker);
+  rememberLastCliInput(ds, input.content, input.content);
+}
+
 ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) => {
   const workflowId = params.id;
   if (!isValidWorkflowId(workflowId)) {
@@ -3074,8 +3150,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 关键：adopt 路径会跳过 ensureCliSkills，若重启后第一次就是 adopt 一个外部
   // claude 会话，必须保证此时全局 ~/.claude/settings.json 已带 hook——否则"全局
   // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
-  try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
-  catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+  if (cfg.handler !== 'control-plane') {
+    try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
+    catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+  }
   sessionStore.init(cfg.larkAppId);
   chatFirstSeenStore.init(cfg.larkAppId);
   // Watch schedules.json for external writes (e.g. `botmux schedule add`
@@ -3083,6 +3161,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
+  if (cfg.handler === 'control-plane') {
+    configureCollabControlPlane({
+      dataDir: config.session.dataDir,
+      reply: sessionReply,
+      spawnWorker: spawnCollabWorker,
+      pushWorker: pushCollabWorker,
+    });
+  }
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
@@ -3275,14 +3361,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       );
     }
 
-    // Start event dispatcher for this bot
+    // Start event dispatcher for this bot. Control-plane bots reuse the same
+    // Lark routing/permission layer, but terminate at a deterministic native
+    // handler instead of creating a CLI-backed daemon session.
+    const nativeMessageHandler = cfg.handler === 'control-plane'
+      ? handleCollabControlMessage
+      : null;
     startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
       handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
-      handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
-      handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
-      handleBotAdded: (chatId, operatorOpenId, appId) => handleBotAdded(chatId, operatorOpenId, appId),
-      isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
-      resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
+      handleNewTopic: (data, ctx) => nativeMessageHandler ? nativeMessageHandler(data, ctx) : handleNewTopic(data, ctx),
+      handleThreadReply: (data, ctx) => nativeMessageHandler ? nativeMessageHandler(data, ctx) : handleThreadReply(data, ctx),
+      handleBotAdded: (chatId, operatorOpenId, appId) => nativeMessageHandler ? Promise.resolve() : handleBotAdded(chatId, operatorOpenId, appId),
+      isSessionOwner: (anchor, appId) => nativeMessageHandler ? false : activeSessions.has(sessionKey(anchor, appId)),
+      resolveReplyThreadAlias: (rootId, chatId, appId) => nativeMessageHandler ? null : findChatReplyAlias(rootId, chatId, appId),
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
       // Evict it from the routing map so subsequent inbound messages can land
       // on a fresh thread-scope session (dispatcher already rerouted this turn
@@ -3292,6 +3383,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // semantics — that's an edge case worth following up on, not blocking
       // the main fix.
       onChatModeConverted: (chatId, appId) => {
+        if (nativeMessageHandler) return;
         const key = sessionKey(chatId, appId);
         const evicted = activeSessions.delete(key);
         logger.info(`[chat-mode-converted] ${chatId.substring(0, 12)} evicted=${evicted}; worker (if any) keeps running until /close`);

@@ -3310,6 +3310,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
+  if (cfg.collab) {
+    childEnv.BOTMUX_COLLAB_RUN_ID = cfg.collab.runId;
+    childEnv.BOTMUX_COLLAB_WORKER_ID = cfg.collab.workerId;
+    childEnv.BOTMUX_COLLAB_TASK_ID = cfg.collab.taskId;
+    if (cfg.collab.baseDir) childEnv.BOTMUX_COLLAB_RUNS_DIR = cfg.collab.baseDir;
+  }
   if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
   if (claudeResumeTokenThreshold) childEnv.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD = claudeResumeTokenThreshold;
   // Adapter-supplied env: points Claude-family forks at their data root (Seed's

@@ -701,6 +701,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         pendingResponseCardId: session.pendingResponseCardId,
         pendingResponseCardState: session.pendingResponseCardState,
         lastPatchedResponseCardId: session.lastPatchedResponseCardId,
+        collab: session.collab,
         // Restart stays silent for adopt sessions too: forkAdoptWorker shares
         // setupWorkerHandlers, so the recovery ready/screen_update would post a
         // card without this. Cleared on the first real CLI input.
@@ -759,6 +760,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       pendingResponseCardId: session.pendingResponseCardId,
       pendingResponseCardState: session.pendingResponseCardState,
       lastPatchedResponseCardId: session.lastPatchedResponseCardId,
+      collab: session.collab,
       // Restart stays silent in the group: the recovery re-fork won't post or
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,

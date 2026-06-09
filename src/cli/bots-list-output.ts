@@ -5,6 +5,7 @@ export type BotInfoEntryForList = {
   botOpenId: string | null;
   botName: string | null;
   cliId: string;
+  handler?: string;
 };
 
 export type BotListOutputEntry = {
@@ -50,7 +51,7 @@ export function formatBotInfoEntriesForCli(
   currentLarkAppId: string,
 ): BotListOutputEntry[] {
   return botEntries
-    .filter((b) => b.botOpenId)
+    .filter((b) => b.botOpenId && b.handler !== 'control-plane')
     .map((b) => ({
       name: b.botName ?? b.cliId,
       openId: b.botOpenId!,

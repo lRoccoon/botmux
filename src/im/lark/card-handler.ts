@@ -21,6 +21,7 @@ import {
   type WorkflowApprovalHandlerDeps,
 } from './workflow-card-handler.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
+import { handleCollabControlCardAction, isCollabControlAction } from '../../core/control-plane.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
@@ -160,6 +161,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+  if (value?.action && isCollabControlAction(value.action) && larkAppId) {
+    if (!operatorOpenId || !canOperate(larkAppId, undefined, operatorOpenId)) {
+      return { toast: { type: 'error', content: 'Only bot operators can control this collab run.' } };
+    }
+    return handleCollabControlCardAction(data, larkAppId);
+  }
   // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
   if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {

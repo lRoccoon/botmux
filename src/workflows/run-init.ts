@@ -147,7 +147,9 @@ function missingBotMessage(
     if (snap.larkAppId) availableIds.add(snap.larkAppId);
   }
   try {
-    for (const cfg of loadBotConfigs()) availableIds.add(cfg.larkAppId);
+    for (const cfg of loadBotConfigs()) {
+      if (cfg.handler !== 'control-plane') availableIds.add(cfg.larkAppId);
+    }
   } catch {
     // Missing/invalid bots.json should not hide the original workflow error.
   }
