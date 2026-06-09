@@ -55,6 +55,13 @@ function requireConfig(): ControlPlaneConfig {
   return configured;
 }
 
+/** A terminal run accepts no further goal-change / stop interventions. Gating on
+ *  this is what stops the operator from re-triggering the card form on a
+ *  finished run and re-pushing turns into a (re-forked) worker. */
+function isTerminalStatus(status: string): boolean {
+  return status === 'succeeded' || status === 'failed' || status === 'stopped';
+}
+
 function collabBaseDir(cfg = requireConfig()): string {
   const dir = join(cfg.dataDir, 'collab-runs');
   mkdirSync(dir, { recursive: true });
@@ -353,29 +360,45 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
 
     const goalMatch = raw.match(/^\/(?:goal|set-goal)\s+([\s\S]+)$/i);
     const stopMatch = raw.match(/^\/(?:stop|collab-stop)\b\s*([\s\S]*)$/i);
-    if (goalMatch) {
-      await requestGoalChange(board, {
-        goal: goalMatch[1].trim(),
-        topicId,
-        idempotencyPrefix: `msg:${parsed.messageId}:goal`,
-        actor: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'control-plane' : 'human',
-      });
-      const snapshot = await board.snapshot();
-      await cfg.pushWorker?.({
-        runId: board.runId,
-        workerId: snapshot.worker?.workerId,
-        taskId: snapshot.task?.taskId,
-        larkAppId: ctx.larkAppId,
-        topicId,
-        content: `Goal changed. Read BOTMUX_COLLAB_RUN_ID from the collab board, acknowledge the intervention receipt, and adjust your work.\n\nNew goal:\n${goalMatch[1].trim()}`,
-      });
-    } else if (stopMatch) {
-      await requestStop(board, {
-        reason: stopMatch[1]?.trim() || undefined,
-        topicId,
-        idempotencyPrefix: `msg:${parsed.messageId}:stop`,
-        actor: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'control-plane' : 'human',
-      });
+    if (goalMatch || stopMatch) {
+      const current = await board.snapshot();
+      if (isTerminalStatus(current.status)) {
+        // Terminal run: refuse further goal/stop; just re-render the (now
+        // control-disabled) card below.
+        logger.info(`[collab-control] ignoring ${goalMatch ? 'goal' : 'stop'} on terminal run ${board.runId} (${current.status})`);
+      } else if (goalMatch) {
+        const newGoal = goalMatch[1].trim();
+        if (newGoal === current.goal) {
+          // No-op goal: don't write a redundant intervention or re-push the worker.
+          logger.info(`[collab-control] goal unchanged on run ${board.runId}; skip push`);
+        } else {
+          await requestGoalChange(board, {
+            goal: newGoal,
+            topicId,
+            idempotencyPrefix: `msg:${parsed.messageId}:goal`,
+            actor: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'control-plane' : 'human',
+          });
+          const after = await board.snapshot();
+          const pushTopicId = after.worker?.topicId ?? topicId;
+          if (pushTopicId) {
+            await cfg.pushWorker?.({
+              runId: board.runId,
+              workerId: after.worker?.workerId,
+              taskId: after.task?.taskId,
+              larkAppId: after.worker?.larkAppId ?? ctx.larkAppId,
+              topicId: pushTopicId,
+              content: `Goal changed. Read BOTMUX_COLLAB_RUN_ID from the collab board, acknowledge the intervention receipt, and adjust your work.\n\nNew goal:\n${newGoal}`,
+            });
+          }
+        }
+      } else if (stopMatch) {
+        await requestStop(board, {
+          reason: stopMatch[1]?.trim() || undefined,
+          topicId,
+          idempotencyPrefix: `msg:${parsed.messageId}:stop`,
+          actor: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'control-plane' : 'human',
+        });
+      }
     }
 
     await cfg.reply(topicId, await renderCard(board, localeForBot(ctx.larkAppId)), 'interactive', ctx.larkAppId);
@@ -405,11 +428,17 @@ export async function handleCollabControlCardAction(data: any, larkAppId: string
 
   try {
     const board = await boardForRun(runId);
+    const snapshot = await board.snapshot();
     const cardMessageId = data?.context?.open_message_id ?? data?.open_message_id ?? 'card';
     if (action === 'collab_goal_change') {
       const goal = String(data?.action?.form_value?.goal ?? '').trim();
       if (!goal) return { toast: { type: 'error', content: 'Goal is empty' } };
-      const snapshot = await board.snapshot();
+      if (isTerminalStatus(snapshot.status)) {
+        return { toast: { type: 'info', content: `Run already ${snapshot.status}` } };
+      }
+      if (goal === snapshot.goal) {
+        return { toast: { type: 'info', content: 'Goal unchanged' } };
+      }
       const topicId = topicIdForRun(larkAppId, runId);
       await requestGoalChange(board, {
         goal,
@@ -418,17 +447,21 @@ export async function handleCollabControlCardAction(data: any, larkAppId: string
         idempotencyPrefix: `card:${cardMessageId}:goal:${goal}`,
         actor: 'human',
       });
-      if (topicId) {
+      const pushTopicId = snapshot.worker?.topicId ?? topicId;
+      if (pushTopicId) {
         await requireConfig().pushWorker?.({
           runId,
           workerId: snapshot.worker?.workerId,
           taskId: snapshot.task?.taskId,
-          larkAppId,
-          topicId,
+          larkAppId: snapshot.worker?.larkAppId ?? larkAppId,
+          topicId: pushTopicId,
           content: `Goal changed from the control card. Read BOTMUX_COLLAB_RUN_ID from the collab board, acknowledge the intervention receipt, and adjust your work.\n\nNew goal:\n${goal}`,
         });
       }
     } else if (action === 'collab_stop') {
+      if (isTerminalStatus(snapshot.status)) {
+        return { toast: { type: 'info', content: `Run already ${snapshot.status}` } };
+      }
       await requestStop(board, {
         reason: 'Stopped from control card',
         idempotencyPrefix: `card:${cardMessageId}:stop`,

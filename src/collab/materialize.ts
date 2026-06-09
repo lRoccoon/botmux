@@ -90,6 +90,8 @@ export function materialize(runId: string, events: CollabEvent[]): BoardSnapshot
           taskId: e.payload.taskId,
           phase: 'allocated',
           leaseExpiresAt: e.payload.leaseExpiresAt,
+          larkAppId: e.payload.larkAppId,
+          topicId: e.payload.topicId,
         };
         break;
       case 'WorkerTurnStarted':

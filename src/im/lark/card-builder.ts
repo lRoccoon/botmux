@@ -207,8 +207,15 @@ export function buildCollabControlCard(snapshot: BoardSnapshot, locale?: Locale)
     ? `${snapshot.budget.remaining}/${snapshot.budget.limit} ${snapshot.budget.unit}`
     : 'n/a';
   const worker = snapshot.worker
-    ? `${snapshot.worker.workerId} · ${snapshot.worker.phase}`
+    ? `${snapshot.worker.workerId} · ${snapshot.worker.phase}` +
+      (snapshot.worker.topicId ? ` · @${snapshot.worker.topicId}` : '')
     : 'unassigned';
+  // A terminal run accepts no more goal-change / stop interventions — rendering
+  // the form on a finished run is what let the operator spam the worker queue.
+  const terminal =
+    snapshot.status === 'succeeded' ||
+    snapshot.status === 'failed' ||
+    snapshot.status === 'stopped';
   const task = snapshot.task
     ? `${snapshot.task.title} · ${snapshot.task.status}`
     : 'no task';
@@ -229,52 +236,60 @@ export function buildCollabControlCard(snapshot: BoardSnapshot, locale?: Locale)
     `**Progress** ${escapeMd(progress)}` +
     (pendingInterventions ? `\n\n**Interventions**\n${escapeMd(pendingInterventions)}` : '');
 
+  const actions: any[] = [
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: 'Refresh' },
+      type: 'default',
+      value: { action: 'collab_refresh', run_id: snapshot.runId },
+    },
+  ];
+  if (!terminal) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: 'Stop' },
+      type: 'danger',
+      value: { action: 'collab_stop', run_id: snapshot.runId },
+    });
+  }
+
+  const elements: any[] = [{ tag: 'markdown', content: body }];
+  if (terminal) {
+    elements.push({
+      tag: 'markdown',
+      content: `_Run ${snapshot.status}; goal/stop controls disabled. Start a new run to continue._`,
+    });
+  } else {
+    elements.push({
+      tag: 'form',
+      name: 'collab_goal_form',
+      elements: [
+        {
+          tag: 'input',
+          name: 'goal',
+          default_value: snapshot.goal,
+          placeholder: { tag: 'plain_text', content: 'Goal' },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'Update goal' },
+          type: 'primary',
+          name: 'collab_goal_submit',
+          action_type: 'form_submit',
+          value: { action: 'collab_goal_change', run_id: snapshot.runId },
+        },
+      ],
+    });
+  }
+  elements.push({ tag: 'action', actions });
+
   return JSON.stringify({
     config: { wide_screen_mode: true, update_multi: true },
     header: {
       template: snapshot.status === 'running' || snapshot.status === 'pending' ? 'blue' : 'grey',
       title: { tag: 'plain_text', content: 'Collab control' },
     },
-    elements: [
-      { tag: 'markdown', content: body },
-      {
-        tag: 'form',
-        name: 'collab_goal_form',
-        elements: [
-          {
-            tag: 'input',
-            name: 'goal',
-            default_value: snapshot.goal,
-            placeholder: { tag: 'plain_text', content: 'Goal' },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: 'Update goal' },
-            type: 'primary',
-            name: 'collab_goal_submit',
-            action_type: 'form_submit',
-            value: { action: 'collab_goal_change', run_id: snapshot.runId },
-          },
-        ],
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: 'Refresh' },
-            type: 'default',
-            value: { action: 'collab_refresh', run_id: snapshot.runId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: 'Stop' },
-            type: 'danger',
-            value: { action: 'collab_stop', run_id: snapshot.runId },
-          },
-        ],
-      },
-    ],
+    elements,
   });
 }
 

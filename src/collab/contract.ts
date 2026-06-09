@@ -196,6 +196,13 @@ export const WorkerAllocatedEventSchema = event('WorkerAllocated', z.object({
   taskId: TaskIdSchema,
   /** epoch ms; watchdog reclaims the lease past this. */
   leaseExpiresAt: z.number().int().positive().optional(),
+  /** Where this worker physically runs: its own bot identity + topic/chat
+   *  anchor. Set when the worker is spawned under a pool bot in its own topic
+   *  (P0.1) so the control-plane can route interventions to the worker's
+   *  session instead of colocating it under the control bot. Omitted ⇒ legacy
+   *  colocated-under-control behaviour. */
+  larkAppId: z.string().optional(),
+  topicId: z.string().optional(),
 }));
 export const WorkerTurnStartedEventSchema = event('WorkerTurnStarted', z.object({
   workerId: WorkerIdSchema,
@@ -334,6 +341,11 @@ export interface WorkerState {
   taskId: string;
   phase: 'allocated' | 'running' | 'suspended' | 'lost';
   leaseExpiresAt?: number;
+  /** Worker's own bot identity + topic/chat anchor (P0.1 separate-identity
+   *  routing). The control-plane routes interventions here; null/undefined ⇒
+   *  legacy colocated-under-control worker. */
+  larkAppId?: string;
+  topicId?: string;
 }
 
 export interface ArtifactRef {
