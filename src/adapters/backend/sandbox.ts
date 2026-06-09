@@ -148,27 +148,26 @@ export function seedScopedConfig(cliId: string, scopedHome: string, projectMount
   }
 
   if (scope.claudeTrust && projectMount) seedClaudeTrust(scopedHome, projectMount);
-  rewriteSeededRuntimePaths(dstRoot);
+  scrubSeededHooks(dstRoot);
   return true;
 }
 
-/** Any seeded config that references the host botmux runtime (e.g. claude
- *  settings.json's AskUserQuestion → Lark-card hook `<node> <host>/dist/cli.js
- *  hook claude-code`, codex hooks.json) must point at the IN-SANDBOX relocated
- *  runtime — otherwise the host path isn't bound in the sandbox and the hook
- *  fails (exit 127 if even the hardcoded node path differs, else exit 1
- *  "cannot find cli.js"). Rewrite any `…/dist/cli.js` → /botmux-runtime/dist/cli.js
- *  and any absolute `…/bin/node` → `node` (resolved on the sandbox PATH). */
-function rewriteSeededRuntimePaths(dstRoot: string): void {
-  const fixStr = (s: string): string =>
-    s.replace(/"[^"]*\/dist\/cli\.js"/g, '"/botmux-runtime/dist/cli.js"')
-     .replace(/"[^"]*\/bin\/node"/g, '"node"');
-  const walk = (o: any): any => {
-    if (typeof o === 'string') return o.includes('/dist/cli.js') ? fixStr(o) : o;
-    if (Array.isArray(o)) return o.map(walk);
-    if (o && typeof o === 'object') { for (const k of Object.keys(o)) o[k] = walk(o[k]); return o; }
-    return o;
-  };
+/** Fix the hooks in the seeded config (claude settings.json, codex hooks.json …)
+ *  so they don't fail inside the sandbox:
+ *   - botmux's OWN hook (`<node> <host>/dist/cli.js hook <cli>`, e.g. claude's
+ *     AskUserQuestion → Lark card) → KEEP, but rewrite its paths to the
+ *     in-sandbox relocated runtime: `…/dist/cli.js` → /botmux-runtime/dist/cli.js,
+ *     absolute `…/bin/node` → `node` (resolved on the sandbox PATH).
+ *   - every OTHER hook (the owner's host tooling, e.g. `/root/.flux/bin/...`) →
+ *     STRIP. Those binaries aren't bound in the sandbox, so they'd exit 127
+ *     ("command not found") and spam the CLI's hook UI; the owner's personal
+ *     host hooks also shouldn't run inside an isolated oncall sandbox. */
+function scrubSeededHooks(dstRoot: string): void {
+  const isBotmuxHook = (cmd: unknown): cmd is string =>
+    typeof cmd === 'string' && /\/cli\.js\b/.test(cmd) && /\bhook\b/.test(cmd);
+  const rewrite = (cmd: string): string =>
+    cmd.replace(/"[^"]*\/dist\/cli\.js"/g, '"/botmux-runtime/dist/cli.js"')
+       .replace(/"[^"]*\/bin\/node"/g, '"node"');
   let names: string[] = [];
   try { names = readdirSync(dstRoot); } catch { return; }
   for (const name of names) {
@@ -176,11 +175,26 @@ function rewriteSeededRuntimePaths(dstRoot: string): void {
     const p = join(dstRoot, name);
     let data: any;
     try { data = JSON.parse(readFileSync(p, 'utf8')); } catch { continue; }
-    const before = JSON.stringify(data);
-    data = walk(data);
-    if (JSON.stringify(data) !== before) {
-      try { writeFileSync(p, JSON.stringify(data, null, 2)); } catch { /* */ }
+    if (!data?.hooks || typeof data.hooks !== 'object') continue;
+    let changed = false;
+    for (const event of Object.keys(data.hooks)) {
+      const entries = data.hooks[event];
+      if (!Array.isArray(entries)) continue;
+      const keptEntries: any[] = [];
+      for (const entry of entries) {
+        const hooks = Array.isArray(entry?.hooks) ? entry.hooks : [];
+        const keptHooks = hooks.filter((h: any) => {
+          if (!isBotmuxHook(h?.command)) { changed = true; return false; }   // strip host hook
+          const nc = rewrite(h.command); if (nc !== h.command) { h.command = nc; changed = true; }
+          return true;
+        });
+        if (keptHooks.length) { entry.hooks = keptHooks; keptEntries.push(entry); }
+        else changed = true;
+      }
+      if (keptEntries.length) data.hooks[event] = keptEntries;
+      else { delete data.hooks[event]; changed = true; }
     }
+    if (changed) { try { writeFileSync(p, JSON.stringify(data, null, 2)); } catch { /* */ } }
   }
 }
 
