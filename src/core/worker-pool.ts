@@ -41,6 +41,7 @@ import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingRes
 import { buildTerminalUrl } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import { openCollabBoard, runReferee } from '../collab/index.js';
+import { releaseCollabWorker } from '../collab/worker-pool-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -2046,6 +2047,7 @@ async function handleCollabTurnFinished(
   logger.info(`[${tag}] collab referee verdict=${result.verdict}${result.exitCode !== undefined ? ` exit=${result.exitCode}` : ''}`);
   const snapshot = await board.snapshot();
   if (snapshot.status !== 'running' && snapshot.status !== 'pending') {
+    await releaseCollabWorker(config.session.dataDir, collab.runId);
     await closeSession(ds.session.sessionId);
     logger.info(`[${tag}] collab run terminal (${snapshot.status}); session closed`);
   }

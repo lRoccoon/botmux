@@ -3,7 +3,7 @@ import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
-import { loadBotConfigs } from '../../bot-registry.js';
+import { loadBotConfigs, isUserVisibleBotConfig } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
@@ -40,7 +40,7 @@ let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<ty
 function getAllBotClients() {
   if (!allBotClients) {
     allBotClients = loadBotConfigs()
-      .filter((cfg) => cfg.handler !== 'control-plane')
+      .filter(isUserVisibleBotConfig)
       .map((cfg) => ({
         appId: cfg.larkAppId,
         cliId: cfg.cliId,

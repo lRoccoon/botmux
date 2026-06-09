@@ -26,6 +26,7 @@ vi.mock('../src/bot-registry.js', () => ({
     { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
     { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
   ]),
+  isUserVisibleBotConfig: (cfg: { handler?: string }) => !cfg.handler || cfg.handler === 'cli',
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({

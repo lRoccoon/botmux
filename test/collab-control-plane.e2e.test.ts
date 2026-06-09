@@ -11,6 +11,7 @@ import {
   type SpawnCollabWorkerInput,
 } from '../src/core/control-plane.js';
 import { openCollabBoard } from '../src/collab/index.js';
+import { addCollabWorker, readCollabWorkerPool } from '../src/collab/worker-pool-store.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
 type Reply = { anchor: string; msgType?: string; larkAppId?: string; content: string };
@@ -126,6 +127,51 @@ describe('collab control-plane integration seam', () => {
 
     const index = JSON.parse(readFileSync(join(dataDir, 'collab/control-topic-index.json'), 'utf-8'));
     expect(index.topics['cli_control::om_topic_root']).toBe(spawns[0].runId);
+  });
+
+  it('leases a pooled collab-worker identity and writes its route into WorkerAllocated', async () => {
+    await addCollabWorker(dataDir, {
+      id: 'coder-1',
+      larkAppId: 'worker_app',
+      chatId: 'oc_worker_room',
+      label: 'Coder 1',
+      cliId: 'codex',
+    });
+
+    await handleCollabControlMessage(rawTextEvent('/collab use pool | test: test -f done.txt', 'om_seed_pool'), ctx());
+
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]).toMatchObject({
+      larkAppId: 'worker_app',
+      chatId: 'oc_worker_room',
+      topicId: 'oc_worker_room',
+      workerId: 'coder-1',
+      taskId: 'task-1',
+    });
+
+    const board = openCollabBoard(spawns[0].runId, { baseDir: spawns[0].baseDir });
+    const snapshot = await board.snapshot();
+    expect(snapshot.worker).toMatchObject({
+      workerId: 'coder-1',
+      larkAppId: 'worker_app',
+      topicId: 'oc_worker_room',
+      phase: 'running',
+    });
+
+    let pool = readCollabWorkerPool(dataDir);
+    expect(pool.workers[0]).toMatchObject({ id: 'coder-1', status: 'leased', leasedBy: spawns[0].runId });
+
+    await handleCollabControlCardAction({
+      operator: { open_id: 'ou_human' },
+      context: { open_message_id: 'om_card_stop_pool' },
+      action: {
+        value: { action: 'collab_stop', run_id: spawns[0].runId },
+      },
+    }, 'cli_control');
+
+    pool = readCollabWorkerPool(dataDir);
+    expect(pool.workers[0]).toMatchObject({ id: 'coder-1', status: 'available' });
+    expect(pool.workers[0].leasedBy).toBeUndefined();
   });
 
   it('handles control-card goal changes as typed events, delivered receipt, and worker push', async () => {

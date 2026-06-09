@@ -1,4 +1,4 @@
-import { loadBotConfigs, getAllBots } from '../../bot-registry.js';
+import { loadBotConfigs, getAllBots, isUserVisibleBotConfig } from '../../bot-registry.js';
 import { EventLog } from '../../workflows/events/append.js';
 import { loadWorkflowDefinition } from '../../workflows/loader.js';
 import { getRunsDir } from '../../workflows/runs-dir.js';
@@ -234,7 +234,7 @@ export function createWorkflowRunId(workflowId: string, nowMs = Date.now()): str
 
 export function resolveBotSnapshot(botName: string): BotSnapshot | undefined {
   const registered = getAllBots().find((bot) =>
-    bot.config.handler !== 'control-plane' &&
+    isUserVisibleBotConfig(bot.config) &&
     (botMatches(bot.config.name, botName) ||
       botMatches(bot.botName, botName) ||
       botMatches(bot.config.larkAppId, botName))
@@ -243,7 +243,7 @@ export function resolveBotSnapshot(botName: string): BotSnapshot | undefined {
 
   try {
     const cfg = loadBotConfigs().find((bot) =>
-      bot.handler !== 'control-plane' &&
+      isUserVisibleBotConfig(bot) &&
       (botMatches(bot.name, botName) || botMatches(bot.larkAppId, botName))
     );
     return cfg ? snapshotFromConfig(botName, cfg) : undefined;

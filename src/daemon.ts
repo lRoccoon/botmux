@@ -13,7 +13,7 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { chatHasAllowedUser, resolveGroupJoinPrompt } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, isDaemonBotConfig, isUserVisibleBotConfig, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -1269,7 +1269,7 @@ function workflowSpawnFn(): WorkerSpawnFn {
   const daemonDeps = createWorkflowDaemonSpawn({
     resolveLarkCredentials: (botName) => {
       const bot = getAllBots().find(
-        (b) => b.config.name === botName || b.botName === botName || b.config.larkAppId === botName,
+        (b) => isUserVisibleBotConfig(b.config) && (b.config.name === botName || b.botName === botName || b.config.larkAppId === botName),
       );
       if (bot) {
         return {
@@ -1278,8 +1278,8 @@ function workflowSpawnFn(): WorkerSpawnFn {
         };
       }
       const siblingConfigs = loadBotConfigs();
-      const sibling = siblingConfigs.find(
-        (c) => c.name === botName || c.larkAppId === botName,
+      const sibling = siblingConfigs.find((c) =>
+        isUserVisibleBotConfig(c) && (c.name === botName || c.larkAppId === botName)
       );
       if (!sibling) {
         throw new Error(`workflow: bot '${botName}' not found in registry`);
@@ -3188,13 +3188,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   ensureCjkFontsInstalled();
 
   // Load the assigned bot (one daemon per bot)
-  const botConfigs = loadBotConfigs();
+  const allBotConfigs = loadBotConfigs();
+  const botConfigs = allBotConfigs.filter(isDaemonBotConfig);
   const idx = botIndex ?? 0;
   if (idx < 0 || idx >= botConfigs.length) {
     throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} bot(s) configured`);
   }
   const cfg = botConfigs[idx];
   registerBot(cfg);
+  if (cfg.handler === 'control-plane') {
+    for (const workerCfg of allBotConfigs.filter((c) => c.handler === 'collab-worker')) {
+      registerBot(workerCfg);
+    }
+  }
   // 启动即为本 bot 的 CLI 预装环境（skills + askUserQuestion hook + 兜底 skill）。
   // 关键：adopt 路径会跳过 ensureCliSkills，若重启后第一次就是 adopt 一个外部
   // claude 会话，必须保证此时全局 ~/.claude/settings.json 已带 hook——否则"全局
@@ -3334,6 +3340,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Per-bot initialization
   for (const bot of getAllBots()) {
     const cfg = bot.config;
+    if (cfg.handler === 'collab-worker') {
+      refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
+      probeBotOpenId(cfg.larkAppId).then(() => {
+        writeBotInfoFile(config.session.dataDir);
+      }).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] collab-worker bot open_id probe failed (will retry): ${err.message}`);
+      });
+      continue;
+    }
 
     // Refresh CLI version per bot's cliId
     refreshCliVersion(cfg.cliId, cfg.cliPathOverride);

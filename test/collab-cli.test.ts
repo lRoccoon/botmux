@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openCollabBoard } from '../src/collab/board.js';
 import { cmdCollab } from '../src/collab/cli.js';
 import type { CollabEventDraft } from '../src/collab/contract.js';
+import { readCollabWorkerPool } from '../src/collab/worker-pool-store.js';
 
 const RUN = 'run-cli-1';
 
@@ -70,5 +71,29 @@ describe('collab CLI (worker board access)', () => {
     log.mockRestore();
     const hist = await board.history();
     expect(hist.filter((e) => e.type === 'InterventionReceiptUpdated')).toHaveLength(1);
+  });
+
+  it('pool add validates collab-worker config and writes the pool store', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'collab-pool-'));
+    const botsFile = join(dataDir, 'bots.json');
+    writeFileSync(botsFile, JSON.stringify([
+      { larkAppId: 'worker_app', larkAppSecret: 'secret', handler: 'collab-worker', cliId: 'codex' },
+    ]));
+    process.env = {
+      ...process.env,
+      SESSION_DATA_DIR: dataDir,
+      BOTS_CONFIG: botsFile,
+    };
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await cmdCollab('pool', ['add', '--id', 'coder-1', '--lark-app-id', 'worker_app', '--chat-id', 'oc_worker', '--label', 'Coder']);
+    await cmdCollab('pool', ['list', '--json', '--compact']);
+
+    const listed = JSON.parse(log.mock.calls.at(-1)?.[0] as string);
+    log.mockRestore();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({ id: 'coder-1', larkAppId: 'worker_app', chatId: 'oc_worker', status: 'available', cliId: 'codex' });
+    expect(readCollabWorkerPool(dataDir).workers[0]).toMatchObject({ id: 'coder-1' });
+    rmSync(dataDir, { recursive: true, force: true });
   });
 });

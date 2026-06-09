@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
-import { loadBotConfigs } from '../bot-registry.js';
+import { loadBotConfigs, isUserVisibleBotConfig } from '../bot-registry.js';
 import { canonicalJsonStringify, computeRevisionId } from './definition.js';
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
@@ -148,7 +148,7 @@ function missingBotMessage(
   }
   try {
     for (const cfg of loadBotConfigs()) {
-      if (cfg.handler !== 'control-plane') availableIds.add(cfg.larkAppId);
+      if (isUserVisibleBotConfig(cfg)) availableIds.add(cfg.larkAppId);
     }
   } catch {
     // Missing/invalid bots.json should not hide the original workflow error.

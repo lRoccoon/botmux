@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AcceptanceCriteria, CollabBoard, CollabEventDraft } from '../collab/contract.js';
 import { getWorkerProtocolText, parseCollabIntake } from '../collab/index.js';
+import { leaseCollabWorker, readCollabWorkerPool, releaseCollabWorker } from '../collab/worker-pool-store.js';
 import { buildCollabControlCard } from '../im/lark/card-builder.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions } from '../im/lark/message-parser.js';
 import type { RoutingContext } from '../im/lark/event-dispatcher.js';
@@ -146,6 +147,33 @@ async function boardForTopic(larkAppId: string, topicId: string): Promise<{ boar
 
 function workerIdForRun(runId: string): string {
   return `${runId}-worker-1`;
+}
+
+async function allocateWorkerTarget(runId: string, fallback: { larkAppId: string; chatId: string; topicId: string }) {
+  const cfg = requireConfig();
+  const pool = readCollabWorkerPool(cfg.dataDir);
+  if (pool.workers.length === 0) {
+    return {
+      workerId: workerIdForRun(runId),
+      larkAppId: fallback.larkAppId,
+      chatId: fallback.chatId,
+      topicId: fallback.topicId,
+      pooled: false,
+      leaseExpiresAt: Date.now() + 30 * 60 * 1000,
+    };
+  }
+  const leased = await leaseCollabWorker(cfg.dataDir, { runId });
+  if (!leased) {
+    throw new Error('collab worker pool has no available worker');
+  }
+  return {
+    workerId: leased.id,
+    larkAppId: leased.larkAppId,
+    chatId: leased.chatId,
+    topicId: leased.topicId ?? leased.chatId,
+    pooled: true,
+    leaseExpiresAt: leased.leaseExpiresAt,
+  };
 }
 
 function topicIdForRun(larkAppId: string, runId: string): string | undefined {
@@ -297,20 +325,26 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
     });
     const snapshotAfterCreate = await board.snapshot();
     if (!snapshotAfterCreate.worker && snapshotAfterCreate.task) {
-      const workerId = workerIdForRun(board.runId);
+      const worker = await allocateWorkerTarget(board.runId, {
+        larkAppId: ctx.larkAppId,
+        chatId: ctx.chatId,
+        topicId,
+      });
       await append(board, {
         runId: board.runId,
         type: 'WorkerAllocated',
         actor: 'control-plane',
         idempotencyKey: `worker-allocated:${board.runId}`,
         affectedPaths: ['worker'],
-        topicId,
+        topicId: worker.topicId,
         taskId: snapshotAfterCreate.task.taskId,
-        workerId,
+        workerId: worker.workerId,
         payload: {
-          workerId,
+          workerId: worker.workerId,
           taskId: snapshotAfterCreate.task.taskId,
-          leaseExpiresAt: Date.now() + 30 * 60 * 1000,
+          leaseExpiresAt: worker.leaseExpiresAt,
+          larkAppId: worker.pooled ? worker.larkAppId : undefined,
+          topicId: worker.pooled ? worker.topicId : undefined,
         },
       });
       await append(board, {
@@ -319,23 +353,23 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
         actor: 'control-plane',
         idempotencyKey: `task-assigned:${board.runId}`,
         affectedPaths: ['task'],
-        topicId,
+        topicId: worker.topicId,
         taskId: snapshotAfterCreate.task.taskId,
-        workerId,
+        workerId: worker.workerId,
         payload: {
           taskId: snapshotAfterCreate.task.taskId,
-          workerId,
+          workerId: worker.workerId,
         },
       });
       if (cfg.spawnWorker) {
         await cfg.spawnWorker({
           runId: board.runId,
-          workerId,
+          workerId: worker.workerId,
           taskId: snapshotAfterCreate.task.taskId,
           baseDir: collabBaseDir(),
-          larkAppId: ctx.larkAppId,
-          chatId: ctx.chatId,
-          topicId,
+          larkAppId: worker.larkAppId,
+          chatId: worker.chatId,
+          topicId: worker.topicId,
           goal: snapshotAfterCreate.goal,
           prompt:
             `${getWorkerProtocolText()}\n\n` +
@@ -350,10 +384,10 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
           actor: 'control-plane',
           idempotencyKey: `worker-turn-started:${board.runId}`,
           affectedPaths: ['worker'],
-          topicId,
+          topicId: worker.topicId,
           taskId: snapshotAfterCreate.task.taskId,
-          workerId,
-          payload: { workerId },
+          workerId: worker.workerId,
+          payload: { workerId: worker.workerId },
         });
       }
     }
@@ -398,6 +432,7 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
           idempotencyPrefix: `msg:${parsed.messageId}:stop`,
           actor: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'control-plane' : 'human',
         });
+        await releaseCollabWorker(cfg.dataDir, board.runId);
       }
     }
 
@@ -467,6 +502,7 @@ export async function handleCollabControlCardAction(data: any, larkAppId: string
         idempotencyPrefix: `card:${cardMessageId}:stop`,
         actor: 'human',
       });
+      await releaseCollabWorker(requireConfig().dataDir, runId);
     }
     return JSON.parse(await renderCard(board, localeForBot(larkAppId)));
   } catch (err) {

@@ -51,7 +51,7 @@ export function formatBotInfoEntriesForCli(
   currentLarkAppId: string,
 ): BotListOutputEntry[] {
   return botEntries
-    .filter((b) => b.botOpenId && b.handler !== 'control-plane')
+    .filter((b) => b.botOpenId && b.handler !== 'control-plane' && b.handler !== 'collab-worker')
     .map((b) => ({
       name: b.botName ?? b.cliId,
       openId: b.botOpenId!,

@@ -228,7 +228,7 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
 
 function ecosystemConfig(): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
-  const bots = loadBotsJson();
+  const bots = loadBotsJson().filter((bot: any) => bot?.handler !== 'collab-worker');
   ensureUniqueBotProcessNames(bots);
 
   const baseApp = {
@@ -3963,7 +3963,7 @@ botmux create-group — 用一组机器人新建飞书群
   let botConfigs: Array<{ larkAppId: string; cliId: string }>;
   try {
     botConfigs = loadBotConfigs()
-      .filter(c => c.handler !== 'control-plane')
+      .filter(c => c.handler !== 'control-plane' && c.handler !== 'collab-worker')
       .map(c => ({ larkAppId: c.larkAppId, cliId: c.cliId }));
   } catch (err: any) {
     console.error(`加载 bots.json 失败: ${err?.message ?? err}`);
@@ -3979,7 +3979,9 @@ botmux create-group — 用一组机器人新建飞书群
   const resolved = resolveBotRefs(
     botRefs,
     botConfigs,
-    botInfoEntries.filter(b => b.handler !== 'control-plane').map(b => ({ larkAppId: b.larkAppId, botName: b.botName })),
+    botInfoEntries
+      .filter(b => b.handler !== 'control-plane' && b.handler !== 'collab-worker')
+      .map(b => ({ larkAppId: b.larkAppId, botName: b.botName })),
   );
 
   for (const w of resolved.ambiguousWarnings) console.error(`⚠️  ${w}`);
@@ -4998,6 +5000,7 @@ switch (command) {
     break;
   }
   case 'collab': {
+    process.env.SESSION_DATA_DIR ??= resolveDataDir();
     const { cmdCollab } = await import('./collab/cli.js');
     await cmdCollab(process.argv[3] ?? '', process.argv.slice(4));
     break;

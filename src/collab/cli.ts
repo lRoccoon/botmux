@@ -15,8 +15,16 @@
  *        append --file <draft.json>     (generic, for ops/power use)
  */
 import { readFileSync } from 'node:fs';
+import { config } from '../config.js';
+import { loadBotConfigs } from '../bot-registry.js';
 import { openCollabBoard } from './board.js';
 import type { CollabEventDraft, TaskStatus, ReceiptState, BoardPath } from './contract.js';
+import {
+  addCollabWorker,
+  collabWorkerPoolPath,
+  readCollabWorkerPool,
+  removeCollabWorker,
+} from './worker-pool-store.js';
 
 // ─── tiny flag parser (`--key value` and bare `--flag`) ──────────────────────
 function parseFlags(args: string[]): Record<string, string | boolean> {
@@ -59,6 +67,10 @@ export async function cmdCollab(sub: string, args: string[]): Promise<void> {
   const flags = parseFlags(args);
 
   switch (sub) {
+    case 'pool': {
+      await cmdPool(args);
+      return;
+    }
     case 'snapshot': {
       const { board } = resolveCtx(flags);
       console.log(JSON.stringify(await board.snapshot(), null, flags.compact ? 0 : 2));
@@ -137,13 +149,76 @@ export async function cmdCollab(sub: string, args: string[]): Promise<void> {
 
     default:
       console.error(
-        'usage: botmux collab <snapshot|revision|history|artifact|status|receipt|append> [flags]\n' +
+        'usage: botmux collab <pool|snapshot|revision|history|artifact|status|receipt|append> [flags]\n' +
+        '  pool: pool add|list|remove|status\n' +
         '  read:  snapshot [--compact] | revision | history\n' +
         '  write: artifact --path <p> [--kind file|diff|log|note] [--sha <h>] [--note <s>]\n' +
         '         status --status <open|in_progress|blocked|done|failed> [--note <s>]\n' +
         '         receipt --intervention <eventId> --state <delivered|read|applied|superseded>\n' +
         '         append --file <draft.json>   (generic)\n' +
         '  context: --run/--worker/--task/--base-dir override BOTMUX_COLLAB_* env',
+      );
+      process.exit(sub ? 1 : 0);
+  }
+}
+
+async function cmdPool(args: string[]): Promise<void> {
+  const sub = args[0] ?? '';
+  const flags = parseFlags(args.slice(1));
+  const dataDir = config.session.dataDir;
+
+  switch (sub) {
+    case 'add': {
+      const id = str(flags.id) ?? fail('pool add: --id required');
+      const larkAppId = str(flags['lark-app-id']) ?? str(flags.app) ?? fail('pool add: --lark-app-id required');
+      const chatId = str(flags['chat-id']) ?? fail('pool add: --chat-id required');
+      const cfg = loadBotConfigs().find((c) => c.larkAppId === larkAppId);
+      if (!cfg) fail(`pool add: larkAppId ${larkAppId} not found in bots.json`);
+      if (cfg.handler !== 'collab-worker') {
+        fail(`pool add: ${larkAppId} must have handler:"collab-worker" in bots.json`);
+      }
+      const entry = await addCollabWorker(dataDir, {
+        id,
+        larkAppId,
+        chatId,
+        topicId: str(flags['topic-id']) ?? chatId,
+        label: str(flags.label),
+        cliId: cfg.cliId,
+      });
+      console.log(JSON.stringify(entry, null, flags.compact ? 0 : 2));
+      return;
+    }
+    case 'list':
+    case 'status': {
+      const pool = readCollabWorkerPool(dataDir);
+      if (flags.json) {
+        console.log(JSON.stringify(pool.workers, null, flags.compact ? 0 : 2));
+        return;
+      }
+      if (pool.workers.length === 0) {
+        console.log(`No collab workers registered (${collabWorkerPoolPath(dataDir)})`);
+        return;
+      }
+      for (const w of pool.workers) {
+        const lease = w.leasedBy ? ` leasedBy=${w.leasedBy}${w.leaseExpiresAt ? ` until=${new Date(w.leaseExpiresAt).toISOString()}` : ''}` : '';
+        console.log(`${w.id}\t${w.status}\t${w.label ?? '-'}\t${w.larkAppId}\t${w.chatId}${w.topicId && w.topicId !== w.chatId ? `\ttopic=${w.topicId}` : ''}${lease}`);
+      }
+      return;
+    }
+    case 'remove': {
+      const id = str(flags.id) ?? args[1] ?? fail('pool remove: --id required');
+      const removed = await removeCollabWorker(dataDir, id);
+      console.log(removed ? 'removed' : 'not-found');
+      return;
+    }
+    default:
+      console.error(
+        'usage: botmux collab pool <add|list|remove|status> [flags]\n' +
+        '  add --id <workerId> --lark-app-id <appId> --chat-id <oc_xxx> [--label <name>] [--topic-id <anchor>]\n' +
+        '      requires the app in bots.json with handler:"collab-worker"\n' +
+        '  list [--json] [--compact]\n' +
+        '  status [--json] [--compact]\n' +
+        '  remove --id <workerId>',
       );
       process.exit(sub ? 1 : 0);
   }

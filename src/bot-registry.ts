@@ -10,7 +10,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
-export type BotHandler = 'cli' | 'control-plane';
+export type BotHandler = 'cli' | 'control-plane' | 'collab-worker';
 
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
@@ -43,6 +43,7 @@ export interface BotConfig {
    * Runtime handler for inbound Lark events.
    *   - cli (default): existing botmux CLI worker bridge.
    *   - control-plane: deterministic collab supervisor; no CLI worker is forked.
+   *   - collab-worker: pool-only worker identity; hidden from user-facing bot lists and auto-start routes.
    */
   handler?: BotHandler;
   /**
@@ -352,6 +353,14 @@ export function getAllBots(): BotState[] {
   return Array.from(bots.values());
 }
 
+export function isUserVisibleBotConfig(cfg: Pick<BotConfig, 'handler'>): boolean {
+  return cfg.handler === undefined || cfg.handler === 'cli';
+}
+
+export function isDaemonBotConfig(cfg: Pick<BotConfig, 'handler'>): boolean {
+  return cfg.handler !== 'collab-worker';
+}
+
 /** Lookup the oncall binding for a given bot+chat, if any. */
 export function findOncallChat(larkAppId: string, chatId: string): OncallChat | undefined {
   const bot = bots.get(larkAppId);
@@ -656,7 +665,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     configs.push({
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
-      handler: entry.handler === 'control-plane' ? 'control-plane' : undefined,
+      handler: entry.handler === 'control-plane' || entry.handler === 'collab-worker' ? entry.handler : undefined,
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
