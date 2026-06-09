@@ -31,6 +31,20 @@ export type PushCollabWorkerInput = {
   topicId: string;
   content: string;
 };
+export type CollabWorkerLostInput = {
+  runId: string;
+  workerId: string;
+  taskId: string;
+  baseDir?: string;
+  larkAppId: string;
+  chatId: string;
+  topicId: string;
+  ownerOpenId?: string;
+  sessionId?: string;
+  workerPid?: number;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+};
 
 type ControlPlaneConfig = {
   dataDir: string;
@@ -38,6 +52,7 @@ type ControlPlaneConfig = {
   boardFactory?: BoardFactory;
   spawnWorker?: (input: SpawnCollabWorkerInput) => Promise<void>;
   pushWorker?: (input: PushCollabWorkerInput) => Promise<void>;
+  maxWorkerReallocations?: number;
 };
 
 type TopicIndex = {
@@ -46,6 +61,7 @@ type TopicIndex = {
 
 let configured: ControlPlaneConfig | null = null;
 const boards = new Map<string, Promise<CollabBoard>>();
+const DEFAULT_MAX_WORKER_REALLOCATIONS = 3;
 
 export function configureCollabControlPlane(cfg: ControlPlaneConfig): void {
   configured = cfg;
@@ -191,6 +207,14 @@ async function append(board: CollabBoard, draft: CollabEventDraft): Promise<stri
   return res.event.eventId;
 }
 
+function workerAssignmentPrompt(goal: string, task: { title: string; taskId: string }, prefix?: string): string {
+  return `${getWorkerProtocolText()}\n\n` +
+    `---\n${prefix ? `${prefix}\n\n` : ''}` +
+    `Assigned task: ${task.title}\n` +
+    `Task id: ${task.taskId}\n\n` +
+    `Goal:\n${goal}`;
+}
+
 async function ensureRunCreated(board: CollabBoard, input: {
   goal: string;
   acceptanceCriteria: AcceptanceCriteria;
@@ -227,6 +251,176 @@ async function ensureRunCreated(board: CollabBoard, input: {
       spec: input.goal,
     },
   });
+}
+
+function lostEventSuffix(input: CollabWorkerLostInput): string {
+  return [
+    input.sessionId ?? 'session',
+    input.workerPid ?? 'pid',
+    input.exitCode ?? 'null',
+    input.signal ?? 'none',
+  ].join(':');
+}
+
+export async function handleCollabWorkerLost(input: CollabWorkerLostInput): Promise<'ignored' | 'reallocated' | 'failed'> {
+  const cfg = requireConfig();
+  const board = await boardForRun(input.runId);
+  const before = await board.snapshot();
+  if (isTerminalStatus(before.status)) {
+    logger.info(`[collab-control] ignore worker loss on terminal run ${input.runId} (${before.status})`);
+    return 'ignored';
+  }
+  if (!before.task || !before.worker || before.worker.workerId !== input.workerId) {
+    logger.info(`[collab-control] ignore stale worker loss run=${input.runId} worker=${input.workerId}`);
+    return 'ignored';
+  }
+
+  const suffix = lostEventSuffix(input);
+  await append(board, {
+    runId: input.runId,
+    type: 'WorkerLost',
+    actor: 'system',
+    idempotencyKey: `worker-lost:${input.runId}:${input.workerId}:${suffix}`,
+    affectedPaths: ['worker'],
+    topicId: input.topicId,
+    taskId: input.taskId,
+    workerId: input.workerId,
+    payload: {
+      workerId: input.workerId,
+      detectedBy: 'crash',
+      reason: input.signal ? `signal:${input.signal}` : `exit_code:${input.exitCode ?? 'null'}`,
+    },
+  });
+
+  const history = await board.history();
+  const lostCount = history.filter((e) => e.type === 'WorkerLost').length;
+  const current = await board.snapshot();
+  const maxReallocations = cfg.maxWorkerReallocations ?? DEFAULT_MAX_WORKER_REALLOCATIONS;
+  if (current.budget?.exhausted) {
+    await append(board, {
+      runId: input.runId,
+      type: 'RunFinished',
+      actor: 'system',
+      idempotencyKey: `worker-lost-budget-exhausted:${input.runId}:${suffix}`,
+      affectedPaths: ['status'],
+      topicId: input.topicId,
+      payload: {
+        outcome: 'budget-exhausted',
+        summary: `Worker ${input.workerId} was lost and budget is exhausted.`,
+      },
+    });
+    await releaseCollabWorker(cfg.dataDir, input.runId);
+    return 'failed';
+  }
+  if (lostCount > maxReallocations) {
+    await append(board, {
+      runId: input.runId,
+      type: 'RunFinished',
+      actor: 'system',
+      idempotencyKey: `worker-unrecoverable:${input.runId}:${suffix}`,
+      affectedPaths: ['status'],
+      topicId: input.topicId,
+      payload: {
+        outcome: 'failed',
+        summary: `Worker ${input.workerId} was lost ${lostCount} times; reallocation cap ${maxReallocations} exceeded.`,
+      },
+    });
+    await releaseCollabWorker(cfg.dataDir, input.runId);
+    return 'failed';
+  }
+
+  // Reuse the current lease/identity for P0. This proves process-level recovery
+  // with a fresh worker reading the board, and works even with a one-worker pool.
+  const isPooledWorker = !!before.worker.larkAppId;
+  const renewedLease = isPooledWorker
+    ? await leaseCollabWorker(cfg.dataDir, { runId: input.runId }).catch(() => null)
+    : null;
+  const worker = {
+    workerId: input.workerId,
+    taskId: before.task.taskId,
+    larkAppId: before.worker.larkAppId ?? input.larkAppId,
+    chatId: input.chatId,
+    topicId: before.worker.topicId ?? input.topicId,
+    leaseExpiresAt: renewedLease?.leaseExpiresAt ?? before.worker.leaseExpiresAt ?? Date.now() + 30 * 60 * 1000,
+    pooled: isPooledWorker,
+  };
+  await append(board, {
+    runId: input.runId,
+    type: 'WorkerAllocated',
+    actor: 'control-plane',
+    idempotencyKey: `worker-reallocated:${input.runId}:${input.workerId}:${suffix}`,
+    affectedPaths: ['worker'],
+    topicId: worker.topicId,
+    taskId: before.task.taskId,
+    workerId: input.workerId,
+    payload: {
+      workerId: input.workerId,
+      taskId: before.task.taskId,
+      leaseExpiresAt: worker.leaseExpiresAt,
+      larkAppId: worker.pooled ? worker.larkAppId : undefined,
+      topicId: worker.pooled ? worker.topicId : undefined,
+    },
+  });
+  await append(board, {
+    runId: input.runId,
+    type: 'TaskAssigned',
+    actor: 'control-plane',
+    idempotencyKey: `task-reassigned:${input.runId}:${input.workerId}:${suffix}`,
+    affectedPaths: ['task'],
+    topicId: worker.topicId,
+    taskId: before.task.taskId,
+    workerId: input.workerId,
+    payload: {
+      taskId: before.task.taskId,
+      workerId: input.workerId,
+    },
+  });
+  try {
+    await cfg.spawnWorker?.({
+      runId: input.runId,
+      workerId: input.workerId,
+      taskId: before.task.taskId,
+      baseDir: input.baseDir ?? collabBaseDir(),
+      larkAppId: worker.larkAppId,
+      chatId: worker.chatId,
+      topicId: worker.topicId,
+      goal: current.goal,
+      prompt: workerAssignmentPrompt(
+        current.goal,
+        before.task,
+        `Previous worker ${input.workerId} was lost. Read the board and resume from the latest snapshot/history.`,
+      ),
+      ownerOpenId: input.ownerOpenId,
+    });
+  } catch (err) {
+    await append(board, {
+      runId: input.runId,
+      type: 'RunFinished',
+      actor: 'system',
+      idempotencyKey: `worker-respawn-failed:${input.runId}:${input.workerId}:${suffix}`,
+      affectedPaths: ['status'],
+      topicId: worker.topicId,
+      payload: {
+        outcome: 'failed',
+        summary: `Worker ${input.workerId} was lost and respawn failed: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    });
+    await releaseCollabWorker(cfg.dataDir, input.runId);
+    return 'failed';
+  }
+  await append(board, {
+    runId: input.runId,
+    type: 'WorkerTurnStarted',
+    actor: 'control-plane',
+    idempotencyKey: `worker-turn-restarted:${input.runId}:${input.workerId}:${suffix}`,
+    affectedPaths: ['worker'],
+    topicId: worker.topicId,
+    taskId: before.task.taskId,
+    workerId: input.workerId,
+    payload: { workerId: input.workerId },
+  });
+  logger.info(`[collab-control] reallocated worker ${input.workerId} for run ${input.runId} after loss (${lostCount}/${maxReallocations})`);
+  return 'reallocated';
 }
 
 async function requestGoalChange(board: CollabBoard, input: {
@@ -371,11 +565,7 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
           chatId: worker.chatId,
           topicId: worker.topicId,
           goal: snapshotAfterCreate.goal,
-          prompt:
-            `${getWorkerProtocolText()}\n\n` +
-            `---\nAssigned task: ${snapshotAfterCreate.task.title}\n` +
-            `Task id: ${snapshotAfterCreate.task.taskId}\n\n` +
-            `Goal:\n${snapshotAfterCreate.goal}`,
+          prompt: workerAssignmentPrompt(snapshotAfterCreate.goal, snapshotAfterCreate.task),
           ownerOpenId: parsed.senderId || undefined,
         });
         await append(board, {

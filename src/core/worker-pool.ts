@@ -54,6 +54,20 @@ export interface WorkerPoolCallbacks {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
+  collabWorkerLost?: (input: {
+    runId: string;
+    workerId: string;
+    taskId: string;
+    baseDir?: string;
+    larkAppId: string;
+    chatId: string;
+    topicId: string;
+    ownerOpenId?: string;
+    sessionId: string;
+    workerPid?: number;
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+  }) => Promise<void>;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
 }
@@ -1987,13 +2001,31 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
     }
   });
 
-  worker.on('exit', (code) => {
-    logger.info(`[${t}] Worker process exited (code: ${code})`);
+  worker.on('exit', (code, signal) => {
+    logger.info(`[${t}] Worker process exited (code: ${code}, signal: ${signal ?? 'none'})`);
     // Only clear ds.worker if it's still THIS worker — during takeover,
     // the old worker's exit fires AFTER the new worker has been assigned.
-    if (ds.worker === worker) {
+    const wasCurrentWorker = ds.worker === worker;
+    if (wasCurrentWorker) {
       ds.worker = null;
       ds.workerPort = null;
+    }
+    const collab = ds.collab ?? ds.session.collab;
+    if (wasCurrentWorker && collab && (code !== 0 || signal)) {
+      const cb = requireCallbacks();
+      cb.collabWorkerLost?.({
+        ...collab,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        topicId: sessionAnchorId(ds),
+        ownerOpenId: ds.ownerOpenId,
+        sessionId: ds.session.sessionId,
+        workerPid: worker.pid,
+        exitCode: code,
+        signal,
+      }).catch((err) => {
+        logger.warn(`[${t}] collab worker reallocation failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
     }
     // Notify dashboard, but only once per session lifecycle. The
     // dashboard-driven `closeSession()` path also publishes; whichever

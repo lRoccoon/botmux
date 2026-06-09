@@ -7,6 +7,7 @@ import {
   configureCollabControlPlane,
   handleCollabControlCardAction,
   handleCollabControlMessage,
+  handleCollabWorkerLost,
   type PushCollabWorkerInput,
   type SpawnCollabWorkerInput,
 } from '../src/core/control-plane.js';
@@ -170,6 +171,156 @@ describe('collab control-plane integration seam', () => {
     }, 'cli_control');
 
     pool = readCollabWorkerPool(dataDir);
+    expect(pool.workers[0]).toMatchObject({ id: 'coder-1', status: 'available' });
+    expect(pool.workers[0].leasedBy).toBeUndefined();
+  });
+
+  it('reallocates a lost pooled worker by respawning the same lease from the board', async () => {
+    await addCollabWorker(dataDir, {
+      id: 'coder-1',
+      larkAppId: 'worker_app',
+      chatId: 'oc_worker_room',
+      label: 'Coder 1',
+      cliId: 'codex',
+    });
+    await handleCollabControlMessage(rawTextEvent('/collab resume after kill | test: test -f done.txt', 'om_seed_realloc'), ctx());
+    const first = spawns[0];
+
+    const result = await handleCollabWorkerLost({
+      runId: first.runId,
+      workerId: first.workerId,
+      taskId: first.taskId,
+      baseDir: first.baseDir,
+      larkAppId: first.larkAppId,
+      chatId: first.chatId,
+      topicId: first.topicId,
+      ownerOpenId: first.ownerOpenId,
+      sessionId: 'sess-worker-1',
+      workerPid: 12345,
+      exitCode: null,
+      signal: 'SIGKILL',
+    });
+
+    expect(result).toBe('reallocated');
+    expect(spawns).toHaveLength(2);
+    expect(spawns[1]).toMatchObject({
+      runId: first.runId,
+      workerId: 'coder-1',
+      larkAppId: 'worker_app',
+      chatId: 'oc_worker_room',
+      topicId: 'oc_worker_room',
+      taskId: 'task-1',
+    });
+    expect(spawns[1].prompt).toContain('Previous worker coder-1 was lost');
+    expect(spawns[1].prompt).toContain('botmux collab snapshot');
+
+    const board = openCollabBoard(first.runId, { baseDir: first.baseDir });
+    const snapshot = await board.snapshot();
+    expect(snapshot.status).toBe('running');
+    expect(snapshot.worker).toMatchObject({ workerId: 'coder-1', phase: 'running' });
+    expect(snapshot.task).toMatchObject({ assignedWorkerId: 'coder-1' });
+    const types = (await board.history()).map((e) => e.type);
+    expect(types.slice(-4)).toEqual([
+      'WorkerLost',
+      'WorkerAllocated',
+      'TaskAssigned',
+      'WorkerTurnStarted',
+    ]);
+    const pool = readCollabWorkerPool(dataDir);
+    expect(pool.workers[0]).toMatchObject({ id: 'coder-1', status: 'leased', leasedBy: first.runId });
+  });
+
+  it('fails the run instead of reallocating past the crash-loop cap', async () => {
+    configureCollabControlPlane({
+      dataDir,
+      reply: async (anchor, content, msgType, larkAppId) => {
+        replies.push({ anchor, content, msgType, larkAppId });
+        return `om_reply_${replies.length}`;
+      },
+      spawnWorker: async (input) => {
+        spawns.push(input);
+      },
+      pushWorker: async (input) => {
+        pushes.push(input);
+      },
+      maxWorkerReallocations: 0,
+    });
+    await handleCollabControlMessage(rawTextEvent('/collab cap recovery | test: test -f done.txt', 'om_seed_cap'), ctx('om_cap_topic'));
+    const first = spawns[0];
+
+    const result = await handleCollabWorkerLost({
+      runId: first.runId,
+      workerId: first.workerId,
+      taskId: first.taskId,
+      baseDir: first.baseDir,
+      larkAppId: first.larkAppId,
+      chatId: first.chatId,
+      topicId: first.topicId,
+      sessionId: 'sess-cap',
+      workerPid: 222,
+      exitCode: 1,
+      signal: null,
+    });
+
+    expect(result).toBe('failed');
+    expect(spawns).toHaveLength(1);
+    const board = openCollabBoard(first.runId, { baseDir: first.baseDir });
+    const snapshot = await board.snapshot();
+    expect(snapshot.status).toBe('failed');
+    const types = (await board.history()).map((e) => e.type);
+    expect(types.slice(-2)).toEqual(['WorkerLost', 'RunFinished']);
+  });
+
+  it('fails and releases the lease when worker respawn itself fails', async () => {
+    await addCollabWorker(dataDir, {
+      id: 'coder-1',
+      larkAppId: 'worker_app',
+      chatId: 'oc_worker_room',
+      label: 'Coder 1',
+      cliId: 'codex',
+    });
+    await handleCollabControlMessage(rawTextEvent('/collab respawn failure | test: test -f done.txt', 'om_seed_respawn_fail'), ctx('om_respawn_fail'));
+    const first = spawns[0];
+    configureCollabControlPlane({
+      dataDir,
+      reply: async (anchor, content, msgType, larkAppId) => {
+        replies.push({ anchor, content, msgType, larkAppId });
+        return `om_reply_${replies.length}`;
+      },
+      spawnWorker: async () => {
+        throw new Error('spawn unavailable');
+      },
+      pushWorker: async (input) => {
+        pushes.push(input);
+      },
+    });
+
+    const result = await handleCollabWorkerLost({
+      runId: first.runId,
+      workerId: first.workerId,
+      taskId: first.taskId,
+      baseDir: first.baseDir,
+      larkAppId: first.larkAppId,
+      chatId: first.chatId,
+      topicId: first.topicId,
+      sessionId: 'sess-respawn-fail',
+      workerPid: 333,
+      exitCode: 1,
+      signal: null,
+    });
+
+    expect(result).toBe('failed');
+    const board = openCollabBoard(first.runId, { baseDir: first.baseDir });
+    const snapshot = await board.snapshot();
+    expect(snapshot.status).toBe('failed');
+    const types = (await board.history()).map((e) => e.type);
+    expect(types.slice(-4)).toEqual([
+      'WorkerLost',
+      'WorkerAllocated',
+      'TaskAssigned',
+      'RunFinished',
+    ]);
+    const pool = readCollabWorkerPool(dataDir);
     expect(pool.workers[0]).toMatchObject({ id: 'coder-1', status: 'available' });
     expect(pool.workers[0].leasedBy).toBeUndefined();
   });

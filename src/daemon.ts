@@ -142,7 +142,7 @@ import {
 } from './core/ask-broker.js';
 import { parseAskBody, resolveAskApprovers } from './core/ask-api.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
-import { configureCollabControlPlane, handleCollabControlMessage, type PushCollabWorkerInput, type SpawnCollabWorkerInput } from './core/control-plane.js';
+import { configureCollabControlPlane, handleCollabControlMessage, handleCollabWorkerLost, type PushCollabWorkerInput, type SpawnCollabWorkerInput } from './core/control-plane.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -3251,6 +3251,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     sessionReply,
     getSessionWorkingDir,
     getActiveCount,
+    collabWorkerLost(input) {
+      if (cfg.handler !== 'control-plane') return Promise.resolve();
+      return handleCollabWorkerLost(input).then(() => undefined);
+    },
     closeSession(ds: DaemonSession) {
       // Route through the dashboard-aware helper so session.exited / session.update
       // events fire for withdrawn-message / crash / adopt-exit teardown paths too,
