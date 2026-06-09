@@ -316,6 +316,28 @@ function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<
   });
 }
 
+/**
+ * 反复询问直到通过校验——一次输错不应中止整个流程、丢掉前面已填的凭证。
+ * - 输入为空且给了 `def` → 用 `def`。
+ * - `validate` 返回字符串 = 错误消息（打印后重问）；返回 null = 通过。
+ * - 用户可输入 `q` / `quit` 主动放弃，返回 null（调用方据此中止且不写盘）。
+ */
+async function askValidated(
+  rl: ReturnType<typeof createInterface>,
+  question: string,
+  validate: (val: string) => string | null,
+  opts?: { def?: string },
+): Promise<string | null> {
+  for (;;) {
+    const raw = (await ask(rl, question)).trim();
+    if (!raw && opts?.def !== undefined) return opts.def;
+    if (raw === 'q' || raw === 'quit') return null;
+    const err = validate(raw);
+    if (err === null) return raw;
+    console.log(`   ⚠️  ${err}（重新输入，或输入 q 放弃）`);
+  }
+}
+
 // ─── Setup helpers ──────────────────────────────────────────────────────────
 
 function printInputHelp(title: string, lines: string[]): void {
@@ -905,7 +927,8 @@ async function writeSingleBotConfig(): Promise<boolean> {
  *
  * 一体完成两段注册：① bots.json 写入 `handler:'collab-worker'` 凭证条目（复用
  * setup 的 obtainCredentials/tenant_access_token 校验链路，不问 allowedUsers）；
- * ② pool store 登记 worker id + 专属群 chatId/topicId。用户拿到的是「凭证 + 池」
+ * ② pool store 登记 worker id + 落地群 chatId/topicId（worker 的 IM 触发/输出通道，
+ * 可多个 worker 共用一个群，非必须每 worker 一个专属群）。用户拿到的是「凭证 + 池」
  * 一把梭，不必再手打 `collab pool add`。
  *
  * 放在 cli.ts（而非 collab/cli.ts）是因为要就地复用 obtainCredentials /
@@ -952,18 +975,34 @@ async function cmdCollabPoolRegister(): Promise<void> {
     if (cliId === null) { console.log('   不写 bots.json。'); return; }
     const workingDir = await ask(rl, '默认工作目录 [~]: ');
 
-    // ③ 池内身份：worker id + 专属群
-    const workerId = (await ask(rl, 'worker id（池内唯一，如 coder-1）: ')).trim();
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(workerId)) {
-      console.log('   ❌ worker id 需匹配 /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/，未写入。');
-      return;
-    }
-    if (readCollabWorkerPool(dataDir).workers.some(w => w.id === workerId)) {
-      console.log(`   ❌ pool 里已有 worker id=${workerId}，未写入。`);
-      return;
-    }
-    const chatId = (await ask(rl, '专属群 chat_id（oc_xxx，群你先建好并把机器人拉进去）: ')).trim();
-    if (!chatId) { console.log('   ❌ chat_id 不能为空，未写入。'); return; }
+    // ③ 池内身份：worker id + 落地群（worker 的 IM 触发/输出通道，可多个 worker 共享）
+    const idBase = cliId.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'worker';
+    const usedIds = new Set(readCollabWorkerPool(dataDir).workers.map(w => w.id));
+    let nDefault = 1;
+    while (usedIds.has(`${idBase}-${nDefault}`)) nDefault++;
+    const defaultWorkerId = `${idBase}-${nDefault}`;
+    const workerId = await askValidated(
+      rl,
+      `worker id（池内唯一）[${defaultWorkerId}]: `,
+      (val) => {
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(val)) {
+          return 'worker id 需匹配 /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/';
+        }
+        if (readCollabWorkerPool(dataDir).workers.some(w => w.id === val)) {
+          return `pool 里已有 worker id=${val}`;
+        }
+        return null;
+      },
+      { def: defaultWorkerId },
+    );
+    if (workerId === null) { console.log('   已放弃，bots.json / pool 不动。'); return; }
+
+    const chatId = await askValidated(
+      rl,
+      'worker 落地群 chat_id（oc_xxx；worker 的触发/输出通道，可多个 worker 共用一个群）: ',
+      (val) => (val ? null : 'chat_id 不能为空'),
+    );
+    if (chatId === null) { console.log('   已放弃，bots.json / pool 不动。'); return; }
     if (!chatId.startsWith('oc_')) {
       console.log('   ⚠️  chat_id 通常以 oc_ 开头，请确认无误。');
     }
