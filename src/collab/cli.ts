@@ -213,7 +213,8 @@ async function cmdPool(args: string[]): Promise<void> {
     }
     default:
       console.error(
-        'usage: botmux collab pool <add|list|remove|status> [flags]\n' +
+        'usage: botmux collab pool <register|add|list|remove|status> [flags]\n' +
+        '  register  interactive: obtain creds + write bots.json (handler:collab-worker) + pool entry in one go\n' +
         '  add --id <workerId> --lark-app-id <appId> --chat-id <oc_xxx> [--label <name>] [--topic-id <anchor>]\n' +
         '      requires the app in bots.json with handler:"collab-worker"\n' +
         '  list [--json] [--compact]\n' +

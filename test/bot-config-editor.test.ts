@@ -4,6 +4,7 @@ import {
   assertUniqueBotProcessNames,
   assertOwnerWhenChatGroups,
   botProcessName,
+  buildCollabWorkerBotConfig,
   findInvalidAllowedUserEntries,
   hasOwnerEntry,
   isValidAllowedUserEntry,
@@ -13,6 +14,44 @@ import {
   removeBotConfig,
   resolveCliId,
 } from '../src/setup/bot-config-editor.js';
+import { parseBotConfigsFromText } from '../src/bot-registry.js';
+
+describe('buildCollabWorkerBotConfig', () => {
+  it('fixes handler to collab-worker and omits allowedUsers/owner', () => {
+    const entry = buildCollabWorkerBotConfig({
+      appId: 'cli_worker',
+      appSecret: 'secret',
+      cliId: 'claude-code',
+      workingDir: '/tmp/work',
+    });
+    expect(entry.handler).toBe('collab-worker');
+    expect(entry.larkAppId).toBe('cli_worker');
+    expect(entry.larkAppSecret).toBe('secret');
+    expect(entry.cliId).toBe('claude-code');
+    expect(entry.workingDir).toBe('/tmp/work');
+    expect(entry.allowedUsers).toBeUndefined();
+    // feishu (default) 不写 brand 字段，保持 bots.json 干净
+    expect(entry.brand).toBeUndefined();
+  });
+
+  it('defaults workingDir to ~ and only writes brand for lark', () => {
+    const feishu = buildCollabWorkerBotConfig({ appId: 'a', appSecret: 's', cliId: 'codex' });
+    expect(feishu.workingDir).toBe('~');
+    expect(feishu.brand).toBeUndefined();
+    const lark = buildCollabWorkerBotConfig({ appId: 'a', appSecret: 's', cliId: 'codex', brand: 'lark' });
+    expect(lark.brand).toBe('lark');
+  });
+
+  it('survives the bots.json write→read round-trip with handler intact', () => {
+    const entry = buildCollabWorkerBotConfig({ appId: 'cli_w', appSecret: 's', cliId: 'claude-code' });
+    // normalizeBotConfig (writeBotsJsonAtomic 也会再跑一次) 不应丢 handler
+    expect(normalizeBotConfig(entry).handler).toBe('collab-worker');
+    // 真实读路径 parseBotConfigsFromText 应保留 collab-worker handler
+    const reparsed = parseBotConfigsFromText(JSON.stringify([entry]));
+    expect(reparsed[0].handler).toBe('collab-worker');
+    expect(reparsed[0].larkAppId).toBe('cli_w');
+  });
+});
 
 describe('parseBotSelection', () => {
   const bots = [

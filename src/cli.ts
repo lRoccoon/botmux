@@ -36,6 +36,7 @@ import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
   botProcessName,
+  buildCollabWorkerBotConfig,
   normalizeBotConfig,
   parseBotConfigsJson,
   parseBotSelection,
@@ -46,6 +47,7 @@ import {
   hasOwnerEntry,
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
+import { addCollabWorker, readCollabWorkerPool } from './collab/worker-pool-store.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
@@ -640,6 +642,21 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
 }
 
 /**
+ * 选 CLI 适配器. 返回 null = 输入非法 (调用方负责中止并提示).
+ * setup 加 bot 与 `collab pool register` 共用, 避免 CLI 清单两处维护。
+ */
+async function promptCliId(rl: ReturnType<typeof createInterface>): Promise<CliId | null> {
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi');
+  const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
+  try {
+    return resolveCliId(cliChoice) ?? 'claude-code';
+  } catch (err: any) {
+    console.log(`\n❌ ${err?.message ?? String(err)}`);
+    return null;
+  }
+}
+
+/**
  * 收集一个机器人完整配置 (凭证 + CLI/工作目录/allowedUsers).
  *
  * 顺序: 拿凭证 → tenant_access_token 验证 → 通过才返回 bot 对象. 验证失败
@@ -660,13 +677,8 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi');
-  const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
-  let cliId: CliId;
-  try {
-    cliId = resolveCliId(cliChoice) ?? 'claude-code';
-  } catch (err: any) {
-    console.log(`\n❌ ${err?.message ?? String(err)}`);
+  const cliId = await promptCliId(rl);
+  if (cliId === null) {
     console.log('   不写 bots.json。请重新运行 botmux setup。');
     return null;
   }
@@ -887,6 +899,108 @@ async function writeSingleBotConfig(): Promise<boolean> {
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
+
+/**
+ * `botmux collab pool register` — 交互式注册一个 collab-worker（协作 worker 身份池）。
+ *
+ * 一体完成两段注册：① bots.json 写入 `handler:'collab-worker'` 凭证条目（复用
+ * setup 的 obtainCredentials/tenant_access_token 校验链路，不问 allowedUsers）；
+ * ② pool store 登记 worker id + 专属群 chatId/topicId。用户拿到的是「凭证 + 池」
+ * 一把梭，不必再手打 `collab pool add`。
+ *
+ * 放在 cli.ts（而非 collab/cli.ts）是因为要就地复用 obtainCredentials /
+ * register-app / writeBotsJsonAtomic 这条 setup 写盘链路；collab/cli.ts 只补 usage。
+ */
+async function cmdCollabPoolRegister(): Promise<void> {
+  ensureConfigDir();
+  const dataDir = resolveDataDir();
+
+  console.log('\n🤝 注册 collab-worker（协作 worker 身份池）\n');
+  console.log(`配置目录: ${CONFIG_DIR}`);
+  console.log(`数据目录: ${dataDir}\n`);
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    // ① 凭证 + 校验（复用 setup 链路）
+    const creds = await obtainCredentials(rl);
+    if (!creds.ok) {
+      console.log('\n⚠️  注册中止，bots.json / pool 不动。');
+      return;
+    }
+    console.log('\n校验凭证（取 tenant_access_token）…');
+    const { validateCredentials } = await import('./setup/verify-permissions.js');
+    const v = await validateCredentials(creds.appId, creds.appSecret, creds.brand);
+    if (!v.ok) {
+      console.log(`\n❌ 凭证校验失败 (${v.error}): ${v.message}`);
+      console.log('   不写 bots.json。');
+      return;
+    }
+    console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
+
+    // 同一个 app 不能既是普通 bot 又是 worker——避免 control-plane 与 PM2 fleet
+    // 对同一 larkAppId 各自起一份长连接。
+    const bots = loadBotsJson();
+    const dup = bots.find((b: any) => b?.larkAppId === creds.appId);
+    if (dup) {
+      console.log(`\n❌ bots.json 已存在该 AppID (${creds.appId})，handler=${dup.handler ?? 'cli'}。`);
+      console.log('   一个应用不能既是普通 bot 又是 collab-worker，请换一个应用。');
+      return;
+    }
+
+    // ② cliId / workingDir（不问 allowedUsers：worker 不收 inbound，control-plane 把关）
+    const cliId = await promptCliId(rl);
+    if (cliId === null) { console.log('   不写 bots.json。'); return; }
+    const workingDir = await ask(rl, '默认工作目录 [~]: ');
+
+    // ③ 池内身份：worker id + 专属群
+    const workerId = (await ask(rl, 'worker id（池内唯一，如 coder-1）: ')).trim();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(workerId)) {
+      console.log('   ❌ worker id 需匹配 /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/，未写入。');
+      return;
+    }
+    if (readCollabWorkerPool(dataDir).workers.some(w => w.id === workerId)) {
+      console.log(`   ❌ pool 里已有 worker id=${workerId}，未写入。`);
+      return;
+    }
+    const chatId = (await ask(rl, '专属群 chat_id（oc_xxx，群你先建好并把机器人拉进去）: ')).trim();
+    if (!chatId) { console.log('   ❌ chat_id 不能为空，未写入。'); return; }
+    if (!chatId.startsWith('oc_')) {
+      console.log('   ⚠️  chat_id 通常以 oc_ 开头，请确认无误。');
+    }
+    const topicId = (await ask(rl, '话题锚点 topic_id [默认 = chat_id]: ')).trim() || chatId;
+    const label = (await ask(rl, '展示名 label（可选）: ')).trim();
+
+    // ④ 先写 bots.json 凭证条目，再登记 pool store
+    const entry = buildCollabWorkerBotConfig({
+      appId: creds.appId,
+      appSecret: creds.appSecret,
+      cliId,
+      workingDir,
+      brand: creds.brand,
+    });
+    if (!ensureBotWorkingDirsExist(entry, '默认工作目录')) {
+      console.log('   未写入。');
+      return;
+    }
+    writeBotsJsonAtomic([...bots, entry]);
+    console.log(`\n✅ bots.json 已加入 collab-worker 条目（${creds.appId}）`);
+
+    const pooled = await addCollabWorker(dataDir, {
+      id: workerId,
+      larkAppId: creds.appId,
+      chatId,
+      topicId,
+      label: label || undefined,
+      cliId,
+    });
+    console.log(`✅ pool store 已登记：id=${pooled.id} chat=${pooled.chatId}${pooled.topicId !== pooled.chatId ? ` topic=${pooled.topicId}` : ''}`);
+    console.log(`\n下一步: botmux restart（control-plane 重启时会自动把该 worker app 注册进 registry）\n`);
+  } catch (err: any) {
+    console.log(`\n❌ 注册失败: ${err?.message ?? String(err)}`);
+  } finally {
+    rl.close();
+  }
+}
 
 async function cmdSetup(): Promise<void> {
   ensureConfigDir();
@@ -5001,6 +5115,12 @@ switch (command) {
   }
   case 'collab': {
     process.env.SESSION_DATA_DIR ??= resolveDataDir();
+    // `pool register` 走交互式注册（复用 setup 凭证/写盘链路，住 cli.ts）；
+    // 其余 collab 子命令仍交给 collab/cli.ts。
+    if (process.argv[3] === 'pool' && process.argv[4] === 'register') {
+      await cmdCollabPoolRegister();
+      break;
+    }
     const { cmdCollab } = await import('./collab/cli.js');
     await cmdCollab(process.argv[3] ?? '', process.argv.slice(4));
     break;

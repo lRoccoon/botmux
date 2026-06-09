@@ -178,6 +178,36 @@ export function normalizeBotConfig<T extends Record<string, any>>(bot: T): T {
   return out as T;
 }
 
+/**
+ * 构造一个 collab-worker 的 bots.json 条目（纯函数，便于测试）。
+ * 与普通 bot 的区别：
+ *   - 固定 `handler:'collab-worker'`：池内 worker 身份，对用户可见列表 /
+ *     自动接活入口 / PM2 fleet 全部隐藏，只由 control-plane 注册进 registry 供
+ *     outbound send/spawn 用。
+ *   - **不带 allowedUsers**：worker 不收 inbound 事件，访问由 control-plane
+ *     把关，没有 owner 概念（普通 bot setup 会强制收口 owner，这里不需要）。
+ * 凭证/cliId/workingDir 与普通 bot 同构，所以注册命令能复用 setup 的凭证链路。
+ */
+export function buildCollabWorkerBotConfig(p: {
+  appId: string;
+  appSecret: string;
+  cliId: CliId;
+  workingDir?: string;
+  brand?: 'feishu' | 'lark';
+}): Record<string, any> {
+  const bot: Record<string, any> = {
+    larkAppId: p.appId,
+    larkAppSecret: p.appSecret,
+    cliId: p.cliId,
+    handler: 'collab-worker',
+    // 总是写 workingDir, 留空用 '~'（与 promptBotConfig 一致）。
+    workingDir: p.workingDir?.trim() || '~',
+  };
+  // brand 只在国际版 (lark) 时落字段, feishu 留空保持 bots.json 干净。
+  if (p.brand === 'lark') bot.brand = 'lark';
+  return normalizeBotConfig(bot);
+}
+
 export function parseBotConfigsJson<T extends Record<string, any> = Record<string, any>>(
   content: string,
   filePath = 'bots.json',
