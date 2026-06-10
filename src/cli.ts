@@ -927,9 +927,9 @@ async function writeSingleBotConfig(): Promise<boolean> {
  *
  * 一体完成两段注册：① bots.json 写入 `handler:'collab-worker'` 凭证条目（复用
  * setup 的 obtainCredentials/tenant_access_token 校验链路，不问 allowedUsers）；
- * ② pool store 登记 worker id + 落地群 chatId/topicId（worker 的 IM 触发/输出通道，
- * 可多个 worker 共用一个群，非必须每 worker 一个专属群）。用户拿到的是「凭证 + 池」
- * 一把梭，不必再手打 `collab pool add`。
+ * ② pool store 登记 worker 身份（identity-only：id/label/cliId，不绑定任何群——
+ * 任务落点由触发时的控制群上下文决定，同一身份可同时在多个群干活）。用户拿到
+ * 的是「凭证 + 池」一把梭，不必再手打 `collab pool add`。
  *
  * 放在 cli.ts（而非 collab/cli.ts）是因为要就地复用 obtainCredentials /
  * register-app / writeBotsJsonAtomic 这条 setup 写盘链路；collab/cli.ts 只补 usage。
@@ -975,7 +975,7 @@ async function cmdCollabPoolRegister(): Promise<void> {
     if (cliId === null) { console.log('   不写 bots.json。'); return; }
     const workingDir = await ask(rl, '默认工作目录 [~]: ');
 
-    // ③ 池内身份：worker id + 落地群（worker 的 IM 触发/输出通道，可多个 worker 共享）
+    // ③ 池内身份：worker id（identity-only，不绑群——落点跟随触发上下文）
     const idBase = cliId.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'worker';
     const usedIds = new Set(readCollabWorkerPool(dataDir).workers.map(w => w.id));
     let nDefault = 1;
@@ -997,16 +997,6 @@ async function cmdCollabPoolRegister(): Promise<void> {
     );
     if (workerId === null) { console.log('   已放弃，bots.json / pool 不动。'); return; }
 
-    const chatId = await askValidated(
-      rl,
-      'worker 落地群 chat_id（oc_xxx；worker 的触发/输出通道，可多个 worker 共用一个群）: ',
-      (val) => (val ? null : 'chat_id 不能为空'),
-    );
-    if (chatId === null) { console.log('   已放弃，bots.json / pool 不动。'); return; }
-    if (!chatId.startsWith('oc_')) {
-      console.log('   ⚠️  chat_id 通常以 oc_ 开头，请确认无误。');
-    }
-    const topicId = (await ask(rl, '话题锚点 topic_id [默认 = chat_id]: ')).trim() || chatId;
     const label = (await ask(rl, '展示名 label（可选）: ')).trim();
 
     // ④ 先写 bots.json 凭证条目，再登记 pool store
@@ -1027,12 +1017,10 @@ async function cmdCollabPoolRegister(): Promise<void> {
     const pooled = await addCollabWorker(dataDir, {
       id: workerId,
       larkAppId: creds.appId,
-      chatId,
-      topicId,
       label: label || undefined,
       cliId,
     });
-    console.log(`✅ pool store 已登记：id=${pooled.id} chat=${pooled.chatId}${pooled.topicId !== pooled.chatId ? ` topic=${pooled.topicId}` : ''}`);
+    console.log(`✅ pool store 已登记：id=${pooled.id}（identity-only，任务落点跟随触发群）`);
     // worker 虽不收 inbound，但 outbound 发消息/卡片仍依赖应用能力与 scopes，
     // 所以和普通 setup 一样跑一遍开放平台自动配置（导入权限/配 redirect/发版本），
     // 失败会自动回退到手动步骤提示，不影响已写入的 bots.json / pool。
