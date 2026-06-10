@@ -21,7 +21,7 @@
  */
 import { homedir } from 'node:os';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, statSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
@@ -139,8 +139,22 @@ export interface SandboxSpawn {
   outbox: string;
   /** Project overlay UPPER dir — THE LANDABLE CHANGESET (used by sandbox-land). */
   workDir: string;
+  /** HOME overlay UPPER dir (/var/tmp/botmux-sbx/<sid>/home-upper). The sandboxed
+   *  CLI's $HOME writes — INCLUDING its session jsonl under CLAUDE_CONFIG_DIR —
+   *  land here (invisible at the real path). The worker redirects its bridge/idle
+   *  watch into this via sandboxedClaudeDataDir() so it sees the CLI's turns. */
+  homeUpper: string;
   /** Unmount the overlays + remove the per-session sandbox tree. */
   cleanup: () => void;
+}
+
+/** The path where a sandboxed session's CLI actually writes a $HOME-relative
+ *  data dir (e.g. CLAUDE_CONFIG_DIR / `.claude-runtime`): the HOME overlay's
+ *  ephemeral UPPER copy. The worker redirects its jsonl/bridge watch here so it
+ *  sees the sandboxed CLI's writes (which are invisible at the real host path).
+ *  Mirrors prepareSandbox's homeUpper layout — keep in sync. */
+export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): string {
+  return join(VARTMP_ROOT, sessionId, 'home-upper', relative(homedir(), realDataDir));
 }
 
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
@@ -282,6 +296,7 @@ export function prepareSandbox(opts: {
     env,
     outbox,
     workDir: projUpper,
+    homeUpper,
     cleanup: () => {
       unmountOverlay(projMerged);
       unmountOverlay(homeMerged);
@@ -335,6 +350,27 @@ function reclaimSandbox(dataDir: string, sid: string): void {
   try { rmSync(join(VARTMP_ROOT, sid), { recursive: true, force: true }); } catch { /* */ }
 }
 
+/** Scan the process table for sandbox session-ids referenced by any running
+ *  process's argv. A live bwrap's bind/overlay paths contain `sandboxes/<sid>`
+ *  and `botmux-sbx/<sid>`, so this physically detects which sandbox dirs are
+ *  still in use — by overlay sessions AND old clone-model sessions alike. Used as
+ *  a hard guard so the sweep never deletes a dir out from under a live CLI. */
+function liveSandboxSids(): Set<string> {
+  const live = new Set<string>();
+  let pids: string[];
+  try { pids = readdirSync('/proc'); } catch { return live; }
+  const re = /(?:sandboxes|botmux-sbx)\/([^/\0]+)/g;
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue;
+    let cmd: string;
+    try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { continue; } // gone/perms
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(cmd))) live.add(m[1]);
+  }
+  return live;
+}
+
 /**
  * Reclaim leaked sandbox residue.
  *
@@ -367,8 +403,17 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
   // (no live worker can be mid-spawn for a session that isn't active).
   const ACTIVE_DEAD_GRACE_MS = 60_000;
   const now = Date.now();
+  // Hard physical guard: NEVER reclaim a session whose dir is referenced by a
+  // live process. A running bwrap binds/overlays paths containing the sid, so a
+  // process-table scan catches BOTH overlay sessions (merged mounts) AND old
+  // clone-model sessions re-attached after a daemon restart (which have NO
+  // overlay mount, so the isMounted check below would wrongly deem them dead and
+  // delete their bind-source dirs out from under the live CLI). This is the root
+  // cause of the 2026-06-10 incident — keep it as the FIRST gate.
+  const live = liveSandboxSids();
   for (const sid of sids) {
     const sessionRoot = join(root, sid);
+    if (live.has(sid)) continue; // a running process holds this sandbox — leave it
     if (activeSessionIds.has(sid)) {
       // Active session: keep it while a host-side overlay is still mounted (= a
       // live CLI may be bound to the changeset). If BOTH merged overlays are gone

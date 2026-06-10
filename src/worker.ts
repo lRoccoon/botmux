@@ -66,7 +66,7 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
-import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled } from './adapters/backend/sandbox.js';
+import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
@@ -3319,7 +3319,21 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // forks (Seed → `.claude-runtime`), undefined for everything else. Every
   // JSONL/pid/bridge gate below keys off it instead of `cliId === 'claude-code'`,
   // so a fork inherits the whole submit-confirm + bridge-fallback machinery.
-  const claudeDataDir = cliAdapter.claudeDataDir;
+  let claudeDataDir = cliAdapter.claudeDataDir;
+  // When this session will be file-sandboxed, the CLI's session jsonl is written
+  // into the overlay's EPHEMERAL home upper (CLAUDE_CONFIG_DIR lives under $HOME),
+  // invisible at the real path the bridge normally watches → "Bridge mark expired"
+  // and the turn never relays (2026-06-10 incident). Redirect every jsonl/pid/
+  // bridge gate below to the upper copy where the sandboxed CLI actually writes.
+  const willFileSandbox =
+    (cfg.sandbox === true || sandboxEnabled()) &&
+    (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux') &&
+    !!process.env.SESSION_DATA_DIR;
+  if (claudeDataDir && willFileSandbox) {
+    const redirected = sandboxedClaudeDataDir(cfg.sessionId, claudeDataDir);
+    log(`[sandbox] redirecting Claude bridge dataDir → overlay upper: ${redirected}`);
+    claudeDataDir = redirected;
+  }
   if (claudeDataDir) {
     (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
       claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir, claudeDataDir);
