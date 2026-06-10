@@ -30,7 +30,15 @@ import type {
   RefereeVerdict,
 } from './contract.js';
 
-const pexec = promisify(execFile);
+// Promisified lazily inside the adapter: importing this module must not touch
+// child_process — test environments mock node:child_process with partial
+// surfaces, and this module reaches their import graphs via session-manager.
+type PExec = (file: string, args: readonly string[], options: { cwd?: string; maxBuffer?: number }) => Promise<{ stdout: string; stderr: string }>;
+let pexecLazy: PExec | undefined;
+function pexec(file: string, args: readonly string[], options: { cwd?: string; maxBuffer?: number }): Promise<{ stdout: string; stderr: string }> {
+  pexecLazy ??= promisify(execFile) as PExec;
+  return pexecLazy(file, args, options);
+}
 
 /** Consecutive no-improvement evaluations before the referee calls a human. */
 export const STALL_THRESHOLD = 3;
