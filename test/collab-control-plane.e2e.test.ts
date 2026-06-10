@@ -18,7 +18,7 @@ import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
 type Reply = { anchor: string; msgType?: string; larkAppId?: string; content: string };
 
-function rawTextEvent(text: string, messageId: string) {
+function rawTextEvent(text: string, messageId: string, chatId = 'oc_collab') {
   return {
     sender: {
       sender_id: { open_id: 'ou_human' },
@@ -28,14 +28,14 @@ function rawTextEvent(text: string, messageId: string) {
       message_id: messageId,
       message_type: 'text',
       content: JSON.stringify({ text }),
-      chat_id: 'oc_collab',
+      chat_id: chatId,
       chat_type: 'group',
       create_time: String(Date.now()),
     },
   };
 }
 
-function ctx(anchor = 'om_topic_root'): RoutingContext {
+function ctx(anchor = 'om_topic_root', overrides: Partial<RoutingContext> = {}): RoutingContext {
   return {
     chatId: 'oc_collab',
     messageId: 'om_msg',
@@ -43,6 +43,7 @@ function ctx(anchor = 'om_topic_root'): RoutingContext {
     scope: 'thread',
     anchor,
     larkAppId: 'cli_control',
+    ...overrides,
   };
 }
 
@@ -147,7 +148,7 @@ describe('collab control-plane integration seam', () => {
     expect(snapshot.acceptanceCriteria?.command).toBe('test -f done.txt');
   });
 
-  it('allows concurrent collab runs in distinct topics with distinct pooled workers', async () => {
+  it('allows concurrent collab runs in distinct groups with distinct pooled workers', async () => {
     await addCollabWorker(dataDir, {
       id: 'coder-1',
       larkAppId: 'worker_app_1',
@@ -161,17 +162,19 @@ describe('collab control-plane integration seam', () => {
       cliId: 'claude-code',
     });
 
-    await handleCollabControlMessage(rawTextEvent('/collab run A | test: test -f a.txt', 'om_seed_a'), ctx('om_thread_a'));
-    await handleCollabControlMessage(rawTextEvent('/collab run B | test: test -f b.txt', 'om_seed_b'), ctx('om_thread_b'));
+    const groupA = ctx('oc_group_a', { chatId: 'oc_group_a', scope: 'chat' });
+    const groupB = ctx('oc_group_b', { chatId: 'oc_group_b', scope: 'chat' });
+    await handleCollabControlMessage(rawTextEvent('/collab run A | test: test -f a.txt', 'om_seed_a', 'oc_group_a'), groupA);
+    await handleCollabControlMessage(rawTextEvent('/collab run B | test: test -f b.txt', 'om_seed_b', 'oc_group_b'), groupB);
 
     expect(spawns).toHaveLength(2);
-    expect(spawns[0]).toMatchObject({ workerId: 'coder-1', larkAppId: 'worker_app_1', topicId: 'om_thread_a' });
-    expect(spawns[1]).toMatchObject({ workerId: 'coder-2', larkAppId: 'worker_app_2', topicId: 'om_thread_b' });
+    expect(spawns[0]).toMatchObject({ workerId: 'coder-1', larkAppId: 'worker_app_1', chatId: 'oc_group_a', topicId: 'oc_group_a' });
+    expect(spawns[1]).toMatchObject({ workerId: 'coder-2', larkAppId: 'worker_app_2', chatId: 'oc_group_b', topicId: 'oc_group_b' });
     expect(spawns[0].runId).not.toBe(spawns[1].runId);
 
     const index = JSON.parse(readFileSync(join(dataDir, 'collab/control-topic-index.json'), 'utf-8'));
-    expect(index.topics['cli_control::om_thread_a']).toBe(spawns[0].runId);
-    expect(index.topics['cli_control::om_thread_b']).toBe(spawns[1].runId);
+    expect(index.topics['cli_control::oc_group_a']).toBe(spawns[0].runId);
+    expect(index.topics['cli_control::oc_group_b']).toBe(spawns[1].runId);
 
     const pool = readCollabWorkerPool(dataDir);
     expect(pool.workers).toEqual(expect.arrayContaining([
@@ -194,7 +197,8 @@ describe('collab control-plane integration seam', () => {
 
     expect(spawns).toHaveLength(1);
     expect(replies.at(-1)).toMatchObject({ anchor: 'oc_collab', msgType: 'text', larkAppId: 'cli_control' });
-    expect(replies.at(-1)?.content).toContain('already has an active collab run');
+    expect(replies.at(-1)?.content).toContain('This group already has an active collab run');
+    expect(replies.at(-1)?.content).toContain('different group');
 
     const index = JSON.parse(readFileSync(join(dataDir, 'collab/control-topic-index.json'), 'utf-8'));
     expect(index.topics['cli_control::oc_collab']).toBe(spawns[0].runId);

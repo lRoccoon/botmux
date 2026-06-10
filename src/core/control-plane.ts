@@ -629,7 +629,7 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
       if (!isTerminalStatus(existing.status)) {
         await cfg.reply(
           topicId,
-          `This chat/topic already has an active collab run (${board.runId}). Start another run in a new Lark topic/thread, or stop the current run first.`,
+          `This group already has an active collab run (${board.runId}). Start another run in a different group, or stop the current run first.`,
           'text',
           ctx.larkAppId,
         );
