@@ -86,13 +86,14 @@ describe('collab CLI (worker board access)', () => {
     };
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await cmdCollab('pool', ['add', '--id', 'coder-1', '--lark-app-id', 'worker_app', '--chat-id', 'oc_worker', '--label', 'Coder']);
+    await cmdCollab('pool', ['add', '--id', 'coder-1', '--lark-app-id', 'worker_app', '--label', 'Coder']);
     await cmdCollab('pool', ['list', '--json', '--compact']);
 
     const listed = JSON.parse(log.mock.calls.at(-1)?.[0] as string);
     log.mockRestore();
     expect(listed).toHaveLength(1);
-    expect(listed[0]).toMatchObject({ id: 'coder-1', larkAppId: 'worker_app', chatId: 'oc_worker', status: 'available', cliId: 'codex' });
+    expect(listed[0]).toMatchObject({ id: 'coder-1', larkAppId: 'worker_app', status: 'available', cliId: 'codex' });
+    expect(listed[0].chatId).toBeUndefined();
     expect(readCollabWorkerPool(dataDir).workers[0]).toMatchObject({ id: 'coder-1' });
     rmSync(dataDir, { recursive: true, force: true });
   });

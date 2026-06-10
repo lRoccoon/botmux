@@ -10,7 +10,9 @@ export interface CollabWorkerPoolEntry {
   kind: CollabWorkerKind;
   label?: string;
   larkAppId: string;
-  chatId: string;
+  /** Deprecated legacy placement fields. P1 identity-only workers receive
+   *  chat/topic placement from the triggering control-plane context. */
+  chatId?: string;
   topicId?: string;
   cliId?: string;
   status: CollabWorkerStatus;
@@ -28,7 +30,9 @@ export interface CollabWorkerPoolFile {
 export interface AddCollabWorkerInput {
   id: string;
   larkAppId: string;
-  chatId: string;
+  /** Deprecated legacy placement fields accepted for old callers; ignored for
+   *  new identity-only pool entries. */
+  chatId?: string;
   topicId?: string;
   label?: string;
   cliId?: string;
@@ -58,7 +62,6 @@ export function readCollabWorkerPool(dataDir: string): CollabWorkerPoolFile {
 export async function addCollabWorker(dataDir: string, input: AddCollabWorkerInput): Promise<CollabWorkerPoolEntry> {
   validateId(input.id);
   if (!input.larkAppId.trim()) throw new Error('larkAppId is required');
-  if (!input.chatId.trim()) throw new Error('chatId is required');
   const file = collabWorkerPoolPath(dataDir);
   return withPoolLock(dataDir, async () => {
     const pool = readCollabWorkerPool(dataDir);
@@ -69,8 +72,6 @@ export async function addCollabWorker(dataDir: string, input: AddCollabWorkerInp
       kind: 'botmux-cli',
       label: input.label?.trim() || existing?.label,
       larkAppId: input.larkAppId.trim(),
-      chatId: input.chatId.trim(),
-      topicId: input.topicId?.trim() || input.chatId.trim(),
       cliId: input.cliId?.trim() || existing?.cliId,
       status: existing?.status ?? 'available',
       leasedBy: existing?.leasedBy,
@@ -161,15 +162,15 @@ function validateId(id: string): void {
 function normalizeEntry(raw: any): CollabWorkerPoolEntry | null {
   if (!raw || typeof raw !== 'object') return null;
   if (raw.kind !== 'botmux-cli') return null;
-  if (typeof raw.id !== 'string' || typeof raw.larkAppId !== 'string' || typeof raw.chatId !== 'string') return null;
+  if (typeof raw.id !== 'string' || typeof raw.larkAppId !== 'string') return null;
   const now = Date.now();
   return {
     id: raw.id,
     kind: 'botmux-cli',
     label: typeof raw.label === 'string' ? raw.label : undefined,
     larkAppId: raw.larkAppId,
-    chatId: raw.chatId,
-    topicId: typeof raw.topicId === 'string' ? raw.topicId : raw.chatId,
+    chatId: typeof raw.chatId === 'string' ? raw.chatId : undefined,
+    topicId: typeof raw.topicId === 'string' ? raw.topicId : undefined,
     cliId: typeof raw.cliId === 'string' ? raw.cliId : undefined,
     status: raw.status === 'leased' ? 'leased' : 'available',
     leasedBy: typeof raw.leasedBy === 'string' ? raw.leasedBy : undefined,

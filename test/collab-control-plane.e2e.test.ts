@@ -134,7 +134,6 @@ describe('collab control-plane integration seam', () => {
     await addCollabWorker(dataDir, {
       id: 'coder-1',
       larkAppId: 'worker_app',
-      chatId: 'oc_worker_room',
       label: 'Coder 1',
       cliId: 'codex',
     });
@@ -144,8 +143,8 @@ describe('collab control-plane integration seam', () => {
     expect(spawns).toHaveLength(1);
     expect(spawns[0]).toMatchObject({
       larkAppId: 'worker_app',
-      chatId: 'oc_worker_room',
-      topicId: 'oc_worker_room',
+      chatId: 'oc_collab',
+      topicId: 'om_topic_root',
       workerId: 'coder-1',
       taskId: 'task-1',
     });
@@ -155,7 +154,7 @@ describe('collab control-plane integration seam', () => {
     expect(snapshot.worker).toMatchObject({
       workerId: 'coder-1',
       larkAppId: 'worker_app',
-      topicId: 'oc_worker_room',
+      topicId: 'om_topic_root',
       phase: 'running',
     });
 
@@ -179,7 +178,6 @@ describe('collab control-plane integration seam', () => {
     await addCollabWorker(dataDir, {
       id: 'coder-1',
       larkAppId: 'worker_app',
-      chatId: 'oc_worker_room',
       label: 'Coder 1',
       cliId: 'codex',
     });
@@ -207,8 +205,8 @@ describe('collab control-plane integration seam', () => {
       runId: first.runId,
       workerId: 'coder-1',
       larkAppId: 'worker_app',
-      chatId: 'oc_worker_room',
-      topicId: 'oc_worker_room',
+      chatId: 'oc_collab',
+      topicId: 'om_topic_root',
       taskId: 'task-1',
     });
     expect(spawns[1].prompt).toContain('Previous worker coder-1 was lost');
@@ -275,7 +273,6 @@ describe('collab control-plane integration seam', () => {
     await addCollabWorker(dataDir, {
       id: 'coder-1',
       larkAppId: 'worker_app',
-      chatId: 'oc_worker_room',
       label: 'Coder 1',
       cliId: 'codex',
     });
@@ -334,7 +331,7 @@ describe('collab control-plane integration seam', () => {
       context: { open_message_id: 'om_card_goal' },
       action: {
         value: { action: 'collab_goal_change', run_id: runId },
-        form_value: { goal: 'new goal from card' },
+        form_value: { goal: '/goal new goal from card' },
       },
     }, 'cli_control');
 
@@ -360,10 +357,46 @@ describe('collab control-plane integration seam', () => {
     });
 
     const types = (await board.history()).map((e) => e.type);
-    expect(types.slice(-3)).toEqual([
+    expect(types.slice(-4)).toEqual([
       'GoalChangeRequested',
       'GoalChanged',
       'InterventionReceiptUpdated',
+      'WorkerTurnStarted',
+    ]);
+  });
+
+  it('handles criteria changes as typed events and worker push', async () => {
+    await handleCollabControlMessage(rawTextEvent('/collab old criteria | test: test -f old.txt', 'om_seed_criteria'), ctx('om_criteria_topic'));
+    const { runId, baseDir, workerId } = spawns[0];
+
+    await handleCollabControlMessage(
+      rawTextEvent('/criteria test -f done.txt', 'om_change_criteria'),
+      ctx('om_criteria_topic'),
+    );
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toMatchObject({
+      runId,
+      workerId,
+      taskId: 'task-1',
+      larkAppId: 'cli_control',
+      topicId: 'om_criteria_topic',
+    });
+    expect(pushes[0].content).toContain('Acceptance criteria changed');
+    expect(pushes[0].content).toContain('test -f done.txt');
+
+    const board = openCollabBoard(runId, { baseDir });
+    const snapshot = await board.snapshot();
+    expect(snapshot.acceptanceCriteria).toMatchObject({
+      command: 'test -f done.txt',
+      doneWhen: 'exitZero',
+    });
+
+    const types = (await board.history()).map((e) => e.type);
+    expect(types.slice(-3)).toEqual([
+      'AcceptanceCriteriaChanged',
+      'InterventionReceiptUpdated',
+      'WorkerTurnStarted',
     ]);
   });
 

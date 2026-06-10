@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AcceptanceCriteria, CollabBoard, CollabEventDraft } from '../collab/contract.js';
-import { getWorkerProtocolText, parseCollabIntake } from '../collab/index.js';
+import { buildAcceptanceCriteria, getWorkerProtocolText, parseCollabIntake } from '../collab/index.js';
 import { leaseCollabWorker, readCollabWorkerPool, releaseCollabWorker } from '../collab/worker-pool-store.js';
 import { buildCollabControlCard } from '../im/lark/card-builder.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions } from '../im/lark/message-parser.js';
@@ -185,8 +185,8 @@ async function allocateWorkerTarget(runId: string, fallback: { larkAppId: string
   return {
     workerId: leased.id,
     larkAppId: leased.larkAppId,
-    chatId: leased.chatId,
-    topicId: leased.topicId ?? leased.chatId,
+    chatId: fallback.chatId,
+    topicId: fallback.topicId,
     pooled: true,
     leaseExpiresAt: leased.leaseExpiresAt,
   };
@@ -213,6 +213,10 @@ function workerAssignmentPrompt(goal: string, task: { title: string; taskId: str
     `Assigned task: ${task.title}\n` +
     `Task id: ${task.taskId}\n\n` +
     `Goal:\n${goal}`;
+}
+
+function normalizeGoalInput(raw: string): string {
+  return raw.trim().replace(/^\/(?:goal|set-goal)\s+/i, '').trim();
 }
 
 async function ensureRunCreated(board: CollabBoard, input: {
@@ -462,6 +466,59 @@ async function requestGoalChange(board: CollabBoard, input: {
   });
 }
 
+async function requestCriteriaChange(board: CollabBoard, input: {
+  command: string;
+  goal: string;
+  topicId?: string;
+  workerId?: string;
+  idempotencyPrefix: string;
+  actor: 'human' | 'control-plane';
+}): Promise<string> {
+  const eventId = await append(board, {
+    runId: board.runId,
+    type: 'AcceptanceCriteriaChanged',
+    actor: input.actor,
+    idempotencyKey: `${input.idempotencyPrefix}:change`,
+    affectedPaths: ['acceptanceCriteria'],
+    topicId: input.topicId,
+    workerId: input.workerId,
+    payload: {
+      acceptanceCriteria: buildAcceptanceCriteria({ goal: input.goal, test: input.command }),
+    },
+  });
+  await append(board, {
+    runId: board.runId,
+    type: 'InterventionReceiptUpdated',
+    actor: 'control-plane',
+    idempotencyKey: `${input.idempotencyPrefix}:delivered`,
+    affectedPaths: ['interventions'],
+    topicId: input.topicId,
+    workerId: input.workerId,
+    payload: { interventionId: eventId, state: 'delivered' },
+  });
+  return eventId;
+}
+
+async function startWorkerTurn(board: CollabBoard, input: {
+  idempotencyKey: string;
+  topicId?: string;
+  taskId?: string;
+  workerId?: string;
+}): Promise<void> {
+  if (!input.workerId) return;
+  await append(board, {
+    runId: board.runId,
+    type: 'WorkerTurnStarted',
+    actor: 'control-plane',
+    idempotencyKey: input.idempotencyKey,
+    affectedPaths: ['worker'],
+    topicId: input.topicId,
+    taskId: input.taskId,
+    workerId: input.workerId,
+    payload: { workerId: input.workerId },
+  });
+}
+
 async function requestStop(board: CollabBoard, input: {
   reason?: string;
   topicId?: string;
@@ -583,15 +640,16 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
     }
 
     const goalMatch = raw.match(/^\/(?:goal|set-goal)\s+([\s\S]+)$/i);
+    const criteriaMatch = raw.match(/^\/(?:criteria|set-criteria)\s+([\s\S]+)$/i);
     const stopMatch = raw.match(/^\/(?:stop|collab-stop)\b\s*([\s\S]*)$/i);
-    if (goalMatch || stopMatch) {
+    if (goalMatch || criteriaMatch || stopMatch) {
       const current = await board.snapshot();
       if (isTerminalStatus(current.status)) {
         // Terminal run: refuse further goal/stop; just re-render the (now
         // control-disabled) card below.
-        logger.info(`[collab-control] ignoring ${goalMatch ? 'goal' : 'stop'} on terminal run ${board.runId} (${current.status})`);
+        logger.info(`[collab-control] ignoring ${goalMatch ? 'goal' : criteriaMatch ? 'criteria' : 'stop'} on terminal run ${board.runId} (${current.status})`);
       } else if (goalMatch) {
-        const newGoal = goalMatch[1].trim();
+        const newGoal = normalizeGoalInput(goalMatch[1]);
         if (newGoal === current.goal) {
           // No-op goal: don't write a redundant intervention or re-push the worker.
           logger.info(`[collab-control] goal unchanged on run ${board.runId}; skip push`);
@@ -612,6 +670,44 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
               larkAppId: after.worker?.larkAppId ?? ctx.larkAppId,
               topicId: pushTopicId,
               content: `Goal changed. Read BOTMUX_COLLAB_RUN_ID from the collab board, acknowledge the intervention receipt, and adjust your work.\n\nNew goal:\n${newGoal}`,
+            });
+            await startWorkerTurn(board, {
+              idempotencyKey: `msg:${parsed.messageId}:goal:worker-turn-started`,
+              topicId: pushTopicId,
+              taskId: after.task?.taskId,
+              workerId: after.worker?.workerId,
+            });
+          }
+        }
+      } else if (criteriaMatch) {
+        const command = criteriaMatch[1].trim();
+        if (!command) {
+          logger.info(`[collab-control] empty criteria command on run ${board.runId}; skip push`);
+        } else {
+          await requestCriteriaChange(board, {
+            command,
+            goal: current.goal,
+            topicId,
+            workerId: current.worker?.workerId,
+            idempotencyPrefix: `msg:${parsed.messageId}:criteria`,
+            actor: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'control-plane' : 'human',
+          });
+          const after = await board.snapshot();
+          const pushTopicId = after.worker?.topicId ?? topicId;
+          if (pushTopicId) {
+            await cfg.pushWorker?.({
+              runId: board.runId,
+              workerId: after.worker?.workerId,
+              taskId: after.task?.taskId,
+              larkAppId: after.worker?.larkAppId ?? ctx.larkAppId,
+              topicId: pushTopicId,
+              content: `Acceptance criteria changed. Read BOTMUX_COLLAB_RUN_ID from the collab board, acknowledge the intervention receipt, and adjust your validation loop.\n\nNew acceptance command:\n${command}`,
+            });
+            await startWorkerTurn(board, {
+              idempotencyKey: `msg:${parsed.messageId}:criteria:worker-turn-started`,
+              topicId: pushTopicId,
+              taskId: after.task?.taskId,
+              workerId: after.worker?.workerId,
             });
           }
         }
@@ -656,7 +752,7 @@ export async function handleCollabControlCardAction(data: any, larkAppId: string
     const snapshot = await board.snapshot();
     const cardMessageId = data?.context?.open_message_id ?? data?.open_message_id ?? 'card';
     if (action === 'collab_goal_change') {
-      const goal = String(data?.action?.form_value?.goal ?? '').trim();
+      const goal = normalizeGoalInput(String(data?.action?.form_value?.goal ?? ''));
       if (!goal) return { toast: { type: 'error', content: 'Goal is empty' } };
       if (isTerminalStatus(snapshot.status)) {
         return { toast: { type: 'info', content: `Run already ${snapshot.status}` } };
@@ -672,15 +768,22 @@ export async function handleCollabControlCardAction(data: any, larkAppId: string
         idempotencyPrefix: `card:${cardMessageId}:goal:${goal}`,
         actor: 'human',
       });
-      const pushTopicId = snapshot.worker?.topicId ?? topicId;
+      const after = await board.snapshot();
+      const pushTopicId = after.worker?.topicId ?? topicId;
       if (pushTopicId) {
         await requireConfig().pushWorker?.({
           runId,
-          workerId: snapshot.worker?.workerId,
-          taskId: snapshot.task?.taskId,
-          larkAppId: snapshot.worker?.larkAppId ?? larkAppId,
+          workerId: after.worker?.workerId,
+          taskId: after.task?.taskId,
+          larkAppId: after.worker?.larkAppId ?? larkAppId,
           topicId: pushTopicId,
           content: `Goal changed from the control card. Read BOTMUX_COLLAB_RUN_ID from the collab board, acknowledge the intervention receipt, and adjust your work.\n\nNew goal:\n${goal}`,
+        });
+        await startWorkerTurn(board, {
+          idempotencyKey: `card:${cardMessageId}:goal:${goal}:worker-turn-started`,
+          topicId: pushTopicId,
+          taskId: after.task?.taskId,
+          workerId: after.worker?.workerId,
         });
       }
     } else if (action === 'collab_stop') {

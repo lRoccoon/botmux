@@ -171,7 +171,6 @@ async function cmdPool(args: string[]): Promise<void> {
     case 'add': {
       const id = str(flags.id) ?? fail('pool add: --id required');
       const larkAppId = str(flags['lark-app-id']) ?? str(flags.app) ?? fail('pool add: --lark-app-id required');
-      const chatId = str(flags['chat-id']) ?? fail('pool add: --chat-id required');
       const cfg = loadBotConfigs().find((c) => c.larkAppId === larkAppId);
       if (!cfg) fail(`pool add: larkAppId ${larkAppId} not found in bots.json`);
       if (cfg.handler !== 'collab-worker') {
@@ -180,8 +179,6 @@ async function cmdPool(args: string[]): Promise<void> {
       const entry = await addCollabWorker(dataDir, {
         id,
         larkAppId,
-        chatId,
-        topicId: str(flags['topic-id']) ?? chatId,
         label: str(flags.label),
         cliId: cfg.cliId,
       });
@@ -201,7 +198,7 @@ async function cmdPool(args: string[]): Promise<void> {
       }
       for (const w of pool.workers) {
         const lease = w.leasedBy ? ` leasedBy=${w.leasedBy}${w.leaseExpiresAt ? ` until=${new Date(w.leaseExpiresAt).toISOString()}` : ''}` : '';
-        console.log(`${w.id}\t${w.status}\t${w.label ?? '-'}\t${w.larkAppId}\t${w.chatId}${w.topicId && w.topicId !== w.chatId ? `\ttopic=${w.topicId}` : ''}${lease}`);
+        console.log(`${w.id}\t${w.status}\t${w.label ?? '-'}\t${w.larkAppId}${lease}`);
       }
       return;
     }
@@ -215,7 +212,7 @@ async function cmdPool(args: string[]): Promise<void> {
       console.error(
         'usage: botmux collab pool <register|add|list|remove|status> [flags]\n' +
         '  register  interactive: obtain creds + write bots.json (handler:collab-worker) + pool entry in one go\n' +
-        '  add --id <workerId> --lark-app-id <appId> --chat-id <oc_xxx> [--label <name>] [--topic-id <anchor>]\n' +
+        '  add --id <workerId> --lark-app-id <appId> [--label <name>]\n' +
         '      requires the app in bots.json with handler:"collab-worker"\n' +
         '  list [--json] [--compact]\n' +
         '  status [--json] [--compact]\n' +

@@ -1654,6 +1654,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           });
         }
 
+        if (ds.lastScreenStatus === 'idle') {
+          handleCollabTurnFinished(ds, { source: 'idle', reason: 'yielded' }, t).catch((err) => {
+            logger.warn(`[${t}] collab idle turn-finished/referee failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card.
         if (streamingCardDisabled(ds)) break;
@@ -1965,7 +1971,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
         deliverFinalOutput(ds, msg, t, 0);
-        handleCollabTurnFinished(ds, msg, t).catch((err) => {
+        handleCollabTurnFinished(ds, {
+          source: 'final_output',
+          reason: 'completed',
+          turnId: msg.turnId,
+          lastUuid: msg.lastUuid,
+        }, t).catch((err) => {
           logger.warn(`[${t}] collab turn-finished/referee failed: ${err instanceof Error ? err.message : String(err)}`);
         });
         break;
@@ -2051,15 +2062,37 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 
+type CollabTurnFinishSignal =
+  | { source: 'final_output'; reason: 'completed'; turnId?: string; lastUuid?: string }
+  | { source: 'idle'; reason: 'yielded' };
+
 async function handleCollabTurnFinished(
   ds: DaemonSession,
-  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  signal: CollabTurnFinishSignal,
   tag: string,
 ): Promise<void> {
   const collab = ds.collab ?? ds.session.collab;
   if (!collab) return;
   const board = openCollabBoard(collab.runId, collab.baseDir ? { baseDir: collab.baseDir } : {});
-  const idem = `turn-finished:${msg.turnId || msg.lastUuid || Date.now()}`;
+  const snapshot = await board.snapshot();
+  if (snapshot.worker?.workerId !== collab.workerId || snapshot.worker.phase !== 'running') return;
+  if (signal.source === 'idle') {
+    const history = await board.history();
+    const lastStart = [...history].reverse().find((e) =>
+      e.type === 'WorkerTurnStarted' && e.workerId === collab.workerId
+    );
+    if (!lastStart) return;
+    const hasWorkerProgress = history.some((e) =>
+      e.seq > lastStart.seq &&
+      e.actor === 'worker' &&
+      e.workerId === collab.workerId &&
+      e.type !== 'WorkerTurnFinished'
+    );
+    if (!hasWorkerProgress) return;
+  }
+  const idem = signal.source === 'idle'
+    ? `turn-finished:idle:${snapshot.revision}`
+    : `turn-finished:${signal.turnId || signal.lastUuid || `rev${snapshot.revision}`}`;
   await board.append({
     type: 'WorkerTurnFinished',
     runId: collab.runId,
@@ -2071,17 +2104,17 @@ async function handleCollabTurnFinished(
     budgetDelta: -1,
     payload: {
       workerId: collab.workerId,
-      reason: 'completed',
+      reason: signal.reason,
     },
   });
   const cwd = ds.workingDir ?? requireCallbacks().getSessionWorkingDir(ds);
   const result = await runReferee(board, { cwd, idemSuffix: idem });
   logger.info(`[${tag}] collab referee verdict=${result.verdict}${result.exitCode !== undefined ? ` exit=${result.exitCode}` : ''}`);
-  const snapshot = await board.snapshot();
-  if (snapshot.status !== 'running' && snapshot.status !== 'pending') {
+  const after = await board.snapshot();
+  if (after.status !== 'running' && after.status !== 'pending') {
     await releaseCollabWorker(config.session.dataDir, collab.runId);
     await closeSession(ds.session.sessionId);
-    logger.info(`[${tag}] collab run terminal (${snapshot.status}); session closed`);
+    logger.info(`[${tag}] collab run terminal (${after.status}); session closed`);
   }
 }
 
