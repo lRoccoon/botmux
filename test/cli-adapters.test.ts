@@ -30,6 +30,7 @@ import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
@@ -39,7 +40,7 @@ import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'pi', 'copilot', 'oh-my-pi'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'traex', 'pi', 'copilot', 'oh-my-pi'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -73,7 +74,7 @@ describe('createCliAdapterSync factory', () => {
 describe('lazy binary resolution', () => {
   // Adapters whose resolvedBin is the resolved CLI (codex-app/mira use
   // process.execPath and never probe, so they're excluded).
-  const PROBING_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'copilot'];
+  const PROBING_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot'];
 
   it.each(PROBING_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -760,6 +761,14 @@ describe('readyPattern', () => {
     expect(adapter.readyPattern).toBeDefined();
     expect(adapter.readyPattern!.test('›')).toBe(true);
     expect(adapter.readyPattern!.test('97% left')).toBe(true);
+  });
+
+  it('traex matches prompt and context indicators', () => {
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('›')).toBe(true);
+    expect(adapter.readyPattern!.test('❯ Run /review on my current changes')).toBe(true);
+    expect(adapter.readyPattern!.test('GPT-5.5 · Context 100% left')).toBe(true);
   });
 
   it('codex-app matches runner prompt indicator', () => {
