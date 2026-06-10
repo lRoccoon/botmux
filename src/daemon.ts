@@ -1734,6 +1734,34 @@ async function pushCollabWorker(input: PushCollabWorkerInput): Promise<void> {
   rememberLastCliInput(ds, input.content, input.content);
 }
 
+async function createCollabWorkerTopic(input: {
+  runId: string;
+  workerId: string;
+  taskId: string;
+  larkAppId: string;
+  chatId: string;
+  controlTopicId: string;
+  goal: string;
+}): Promise<string> {
+  const shortRun = input.runId.slice(-8);
+  const goal = input.goal.length > 1200 ? `${input.goal.slice(0, 1200)}...` : input.goal;
+  const content =
+    `Collab worker topic\n` +
+    `Run: ${input.runId}\n` +
+    `Worker: ${input.workerId}\n` +
+    `Task: ${input.taskId}\n` +
+    `Control topic: ${input.controlTopicId}\n\n` +
+    `Goal:\n${goal}`;
+  return sendMessage(
+    input.larkAppId,
+    input.chatId,
+    content,
+    'text',
+    `collab-worker-topic:${shortRun}:${input.workerId}`,
+    { sessionId: input.runId, scope: 'thread', anchor: input.controlTopicId },
+  );
+}
+
 function collabForSession(ds: DaemonSession): { runId: string; workerId: string; taskId: string; baseDir?: string } | undefined {
   return ds.collab ?? ds.session.collab;
 }
@@ -3285,6 +3313,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     configureCollabControlPlane({
       dataDir: config.session.dataDir,
       reply: sessionReply,
+      createWorkerTopic: createCollabWorkerTopic,
       spawnWorker: spawnCollabWorker,
       pushWorker: pushCollabWorker,
     });

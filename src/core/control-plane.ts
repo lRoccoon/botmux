@@ -23,6 +23,15 @@ export type SpawnCollabWorkerInput = {
   prompt: string;
   ownerOpenId?: string;
 };
+export type CreateCollabWorkerTopicInput = {
+  runId: string;
+  workerId: string;
+  taskId: string;
+  larkAppId: string;
+  chatId: string;
+  controlTopicId: string;
+  goal: string;
+};
 export type PushCollabWorkerInput = {
   runId: string;
   workerId?: string;
@@ -52,6 +61,7 @@ type ControlPlaneConfig = {
   dataDir: string;
   reply: ReplyFn;
   boardFactory?: BoardFactory;
+  createWorkerTopic?: (input: CreateCollabWorkerTopicInput) => Promise<string>;
   spawnWorker?: (input: SpawnCollabWorkerInput) => Promise<void>;
   pushWorker?: (input: PushCollabWorkerInput) => Promise<void>;
   maxWorkerReallocations?: number;
@@ -120,6 +130,10 @@ function safeIdPart(s: string): string {
 
 function makeRunId(topicId: string): string {
   return `collab_${safeIdPart(topicId)}_${Date.now().toString(36)}`;
+}
+
+function independentWorkerRoute(worker: { pooled: boolean; topicId: string }, controlTopicId: string): boolean {
+  return worker.pooled || worker.topicId !== controlTopicId;
 }
 
 async function resolveBoardFactory(): Promise<BoardFactory> {
@@ -192,6 +206,26 @@ async function allocateWorkerTarget(runId: string, fallback: { larkAppId: string
     pooled: true,
     leaseExpiresAt: leased.leaseExpiresAt,
   };
+}
+
+async function placeWorkerTarget(worker: Awaited<ReturnType<typeof allocateWorkerTarget>>, input: {
+  runId: string;
+  taskId: string;
+  controlTopicId: string;
+  goal: string;
+}): Promise<typeof worker> {
+  const createWorkerTopic = requireConfig().createWorkerTopic;
+  if (!createWorkerTopic) return worker;
+  const topicId = await createWorkerTopic({
+    runId: input.runId,
+    workerId: worker.workerId,
+    taskId: input.taskId,
+    larkAppId: worker.larkAppId,
+    chatId: worker.chatId,
+    controlTopicId: input.controlTopicId,
+    goal: input.goal,
+  });
+  return { ...worker, topicId };
 }
 
 function topicIdForRun(larkAppId: string, runId: string): string | undefined {
@@ -358,6 +392,7 @@ export async function handleCollabWorkerLost(input: CollabWorkerLostInput): Prom
     leaseExpiresAt: renewedLease?.leaseExpiresAt ?? before.worker.leaseExpiresAt ?? Date.now() + 30 * 60 * 1000,
     pooled: isPooledWorker,
   };
+  const independentRoute = worker.pooled || !!before.worker.topicId || worker.topicId !== input.topicId;
   await append(board, {
     runId: input.runId,
     type: 'WorkerAllocated',
@@ -372,7 +407,7 @@ export async function handleCollabWorkerLost(input: CollabWorkerLostInput): Prom
       taskId: before.task.taskId,
       leaseExpiresAt: worker.leaseExpiresAt,
       larkAppId: worker.pooled ? worker.larkAppId : undefined,
-      topicId: worker.pooled ? worker.topicId : undefined,
+      topicId: independentRoute ? worker.topicId : undefined,
     },
   });
   await append(board, {
@@ -596,6 +631,25 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
         await cfg.reply(topicId, await renderCard(board, localeForBot(ctx.larkAppId)), 'interactive', ctx.larkAppId);
         return;
       }
+      try {
+        worker = await placeWorkerTarget(worker, {
+          runId: board.runId,
+          taskId: snapshotAfterCreate.task.taskId,
+          controlTopicId: topicId,
+          goal: snapshotAfterCreate.goal,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await failRun(board, {
+          idempotencyKey: `worker-placement-failed:${board.runId}`,
+          topicId,
+          summary: `No collab worker topic could be created: ${message}`,
+        });
+        logger.warn(`[collab-control] worker topic placement failed run=${board.runId}: ${message}`);
+        await cfg.reply(topicId, await renderCard(board, localeForBot(ctx.larkAppId)), 'interactive', ctx.larkAppId);
+        return;
+      }
+      const independentRoute = independentWorkerRoute(worker, topicId);
       await append(board, {
         runId: board.runId,
         type: 'WorkerAllocated',
@@ -610,7 +664,7 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
           taskId: snapshotAfterCreate.task.taskId,
           leaseExpiresAt: worker.leaseExpiresAt,
           larkAppId: worker.pooled ? worker.larkAppId : undefined,
-          topicId: worker.pooled ? worker.topicId : undefined,
+          topicId: independentRoute ? worker.topicId : undefined,
         },
       });
       await append(board, {

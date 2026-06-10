@@ -8,6 +8,7 @@ import {
   handleCollabControlCardAction,
   handleCollabControlMessage,
   handleCollabWorkerLost,
+  type CreateCollabWorkerTopicInput,
   type PushCollabWorkerInput,
   type SpawnCollabWorkerInput,
 } from '../src/core/control-plane.js';
@@ -50,12 +51,14 @@ describe('collab control-plane integration seam', () => {
   let replies: Reply[];
   let spawns: SpawnCollabWorkerInput[];
   let pushes: PushCollabWorkerInput[];
+  let workerTopics: CreateCollabWorkerTopicInput[];
 
   beforeEach(() => {
     dataDir = mkdtempSync(join(tmpdir(), 'botmux-collab-control-'));
     replies = [];
     spawns = [];
     pushes = [];
+    workerTopics = [];
     configureCollabControlPlane({
       dataDir,
       reply: async (anchor, content, msgType, larkAppId) => {
@@ -172,6 +175,64 @@ describe('collab control-plane integration seam', () => {
     pool = readCollabWorkerPool(dataDir);
     expect(pool.workers[0]).toMatchObject({ id: 'coder-1', status: 'available' });
     expect(pool.workers[0].leasedBy).toBeUndefined();
+  });
+
+  it('creates a per-run worker topic when a placement hook is configured', async () => {
+    configureCollabControlPlane({
+      dataDir,
+      reply: async (anchor, content, msgType, larkAppId) => {
+        replies.push({ anchor, content, msgType, larkAppId });
+        return `om_reply_${replies.length}`;
+      },
+      createWorkerTopic: async (input) => {
+        workerTopics.push(input);
+        return `om_worker_topic_${workerTopics.length}`;
+      },
+      spawnWorker: async (input) => {
+        spawns.push(input);
+      },
+      pushWorker: async (input) => {
+        pushes.push(input);
+      },
+    });
+    await addCollabWorker(dataDir, {
+      id: 'coder-1',
+      larkAppId: 'worker_app',
+      label: 'Coder 1',
+      cliId: 'codex',
+    });
+
+    await handleCollabControlMessage(rawTextEvent('/collab per-run topic | test: test -f done.txt', 'om_seed_topic'), ctx());
+
+    expect(workerTopics).toHaveLength(1);
+    expect(workerTopics[0]).toMatchObject({
+      larkAppId: 'worker_app',
+      chatId: 'oc_collab',
+      controlTopicId: 'om_topic_root',
+      workerId: 'coder-1',
+      taskId: 'task-1',
+      goal: 'per-run topic',
+    });
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]).toMatchObject({
+      larkAppId: 'worker_app',
+      chatId: 'oc_collab',
+      topicId: 'om_worker_topic_1',
+      workerId: 'coder-1',
+    });
+
+    const board = openCollabBoard(spawns[0].runId, { baseDir: spawns[0].baseDir });
+    const snapshot = await board.snapshot();
+    expect(snapshot.controlTopicId).toBe('om_topic_root');
+    expect(snapshot.worker).toMatchObject({
+      workerId: 'coder-1',
+      larkAppId: 'worker_app',
+      topicId: 'om_worker_topic_1',
+      phase: 'running',
+    });
+
+    const index = JSON.parse(readFileSync(join(dataDir, 'collab/control-topic-index.json'), 'utf-8'));
+    expect(index.topics['cli_control::om_topic_root']).toBe(spawns[0].runId);
   });
 
   it('reallocates a lost pooled worker by respawning the same lease from the board', async () => {
