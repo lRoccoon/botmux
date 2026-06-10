@@ -3,9 +3,10 @@
  *
  * This is the typed write API the integration面 imports. It is a thin policy
  * layer over the event-log (write-model) and materialize (read-model):
- *   - append(): decides baseRevision, applies P0.0 last-write-wins conflict
- *     policy (write the event; if the caller's baseRevision was stale, also log
- *     a ConflictRaised audit marker), returns AppendResult.
+ *   - append(): decides baseRevision and applies the section conflict policy —
+ *     exclusive sections (EXCLUSIVE_BOARD_PATHS) reject stale claimed writes
+ *     (CAS, checked under the log's file lock); everything else keeps P0.0
+ *     last-write-wins with a ConflictRaised audit marker. Returns AppendResult.
  *   - snapshot()/revision()/history(): read side, always derived from the log.
  *
  * Construction (which runId, where the log lives) is the core's concern; the
@@ -14,6 +15,7 @@
 import { join } from 'node:path';
 import { config } from '../config.js';
 import {
+  EXCLUSIVE_BOARD_PATHS,
   type CollabBoard,
   type CollabEventDraft,
   type AppendResult,
@@ -34,9 +36,54 @@ class CollabBoardImpl implements CollabBoard {
   async append(draft: CollabEventDraft): Promise<AppendResult> {
     const rev = await this.log.currentSeq();
     const base = draft.baseRevision ?? rev;
-    const stale = draft.baseRevision != null && draft.baseRevision < rev;
-
     const persistDraft = { ...draft, baseRevision: base } as EventLogDraft;
+
+    // P3 minimal CAS: a write touching an exclusive section with an explicit
+    // baseRevision claim must be fresh — staleness is checked under the log's
+    // file lock and a stale write is REJECTED, never applied. Writes that omit
+    // baseRevision make no claim and fall through to LWW below (today's
+    // control-plane GoalChanged path; tightening that to mandatory claims is
+    // the integration side's follow-up).
+    const exclusive = draft.affectedPaths.some((p) => EXCLUSIVE_BOARD_PATHS.has(p));
+    if (exclusive && draft.baseRevision != null) {
+      const res = await this.log.appendUnlessStale(persistDraft);
+      if ('staleAtSeq' in res) {
+        const marker = await this.log.append({
+          type: 'ConflictRaised',
+          runId: this.runId,
+          actor: 'system',
+          // keyed by the draft's own idempotencyKey: retrying the same stale
+          // write dedupes to one marker; a fresh-based retry of the same op
+          // uses the draft key untouched and applies normally.
+          idempotencyKey: `${draft.idempotencyKey}:rejected`,
+          baseRevision: res.staleAtSeq,
+          affectedPaths: draft.affectedPaths,
+          payload: {
+            staleBaseRevision: base,
+            currentRevision: res.staleAtSeq,
+            resolution: 'rejected',
+          },
+        } as EventLogDraft);
+        return {
+          ok: true,
+          event: marker.event,
+          revision: marker.event.seq,
+          deduped: marker.deduped,
+          conflictLogged: true,
+          rejected: true,
+        };
+      }
+      return {
+        ok: true,
+        event: res.event,
+        revision: res.event.seq,
+        deduped: res.deduped,
+        conflictLogged: false,
+        rejected: false,
+      };
+    }
+
+    const stale = draft.baseRevision != null && draft.baseRevision < rev;
     const res = await this.log.append(persistDraft);
 
     // P0.0 last-write-wins: the write always lands. If the caller reasoned about
@@ -67,6 +114,7 @@ class CollabBoardImpl implements CollabBoard {
       revision: res.event.seq,
       deduped: res.deduped,
       conflictLogged,
+      rejected: false,
     };
   }
 

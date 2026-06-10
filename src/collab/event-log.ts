@@ -91,6 +91,28 @@ export class CollabEventLog {
     );
   }
 
+  /**
+   * Like append(), but if the draft carries a baseRevision BEHIND the log's
+   * authoritative seq, nothing is written and `{ staleAtSeq }` is returned.
+   * The check runs under the same mutex+file lock as the write, so it is
+   * race-free across processes (no TOCTOU window). An idempotent retry of an
+   * already-applied write still dedupes and returns the prior event — dedupe
+   * is checked before staleness, so retrying a write that landed earlier never
+   * reads as a conflict.
+   */
+  async appendUnlessStale(draft: EventLogDraft): Promise<AppendOutcome | { staleAtSeq: number }> {
+    return getRunMutex(this.runId).run(() =>
+      withFileLock(this.eventsFile, async () => {
+        await this.refreshIfStale();
+        const isRetry = this.idemIndex.has(draft.idempotencyKey);
+        if (!isRetry && typeof draft.baseRevision === 'number' && draft.baseRevision < this.seq) {
+          return { staleAtSeq: this.seq };
+        }
+        return this.appendLocked(draft);
+      }),
+    );
+  }
+
   private async appendLocked(draft: EventLogDraft): Promise<AppendOutcome> {
     await this.refreshIfStale();
 

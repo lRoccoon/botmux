@@ -82,16 +82,20 @@ describe('collab core', () => {
     expect((await board.history())).toHaveLength(1);
   });
 
-  it('applies last-write-wins and logs ConflictRaised on stale baseRevision', async () => {
+  it('applies last-write-wins and logs ConflictRaised on stale baseRevision (non-exclusive section)', async () => {
     const board = openCollabBoard(RUN, { baseDir });
     await board.append(draft({ type: 'RunCreated', affectedPaths: ['goal'], idempotencyKey: 'rc', topicId: 't1', payload: { goal: 'g', acceptanceCriteria: { command: 'true', doneWhen: 'exitZero' }, budgetLimit: 100, budgetUnit: 'tokens', controlTopicId: 't1' } }));
-    // caller reasoned about revision 0 but log is already at 1 → stale
-    const res = await board.append(draft({ type: 'GoalChanged', affectedPaths: ['goal'], idempotencyKey: 'gc', baseRevision: 0, payload: { goal: 'g2' } }));
+    // caller reasoned about revision 0 but log is already at 1 → stale. artifacts
+    // is append-only (NOT exclusive), so P0.0 LWW still applies the write.
+    // (Exclusive sections like goal now CAS-reject instead — covered in
+    // test/collab-p3-proposals-cas.test.ts.)
+    const res = await board.append(draft({ type: 'ArtifactRecorded', actor: 'worker', affectedPaths: ['artifacts'], idempotencyKey: 'ar', baseRevision: 0, payload: { artifactId: 'a1', kind: 'file', path: 'x.txt' } }));
     expect(res.ok).toBe(true);
+    expect(res.rejected).toBe(false);
     expect(res.conflictLogged).toBe(true);
     const hist = await board.history();
     expect(hist.some((e) => e.type === 'ConflictRaised')).toBe(true);
-    expect((await board.snapshot()).goal).toBe('g2'); // write still landed
+    expect((await board.snapshot()).artifacts).toHaveLength(1); // write still landed
   });
 
   it('budget breaker: BudgetExhausted forces exhausted', async () => {

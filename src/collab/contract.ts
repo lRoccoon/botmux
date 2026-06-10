@@ -61,6 +61,7 @@ export const BoardPathEnum = z.enum([
   'goal',
   'acceptanceCriteria',
   'task',
+  'proposals',
   'worker',
   'artifacts',
   'progressLog',
@@ -70,6 +71,20 @@ export const BoardPathEnum = z.enum([
   'status',
 ]);
 export type BoardPath = z.infer<typeof BoardPathEnum>;
+
+/**
+ * Sections owned exclusively by control-plane/human decisions (P3 minimal CAS).
+ * A write touching one of these WITH an explicit-but-stale baseRevision is
+ * REJECTED — nothing is applied, a ConflictRaised(resolution:'rejected') audit
+ * event is logged, and AppendResult.rejected is set. The staleness check runs
+ * under the event-log file lock, so it is race-free across processes. Writes
+ * that omit baseRevision make no CAS claim and keep legacy LWW semantics; all
+ * other sections keep P0.0 last-write-wins (+ ConflictRaised audit marker).
+ */
+export const EXCLUSIVE_BOARD_PATHS: ReadonlySet<BoardPath> = new Set<BoardPath>([
+  'goal',
+  'acceptanceCriteria',
+]);
 
 /** Delivery state of a human intervention. delivered→read→applied, or superseded. */
 export const ReceiptStateEnum = z.enum([
@@ -189,6 +204,30 @@ export const TaskStatusChangedEventSchema = event('TaskStatusChanged', z.object(
   taskId: TaskIdSchema,
   status: TaskStatusEnum,
   note: z.string().optional(),
+}));
+
+// ── dynamic tasks (P3: worker proposes, deterministic planner/human ratifies) ─
+// A worker may NOT create tasks. It appends TaskProposed; the control-plane's
+// deterministic planner (or a human) appends TaskProposalResolved, and only an
+// accepted resolution is followed by a TaskCreated/TaskAssigned written by the
+// control-plane. LLM 只提议、确定性代码才裁决.
+export const TaskProposedEventSchema = event('TaskProposed', z.object({
+  proposalId: z.string().min(1),
+  title: z.string().min(1),
+  spec: z.string().min(1),
+  /** Why this task should exist — the ratifier's primary input. */
+  why: z.string().min(1),
+  parentTaskId: TaskIdSchema.optional(),
+  expectedArtifact: z.string().optional(),
+  doneCriteria: z.string().optional(),
+  deps: z.array(TaskIdSchema).optional(),
+}));
+export const TaskProposalResolvedEventSchema = event('TaskProposalResolved', z.object({
+  proposalId: z.string().min(1),
+  resolution: z.enum(['accepted', 'rejected']),
+  /** Set on acceptance: the taskId the follow-up TaskCreated carries. */
+  taskId: TaskIdSchema.optional(),
+  reason: z.string().optional(),
 }));
 
 // ── worker lease lifecycle (the kill/resume命题) ─────────────────────────────
@@ -316,11 +355,13 @@ export const InterventionReceiptUpdatedEventSchema = event('InterventionReceiptU
   state: ReceiptStateEnum,
 }));
 
-// ── conflict (recorded under P0.0 last-write-wins; real CAS later) ───────────
+// ── conflict (LWW audit marker for P0.0 sections; CAS reject for exclusive) ──
 export const ConflictRaisedEventSchema = event('ConflictRaised', z.object({
   staleBaseRevision: z.number().int().nonnegative(),
   currentRevision: z.number().int().nonnegative(),
-  resolution: z.literal('last-write-wins'),
+  /** 'last-write-wins' = stale write applied anyway (P0.0 sections);
+   *  'rejected' = exclusive-section CAS refused the write, nothing applied. */
+  resolution: z.enum(['last-write-wins', 'rejected']),
 }));
 
 // ── the discriminated union over every event ─────────────────────────────────
@@ -332,6 +373,8 @@ export const CollabEventSchema = z.discriminatedUnion('type', [
   TaskCreatedEventSchema,
   TaskAssignedEventSchema,
   TaskStatusChangedEventSchema,
+  TaskProposedEventSchema,
+  TaskProposalResolvedEventSchema,
   WorkerAllocatedEventSchema,
   WorkerTurnStartedEventSchema,
   WorkerTurnFinishedEventSchema,
@@ -374,6 +417,24 @@ export interface TaskState {
   status: TaskStatus;
   assignedWorkerId: string | null;
   note?: string;
+}
+
+/** A worker-proposed task awaiting (or past) deterministic ratification. */
+export interface TaskProposalEntry {
+  proposalId: string;
+  title: string;
+  spec: string;
+  why: string;
+  parentTaskId?: string;
+  expectedArtifact?: string;
+  doneCriteria?: string;
+  deps?: string[];
+  status: 'pending' | 'accepted' | 'rejected';
+  /** Set when accepted: the taskId the proposal became. */
+  taskId?: string;
+  reason?: string;
+  proposedAtSeq: number;
+  resolvedAtSeq?: number;
 }
 
 export interface WorkerState {
@@ -441,7 +502,12 @@ export interface BoardSnapshot {
   status: RunStatus;
   goal: string;
   acceptanceCriteria: AcceptanceCriteria | null;
-  task: TaskState | null;    // P0.0: exactly one
+  /** The initial task (= tasks[0]); kept as the legacy P0.0 single-task view. */
+  task: TaskState | null;
+  /** All tasks in creation order (P3: accepted proposals append here). */
+  tasks: TaskState[];
+  /** Worker-proposed tasks with their ratification state. */
+  proposals: TaskProposalEntry[];
   worker: WorkerState | null;
   artifacts: ArtifactRef[];
   progressLog: ProgressEntry[];
@@ -464,8 +530,13 @@ export type AppendResult = {
   revision: number;
   /** true ⇒ idempotencyKey already seen; `event` is the prior one, no new write. */
   deduped: boolean;
-  /** true ⇒ baseRevision was stale; write applied last-write-wins + ConflictRaised logged. */
+  /** true ⇒ baseRevision was stale; a ConflictRaised audit event was logged. */
   conflictLogged: boolean;
+  /** true ⇒ exclusive-section CAS refused the write: NOTHING was applied and
+   *  `event` is the ConflictRaised audit record, not the caller's draft. The
+   *  caller should re-read the snapshot and decide whether to retry on the new
+   *  revision. Always false for non-exclusive sections (those keep LWW). */
+  rejected: boolean;
 };
 
 /**

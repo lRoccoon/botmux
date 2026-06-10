@@ -16,6 +16,7 @@ import type {
   CollabEvent,
   BoardSnapshot,
   TaskState,
+  TaskProposalEntry,
   WorkerState,
   ArtifactRef,
   ProgressEntry,
@@ -27,7 +28,8 @@ import type {
 export function materialize(runId: string, events: CollabEvent[]): BoardSnapshot {
   let goal = '';
   let acceptanceCriteria: BoardSnapshot['acceptanceCriteria'] = null;
-  let task: TaskState | null = null;
+  const tasks: TaskState[] = [];
+  const proposals: TaskProposalEntry[] = [];
   let worker: WorkerState | null = null;
   const artifacts: ArtifactRef[] = [];
   const progressLog: ProgressEntry[] = [];
@@ -66,26 +68,62 @@ export function materialize(runId: string, events: CollabEvent[]): BoardSnapshot
           : 'failed'; // 'failed' | 'budget-exhausted'
         break;
 
-      case 'TaskCreated':
-        task = {
+      case 'TaskCreated': {
+        const created: TaskState = {
           taskId: e.payload.taskId,
           title: e.payload.title,
           spec: e.payload.spec,
           status: 'open',
           assignedWorkerId: null,
         };
+        // creation order; a same-taskId re-create (replayed dupes) replaces in place
+        const at = tasks.findIndex((t) => t.taskId === created.taskId);
+        if (at >= 0) tasks[at] = created;
+        else tasks.push(created);
         break;
-      case 'TaskAssigned':
-        if (task && task.taskId === e.payload.taskId) {
-          task.assignedWorkerId = e.payload.workerId;
+      }
+      case 'TaskAssigned': {
+        const t = tasks.find((t) => t.taskId === e.payload.taskId);
+        if (t) t.assignedWorkerId = e.payload.workerId;
+        break;
+      }
+      case 'TaskStatusChanged': {
+        const t = tasks.find((t) => t.taskId === e.payload.taskId);
+        if (t) {
+          t.status = e.payload.status;
+          t.note = e.payload.note;
         }
         break;
-      case 'TaskStatusChanged':
-        if (task && task.taskId === e.payload.taskId) {
-          task.status = e.payload.status;
-          task.note = e.payload.note;
+      }
+
+      case 'TaskProposed': {
+        // first proposal wins the id; log-level idempotency already dedupes retries
+        if (!proposals.some((p) => p.proposalId === e.payload.proposalId)) {
+          proposals.push({
+            proposalId: e.payload.proposalId,
+            title: e.payload.title,
+            spec: e.payload.spec,
+            why: e.payload.why,
+            parentTaskId: e.payload.parentTaskId,
+            expectedArtifact: e.payload.expectedArtifact,
+            doneCriteria: e.payload.doneCriteria,
+            deps: e.payload.deps,
+            status: 'pending',
+            proposedAtSeq: e.seq,
+          });
         }
         break;
+      }
+      case 'TaskProposalResolved': {
+        const p = proposals.find((p) => p.proposalId === e.payload.proposalId);
+        if (p) {
+          p.status = e.payload.resolution;
+          p.taskId = e.payload.taskId;
+          p.reason = e.payload.reason;
+          p.resolvedAtSeq = e.seq;
+        }
+        break;
+      }
 
       case 'WorkerAllocated':
         worker = {
@@ -197,7 +235,9 @@ export function materialize(runId: string, events: CollabEvent[]): BoardSnapshot
     status,
     goal,
     acceptanceCriteria,
-    task,
+    task: tasks[0] ?? null,
+    tasks,
+    proposals,
     worker,
     artifacts,
     progressLog,
