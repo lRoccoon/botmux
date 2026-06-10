@@ -40,7 +40,7 @@ import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
-import { openCollabBoard, runReferee } from '../collab/index.js';
+import { openCollabBoard, runReferee, type BoardSnapshot } from '../collab/index.js';
 import { releaseCollabWorker } from '../collab/worker-pool-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -2058,6 +2058,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const collabTurnFinishChains = new Map<string, Promise<void>>();
+const collabStallNotifications = new Set<string>();
 
 type CollabTurnFinishSignal =
   | { source: 'final_output'; reason: 'completed'; turnId?: string; lastUuid?: string }
@@ -2077,6 +2078,30 @@ function queueCollabTurnFinished(ds: DaemonSession, signal: CollabTurnFinishSign
       if (collabTurnFinishChains.get(key) === next) collabTurnFinishChains.delete(key);
     });
   collabTurnFinishChains.set(key, next);
+}
+
+async function notifyCollabStalled(ds: DaemonSession, snapshot: BoardSnapshot, tag: string): Promise<void> {
+  if (!snapshot.stall || !snapshot.controlTopicId) return;
+  const key = `${snapshot.runId}:${snapshot.stall.raisedAtSeq}`;
+  if (collabStallNotifications.has(key)) return;
+  collabStallNotifications.add(key);
+  try {
+    const lastProgress = snapshot.progressLog.at(-1);
+    const task = snapshot.task?.title ?? snapshot.task?.taskId ?? 'unknown task';
+    const summary = lastProgress?.summary ? `\nLast signal: ${lastProgress.summary}` : '';
+    const content =
+      `Collab progress stalled\n` +
+      `Run: ${snapshot.runId}\n` +
+      `Task: ${task}\n` +
+      `No improvement for ${snapshot.stall.streak} referee checks (threshold ${snapshot.stall.threshold}).` +
+      `${lastProgress ? `\nLast verdict: ${lastProgress.verdict}` : ''}` +
+      summary;
+    await requireCallbacks().sessionReply(snapshot.controlTopicId, content, 'text', ds.larkAppId);
+    logger.info(`[${tag}] collab stall notification sent run=${snapshot.runId} seq=${snapshot.stall.raisedAtSeq}`);
+  } catch (err) {
+    collabStallNotifications.delete(key);
+    throw err;
+  }
 }
 
 async function handleCollabTurnFinished(
@@ -2124,6 +2149,13 @@ async function handleCollabTurnFinished(
   const result = await runReferee(board, { cwd, idemSuffix: idem });
   logger.info(`[${tag}] collab referee verdict=${result.verdict}${result.exitCode !== undefined ? ` exit=${result.exitCode}` : ''}`);
   const after = await board.snapshot();
+  if (result.stalled) {
+    try {
+      await notifyCollabStalled(ds, after, tag);
+    } catch (err) {
+      logger.warn(`[${tag}] collab stall notification failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   if (after.status !== 'running' && after.status !== 'pending') {
     await releaseCollabWorker(config.session.dataDir, collab.runId);
     await closeSession(ds.session.sessionId);

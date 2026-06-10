@@ -223,6 +223,9 @@ export function buildCollabControlCard(snapshot: BoardSnapshot, locale?: Locale)
   const progress = lastProgress
     ? `${lastProgress.verdict}${lastProgress.summary ? ` · ${lastProgress.summary}` : ''}`
     : 'no verdict';
+  const stall = snapshot.stall
+    ? `\n**Stall** ${escapeMd(`${snapshot.stall.streak} no-improvement checks (threshold ${snapshot.stall.threshold})`)}`
+    : '';
   const pendingInterventions = snapshot.interventions
     .filter(i => i.receipt !== 'applied' && i.receipt !== 'superseded')
     .map(i => `- ${i.kind}: ${i.receipt ?? 'requested'} (${i.interventionId})`)
@@ -234,6 +237,7 @@ export function buildCollabControlCard(snapshot: BoardSnapshot, locale?: Locale)
     `**Worker** ${escapeMd(worker)}\n` +
     `**Budget** ${escapeMd(budget)}\n` +
     `**Progress** ${escapeMd(progress)}` +
+    stall +
     (pendingInterventions ? `\n\n**Interventions**\n${escapeMd(pendingInterventions)}` : '');
 
   const actions: any[] = [

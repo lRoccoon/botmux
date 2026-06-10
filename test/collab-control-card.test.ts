@@ -13,8 +13,10 @@ function snap(status: RunStatus, over: Partial<BoardSnapshot> = {}): BoardSnapsh
     worker: { workerId: 'w1', taskId: 'task-1', phase: 'running', larkAppId: 'cli_worker', topicId: 'ocworker1' },
     artifacts: [],
     progressLog: [],
+    stall: null,
     budget: { limit: 20, unit: 'turns', spent: 1, remaining: 19, exhausted: false },
     interventions: [],
+    controlTopicId: 'oc-control',
     ...over,
   };
 }
@@ -53,5 +55,14 @@ describe('collab control card gating', () => {
     const card = parse(buildCollabControlCard(snap('running')));
     const body = card.elements.find((e: any) => e.tag === 'markdown').content;
     expect(body).toContain('@ocworker1');
+  });
+
+  it('surfaces an active stall state', () => {
+    const card = parse(buildCollabControlCard(snap('running', {
+      stall: { streak: 3, threshold: 3, raisedAtSeq: 12 },
+    })));
+    const body = card.elements.find((e: any) => e.tag === 'markdown').content;
+    expect(body).toContain('**Stall**');
+    expect(body).toContain('3 no-improvement checks');
   });
 });
