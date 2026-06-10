@@ -93,31 +93,41 @@ export async function writeRunnerInput(
   }
 
   const sendText = pty.sendText.bind(pty);
-  const sendEnter = (): boolean => pty.sendSpecialKeys!('Enter') !== false;
+  const sendEnterWithRetry = (attempts = 3): boolean => {
+    for (let i = 0; i < attempts; i++) {
+      if (pty.sendSpecialKeys!('Enter') !== false) return true;
+    }
+    return false;
+  };
 
-  // Pre-flush any leftover partial control line (see buffer-hygiene contract).
-  // Cheap and idempotent on the happy path: the previous message's submit Enter
-  // already emptied the buffer, so this just enqueues a blank line the runner
-  // ignores.
-  sendEnter();
+  // Pre-flush MUST land before we write a new control line. It terminates any
+  // partial line a prior failed write left in the runner's buffer (runner
+  // discards the fragment as bad input; an empty buffer just ignores the blank
+  // line). If it can't land, the buffer may still hold an old partial — writing
+  // our new line NOW would merge "old partial + new line" into one bad line the
+  // runner drops, while our submit Enter would still report success (a silent
+  // message loss — exactly the failure mode this whole change closes). So bail
+  // with submitted:false and let the worker re-queue; we never touch the buffer
+  // with a half write. (Idempotent on the happy path: the previous message's
+  // submit Enter already emptied the buffer, so this enqueues an ignored blank.)
+  if (!sendEnterWithRetry()) return { submitted: false };
 
   const chunks = chunkAscii(line, RUNNER_INPUT_CHUNK_BYTES);
   for (let i = 0; i < chunks.length; i++) {
     if (sendText(chunks[i]) === false) {
-      // The chunks already written are sitting in the runner's buffer as a
-      // partial control line with no terminating newline. Flush it (best-effort)
-      // so the discarded fragment can't merge with the next message.
-      sendEnter();
+      // The chunks already written are a partial control line with no
+      // terminating newline. Flush it (with retry) so it's less likely to
+      // linger; even if every retry drops, the NEXT call's pre-flush gate above
+      // refuses to write onto the dirty buffer, so no corruption-as-success can
+      // slip through.
+      sendEnterWithRetry();
       return { submitted: false };
     }
     if (i < chunks.length - 1) await delay(RUNNER_INPUT_THROTTLE_MS);
   }
 
-  // Submit, retrying the Enter — a single dropped Enter leaves a complete but
-  // unsubmitted line in the buffer (the next call's pre-flush would belatedly
-  // submit it; retrying here makes that vanishingly rare).
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (sendEnter()) return { submitted: true };
-  }
-  return { submitted: false };
+  // Submit (with retry — a single dropped Enter would leave a complete but
+  // unsubmitted line in the buffer).
+  if (!sendEnterWithRetry()) return { submitted: false };
+  return { submitted: true };
 }

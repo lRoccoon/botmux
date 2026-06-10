@@ -164,10 +164,13 @@ describe('writeRunnerInput — tmux mode', () => {
     expect(enterCount()).toBe(2);
   });
 
-  it('reports submitted:false when every Enter is dropped (after retries)', async () => {
-    const { pty } = fakeTmuxPty({ failEnter: true });
+  it('pre-flush gate: when every Enter is dropped, bail submitted:false WITHOUT writing any chunk', async () => {
+    const { pty, textChunks } = fakeTmuxPty({ failEnter: true });
     const res = await writeRunnerInput(pty, MARKER, 'short message');
     expect(res).toEqual({ submitted: false });
+    // The pre-flush Enter never lands, so we must not write the control line
+    // onto a possibly-dirty buffer.
+    expect(textChunks).toHaveLength(0);
   });
 });
 
@@ -214,5 +217,54 @@ describe('writeRunnerInput — runner buffer hygiene (no cross-message contamina
     expect(runner.enqueued).toEqual(['first', 'second']);
     expect(runner.bad).toEqual([]);
     expect(runner.buf).toBe('');
+  });
+
+  // Codex re-review 🔴: failure-flush Enter ALSO drops, then the next message's
+  // pre-flush Enter ALSO drops. The old code would write the next line onto the
+  // dirty buffer and (if its submit Enter landed) falsely report submitted:true
+  // while the runner only saw a parse error — a silent message loss. The
+  // pre-flush gate must prevent that.
+  it('pre-flush gate blocks a write onto a dirty buffer — no false submitted:true, no corruption', async () => {
+    const runner = makeRunnerSim();
+    // Stateful driver spanning both calls; script global text/enter drop indices.
+    let textIdx = 0;
+    let enterIdx = 0;
+    const dropText = new Set<number>();
+    const dropEnter = new Set<number>();
+    const pty: PtyHandle = {
+      write() { throw new Error('unused'); },
+      sendText(t: string) { const i = textIdx++; if (dropText.has(i)) return false; runner.feed(t); return true; },
+      sendSpecialKeys() { const i = enterIdx++; if (dropEnter.has(i)) return false; runner.feed('\r'); return true; },
+    };
+
+    // Message A: a >=3-chunk payload; drop the last chunk so a partial lingers,
+    // and drop ALL of A's failure-flush Enter retries so the partial is NOT
+    // flushed. (A pre-flush = enter 0 lands; failure-flush = enters 1,2,3 drop.)
+    const aContent = 'A'.repeat(2000);
+    const aChunks = chunkAscii(MARKER + encodeRunnerInput(aContent), RUNNER_INPUT_CHUNK_BYTES);
+    expect(aChunks.length).toBeGreaterThanOrEqual(3);
+    dropText.add(aChunks.length - 1);
+    dropEnter.add(1); dropEnter.add(2); dropEnter.add(3);
+    const a = await writeRunnerInput(pty, MARKER, aContent);
+    expect(a).toEqual({ submitted: false });
+    expect(runner.buf).not.toBe('');            // A's partial is stuck in the buffer
+
+    // Message B: drop ALL of B's pre-flush Enter retries (enters 4,5,6). The gate
+    // must refuse to write B's chunks and report submitted:false.
+    dropEnter.add(4); dropEnter.add(5); dropEnter.add(6);
+    const textBefore = textIdx;
+    const b = await writeRunnerInput(pty, MARKER, 'message B');
+    expect(b).toEqual({ submitted: false });    // NOT a false success
+    expect(textIdx).toBe(textBefore);           // zero chunks written for B
+    expect(runner.enqueued).not.toContain('message B');
+    expect(runner.bad).not.toContain('shape');  // no merged bad line attributed as submitted
+
+    // Recovery: a clean B' (all Enters land) pre-flushes A's stuck partial
+    // (discarded as bad), then enqueues intact.
+    const cleanRunnerPty = fakeRunnerPty(runner); // fresh counters, no drops
+    const bb = await writeRunnerInput(cleanRunnerPty, MARKER, 'message B prime');
+    expect(bb).toEqual({ submitted: true });
+    expect(runner.enqueued).toContain('message B prime');
+    expect(runner.enqueued).not.toContain('message B');
   });
 });
