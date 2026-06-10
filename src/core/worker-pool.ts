@@ -1655,9 +1655,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         }
 
         if (ds.lastScreenStatus === 'idle') {
-          handleCollabTurnFinished(ds, { source: 'idle', reason: 'yielded' }, t).catch((err) => {
-            logger.warn(`[${t}] collab idle turn-finished/referee failed: ${err instanceof Error ? err.message : String(err)}`);
-          });
+          queueCollabTurnFinished(ds, { source: 'idle', reason: 'yielded' }, t);
         }
 
         // Bot opted out of the streaming card — dashboard SSE above already got
@@ -1971,14 +1969,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
         deliverFinalOutput(ds, msg, t, 0);
-        handleCollabTurnFinished(ds, {
+        queueCollabTurnFinished(ds, {
           source: 'final_output',
           reason: 'completed',
           turnId: msg.turnId,
           lastUuid: msg.lastUuid,
-        }, t).catch((err) => {
-          logger.warn(`[${t}] collab turn-finished/referee failed: ${err instanceof Error ? err.message : String(err)}`);
-        });
+        }, t);
         break;
       }
 
@@ -2061,10 +2057,27 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 // ─── Bridge final-output delivery (with retry) ──────────────────────────────
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
+const collabTurnFinishChains = new Map<string, Promise<void>>();
 
 type CollabTurnFinishSignal =
   | { source: 'final_output'; reason: 'completed'; turnId?: string; lastUuid?: string }
   | { source: 'idle'; reason: 'yielded' };
+
+function queueCollabTurnFinished(ds: DaemonSession, signal: CollabTurnFinishSignal, tag: string): void {
+  const key = ds.session.sessionId;
+  const prev = collabTurnFinishChains.get(key) ?? Promise.resolve();
+  let next: Promise<void>;
+  next = prev
+    .catch(() => undefined)
+    .then(() => handleCollabTurnFinished(ds, signal, tag))
+    .catch((err) => {
+      logger.warn(`[${tag}] collab ${signal.source} turn-finished/referee failed: ${err instanceof Error ? err.message : String(err)}`);
+    })
+    .finally(() => {
+      if (collabTurnFinishChains.get(key) === next) collabTurnFinishChains.delete(key);
+    });
+  collabTurnFinishChains.set(key, next);
+}
 
 async function handleCollabTurnFinished(
   ds: DaemonSession,

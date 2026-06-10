@@ -5,7 +5,13 @@ import { tmpdir } from 'node:os';
 import { openCollabBoard } from '../src/collab/board.js';
 import { cmdCollab } from '../src/collab/cli.js';
 import type { CollabEventDraft } from '../src/collab/contract.js';
-import { readCollabWorkerPool } from '../src/collab/worker-pool-store.js';
+import {
+  addCollabWorker,
+  leaseCollabWorker,
+  readCollabWorkerPool,
+  renewCollabWorkerLease,
+  sweepExpiredCollabWorkerLeases,
+} from '../src/collab/worker-pool-store.js';
 
 const RUN = 'run-cli-1';
 
@@ -95,6 +101,30 @@ describe('collab CLI (worker board access)', () => {
     expect(listed[0]).toMatchObject({ id: 'coder-1', larkAppId: 'worker_app', status: 'available', cliId: 'codex' });
     expect(listed[0].chatId).toBeUndefined();
     expect(readCollabWorkerPool(dataDir).workers[0]).toMatchObject({ id: 'coder-1' });
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('pool lease sweep releases expired dead leases while preserving renewed active runs', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'collab-pool-sweep-'));
+    await addCollabWorker(dataDir, { id: 'coder-1', larkAppId: 'worker_app_1' });
+    await addCollabWorker(dataDir, { id: 'coder-2', larkAppId: 'worker_app_2' });
+
+    const leasedActive = await leaseCollabWorker(dataDir, { runId: 'run-active', now: 1_000, ttlMs: 10 });
+    const leasedDead = await leaseCollabWorker(dataDir, { runId: 'run-dead', now: 1_000, ttlMs: 10 });
+    expect(leasedActive?.id).toBe('coder-1');
+    expect(leasedDead?.id).toBe('coder-2');
+
+    await renewCollabWorkerLease(dataDir, { runId: 'run-active', now: 2_000, ttlMs: 10_000 });
+    const released = await sweepExpiredCollabWorkerLeases(dataDir, {
+      now: 2_000,
+      protectedRunIds: ['run-active'],
+    });
+
+    expect(released.map((w) => w.id)).toEqual(['coder-2']);
+    const pool = readCollabWorkerPool(dataDir);
+    expect(pool.workers.find((w) => w.id === 'coder-1')).toMatchObject({ status: 'leased', leasedBy: 'run-active' });
+    expect(pool.workers.find((w) => w.id === 'coder-2')).toMatchObject({ status: 'available' });
+    expect(pool.workers.find((w) => w.id === 'coder-2')?.leasedBy).toBeUndefined();
     rmSync(dataDir, { recursive: true, force: true });
   });
 });

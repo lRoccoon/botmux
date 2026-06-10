@@ -143,6 +143,7 @@ import {
 import { parseAskBody, resolveAskApprovers } from './core/ask-api.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { configureCollabControlPlane, handleCollabControlMessage, handleCollabWorkerLost, type PushCollabWorkerInput, type SpawnCollabWorkerInput } from './core/control-plane.js';
+import { readCollabWorkerPool, renewCollabWorkerLease, sweepExpiredCollabWorkerLeases } from './collab/worker-pool-store.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -1731,6 +1732,70 @@ async function pushCollabWorker(input: PushCollabWorkerInput): Promise<void> {
   }
   ds.worker.send({ type: 'message', content: input.content } as DaemonToWorker);
   rememberLastCliInput(ds, input.content, input.content);
+}
+
+function collabForSession(ds: DaemonSession): { runId: string; workerId: string; taskId: string; baseDir?: string } | undefined {
+  return ds.collab ?? ds.session.collab;
+}
+
+function isLiveCollabWorkerSession(ds: DaemonSession): boolean {
+  return !!ds.worker && !ds.worker.killed && ds.worker.exitCode === null;
+}
+
+function findCollabSession(runId: string, workerId?: string): DaemonSession | undefined {
+  for (const ds of activeSessions.values()) {
+    const collab = collabForSession(ds);
+    if (!collab || collab.runId !== runId) continue;
+    if (workerId && collab.workerId !== workerId) continue;
+    return ds;
+  }
+  return undefined;
+}
+
+async function runCollabLeaseWatchdog(reason: 'startup' | 'interval'): Promise<void> {
+  const pool = readCollabWorkerPool(config.session.dataDir);
+  if (pool.workers.length === 0) return;
+  const protectedRunIds = new Set<string>();
+  for (const worker of pool.workers) {
+    if (worker.status !== 'leased' || !worker.leasedBy) continue;
+    const ds = findCollabSession(worker.leasedBy, worker.id);
+    if (ds && isLiveCollabWorkerSession(ds)) {
+      protectedRunIds.add(worker.leasedBy);
+      await renewCollabWorkerLease(config.session.dataDir, { runId: worker.leasedBy }).catch((err) => {
+        logger.warn(`[collab-watchdog] failed to renew lease run=${worker.leasedBy}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      continue;
+    }
+    if (!ds) continue;
+    const collab = collabForSession(ds);
+    if (!collab) continue;
+    logger.warn(`[collab-watchdog] worker not live run=${collab.runId} worker=${collab.workerId}; triggering recovery (${reason})`);
+    await handleCollabWorkerLost({
+      runId: collab.runId,
+      workerId: collab.workerId,
+      taskId: collab.taskId,
+      baseDir: collab.baseDir,
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      topicId: sessionAnchorId(ds),
+      ownerOpenId: ds.ownerOpenId,
+      sessionId: ds.session.sessionId,
+      workerPid: ds.worker?.pid,
+      exitCode: ds.worker?.exitCode ?? null,
+      signal: null,
+      detectedBy: 'watchdog',
+      reason: `lease watchdog found no live worker during ${reason}`,
+    }).catch((err) => {
+      logger.warn(`[collab-watchdog] worker recovery failed run=${collab.runId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+  const released = await sweepExpiredCollabWorkerLeases(config.session.dataDir, { protectedRunIds }).catch((err) => {
+    logger.warn(`[collab-watchdog] lease sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  });
+  if (released.length > 0) {
+    logger.warn(`[collab-watchdog] released ${released.length} expired collab worker lease(s): ${released.map((w) => `${w.id}:${w.leasedBy}`).join(', ')}`);
+  }
 }
 
 ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) => {
@@ -3461,6 +3526,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
+
+  let collabLeaseWatchdogTimer: ReturnType<typeof setInterval> | undefined;
+  if (cfg.handler === 'control-plane') {
+    runCollabLeaseWatchdog('startup').catch((err) => {
+      logger.warn(`[collab-watchdog] startup failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    collabLeaseWatchdogTimer = setInterval(() => {
+      runCollabLeaseWatchdog('interval').catch((err) => {
+        logger.warn(`[collab-watchdog] interval failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }, 60_000);
+    collabLeaseWatchdogTimer.unref?.();
+  }
 
   const idleWorkerSweepTimer = setInterval(() => {
     const suspended = sweepIdleWorkers(activeSessions);

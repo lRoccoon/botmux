@@ -228,6 +228,66 @@ describe('collab control-plane integration seam', () => {
     expect(pool.workers[0]).toMatchObject({ id: 'coder-1', status: 'leased', leasedBy: first.runId });
   });
 
+  it('records watchdog-detected worker loss distinctly', async () => {
+    await addCollabWorker(dataDir, {
+      id: 'coder-1',
+      larkAppId: 'worker_app',
+      label: 'Coder 1',
+      cliId: 'codex',
+    });
+    await handleCollabControlMessage(rawTextEvent('/collab watchdog recovery | test: test -f done.txt', 'om_seed_watchdog'), ctx('om_watchdog'));
+    const first = spawns[0];
+
+    const result = await handleCollabWorkerLost({
+      runId: first.runId,
+      workerId: first.workerId,
+      taskId: first.taskId,
+      baseDir: first.baseDir,
+      larkAppId: first.larkAppId,
+      chatId: first.chatId,
+      topicId: first.topicId,
+      sessionId: 'sess-watchdog',
+      workerPid: 444,
+      exitCode: null,
+      signal: null,
+      detectedBy: 'watchdog',
+      reason: 'lease watchdog found no live worker during test',
+    });
+
+    expect(result).toBe('reallocated');
+    const board = openCollabBoard(first.runId, { baseDir: first.baseDir });
+    const lost = (await board.history()).find((e) => e.type === 'WorkerLost');
+    expect(lost?.payload).toMatchObject({
+      workerId: 'coder-1',
+      detectedBy: 'watchdog',
+      reason: 'lease watchdog found no live worker during test',
+    });
+  });
+
+  it('fails fast instead of orphaning a run when the worker pool is exhausted', async () => {
+    await addCollabWorker(dataDir, {
+      id: 'coder-1',
+      larkAppId: 'worker_app',
+      label: 'Coder 1',
+      cliId: 'codex',
+    });
+    await handleCollabControlMessage(rawTextEvent('/collab occupy pool | test: test -f done.txt', 'om_seed_occupy'), ctx('om_pool_a'));
+    expect(spawns).toHaveLength(1);
+
+    await handleCollabControlMessage(rawTextEvent('/collab no worker left | test: test -f done.txt', 'om_seed_exhausted'), ctx('om_pool_b'));
+
+    expect(spawns).toHaveLength(1);
+    const index = JSON.parse(readFileSync(join(dataDir, 'collab/control-topic-index.json'), 'utf-8'));
+    const runId = index.topics['cli_control::om_pool_b'];
+    const board = openCollabBoard(runId, { baseDir: join(dataDir, 'collab-runs') });
+    const snapshot = await board.snapshot();
+    expect(snapshot.status).toBe('failed');
+    expect(snapshot.worker).toBeNull();
+    const types = (await board.history()).map((e) => e.type);
+    expect(types.slice(-1)).toEqual(['RunFinished']);
+    expect(replies.at(-1)).toMatchObject({ anchor: 'om_pool_b', msgType: 'interactive' });
+  });
+
   it('fails the run instead of reallocating past the crash-loop cap', async () => {
     configureCollabControlPlane({
       dataDir,

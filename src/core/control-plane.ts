@@ -44,6 +44,8 @@ export type CollabWorkerLostInput = {
   workerPid?: number;
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
+  detectedBy?: 'crash' | 'watchdog' | 'control-plane';
+  reason?: string;
 };
 
 type ControlPlaneConfig = {
@@ -259,11 +261,34 @@ async function ensureRunCreated(board: CollabBoard, input: {
 
 function lostEventSuffix(input: CollabWorkerLostInput): string {
   return [
+    input.detectedBy ?? 'crash',
     input.sessionId ?? 'session',
     input.workerPid ?? 'pid',
     input.exitCode ?? 'null',
     input.signal ?? 'none',
+    input.reason ?? 'reason',
   ].join(':');
+}
+
+async function failRun(board: CollabBoard, input: {
+  idempotencyKey: string;
+  topicId?: string;
+  outcome?: 'failed' | 'budget-exhausted';
+  summary: string;
+}): Promise<void> {
+  await append(board, {
+    runId: board.runId,
+    type: 'RunFinished',
+    actor: 'system',
+    idempotencyKey: input.idempotencyKey,
+    affectedPaths: ['status'],
+    topicId: input.topicId,
+    payload: {
+      outcome: input.outcome ?? 'failed',
+      summary: input.summary,
+    },
+  });
+  await releaseCollabWorker(requireConfig().dataDir, board.runId);
 }
 
 export async function handleCollabWorkerLost(input: CollabWorkerLostInput): Promise<'ignored' | 'reallocated' | 'failed'> {
@@ -291,8 +316,8 @@ export async function handleCollabWorkerLost(input: CollabWorkerLostInput): Prom
     workerId: input.workerId,
     payload: {
       workerId: input.workerId,
-      detectedBy: 'crash',
-      reason: input.signal ? `signal:${input.signal}` : `exit_code:${input.exitCode ?? 'null'}`,
+      detectedBy: input.detectedBy ?? 'crash',
+      reason: input.reason ?? (input.signal ? `signal:${input.signal}` : `exit_code:${input.exitCode ?? 'null'}`),
     },
   });
 
@@ -301,35 +326,20 @@ export async function handleCollabWorkerLost(input: CollabWorkerLostInput): Prom
   const current = await board.snapshot();
   const maxReallocations = cfg.maxWorkerReallocations ?? DEFAULT_MAX_WORKER_REALLOCATIONS;
   if (current.budget?.exhausted) {
-    await append(board, {
-      runId: input.runId,
-      type: 'RunFinished',
-      actor: 'system',
+    await failRun(board, {
       idempotencyKey: `worker-lost-budget-exhausted:${input.runId}:${suffix}`,
-      affectedPaths: ['status'],
       topicId: input.topicId,
-      payload: {
-        outcome: 'budget-exhausted',
-        summary: `Worker ${input.workerId} was lost and budget is exhausted.`,
-      },
+      outcome: 'budget-exhausted',
+      summary: `Worker ${input.workerId} was lost and budget is exhausted.`,
     });
-    await releaseCollabWorker(cfg.dataDir, input.runId);
     return 'failed';
   }
   if (lostCount > maxReallocations) {
-    await append(board, {
-      runId: input.runId,
-      type: 'RunFinished',
-      actor: 'system',
+    await failRun(board, {
       idempotencyKey: `worker-unrecoverable:${input.runId}:${suffix}`,
-      affectedPaths: ['status'],
       topicId: input.topicId,
-      payload: {
-        outcome: 'failed',
-        summary: `Worker ${input.workerId} was lost ${lostCount} times; reallocation cap ${maxReallocations} exceeded.`,
-      },
+      summary: `Worker ${input.workerId} was lost ${lostCount} times; reallocation cap ${maxReallocations} exceeded.`,
     });
-    await releaseCollabWorker(cfg.dataDir, input.runId);
     return 'failed';
   }
 
@@ -397,19 +407,11 @@ export async function handleCollabWorkerLost(input: CollabWorkerLostInput): Prom
       ownerOpenId: input.ownerOpenId,
     });
   } catch (err) {
-    await append(board, {
-      runId: input.runId,
-      type: 'RunFinished',
-      actor: 'system',
+    await failRun(board, {
       idempotencyKey: `worker-respawn-failed:${input.runId}:${input.workerId}:${suffix}`,
-      affectedPaths: ['status'],
       topicId: worker.topicId,
-      payload: {
-        outcome: 'failed',
-        summary: `Worker ${input.workerId} was lost and respawn failed: ${err instanceof Error ? err.message : String(err)}`,
-      },
+      summary: `Worker ${input.workerId} was lost and respawn failed: ${err instanceof Error ? err.message : String(err)}`,
     });
-    await releaseCollabWorker(cfg.dataDir, input.runId);
     return 'failed';
   }
   await append(board, {
@@ -576,11 +578,24 @@ export async function handleCollabControlMessage(data: any, ctx: RoutingContext)
     });
     const snapshotAfterCreate = await board.snapshot();
     if (!snapshotAfterCreate.worker && snapshotAfterCreate.task) {
-      const worker = await allocateWorkerTarget(board.runId, {
-        larkAppId: ctx.larkAppId,
-        chatId: ctx.chatId,
-        topicId,
-      });
+      let worker: Awaited<ReturnType<typeof allocateWorkerTarget>>;
+      try {
+        worker = await allocateWorkerTarget(board.runId, {
+          larkAppId: ctx.larkAppId,
+          chatId: ctx.chatId,
+          topicId,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await failRun(board, {
+          idempotencyKey: `worker-allocation-failed:${board.runId}`,
+          topicId,
+          summary: `No collab worker could be allocated: ${message}`,
+        });
+        logger.warn(`[collab-control] allocation failed run=${board.runId}: ${message}`);
+        await cfg.reply(topicId, await renderCard(board, localeForBot(ctx.larkAppId)), 'interactive', ctx.larkAppId);
+        return;
+      }
       await append(board, {
         runId: board.runId,
         type: 'WorkerAllocated',

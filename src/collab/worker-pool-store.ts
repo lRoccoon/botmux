@@ -122,6 +122,51 @@ export async function leaseCollabWorker(
   });
 }
 
+export async function renewCollabWorkerLease(
+  dataDir: string,
+  input: { runId: string; ttlMs?: number; now?: number },
+): Promise<CollabWorkerPoolEntry | null> {
+  const file = collabWorkerPoolPath(dataDir);
+  return withPoolLock(dataDir, async () => {
+    const pool = readCollabWorkerPool(dataDir);
+    const now = input.now ?? Date.now();
+    const ttlMs = input.ttlMs ?? 30 * 60 * 1000;
+    const worker = pool.workers.find((w) => w.leasedBy === input.runId && w.status === 'leased');
+    if (!worker) return null;
+    worker.leaseExpiresAt = now + ttlMs;
+    worker.updatedAt = now;
+    writePoolFile(file, pool);
+    return { ...worker };
+  });
+}
+
+export async function sweepExpiredCollabWorkerLeases(
+  dataDir: string,
+  input: { now?: number; protectedRunIds?: Iterable<string> } = {},
+): Promise<CollabWorkerPoolEntry[]> {
+  const file = collabWorkerPoolPath(dataDir);
+  return withPoolLock(dataDir, async () => {
+    const pool = readCollabWorkerPool(dataDir);
+    const now = input.now ?? Date.now();
+    const protectedRunIds = new Set(input.protectedRunIds ?? []);
+    const released: CollabWorkerPoolEntry[] = [];
+    let changed = false;
+    for (const worker of pool.workers) {
+      if (worker.status !== 'leased' || !worker.leasedBy) continue;
+      if (protectedRunIds.has(worker.leasedBy)) continue;
+      if (typeof worker.leaseExpiresAt !== 'number' || worker.leaseExpiresAt > now) continue;
+      released.push({ ...worker });
+      worker.status = 'available';
+      worker.leasedBy = undefined;
+      worker.leaseExpiresAt = undefined;
+      worker.updatedAt = now;
+      changed = true;
+    }
+    if (changed) writePoolFile(file, pool);
+    return released;
+  });
+}
+
 export async function releaseCollabWorker(dataDir: string, runId: string): Promise<void> {
   const file = collabWorkerPoolPath(dataDir);
   await withPoolLock(dataDir, async () => {
