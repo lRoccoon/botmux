@@ -75,6 +75,8 @@ export const messages: Record<string, string> = {
   'card.land.body': 'The sandbox session produced **{files}** changed file(s) (**+{ins} / -{del}**).\nTarget: `{dir}`\n\nReview the diff below; "Apply to disk" will `git apply` these changes back to the real repo.',
   'card.land.files_header': 'Changed files',
   'card.land.preview_header': 'Diff preview',
+  'card.land.truncated': 'Preview truncated — full diff in the attached .patch file',
+  'card.land.patch_note': 'Full .patch attached (git apply-able)',
   'card.land.btn_apply': 'Apply to disk',
   'card.land.btn_discard': 'Discard',
   'card.land.note': 'Owner-only; changes come from an isolated clone — the real repo is untouched until you apply.',
@@ -137,9 +139,11 @@ export const messages: Record<string, string> = {
 
   // ─── /relay picker card (pull mode) ─────────────────────────────────────
   'card.relay.title': '📋 Pick a session to relay into this chat',
+  'card.relay.title_p2p': '📋 Pick a session to relay into this DM',
   'card.relay.empty': 'No relayable sessions.\n(Picker only lists sessions you own, on this bot, in other chats.)',
   'card.relay.btn_pull': 'Pull into this chat',
   'card.relay.btn_confirm': 'Confirm relay into this chat',
+  'card.relay.btn_confirm_p2p': 'Confirm relay into this DM',
   'card.relay.btn_confirm_running': 'Session is running — cannot relay yet',
   'card.relay.field_status': 'Status',
   'card.relay.status_running': '🟢 Running',
@@ -177,6 +181,11 @@ export const messages: Record<string, string> = {
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
   'cmd.card.owner_only': '⚠️ Only the bot owner can use /card.',
+  'cmd.term.owner_only': '⚠️ Only the bot owner can use /term to get the operable terminal link.',
+  'cmd.term.no_session': 'No active session in this topic — /term needs a running session.',
+  'cmd.term.not_ready': '🔒 Terminal isn’t ready yet; send /term again once the session is up.',
+  'cmd.term.failed': '⚠️ Failed to send the operable link (both the private card and DM failed); check the daemon logs.',
+  'cmd.term.sent_dm': '🔑 Sent the operable terminal link to your DM (kept out of the group).',
   'cmd.card.off_ok': '🔕 Streaming cards turned off for this chat; status now shows via the in-place pending card (no withdrawal). /card on to restore; /card summons a live card.',
   'cmd.card.on_ok': '🔔 Streaming cards restored for this chat. The next status update posts a live card again.',
   'cmd.card.fail': '⚠️ Operation failed: {reason}',
@@ -328,9 +337,9 @@ export const messages: Record<string, string> = {
   'cmd.relay.adopt_not_relayable': '⚠️ This session was attached via /adopt to an external tmux. The CLI runs on your machine and botmux does not control its tmux lifecycle, so it cannot be relayed.',
   'cmd.relay.not_started_yet': '⚠️ The session has not picked a repo and the CLI has never started — nothing to relay yet. Pick a repo in this session first.',
   'cmd.relay.worker_busy': '⚠️ The session is mid-turn (working). Wait for the current turn to finish (idle), then try /relay again.',
-  'cmd.relay.picker_p2p_unsupported': '⚠️ Relay is not supported in direct (p2p) chats. Use /relay in a group chat.',
   'cmd.relay.resolve_failed': '⚠️ Could not resolve the @-mentioned bots; /relay cancelled. Please retry shortly.',
   'cmd.relay.m1_announce': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\n@ the corresponding bot to continue.',
+  'cmd.relay.m1_announce_dm': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\nJust send a message to continue.',
   'cmd.relay.m1_final_all_ok': '🚀 Sessions relayed into this chat\n📋 Source: {sourceChat}\n✅ Ready: {successBots}\n⚠️ Lark message history stays in the source chat; AI memory has been carried over. @ the corresponding bot to continue.',
   'cmd.relay.m1_final_partial': '🚀 Sessions relayed into this chat\n📋 Source: {sourceChat}\n✅ Ready: {successBots}\n⚠️ Failed to migrate: {failedBots}\n→ Run /relay in this chat to pull those bots\' sessions from the source manually.\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.',
   'cmd.relay.m1_final_all_fresh': '🚀 New group created and bots invited.\n📋 Source: {sourceChat}\nNo source session to migrate — @ any bot to start a fresh conversation.',
@@ -369,6 +378,7 @@ export const messages: Record<string, string> = {
   'help.repo_path': '/repo <path|name> - Use a path or a project name under workingDir, skipping the card',
   'help.status': '/status     - Show current session status (incl. terminal URL)',
   'help.card': '/card       - Manually post the streaming card for this session (summons it even when streaming is off, and resumes live updates; with private-card mode on, sends a static snapshot visible only to authorized users instead)',
+  'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.heading_passthrough': '🔀 Passthrough to {cliName} (forwarded verbatim to its built-in slash commands):',
   'help.heading_schedule': '⏰ Scheduled tasks:',
   'help.schedule_create': '/schedule daily 17:50 summarize AI news  - create a scheduled task (natural language)',
@@ -576,4 +586,130 @@ export const messages: Record<string, string> = {
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
+
+  // ─── i18n coverage v2: shared fragments + cards + chat messages ───────────
+  'common.operator': 'By: {by}',
+  'common.empty_paren': '(empty)',
+  'common.truncated_short': '…(truncated)',
+
+  // Workflow approval card
+  'card.wf.none': 'None',
+  'card.wf.title_pending': 'Approval needed: {node}',
+  'card.wf.title_resolved': '{prefix}: {node}',
+  'card.wf.review_content': 'Review content',
+  'card.wf.review_preview_suffix': ' (preview; full text in Web details below)',
+  'card.wf.comment_placeholder': 'Optional: add a review comment',
+  'card.wf.btn_approve': '✅ Approve',
+  'card.wf.btn_reject': '❌ Reject',
+  'card.wf.btn_cancel_run': 'Cancel run',
+  'card.wf.btn_web_detail': 'Web details',
+  'card.wf.resolved.approved': 'Approved',
+  'card.wf.resolved.rejected': 'Rejected',
+  'card.wf.resolved.cancelled': 'Cancelled',
+  'card.wf.banner.approved': '✅ Approved',
+  'card.wf.banner.rejected': '❌ Rejected',
+  'card.wf.banner.cancelled': '🛑 Cancelled',
+  'card.wf.comment_label': 'Note: {comment}',
+  'card.wf.truncated': '…(truncated; view the full text on the Web)',
+
+  // Workflow progress card
+  'card.wf.field.status': 'Status',
+  'card.wf.field.progress': 'Progress',
+  'card.wf.field.failed': 'Failed',
+  'card.wf.progress_value': '{done} / {total} nodes done',
+  'card.wf.section.running': 'Running',
+  'card.wf.section.waiting': 'Awaiting approval',
+  'card.wf.section.loop': 'Loop nodes',
+  'card.wf.failure_summary': 'Failure summary',
+  'card.wf.terminal.live': 'View live terminal',
+  'card.wf.terminal.log': 'View execution log',
+  'card.wf.usage': 'Usage: /workflow run <id> [key=value ...]\nor: /workflow cancel <runId>',
+  'wf.err.missing_run_id': 'Missing runId',
+  'wf.err.cancel_only_run_id': '/workflow cancel only accepts a runId',
+  'wf.err.run_id_charset': 'runId may only contain letters, digits, underscore, dot and hyphen',
+  'wf.err.unknown_subcommand': 'Only /workflow run / cancel subcommands are supported',
+  'wf.err.missing_workflow_id': 'Missing workflow id',
+  'wf.err.workflow_id_charset': 'workflow id may only contain letters, digits, underscore, dot and hyphen',
+  'wf.err.param_format': 'Parameters must be key=value: {token}',
+  'wf.err.param_name_charset': 'Parameter names may only contain letters, digits, underscore, dot and hyphen: {key}',
+  'wf.err.duplicate_param': 'Duplicate parameter: {key}',
+  'wf.cmd_failed': 'Workflow command failed: {error}',
+
+  // Ask card
+  'card.ask.field.deadline': 'Deadline',
+  'card.ask.field.answerable': 'Can answer',
+  'card.ask.question_n': 'Question {n}',
+  'card.ask.submit': 'Submit',
+  'card.ask.custom_reply_hint': '💬 None of the options fit? Just reply with your answer in this topic.',
+  'card.ask.title': 'botmux ask',
+  'card.ask.title_done': 'botmux ask · done',
+  'card.ask.toast.unauthorized': "You're not allowed to answer this ask",
+  'card.ask.toast.already_settled': 'This ask was already answered or closed',
+  'card.ask.toast.stale': '⚠️ This ask is no longer valid',
+  'card.ask.custom_reply': 'Custom reply',
+  'card.ask.q_summary_line': 'Q{n}: {labels}',
+  'card.ask.q_unparseable': 'Q{n}: (unparseable)',
+  'card.ask.selected': 'Selected',
+  'card.ask.supplement': 'Note: {comment}',
+  'card.ask.timed_out': 'Timed out, no answer',
+  'card.ask.invalidated': 'No longer valid',
+  'card.ask.no_approver': 'No eligible responders',
+
+  // Voice summary instruction (injected into the model session)
+  'card.voice.summary_instruction': '🔊 [Voice summary request] Condense your last reply to the user into spoken prose of at most 5 sentences suitable for reading aloud: drop code, commands, file paths, URLs, English abbreviations and markdown; state only the conclusions, and get to the point in the first sentence. Then call `botmux send --voice "<the condensed spoken text>"` to send it as voice. Send only this one voice message — no extra text.',
+
+  // Card action toasts (dedupe / in-flight / approver gate)
+  'toast.action_received_no_repeat': 'Action received — please don’t click again',
+  'toast.action_in_progress': 'Action in progress — please wait',
+  'toast.action_received_bg': 'Action received — processing in the background',
+  'toast.not_in_approver_list': 'You’re not on the approver list — no action taken',
+
+  // Quote hint (injected into the CLI prompt)
+  'prompt.quote_hint': '[User quoted a message — run `botmux quoted {id}` to view it]',
+
+  // Markdown / contextual reply card chrome
+  'card.you': 'You',
+  'card.sent_to': 'Sent to: ',
+
+  // Adopt preamble card title
+  'card.adopt_last_round': '📜 Last exchange before /adopt',
+  'card.local_turn_resumed': '🖥️ Local terminal turn resumed (model was mid-output during the daemon restart)',
+  'card.local_turn': '🖥️ Local terminal turn (typed directly in the adopted pane, synced to Lark)',
+
+  // Scheduler announcements
+  'scheduler.task_started': '🕐 Scheduled task “{name}” started',
+  'scheduler.task_triggered_target_chat': '🕐 Scheduled task “{name}” triggered in the target chat',
+  'scheduler.task_triggered_target_thread': '🕐 Scheduled task “{name}” triggered in the target topic',
+
+  // External event trigger seed
+  'trigger.external_event': 'External event: {source}',
+
+  // Worker-side submit / notify messages
+  'worker.submit_impossible': '⚠️ Your last message was NOT delivered to {cliName}: the current keybinding config can’t auto-submit from the terminal.\nReason: {reason}\nAdjust the Claude Code Chat keybinding, then resend.\nStart: {preview}',
+  'worker.submit_unconfirmed': '⚠️ Your last message was sent to {cliName} but submission couldn’t be confirmed (after retrying Enter and waiting {secs}s, no new entry showed up in {transcriptLabel}). It may be stuck in the input box — check the Web terminal and press Enter manually or resend.\nStart: {preview}',
+  'worker.coco_session_dir_gone': '⚠️ The current CoCo session directory was deleted (e2e cleanup or a manual rm). Content written to events.jsonl lands on a stale inode the bridge can’t read. Restart CoCo and run /adopt again.',
+
+  // Restart / maintenance report (bot-0 DM to owner)
+  'restart.updated_restarted': '🔄 **botmux updated & restarted**',
+  'restart.restarted': '🔄 **botmux restarted**',
+  'restart.version_delta': 'Version: {old} → {new}',
+  'restart.version': 'Version: {version}',
+  'restart.unfinished_sessions': 'Unfinished sessions: {count}',
+  'restart.dashboard': 'Dashboard: {url}',
+  'restart.changelog_label': 'What’s new:',
+  'restart.changelog_link_fallback': 'Details: {url}',
+  'restart.card_title': 'botmux maintenance notice',
+
+  // Auto-start (joined chat) member-read failure admin DM
+  'daemon.auto_start_member_read_failed': '⚠️ botmux “auto-start when added to a new chat” is on, but reading the chat members failed, so it can’t tell whether any authorized user is present — auto-start was skipped.\n\nMost likely cause: missing permission to read chat members (im:chat / chat info), or the “bot added to chat” event `im.chat.member.bot.added_v1` isn’t subscribed.\n\nGo to the Lark Open Platform → your app → Permissions / Event subscriptions to add them, then `botmux restart`.\n\nDetails: {detail}',
+
+  // Sandbox landing (/land) errors
+  'sandbox.no_clone': 'This session has no sandbox change layer (sandbox off, or the layer was cleaned up).',
+  'sandbox.clone_not_git': 'The sandbox change layer is unavailable; landing isn’t supported.',
+  'sandbox.nothing_to_land': 'No changes to land.',
+  'sandbox.target_not_git': 'Landing target directory does not exist: {dir}',
+  'sandbox.apply_failed': 'Landing failed: {detail}',
+  'sandbox.diff_failed': 'Reading sandbox changes failed: {detail}',
+  'sandbox.workingdir_not_found': 'Session workingDir not found',
+  'sandbox.no_changes_left': 'The sandbox change layer has no changes left',
 };

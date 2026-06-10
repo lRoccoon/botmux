@@ -428,12 +428,12 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   // on/off) legitimately repeat and must not be pinned for the whole TTL.
   if (eventId && !claimEventOnce(key)) {
     logger.info(`[event-dedupe] duplicate card action ignored (claimed): ${key}`);
-    return { toast: { type: 'info', content: '操作已收到，请勿重复点击' } };
+    return { toast: { type: 'info', content: t('toast.action_received_no_repeat', undefined, localeForBot(larkAppId)) } };
   }
 
   if (cardActionInFlight.has(key)) {
     logger.info(`[event-dedupe] duplicate card action ignored while in-flight: ${key}`);
-    return { toast: { type: 'info', content: '操作正在处理中，请稍候' } };
+    return { toast: { type: 'info', content: t('toast.action_in_progress', undefined, localeForBot(larkAppId)) } };
   }
 
   cardActionInFlight.add(key);
@@ -465,7 +465,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   if (result === CARD_ACTION_TIMEOUT) {
     timedOut = true;
     logger.warn(`[card-action] handler exceeded ${CARD_ACTION_ACK_TIMEOUT_MS}ms; ACKing first and continuing in background: ${key}`);
-    return { toast: { type: 'info', content: '操作已收到，后台处理中' } };
+    return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)) } };
   }
   return result;
 }

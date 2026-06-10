@@ -19,6 +19,7 @@ import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, fin
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldWriteNow } from './utils/input-gate.js';
+import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -40,6 +41,7 @@ import { createServer as createHttpServer, type IncomingMessage } from 'node:htt
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
 import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey, ScreenStatus } from './types.js';
+import { t, setDefaultLocale } from './i18n/index.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import {
   DEFAULT_RENDER_COLS,
@@ -64,7 +66,7 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
-import { prepareSandbox, startOutboxWatcher, sandboxEnabled } from './adapters/backend/sandbox.js';
+import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
@@ -88,6 +90,8 @@ let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
+let sandboxCleanup: (() => void) | null = null;      // unmount overlays + rm the per-session sandbox tree
+let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
@@ -127,6 +131,9 @@ let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
 const pendingMessages: Array<{ content: string; turnId?: string }> = [];
+/** Inputs written to the CLI whose turn hasn't completed — re-queued across a
+ *  CLI crash so a submit-time death can't silently eat user messages. */
+const inflightInputs = new InflightInputTracker();
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
@@ -2400,6 +2407,74 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
   }
 }
 
+/**
+ * Drive CoCo's native AskUserQuestion picker to enter the answer the user picked
+ * on the Lark card. CoCo's PreToolUse hook can't inject answers via a directive
+ * (verified), so the daemon sends this after the ask settles and the hook
+ * returned passthrough — meaning CoCo is about to (or just did) render the
+ * picker. We wait for the picker to appear, then play the key sequence.
+ *
+ * Verified behaviour (CoCo 0.120.38):
+ *   - Single question: the per-question final key (Enter / "Next"→Enter / typed
+ *     text→Enter) submits the whole ask DIRECTLY — there is no Review screen, so
+ *     NO extra Enter (sending one would hit the idle prompt).
+ *   - Multiple questions: after the last question advances, a "Review your
+ *     answers / Submit answers" screen appears; needsReviewSubmit drives the
+ *     extra Enter there.
+ *   - Free-text (comment): navKeys move the cursor to the first question's
+ *     "Type something" row; typing a char auto-switches that row to input mode,
+ *     then a single Enter submits. We type via the backend + one Enter (NOT the
+ *     adapter's writeInput, whose submit-verification retries would fire stray
+ *     Enters into the idle prompt). Multi-question free-text isn't fully
+ *     supported (one text can't answer several structured questions).
+ * Key names ('Down'/'Space'/'Enter') match what the manual probe confirmed.
+ */
+async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, comment?: string | null): Promise<void> {
+  if (!backend) return;
+  const snap = () => (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+  const waitFor = async (re: RegExp, timeoutMs: number): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (re.test(snap())) return true;
+      await new Promise(r => setTimeout(r, 200));
+    }
+    return false;
+  };
+
+  // The hook returns passthrough → CoCo renders the picker; only then send keys.
+  const appeared = await waitFor(/Enter to select|Tab\/Arrow keys|Review your answers/, 30_000);
+  if (!appeared) { log('coco_drive_picker: picker not detected within 30s — aborting drive'); return; }
+  tuiPromptBlocking = true;
+
+  if (comment && comment.trim()) {
+    // Free-text reply: navigate to the first question's "Type something" row,
+    // type the text, then a single Enter. Single-question submits directly; for
+    // multi-question this only fills the first question (logged limitation).
+    log(`coco_drive_picker: free-text answer (${navKeys.length} nav keys)${needsReviewSubmit ? ' [multi-question — partial]' : ''}`);
+    const b = backend as any;
+    if ('sendSpecialKeys' in backend) {
+      for (const key of navKeys) { b.sendSpecialKeys(key); await new Promise(r => setTimeout(r, 100)); }
+    } else {
+      for (const key of navKeys) { backend.write(KEY_TO_ANSI[key] ?? key); await new Promise(r => setTimeout(r, 100)); }
+    }
+    await new Promise(r => setTimeout(r, 150));
+    if ('sendText' in backend && b.sendText) b.sendText(comment); else backend.write(comment);
+    await new Promise(r => setTimeout(r, 200));
+    await handleTuiKeys(['Enter'], true); // single Enter submits + clears blocking state
+    return;
+  }
+
+  // Button selection. Single question: navKeys submit directly (isFinal=true).
+  // Multi question: navKeys land on Review, then one Enter on "Submit answers".
+  log(`coco_drive_picker: selection answer (${navKeys.length} keys, review=${needsReviewSubmit})`);
+  await handleTuiKeys(navKeys, !needsReviewSubmit);
+  if (needsReviewSubmit) {
+    const review = await waitFor(/Review your answers|Submit answers/, 8_000);
+    if (!review) log('coco_drive_picker: Review screen not detected — submitting anyway');
+    await handleTuiKeys(['Enter'], true); // cursor defaults to "Submit answers"
+  }
+}
+
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
 // Claude Code: "Yes, I trust this folder"
@@ -2561,6 +2636,10 @@ function onPtyData(data: string): void {
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
   isPromptReady = true;
+  // CLI is back at its prompt — every previously written input has been
+  // consumed, so nothing is in flight anymore. A later crash must not
+  // replay these.
+  inflightInputs.onTurnComplete();
   maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
@@ -2642,7 +2721,7 @@ function scheduleSubmitFailureNotify(
     send({
       type: 'user_notify',
       turnId: currentBotmuxTurnId,
-      message: `⚠️ 刚才那条消息没有写入 ${cliName()}，因为当前按键配置无法从终端自动提交。\n原因：${reason}\n请调整 Claude Code Chat keybinding 后重发。\n开头：${preview}`,
+      message: t('worker.submit_impossible', { cliName: cliName(), reason, preview }),
     });
     return;
   }
@@ -2698,7 +2777,7 @@ function scheduleSubmitFailureNotify(
     send({
       type: 'user_notify',
       turnId: currentBotmuxTurnId,
-      message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（重试 Enter 后等了 ${Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000)}s 仍未在${transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
+      message: t('worker.submit_unconfirmed', { cliName: cliName(), secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000), transcriptLabel, preview }),
     });
   }, SUBMIT_DEFERRED_RECHECK_MS);
 }
@@ -2751,6 +2830,9 @@ async function flushPending(): Promise<void> {
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const item = pendingMessages.shift()!;
+      // Track as in-flight until the CLI returns to idle (markPromptReady).
+      // If the CLI exits first, onExit stashes these for re-queue on respawn.
+      inflightInputs.onWrite(item);
       const msg = item.content;
       currentBotmuxTurnId = item.turnId;
       writeCliPidMarker();
@@ -2999,7 +3081,7 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       if (!existsSync(sessionDir)) {
         send({
           type: 'final_output',
-          content: '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
+          content: t('worker.coco_session_dir_gone'),
           lastUuid: `coco-adopt-stale-${randomBytes(4).toString('hex')}`,
           turnId: 'coco-adopt-stale',
         });
@@ -3090,6 +3172,18 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
 }
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  // Re-deliver inputs that were in-flight when the previous CLI died (see
+  // backend.onExit). killCli() already wiped pendingMessages, so these go to
+  // the front; the normal flush paths (prompt detect / first-prompt timeout)
+  // deliver them once the fresh CLI is ready. Adopt mode observes a CLI we
+  // don't own — never replay into it.
+  if (!cfg.adoptMode) {
+    const carry = inflightInputs.takeCarryOver();
+    if (carry.length > 0) {
+      pendingMessages.unshift(...carry);
+      log(`Re-queued ${carry.length} in-flight message(s) lost to CLI exit`);
+    }
+  }
   // ── Adopt mode: observe the user's existing terminal backend (no attach) ──
   if (cfg.adoptMode && cfg.adoptSource === 'herdr' && cfg.adoptHerdrSessionName && (cfg.adoptHerdrPaneId || cfg.adoptHerdrTarget)) {
     isTmuxMode = false;
@@ -3225,7 +3319,21 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // forks (Seed → `.claude-runtime`), undefined for everything else. Every
   // JSONL/pid/bridge gate below keys off it instead of `cliId === 'claude-code'`,
   // so a fork inherits the whole submit-confirm + bridge-fallback machinery.
-  const claudeDataDir = cliAdapter.claudeDataDir;
+  let claudeDataDir = cliAdapter.claudeDataDir;
+  // When this session will be file-sandboxed, the CLI's session jsonl is written
+  // into the overlay's EPHEMERAL home upper (CLAUDE_CONFIG_DIR lives under $HOME),
+  // invisible at the real path the bridge normally watches → "Bridge mark expired"
+  // and the turn never relays (2026-06-10 incident). Redirect every jsonl/pid/
+  // bridge gate below to the upper copy where the sandboxed CLI actually writes.
+  const willFileSandbox =
+    (cfg.sandbox === true || sandboxEnabled()) &&
+    (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux') &&
+    !!process.env.SESSION_DATA_DIR;
+  if (claudeDataDir && willFileSandbox) {
+    const redirected = sandboxedClaudeDataDir(cfg.sessionId, claudeDataDir);
+    log(`[sandbox] redirecting Claude bridge dataDir → overlay upper: ${redirected}`);
+    claudeDataDir = redirected;
+  }
   if (claudeDataDir) {
     (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
       claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir, claudeDataDir);
@@ -3362,29 +3470,81 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // bwrap directly) and tmux (the tmux pane's command becomes `bwrap … -- cli`);
   // env is carried via bwrap --setenv (see prepareSandbox), not the backend.
   const sandboxOn = cfg.sandbox === true || sandboxEnabled();
-  if (sandboxOn && (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux') && process.env.SESSION_DATA_DIR) {
+  if (sandboxOn) {
+    // FAIL-SAFE (not fail-open): when the sandbox is requested, a missing
+    // precondition (no SESSION_DATA_DIR, or a backend we can't wrap) must be a
+    // HARD ERROR, never a silent skip — otherwise the CLI would spawn UNSANDBOXED
+    // with full host write access and no log, the exact opposite of the
+    // oncall-untrusted-agent invariant. In normal operation worker-pool sets
+    // SESSION_DATA_DIR and the backend is pty/tmux, so this never trips.
+    const dataDir = process.env.SESSION_DATA_DIR;
+    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
+      const msg = `Sandbox ENABLED but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn to avoid an unsandboxed run`;
+      log(msg);
+      throw new Error(msg);
+    }
+    if (!dataDir) {
+      const msg = 'Sandbox ENABLED but SESSION_DATA_DIR is unset — aborting spawn to avoid an unsandboxed run';
+      log(msg);
+      throw new Error(msg);
+    }
     try {
-      const sbx = prepareSandbox({
-        enabled: sandboxOn,
-        cliId: cfg.cliId,
-        sessionId: cfg.sessionId,
-        sourceWorkingDir: cfg.workingDir,
-        dataDir: process.env.SESSION_DATA_DIR,
-        cliBin: cliAdapter.resolvedBin,
-        cliArgs: args,
-      });
-      if (sbx) {
-        spawnBin = sbx.bin;
-        spawnArgs = sbx.args;
-        spawnCwd = sbx.workDir;
-        Object.assign(childEnv, sbx.env);
-        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        // session-id is FORCED here so a relayed send can't target another session.
-        sandboxStopWatcher = startOutboxWatcher(sbx.outbox, childEnv, cfg.sessionId);
-        log(`Sandbox ON (${cfg.cliId}): work=${sbx.workDir} outbox=${sbx.outbox}`);
+      if (willReattachPersistent) {
+        // Daemon-restart reattach to a persistent (tmux/herdr/zellij) pane whose
+        // bwrap'd CLI is STILL ALIVE. backend.spawn() ignores bin/args here and
+        // just re-attaches, and the live CLI is bound to its own namespace-pinned
+        // overlay — so we must NOT unmount/remount (prepareSandbox would leave a
+        // duplicate host-side overlay the CLI isn't using). We only re-wire the
+        // outbox watcher (so the live CLI's `botmux send` keeps being serviced)
+        // and the cleanup ref (so close/exit reclaims the residue). No re-prep.
+        const att = attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir });
+        if (att) {
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+          sandboxCleanup = att.cleanup;
+          sandboxStopWatcher = startOutboxWatcher(att.outbox, childEnv, cfg.sessionId);
+          log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox} (no remount)`);
+        } else {
+          // No sandbox tree on disk for a session we're reattaching to: the
+          // pane's CLI may be unsandboxed (sandbox enabled after it spawned). Do
+          // NOT remount under a live CLI; just continue the reattach as-is.
+          log(`Sandbox REATTACH (${cfg.cliId}): no on-disk sandbox tree — reattaching live pane without re-prep`);
+        }
+      } else {
+        const sbx = prepareSandbox({
+          enabled: sandboxOn,
+          cliId: cfg.cliId,
+          sessionId: cfg.sessionId,
+          sourceWorkingDir: cfg.workingDir,
+          dataDir,
+          cliBin: cliAdapter.resolvedBin,
+          cliArgs: args,
+          hidePaths: cfg.sandboxHidePaths ?? [],
+        });
+        if (sbx) {
+          spawnBin = sbx.bin;
+          spawnArgs = sbx.args;
+          // In the overlay model the child still chdirs to projectMount (via bwrap
+          // --chdir), so spawnCwd stays the real workingDir; the overlay merged dir
+          // is bound there. sbx.workDir is the UPPER changeset (for landing), NOT a cwd.
+          Object.assign(childEnv, sbx.env);
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+          sandboxCleanup = sbx.cleanup;
+          // session-id is FORCED here so a relayed send can't target another session.
+          sandboxStopWatcher = startOutboxWatcher(sbx.outbox, childEnv, cfg.sessionId);
+          log(`Sandbox ON (${cfg.cliId}): upper=${sbx.workDir} outbox=${sbx.outbox}`);
+        } else {
+          // Sandbox was requested but prepareSandbox returned null (a required
+          // overlay mount failed, or non-Linux). Fail safe: do NOT silently run
+          // unsandboxed — surface a hard error so the session doesn't leak.
+          log(`Sandbox ENABLED but prepare returned null (mount failed / unsupported) — aborting spawn to avoid an unsandboxed run`);
+          throw new Error('sandbox requested but could not be established');
+        }
       }
     } catch (err: any) {
-      log(`Sandbox prepare failed (${err.message}) — falling back to direct spawn`);
+      log(`Sandbox prepare failed (${err.message}) — aborting (sandbox is a hard requirement when enabled)`);
+      throw err;
     }
   }
 
@@ -3552,6 +3712,14 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   backend.onData(onPtyData);
   backend.onExit((code, signal) => {
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
+    // Inputs written but not yet consumed (no idle since the write) die with
+    // the CLI — codex crashing mid-submit never records them, and the fresh
+    // respawn comes up empty. Stash them so the next spawnCli re-queues and
+    // re-delivers.
+    const stashed = inflightInputs.onCliExit();
+    if (stashed > 0) {
+      log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
+    }
     backend = null;
     isPromptReady = false;
     send({ type: 'claude_exit', code, signal });
@@ -3600,11 +3768,17 @@ function killCli(): void {
     try { unlinkSync(cliPidMarker); } catch { /* already gone */ }
     cliPidMarker = null;
   }
-  // Stop the sandbox outbox watcher (the per-session sandbox tree is left in
-  // place so a same-topic resume reuses the same clone + scoped config).
+  // Stop the sandbox outbox watcher, then unmount the overlays + remove the
+  // per-session sandbox tree. In the overlay model the upper layer (the
+  // changeset) must be landed BEFORE close — `/land` runs while the session is
+  // still active, so by cleanup time anything worth keeping is already applied.
   if (sandboxStopWatcher) {
     try { sandboxStopWatcher(); } catch { /* */ }
     sandboxStopWatcher = null;
+  }
+  if (sandboxCleanup) {
+    try { sandboxCleanup(); } catch { /* */ }
+    sandboxCleanup = null;
   }
   isPromptReady = false;
   pendingMessages.length = 0;
@@ -4120,7 +4294,6 @@ process.on('message', async (raw: unknown) => {
       // against the bot's chosen language without each callsite needing to
       // re-thread it.
       if (msg.locale === 'zh' || msg.locale === 'en') {
-        const { setDefaultLocale } = await import('./i18n/index.js');
         setDefaultLocale(msg.locale);
       }
       // Scope session store to this bot's per-bot file.
@@ -4342,9 +4515,23 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'coco_drive_picker': {
+      void driveCocoPicker(msg.navKeys, msg.needsReviewSubmit, msg.comment);
+      break;
+    }
+
     case 'set_display_mode': {
       log(`Display mode → ${msg.mode}`);
       applyDisplayMode(msg.mode);
+      break;
+    }
+
+    case 'set_locale': {
+      // Daemon hot-reloaded the bot's UI locale — re-pin this worker's default
+      // so worker-originated user_notify / final_output strings switch language
+      // without a session restart.
+      setDefaultLocale(msg.locale);
+      log(`Locale → ${msg.locale}`);
       break;
     }
 
@@ -4387,6 +4574,16 @@ process.on('message', async (raw: unknown) => {
       try { backend?.kill(); } catch { /* detach best-effort */ }
       backend = null;
       isPromptReady = false;
+      // Suspend INTENDS to resume later: preserve the sandbox overlay mount + the
+      // upper changeset across the suspension (on resume, prepareSandbox re-mounts
+      // over the SAME upper). So we stop the outbox watcher (no live CLI to serve)
+      // but DO NOT run sandboxCleanup (which would unmount + rm the changeset). We
+      // also disarm the exit-time teardown so process.exit(0) below can't reclaim
+      // it. (Crash/SIGKILL of a suspended-but-active session is still backstopped
+      // by the daemon's periodic sandbox reconciler.)
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      sandboxCleanup = null;           // drop the ref WITHOUT calling it (keep the mount)
+      sandboxTeardownDone = true;      // make the process.on('exit') hook a no-op
       cleanup();
       process.exit(0);
     }
@@ -4437,5 +4634,37 @@ setInterval(() => {
     process.exit(0);
   }
 }, 30_000).unref();
+
+// ─── Sandbox crash-time teardown ─────────────────────────────────────────────
+// killCli() (which unmounts the overlays + rm's the per-session tree) only runs
+// from the SIGTERM/SIGINT/disconnect/watchdog handlers and the close/suspend IPC
+// cases. An UNCAUGHT exception or unhandled rejection kills the process WITHOUT
+// any of those firing, so without this hook a crashed sandboxed worker would
+// leak BOTH overlay mounts (mount-table growth) + its upper/work dirs (disk leak)
+// per crash. We run a minimal, synchronous, best-effort sandbox teardown here so
+// the overlay/dir residue is reclaimed even on an abnormal exit. (SIGKILL still
+// can't be trapped — the daemon-side sweep + the periodic reconciler below are
+// the backstop for that.)
+function teardownSandboxBestEffort(): void {
+  if (sandboxTeardownDone) return;
+  sandboxTeardownDone = true;
+  try { sandboxStopWatcher?.(); } catch { /* */ }
+  sandboxStopWatcher = null;
+  try { sandboxCleanup?.(); } catch { /* */ }
+  sandboxCleanup = null;
+}
+process.on('exit', () => { teardownSandboxBestEffort(); });
+process.on('uncaughtException', (err) => {
+  try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
+  teardownSandboxBestEffort();
+  try { cleanup(); } catch { /* */ }
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason: any) => {
+  try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
+  teardownSandboxBestEffort();
+  try { cleanup(); } catch { /* */ }
+  process.exit(1);
+});
 
 log('Worker started, waiting for init...');

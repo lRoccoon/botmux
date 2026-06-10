@@ -210,11 +210,26 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
 }
 
-function daemonCardFooterRecipientOpenId(ds: DaemonSession): string | undefined {
+function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
   const owner = ds.session.ownerOpenId;
-  if (!owner) return undefined;
+  if (!owner) {
+    // Mira runs through botmux's API runner and cannot execute `botmux send`
+    // itself. For bot-to-bot handoffs, address the daemon fallback card back
+    // to the original dispatcher so orchestration resumes.
+    if (effectiveCliId === 'mira' && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+      return ds.session.creatorOpenId;
+    }
+    return undefined;
+  }
   try {
-    return loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner) ? undefined : owner;
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner)) {
+      // `/repo`-primed dispatch records the dispatching bot as owner (unlike
+      // the @-mention auto-create path, which nulls ownerOpenId for bot
+      // senders). Same Mira constraint applies: the daemon fallback is Mira's
+      // only reply channel, so address the dispatcher bot here too.
+      return effectiveCliId === 'mira' ? owner : undefined;
+    }
+    return owner;
   } catch {
     return owner;
   }
@@ -568,12 +583,104 @@ export async function deliverWriteLinkCard(
   }
 }
 
+export interface WriteLinkOwnerDelivery {
+  ok: boolean;
+  error?: 'terminal_unavailable' | 'no_owner' | 'delivery_failed';
+  delivered: number;
+  total: number;
+  channels: Array<'ephemeral' | 'dm' | 'failed'>;
+}
+
+/**
+ * Build the write-enabled session card (writable terminal URL + manage buttons)
+ * for `ds`, or null when the terminal isn't up yet (no worker port/token).
+ * Shared by the owner-fanout ({@link deliverWriteLinkCardToOwners}, behind
+ * `botmux term-link`) and the single-operator delivery
+ * ({@link deliverWritableTerminalCardTo}, behind the `/term` slash command).
+ */
+function buildWritableTerminalCard(ds: DaemonSession): string | null {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port || !ds.workerToken) return null;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  return buildSessionCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    buildTerminalUrl(ds, { write: true }),
+    ds.session.title || getCliDisplayName(effectiveCliId),
+    effectiveCliId,
+    true,             // showManageButtons — write-link card includes restart & close
+    !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+    localeForBot(ds.larkAppId),
+  );
+}
+
+/**
+ * Build the write-enabled session card for `ds` and deliver it privately to the
+ * bot's owner(s) — the payload behind the `botmux term-link` CLI command.
+ *
+ * Mirrors the in-chat "🔑 获取操作链接" button flow ({@link deliverWriteLinkCard}),
+ * but fans out to the owner audience ({@link resolvePrivateCardAudience}) instead
+ * of a single click-operator: a CLI caller has no Lark identity, so "deliver to
+ * the owner(s)" is the closest equivalent of "deliver to the person who asked".
+ * Each owner gets an in-chat visible-to-you ephemeral card, auto-falling back to
+ * a private DM in topic / p2p chats. The write token therefore only ever rides
+ * these private channels — it is never returned to the CLI caller / stdout.
+ */
+export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<WriteLinkOwnerDelivery> {
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) return { ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] };
+
+  const audience = resolvePrivateCardAudience(ds);
+  if (audience.length === 0) return { ok: false, error: 'no_owner', delivered: 0, total: 0, channels: [] };
+
+  const channels: Array<'ephemeral' | 'dm' | 'failed'> = [];
+  // Cap concurrency like postPrivateSnapshotCard (Feishu ephemeral ~50/s total).
+  const CONCURRENCY = 5;
+  for (let i = 0; i < audience.length; i += CONCURRENCY) {
+    const batch = audience.slice(i, i + CONCURRENCY);
+    channels.push(...await Promise.all(batch.map(openId => deliverWriteLinkCard(ds, openId, cardJson))));
+  }
+  const delivered = channels.filter(c => c !== 'failed').length;
+  return {
+    ok: delivered > 0,
+    error: delivered > 0 ? undefined : 'delivery_failed',
+    delivered,
+    total: audience.length,
+    channels,
+  };
+}
+
+/**
+ * Deliver the writable-terminal card privately to a single operator — the `/term`
+ * slash command's payload (the owner who typed it; owner-gated in command-handler).
+ * Same private ephemeral→DM channel as the "🔑 获取操作链接" card button. Returns
+ * 'not_ready' when the terminal isn't up yet, else the channel actually used.
+ */
+export async function deliverWritableTerminalCardTo(
+  ds: DaemonSession,
+  operatorOpenId: string,
+): Promise<'ephemeral' | 'dm' | 'failed' | 'not_ready'> {
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) return 'not_ready';
+  return deliverWriteLinkCard(ds, operatorOpenId, cardJson);
+}
+
 /**
  * Deliver a status confirmation (restart / session-closed / resume) as a
  * "visible-to-the-operator-only" ephemeral message in a plain group; on failure
  * (topic groups reject with 18053) or in p2p, fall back to the normal visible
  * reply (`reply`). `content` is the card JSON when msgType==='interactive',
  * otherwise the plain text. Topic-group / p2p behavior is unchanged.
+ *
+ * IMPORTANT: ephemeral is only attempted for flat **chat-scope** sessions. The
+ * ephemeral API (`ephemeral/v1/send`) takes a `chat_id` only — it has no
+ * thread/root anchoring — so for a **thread-scope** session (a 话题 inside a
+ * 普通群, or a 话题群 topic) an ephemeral card would escape the topic and land at
+ * the group top-level. 话题群 happened to reject ephemeral with 18053 and fall
+ * back to the in-thread reply, but a 话题 inside a 普通群 succeeds and leaks the
+ * card out of the thread. So thread-scope sessions always take the visible
+ * `reply()` path, which routes back into the thread (`reply_in_thread`).
  */
 export async function deliverEphemeralOrReply(
   ds: DaemonSession,
@@ -582,7 +689,7 @@ export async function deliverEphemeralOrReply(
   msgType: 'text' | 'interactive',
   reply: () => Promise<unknown>,
 ): Promise<void> {
-  if (operatorOpenId && ds.chatType !== 'p2p') {
+  if (operatorOpenId && ds.chatType !== 'p2p' && ds.scope === 'chat') {
     try {
       // The ephemeral API is card-only (msg_type=text → 10003), so wrap a plain
       // confirmation line into a minimal markdown card.
@@ -696,6 +803,12 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   if (adapter.hookInstall) {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
     catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+  }
+  // 命令式 hook 安装（CoCo 走 `coco plugin install`，纯写文件搞不定）。内部自带
+  // try/catch，失败只 warn；与 hookInstall 互斥。
+  if (adapter.ensureAskHook) {
+    try { adapter.ensureAskHook(); }
+    catch (err) { logger.warn(`[hook] ensureAskHook failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   }
   // botmux-ask 落在与其它 skill 同一目录：plugin 模式下是 {pluginDir}/skills。
   const askSkillsDir = adapter.pluginDir ? join(adapter.pluginDir, 'skills') : adapter.skillsDir;
@@ -1065,15 +1178,20 @@ export async function transferSession(
   targetChatId: string,
   targetRootMessageId: string,
   /**
-   * Target chat type — narrowed to `'group'` at the type level. The picker-
-   * mode entry guard in command-handler.ts refuses p2p chats upfront; topic
-   * groups are supported via `targetScope: 'thread'`. `/relay --create` builds
-   * the target by createGroupWithBots so it's a regular group by construction;
-   * the cross-daemon migrate-to-chat IPC inherits the same target. Every call
-   * site can vouch — TS prevents any non-'group' literal from reaching here,
-   * and the runtime check just below catches mock data / future bypasses.
+   * Target chat type.
+   *   'group' → topic groups are supported via `targetScope: 'thread'`;
+   *             `/relay --create` builds the target by createGroupWithBots so
+   *             it's a regular group by construction; the cross-daemon
+   *             migrate-to-chat IPC inherits the same target.
+   *   'p2p'   → the bot's DM. Flat DMs (p2pMode 'chat') land chat-scope on the
+   *             chatId anchor; thread-mode DMs land thread-scope on a DM 话题
+   *             root. The session's chatType flips with the move so post-relay
+   *             inbound routing / picker labels / reply targeting treat it as
+   *             a DM. Carried from the picker card's `target_chat_type`.
+   * The runtime check just below catches raw-string casting at module
+   * boundaries (mocks, HTTP body parses, future bypasses).
    */
-  targetChatType: 'group',
+  targetChatType: 'group' | 'p2p',
   /**
    * Target routing scope for the relayed session.
    *   'chat'   → anchor = chatId (flat top-level; `/relay --create`, migrate
@@ -1095,7 +1213,7 @@ export async function transferSession(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   // Depth defense — unreachable per TS narrowing above, but guards against
   // raw-string casting at module boundaries (mocks, HTTP body parses, etc.).
-  if ((targetChatType as string) !== 'group') {
+  if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
   }
   const ds = findActiveBySessionId(sessionId);
@@ -1284,6 +1402,22 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const cwd = rawCwd && existsSync(rawCwd) ? rawCwd : homedir();
   if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — falling back to ${cwd}`);
 
+  // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
+  // restore — so toggling the live bot flag never retroactively (un)sandboxes a
+  // historical session. A brand-new session (resume=false) with no recorded
+  // decision adopts the live bot flag; a restore (resume=true) with no recorded
+  // decision predates the sandbox feature → stays NOT sandboxed.
+  if (ds.session.sandbox === undefined) {
+    if (!resume) {
+      ds.session.sandbox = botCfg.sandbox === true;
+      ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
+    } else {
+      ds.session.sandbox = false;
+      ds.session.sandboxHidePaths = [];
+    }
+    sessionStore.updateSession(ds.session);
+  }
+
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
     logger.warn(`[${t}] Worker already running (pid: ${ds.worker.pid}), killing before re-fork`);
@@ -1357,7 +1491,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     cliPathOverride: botCfg.cliPathOverride,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
-    sandbox: botCfg.sandbox === true,
+    // Use the decision recorded on the session (above), NOT the live bot flag, so
+    // historical sessions never get retroactively sandboxed on restart.
+    sandbox: ds.session.sandbox === true,
+    sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
@@ -1991,14 +2128,15 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           break;
         }
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
-        const recipientOpenId = daemonCardFooterRecipientOpenId(ds);
+        const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         const cardJson = buildContextualReplyCard({
-          title: '📜 /adopt 前最后一轮',
+          title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
           assistantText: msg.assistantText,
           assistantLabel: getCliDisplayName(effectiveCliId),
           recipientOpenId,
           brand: resolveBrandLabel(ds.larkAppId),
+          locale: localeForBot(ds.larkAppId),
         });
         scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -2213,19 +2351,20 @@ function deliverFinalOutput(
       // they use the contextual card so the user prompt sits in a
       // blockquote and only the assistant body goes through full markdown
       // rendering.
-      const recipientOpenId = daemonCardFooterRecipientOpenId(ds);
+      const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
-              ? '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）'
-              : '🖥️ 终端本地对话（在 adopted pane 中直接输入，已同步至飞书）',
+              ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
+              : tr('card.local_turn', undefined, localeForBot(ds.larkAppId)),
             userText: msg.kind === 'local-turn' ? msg.userText ?? '' : undefined,
             assistantText: msg.content,
             assistantLabel: getCliDisplayName(effectiveCliId),
             recipientOpenId,
             brand: resolveBrandLabel(ds.larkAppId),
+            locale: localeForBot(ds.larkAppId),
           })
-        : buildMarkdownCard(msg.content, recipientOpenId, resolveBrandLabel(ds.larkAppId));
+        : buildMarkdownCard(msg.content, recipientOpenId, resolveBrandLabel(ds.larkAppId), localeForBot(ds.larkAppId));
 
       pendingCardId = lockedPendingCardId ?? claimPendingResponseCard(ds.session);
       pendingQuoteTargetId = lockedQuoteTargetId ?? ds.session.quoteTargetId;

@@ -2,7 +2,7 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -14,11 +14,11 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -44,7 +44,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash', '/land']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land']);
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -790,6 +790,51 @@ export async function handleCardCommand(
   await reply(t('cmd.card.usage', undefined, loc));
 }
 
+/**
+ * Handle `/term` (owner-only) — the slash-command twin of the "🔑 获取操作链接"
+ * card button. Privately hands the owner a writable (token-bearing) terminal card:
+ * an in-chat visible-to-you ephemeral card in plain groups, auto-falling back to a
+ * DM in topic / p2p chats. The link rides only that private channel — never the
+ * group. Gated identically to /card (`senderOpenId === owner`), and strictly
+ * needs a live session whose terminal is up. Routed for both the new-topic path
+ * (daemon.ts) and the existing-session switch below.
+ */
+export async function handleTermLinkCommand(
+  rootId: string,
+  larkAppId: string,
+  _chatId: string,
+  senderOpenId: string | undefined,
+  _content: string,
+  deps: CommandHandlerDeps,
+): Promise<void> {
+  const loc = localeForBot(larkAppId);
+  const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
+
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  if (!ownerOpenId || !senderOpenId || senderOpenId !== ownerOpenId) {
+    await reply(t('cmd.term.owner_only', undefined, loc));
+    return;
+  }
+
+  const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+  if (!ds) {
+    await reply(t('cmd.term.no_session', undefined, loc));
+    return;
+  }
+
+  const channel = await deliverWritableTerminalCardTo(ds, senderOpenId);
+  if (channel === 'not_ready') {
+    await reply(t('cmd.term.not_ready', undefined, loc));
+  } else if (channel === 'failed') {
+    await reply(t('cmd.term.failed', undefined, loc));
+  } else if (channel === 'dm') {
+    // The card landed in DM (topic / p2p) — nothing showed in the topic, so drop a
+    // visible breadcrumb pointing the owner at their DM. (No token, safe to show.)
+    await reply(t('cmd.term.sent_dm', undefined, loc));
+  }
+  // channel === 'ephemeral': the visible-to-you card IS the response; no extra msg.
+}
+
 export async function handleCommand(
   cmd: string,
   rootId: string,
@@ -862,14 +907,32 @@ export async function handleCommand(
         const sid = ds.session.sessionId;
         const wd = ds.session.workingDir;
         if (!wd) { await sessionReply(rootId, t('cmd.land.no_workingdir', undefined, loc)); break; }
-        const d = computeSandboxDiff(config.session.dataDir, sid);
+        const d = computeSandboxDiff(config.session.dataDir, sid, loc);
         if (!d.ok) { await sessionReply(rootId, t('cmd.land.cannot', { error: d.error }, loc)); break; }
         if (d.empty) { await sessionReply(rootId, t('cmd.land.empty', undefined, loc)); break; }
-        const lines = d.patch.split('\n');
-        const preview = lines.slice(0, 40).join('\n') + (lines.length > 40 ? '\n…' : '');
-        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview }, loc);
+        // In-card preview: cap by lines AND chars (Lark card size limit); the FULL
+        // diff goes to an attached .patch file (better for large changesets).
+        const MAX_LINES = 60, MAX_CHARS = 4000;
+        const allLines = d.patch.split('\n');
+        let preview = allLines.slice(0, MAX_LINES).join('\n');
+        let truncated = allLines.length > MAX_LINES;
+        if (preview.length > MAX_CHARS) { preview = preview.slice(0, MAX_CHARS); truncated = true; }
+        // Attach the full .patch (git apply-able) — sent as a file message first,
+        // then the review card below it.
+        let patchAttached = false;
+        if (larkAppId) {
+          try {
+            const patchName = `botmux-land-${sid.slice(0, 8)}.patch`;
+            const patchPath = join(config.session.dataDir, 'sandboxes', sid, patchName);
+            writeFileSync(patchPath, d.patch);
+            const fileKey = await uploadFile(larkAppId, patchPath);
+            await sendMessage(larkAppId, ds.session.chatId, JSON.stringify({ file_key: fileKey }), 'file');
+            patchAttached = true;
+          } catch (e) { logger.warn(`[${logTag}] /land patch attach failed: ${(e as Error).message}`); }
+        }
+        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview, truncated, patchAttached }, loc);
         await sessionReply(rootId, card, 'interactive');
-        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → review card`);
+        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → card${patchAttached ? ' + .patch' : ''}`);
         break;
       }
 
@@ -1586,31 +1649,31 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
             break;
           }
-          // ── Chat-type guard + target-routing resolution ───────────────────
-          // p2p (1:1 with bot) has no relay target — there's no other
-          // participant. For group chats we resolve the chat mode (话题群 vs
-          // 普通群) once, then compute WHERE the relayed session should land via
-          // resolveRelayTargetRouting (mirrors decideRouting; 话题群 / 线程内 /
-          // 普通群 new-topic·shared → thread-scope, 普通群 flat → chat-scope).
-          // p2p is also detectable from `ds.chatType` locally (cheap); the API
-          // resolves topic-vs-regular (both record chatType 'group').
-          if (ds?.chatType === 'p2p') {
-            await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
-            break;
+          // ── Target-routing resolution ─────────────────────────────────────
+          // Resolve the chat mode once, then compute WHERE the relayed session
+          // should land via resolveRelayTargetRouting (mirrors decideRouting;
+          // 话题群 / 线程内 / 普通群 new-topic·shared → thread-scope, 普通群
+          // flat → chat-scope; DM 扁平(p2pMode chat) → chat-scope, DM 话题模式
+          // → thread-scope seeded on the /relay message).
+          // p2p is authoritative from `ds.chatType` (recorded off the Lark
+          // event payload — doesn't drift, and the API's safe-default 'group'
+          // on failure would misclassify a DM); only group chats need the API
+          // call to split topic-vs-regular (both record chatType 'group').
+          const targetIsP2p = ds?.chatType === 'p2p';
+          const targetChatType: 'group' | 'p2p' = targetIsP2p ? 'p2p' : 'group';
+          let targetChatMode: 'group' | 'topic' | 'p2p' = 'p2p';
+          if (!targetIsP2p) {
+            const { getChatNameAndMode } = await import('../im/lark/client.js');
+            const info = await getChatNameAndMode(myAppId, targetChatId).catch(() => null);
+            targetChatMode = info?.mode ?? 'group';
           }
-          const { getChatNameAndMode } = await import('../im/lark/client.js');
-          const info = await getChatNameAndMode(myAppId, targetChatId).catch(() => null);
           const { resolveRelayTargetRouting } = await import('../im/lark/relay-target-routing.js');
           const targetRouting = resolveRelayTargetRouting({
             larkAppId: myAppId,
             chatId: targetChatId,
             message: { messageId: message.messageId, rootId: message.rootId || undefined, threadId: message.threadId },
-            chatMode: info?.mode ?? 'group',
+            chatMode: targetChatMode,
           });
-          if ('reject' in targetRouting) {
-            await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
-            break;
-          }
           const targetScope = targetRouting.scope;
           const targetAnchor = targetRouting.anchor;
           // ── Existing-session guard (anchor-based) ─────────────────────────
@@ -1639,7 +1702,7 @@ export async function handleCommand(
           const { collectRelayPickerEntries } = await import('../services/relay-picker.js');
           const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetAnchor, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
-          const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope);
+          const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope, targetChatType);
           await sessionReply(rootId, card, 'interactive');
           break;
         }
@@ -1990,6 +2053,18 @@ export async function handleCommand(
         break;
       }
 
+      case '/term': {
+        // Existing-session path. New topics route /term via handleTermLinkCommand
+        // at the router (daemon.ts) so no phantom worker=null session is created.
+        const appId = ds?.larkAppId ?? larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        await handleTermLinkCommand(rootId, appId, ds?.chatId ?? '', message.senderId, message.content, deps);
+        break;
+      }
+
       case '/list-slash-command':
       case '/slash': {
         // 列出本 bot 当前可用的 slash 命令，分三段：
@@ -2039,6 +2114,7 @@ export async function handleCommand(
           t('help.repo_path', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
+          t('help.term', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
           // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移

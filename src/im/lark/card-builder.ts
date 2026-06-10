@@ -1435,6 +1435,12 @@ export function buildRelayPickerCard(
    *  (thread, reply_in_thread to `root_id`) or flat chat-scope. Default 'chat'
    *  preserves the legacy普通群-flat behavior. */
   targetScope: 'thread' | 'chat' = 'chat',
+  /** Target chat type baked into every button value so relay_confirm can pass
+   *  the right chatType to transferSession (a DM target must flip the session
+   *  to p2p, or post-relay inbound routing misclassifies it as a group).
+   *  Authoritative from the /relay command's session chatType. Default 'group'
+   *  covers legacy cards rendered before this field existed. */
+  targetChatType: 'group' | 'p2p' = 'group',
 ): string {
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
@@ -1457,6 +1463,7 @@ export function buildRelayPickerCard(
     target_chat_id: targetChatId,
     root_id: targetRootMessageId,
     target_scope: targetScope,
+    target_chat_type: targetChatType,
     invoker_open_id: invokerOpenId,
     search: searchQuery,
     page,
@@ -1492,14 +1499,14 @@ export function buildRelayPickerCard(
   // ─── Empty / no-match notice ────────────────────────────────────────
   if (entries.length === 0) {
     elements.push({ tag: 'markdown', content: t('card.relay.empty', undefined, locale) });
-    return JSON.stringify(wrapCard(elements, locale));
+    return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
   if (filtered.length === 0) {
     elements.push({
       tag: 'markdown',
       content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
     });
-    return JSON.stringify(wrapCard(elements, locale));
+    return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
 
   // ─── Session cards (current page) ───────────────────────────────────
@@ -1654,7 +1661,7 @@ export function buildRelayPickerCard(
           elements: [
             {
               tag: 'button',
-              text: { tag: 'plain_text', content: t('card.relay.btn_confirm', undefined, locale) },
+              text: { tag: 'plain_text', content: t(targetChatType === 'p2p' ? 'card.relay.btn_confirm_p2p' : 'card.relay.btn_confirm', undefined, locale) },
               type: 'primary',
               behaviors: [
                 {
@@ -1674,15 +1681,15 @@ export function buildRelayPickerCard(
     });
   }
 
-  return JSON.stringify(wrapCard(elements, locale));
+  return JSON.stringify(wrapCard(elements, locale, targetChatType));
 }
 
-function wrapCard(elements: any[], locale?: Locale): any {
+function wrapCard(elements: any[], locale?: Locale, targetChatType: 'group' | 'p2p' = 'group'): any {
   return {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: t('card.relay.title', undefined, locale) },
+      title: { tag: 'plain_text', content: t(targetChatType === 'p2p' ? 'card.relay.title_p2p' : 'card.relay.title', undefined, locale) },
       template: 'blue',
     },
     body: { direction: 'vertical', elements },
@@ -1796,15 +1803,24 @@ export interface LandCardOpts {
   files: number;
   insertions: number;
   deletions: number;
-  preview: string;   // truncated patch text
+  preview: string;        // patch text for the in-card preview (already truncated)
+  truncated?: boolean;    // preview was cut → full diff is in the attached .patch
+  patchAttached?: boolean; // a .patch file message accompanies this card
 }
 
 export function buildLandCard(o: LandCardOpts, locale?: Locale): string {
   const v = { sessionId: o.sessionId, workingDir: o.workingDir };
   const body = t('card.land.body', { files: o.files, ins: o.insertions, del: o.deletions, dir: escapeMd(o.workingDir) }, locale);
   const elements: any[] = [{ tag: 'div', text: { tag: 'lark_md', content: body } }];
-  if (o.statText) elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**${t('card.land.files_header', undefined, locale)}**\n` + '```\n' + o.statText.slice(0, 1500) + '\n```' } });
-  if (o.preview) elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**${t('card.land.preview_header', undefined, locale)}**\n` + '```diff\n' + o.preview + '\n```' } });
+  // Use the card v2 `markdown` element (NOT a lark_md div) for the stat + diff —
+  // it renders ``` fenced code blocks as real monospace blocks, which lark_md
+  // divs do not. Paths are already project-relative (computeSandboxDiff).
+  if (o.statText) elements.push({ tag: 'markdown', content: `**${t('card.land.files_header', undefined, locale)}**\n` + '```text\n' + o.statText.slice(0, 2000) + '\n```' });
+  if (o.preview) {
+    const note = o.truncated ? `\n\n_${t('card.land.truncated', undefined, locale)}_` : '';
+    elements.push({ tag: 'markdown', content: `**${t('card.land.preview_header', undefined, locale)}**\n` + '```diff\n' + o.preview + '\n```' + note });
+  }
+  if (o.patchAttached) elements.push({ tag: 'note', elements: [{ tag: 'lark_md', content: t('card.land.patch_note', undefined, locale) }] });
   elements.push(
     { tag: 'hr' },
     { tag: 'action', actions: [

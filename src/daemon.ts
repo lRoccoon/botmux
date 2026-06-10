@@ -39,8 +39,9 @@ import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-pr
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { createPendingResponseQueue, markPendingResponseCardPatched, syncPendingResponseState } from './core/pending-response.js';
+import { buildPendingResponseCard, buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { createPendingResponseQueue, markPendingResponseCardPatched, shouldTreatPendingCardAsPatchedByMarker, startPendingResponseTurn, syncPendingResponseState } from './core/pending-response.js';
+import { readPendingResponsePatchMarker } from './services/pending-response-transaction-store.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
@@ -59,7 +60,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -84,6 +85,7 @@ import {
   ensureTerminalWorkerPort,
 } from './core/session-manager.js';
 import { beginReplyTargetTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepIdleWorkers } from './core/idle-worker-sweeper.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
@@ -141,6 +143,7 @@ import {
   submitCustomReply,
 } from './core/ask-broker.js';
 import { parseAskBody, resolveAskApprovers } from './core/ask-api.js';
+import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { configureCollabControlPlane, handleCollabControlMessage, handleCollabWorkerLost, type PushCollabWorkerInput, type SpawnCollabWorkerInput } from './core/control-plane.js';
 import { readCollabWorkerPool, renewCollabWorkerLease, sweepExpiredCollabWorkerLeases } from './collab/worker-pool-store.js';
@@ -346,19 +349,38 @@ function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import(
   return undefined;
 }
 
-async function postPendingResponseCard(ds: DaemonSession, replyToMessageId: string, prompt: string, sender?: { name?: string }, turnId?: string): Promise<void> {
-  // Card-off means no visible botmux cards at all. If a prior build left an
-  // open pending-response placeholder on this session, clear its state so a
-  // later `botmux send --mention...` cannot patch it to “final reply sent via
-  // new message”. Do not call any Lark send/update API here.
+export async function postPendingResponseCard(ds: DaemonSession, replyToMessageId: string, prompt: string, sender?: { name?: string }, turnId?: string): Promise<void> {
+  // Card-off path (streaming card disabled for this session): post a lightweight
+  // 「处理中」 placeholder. The final reply / `botmux send` patches this card in
+  // place — and that patch is also what lets the 完成 emoji land on the user's
+  // original message. When streaming cards are ON the streaming card itself is
+  // the placeholder, so this is a no-op for those sessions.
+  if (!streamingCardDisabledFor(ds)) return;
   await pendingResponseQueue.run(ds.session.sessionId, async () => {
     const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
     syncPendingResponseState(ds, fresh);
     if (fresh) syncReplyTargetState(ds, fresh);
-    if (ds.pendingResponseCardId || ds.session.pendingResponseCardId) {
+    // Reconcile a PATCH that committed at Feishu but whose session save lost the
+    // race, so a stale prior card isn't left dangling as "open".
+    const marker = readPendingResponsePatchMarker(ds.session.sessionId);
+    if (shouldTreatPendingCardAsPatchedByMarker(ds.pendingResponseCardId, marker)) {
       markPendingResponseCardPatched(ds);
-      markPendingResponseCardPatched(ds.session);
+    }
+    syncPendingResponseState(ds.session, ds);
+    const card = buildPendingResponseCard(localeForBot(ds.larkAppId));
+    try {
+      // Route the placeholder to the same target the final reply will use: a
+      // topic-alias turn (chat-scope + matching turnId) lands in the topic
+      // thread; otherwise it's a plain chat message / thread-scope reply.
+      const target = resolveSessionReplyTarget(ds, turnId);
+      const messageId = target.mode === 'thread'
+        ? await replyMessage(ds.larkAppId, target.rootMessageId, card, 'interactive', true)
+        : await sendMessage(ds.larkAppId, target.chatId, card, 'interactive');
+      startPendingResponseTurn(ds, messageId);
+      startPendingResponseTurn(ds.session, messageId);
       sessionStore.updateSession(ds.session);
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] failed to post pending response card: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
 }
@@ -806,6 +828,7 @@ async function updateWorkflowProgressCard(runId: string): Promise<void> {
         // dashboard deeplink contract codex set up in slice 2 (3335adc).
         enrichWithTerminalLink: buildAttemptDeeplinkEnricher(runId, snapshot),
         totalNodes,
+        locale: localeForBot(current.larkAppId),
       });
       await updateMessage(current.larkAppId, current.cardMessageId, cardJson);
     } catch (err) {
@@ -1327,6 +1350,7 @@ async function handleWorkflowCommandIfAny(
           const cardJson = buildWorkflowStartingCard({
             runId: info.runId,
             workflowId: info.workflowId,
+            locale: localeForBot(larkAppId),
           });
           const cardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
           if (chatId) {
@@ -1367,7 +1391,7 @@ async function handleWorkflowCommandIfAny(
   if (!result.ok) {
     await sessionReply(
       anchor,
-      `Workflow 命令失败：${result.error}${result.usage ? `\n${result.usage}` : ''}`,
+      `${tr('wf.cmd_failed', { error: result.error }, localeForBot(larkAppId))}${result.usage ? `\n${result.usage}` : ''}`,
       'text',
       larkAppId,
     );
@@ -1919,6 +1943,37 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     questions: parsed.questions,
     timeoutMs: parsed.timeoutMs,
   });
+
+  // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
+  // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话
+  // 的 worker，由 worker 等 picker 渲染后驱动它自动作答。其它 CLI（claude/opencode）
+  // 仍走 hook directive，不进此分支。
+  if (result.kind === 'answered') {
+    let cocoDs: DaemonSession | undefined;
+    for (const ds of activeSessions.values()) {
+      if (ds.session.sessionId === parsed.sessionId) { cocoDs = ds; break; }
+    }
+    if (cocoDs?.session.cliId === 'coco' && cocoDs.worker) {
+      try {
+        // 单题：picker 选完直接提交（无 Review）；多题：最后一题之后才出 Review，需补提交。
+        const needsReviewSubmit = parsed.questions.length > 1;
+        const comment = result.comment;
+        let navKeys: string[];
+        if (comment && comment.trim()) {
+          // 自由文本：把光标移到第一题 "Type something" 行（= 选项数个 Down）。
+          const optionCount = parsed.questions[0]?.options.length ?? 0;
+          navKeys = Array<string>(optionCount).fill('Down');
+        } else {
+          navKeys = computeCocoPickerKeys(parsed.questions, result.answers).navKeys;
+        }
+        cocoDs.worker.send({ type: 'coco_drive_picker', navKeys, needsReviewSubmit, comment } as DaemonToWorker);
+        logger.info(`[${cocoDs.session.sessionId.slice(0, 8)}] CoCo picker drive: ${navKeys.length} keys, review=${needsReviewSubmit}, comment=${comment ? 'yes' : 'no'}`);
+      } catch (err) {
+        logger.warn(`CoCo picker drive failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
   return jsonRes(res, 200, result);
 });
 
@@ -2215,6 +2270,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
       return;
     }
+    // /term needs a live session's terminal; in a brand-new topic there's none.
+    // Route here (own owner-gate inside) so the generic block below doesn't
+    // pre-create a worker=null phantom session just to reply "no session".
+    if (cmd === '/term') {
+      await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
+      return;
+    }
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
       await sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
@@ -2312,7 +2374,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // weight on first turns. `content` (post force-topic-strip) is what the
   // worker will see; promptContent wraps it for prompt-building paths but
   // leaves `content` untouched for title / log substring uses.
-  const promptContent = buildQuoteHint(parsed, scope, anchor) + content;
+  const promptContent = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
@@ -2453,10 +2515,7 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
     logger.warn(`[auto-start:入群] ${larkAppId} 缺权限提示无法私信（allowedUsers 无 open_id），仅记录日志`);
     return;
   }
-  const dm =
-    `⚠️ botmux「被拉进新群自动开工」已开启，但读取群成员失败，无法判断群里是否有授权用户，自动开工被跳过。\n\n` +
-    `最可能原因：缺少读取群成员的权限（im:chat / 群信息读取），或没有订阅「机器人进群」事件 \`im.chat.member.bot.added_v1\`。\n\n` +
-    `请到飞书开放平台 → 应用 → 权限管理 / 事件订阅 里补齐，然后 \`botmux restart\`。\n\n错误详情：${detail}`;
+  const dm = tr('daemon.auto_start_member_read_failed', { detail }, localeForBot(larkAppId));
   try {
     await sendUserMessage(larkAppId, adminOpenId, dm, 'text');
     logger.info(`[auto-start:入群] ${larkAppId} 已私信 admin 提示补权限`);
@@ -2692,7 +2751,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
 
-  const promptContent = buildQuoteHint(parsed, scope, anchor) + botSenderPrefix + parsed.content;
+  const promptContent = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix + parsed.content;
   const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
   emitHookEvent('thread.reply', {
     larkAppId,
@@ -2824,6 +2883,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
+      // /term only hands out a writable link for an ALREADY-live session — it must
+      // never pre-create one. Special-case it before the canOperate gate + the
+      // pre-create block below (mirrors the new-topic route + /card). Its own
+      // owner gate (stricter than canOperate) is the sole authority; without this,
+      // /term in a thread with no existingDs would spawn a worker:null phantom
+      // session and pollute the dashboard before replying not_ready/owner_only.
+      if (cmd === '/term') {
+        await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, commandDeps);
+        return;
+      }
       // canOperate gate for thread-reply daemon commands — required in every chat
       // (see spawn-path gate above). Denies chat-granted users management commands.
       if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId)) {
@@ -3570,6 +3639,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     collabLeaseWatchdogTimer.unref?.();
   }
 
+  // Sweep orphan sandbox overlays left by a previous run's crash/kill: any
+  // <dataDir>/sandboxes/<sid> whose session is no longer active gets its
+  // overlays unmounted and its dirs removed (plus the /var/tmp home scratch).
+  // Active sessions keep theirs — a same-topic worker reuses the upper changeset.
+  try {
+    sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+  } catch (err: any) {
+    logger.warn(`[sandbox-sweep] failed: ${err?.message ?? err}`);
+  }
+
   const idleWorkerSweepTimer = setInterval(() => {
     const suspended = sweepIdleWorkers(activeSessions);
     if (suspended.length > 0) {
@@ -3577,6 +3656,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
+
+  // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
+  // worker SIGKILL) bypasses worker-side killCli(), so the overlay mounts +
+  // upper/work dirs of a killed-but-still-active sandboxed session would leak for
+  // the rest of this daemon's lifetime (one daemon per bot can run for days). The
+  // startup sweep alone can't catch a session that dies AFTER boot. This re-runs
+  // the sweep on a timer: it reclaims active sessions whose overlays are already
+  // unmounted (= worker/CLI dead) without ever tearing down a live mount.
+  const sandboxReconcileTimer = setInterval(() => {
+    try {
+      sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    } catch (err: any) {
+      logger.warn(`[sandbox-reconcile] failed: ${err?.message ?? err}`);
+    }
+  }, 120_000);
+  sandboxReconcileTimer.unref?.();
 
   await attachColdWorkflowRuns(cfg.larkAppId);
 

@@ -14,7 +14,7 @@ import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
-import type { DashboardLocale } from './i18n.js';
+import { normalizeDashboardLocale, type DashboardLocale } from './i18n.js';
 
 const root = document.getElementById('root')!;
 
@@ -155,9 +155,33 @@ async function loadAuthState(): Promise<void> {
     if (r.ok) {
       const j = await r.json();
       isAuthed = !!j.authed;
+      // Share the cookie-auth verdict with per-row renderers (the sessions
+      // board's writable-terminal segment reads ui.authed at render time).
+      ui.authed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
+      // The global UI locale (`botmux lang`) is the single source of truth: when
+      // set, it wins over the browser-detected / locally-stored locale so the
+      // dashboard always reflects the same language as the Feishu cards. When
+      // unset (null), keep the browser/local default ui.init() already picked.
+      const serverLocale = normalizeDashboardLocale(j.lang);
+      if (serverLocale) ui.setLocale(serverLocale);
     }
   } catch { /* keep defaults */ }
+}
+
+// Persist a language choice back to the global config so it drives `botmux lang`
+// and the Feishu cards too (the server fans the change out to every daemon
+// live). Authed-only — read-only visitors just change their local view, which
+// the server-authoritative locale overrides on their next load.
+async function persistLocale(locale: DashboardLocale): Promise<void> {
+  if (!isAuthed) return;
+  try {
+    await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lang: locale }),
+    });
+  } catch { /* best-effort; UI already switched locally */ }
 }
 
 // Read-only visitors can't use the management pages (all token-gated), so hide
@@ -253,7 +277,11 @@ function paintChrome() {
 
 function wireChromeControls() {
   document.querySelectorAll<HTMLButtonElement>('[data-locale]').forEach(btn => {
-    btn.onclick = () => ui.setLocale(btn.dataset.locale as DashboardLocale);
+    btn.onclick = () => {
+      const locale = btn.dataset.locale as DashboardLocale;
+      ui.setLocale(locale);
+      void persistLocale(locale);
+    };
   });
   initThemeMenu();
 }

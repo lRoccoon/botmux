@@ -1,6 +1,10 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
+import { verifyHmac } from '../dashboard/auth.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -14,15 +18,20 @@ import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { findConfigField, applyConfigField } from '../services/bot-config-store.js';
 import { config } from '../config.js';
 import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
+import { readRawConfig, findEntryIndex, requireConfigPath } from '../services/config-store.js';
+import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
+import { isLocale, type Locale } from '../i18n/types.js';
+import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId } from '../im/lark/client.js';
 import { resumeSession } from './session-manager.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
+import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
@@ -89,6 +98,38 @@ export async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
+// ─── Token-route auth (loopback HMAC) ───────────────────────────────────────
+//
+// Most IPC routes are loopback-trusted: the codebase's threat model treats a
+// local botmux process as already root-equivalent on the box (see the
+// migrate-to-chat route below), so close/resume/sandbox-diff carry no per-route
+// auth. The two write-link routes are different — they HAND OUT a reusable
+// terminal-control credential (the worker write token: GET /write-link returns
+// the URL, POST /write-link-card delivers it as a private Lark card), so they
+// additionally require the caller to prove it can read ~/.botmux/.dashboard-secret.
+// That keeps a sandboxed worker, or a random local process that merely discovered
+// the ipcPort, from minting write tokens for sessions it doesn't own. The legit
+// callers — the dashboard proxy and `botmux term-link` — sign with the same secret
+// + scheme as `botmux dashboard` → /__cli/rotate. (A same-user process that can
+// read the secret is out of scope: it's already trusted.)
+let injectedIpcSecret: string | null = null;
+/** Test seam: override the secret used to verify token-route HMAC. */
+export function setIpcAuthSecret(secret: string | null): void { injectedIpcSecret = secret; }
+function ipcAuthSecret(): string | null {
+  if (injectedIpcSecret) return injectedIpcSecret;
+  try { return readFileSync(join(homedir(), '.botmux', '.dashboard-secret'), 'utf8').trim() || null; }
+  catch { return null; }
+}
+function tokenRouteAuthorized(req: IncomingMessage): boolean {
+  const secret = ipcAuthSecret();
+  if (!secret) return false; // fail-closed: no secret on disk → nobody can sign
+  const ts = req.headers['x-botmux-cli-ts'];
+  const nonce = req.headers['x-botmux-cli-nonce'];
+  const sig = req.headers['x-botmux-cli-auth'];
+  if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') return false;
+  return verifyHmac(secret, { ts, nonce, sig }, req.socket.remoteAddress ?? '').ok;
+}
+
 ipcRoute('GET', '/__health', (_req, res) => {
   jsonRes(res, 200, { ok: true });
 });
@@ -135,6 +176,50 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => 
   jsonRes(res, 200, r);
 });
 
+/**
+ * Mint the WRITABLE web-terminal link for a live session — the dashboard
+ * counterpart to the Lark card's "🔑 获取操作链接" button. Returns the URL with
+ * the worker's write `?token=` appended, built daemon-side via buildTerminalUrl
+ * so it picks up this process's live terminal-proxy state (the dashboard
+ * aggregator can't see it). The token is returned ONLY here, on demand —
+ * deliberately never embedded in /api/sessions rows or the SSE stream.
+ *
+ * Two gates protect it: at the dashboard's HTTP boundary this path is absent
+ * from the public allow-list, so an anonymous browser 401s; and here on the
+ * daemon IPC, tokenRouteAuthorized requires a loopback-HMAC signed with
+ * .dashboard-secret, so a local process that merely knows the ipcPort still
+ * can't pull a write token.
+ */
+ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
+  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port || !ds.workerToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
+  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { write: true }) });
+});
+
+/**
+ * Deliver the writable-terminal card privately to the bot's owner(s) — the
+ * `botmux term-link <id>` CLI command's backend. Unlike the GET route above
+ * (which returns the URL to its single authenticated caller), this POSTs the
+ * card into the owners' private Lark channels (ephemeral → DM fallback) and
+ * returns ONLY delivery counts: the write token never crosses back to the CLI /
+ * stdout. Same loopback-HMAC gate as write-link — it still hands out a control
+ * credential, just into Lark rather than into the HTTP response.
+ */
+ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, params) => {
+  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const r = await deliverWriteLinkCardToOwners(ds);
+  const status = r.ok ? 200
+    : r.error === 'terminal_unavailable' ? 409
+    : r.error === 'no_owner' ? 422
+    : 502;
+  jsonRes(res, status, r);
+});
+
 // ─── Sandbox landing (owner reviews the clone's diff then applies it back) ───
 function workingDirForSession(sessionId: string): string | undefined {
   const ds = findActiveBySessionId(sessionId);
@@ -143,7 +228,7 @@ function workingDirForSession(sessionId: string): string | undefined {
 }
 
 ipcRoute('GET', '/api/sessions/:sessionId/sandbox-diff', (_req, res, params) => {
-  const d = computeSandboxDiff(config.session.dataDir, params.sessionId);
+  const d = computeSandboxDiff(config.session.dataDir, params.sessionId, localeForBot(cachedLarkAppId));
   if (!d.ok) return jsonRes(res, 200, { ok: false, error: d.error });
   jsonRes(res, 200, {
     ok: true, empty: d.empty, files: d.files, insertions: d.insertions, deletions: d.deletions,
@@ -154,12 +239,13 @@ ipcRoute('GET', '/api/sessions/:sessionId/sandbox-diff', (_req, res, params) => 
 ipcRoute('POST', '/api/sessions/:sessionId/sandbox-land/:action', (_req, res, params) => {
   if (params.action === 'discard') return jsonRes(res, 200, { ok: true, discarded: true });
   if (params.action !== 'apply') return jsonRes(res, 400, { ok: false, error: 'unknown action' });
+  const locLand = localeForBot(cachedLarkAppId);
   const wd = workingDirForSession(params.sessionId);
-  if (!wd) return jsonRes(res, 404, { ok: false, error: '找不到会话 workingDir' });
-  const d = computeSandboxDiff(config.session.dataDir, params.sessionId);
+  if (!wd) return jsonRes(res, 404, { ok: false, error: t('sandbox.workingdir_not_found', undefined, locLand) });
+  const d = computeSandboxDiff(config.session.dataDir, params.sessionId, locLand);
   if (!d.ok) return jsonRes(res, 200, { ok: false, error: d.error });
-  if (d.empty) return jsonRes(res, 200, { ok: false, error: '沙盒副本已无改动' });
-  const a = applySandboxDiff(wd, d.patch);
+  if (d.empty) return jsonRes(res, 200, { ok: false, error: t('sandbox.no_changes_left', undefined, locLand) });
+  const a = applySandboxDiff(wd, config.session.dataDir, params.sessionId, locLand);
   jsonRes(res, 200, a.ok ? { ok: true, files: d.files, insertions: d.insertions, deletions: d.deletions, workingDir: wd } : { ok: false, error: a.error });
 });
 
@@ -771,6 +857,45 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
+});
+
+// 实时切换 UI 语言（locale），无需重启 daemon。`botmux lang` / Dashboard 语言开关
+// 写盘后 POST 这个端点，让本 daemon 从磁盘重新读 locale 并热更新：
+//   • 全局默认（~/.botmux/config.json 的 `lang`）→ setDefaultLocale（缺省回落 'zh'）；
+//   • 本 bot 的 per-bot 覆盖（bots.json 的 `lang`）→ 同步进内存 bot.config.lang
+//     （与 applyConfigField 同口径），让 `botmux lang --bot N` 跨进程写入也免重启。
+// 卡片都在 daemon 端按消息实时渲染（localeForBot），所以下一条消息/卡片立即生效。
+// 文件是单一事实源，本端点只是“立即重读”信号——不在此落盘（写入方已落盘）。
+ipcRoute('POST', '/api/locale/reload', async (_req, res) => {
+  const globalLang = readGlobalConfig().lang;
+  const resolvedDefault: Locale = isLocale(globalLang) ? globalLang : 'zh';
+  setDefaultLocale(resolvedDefault);
+
+  let botLang: Locale | null = null;
+  if (cachedLarkAppId) {
+    try {
+      const raw = await readRawConfig(requireConfigPath());
+      const idx = findEntryIndex(raw, cachedLarkAppId);
+      const entryLang = idx >= 0 ? raw[idx]?.lang : undefined;
+      botLang = isLocale(entryLang) ? entryLang : null;
+      getBot(cachedLarkAppId).config.lang = botLang ?? undefined;
+    } catch { /* bot 未注册 / 读盘失败：全局已应用，per-bot 维持原值 */ }
+  }
+
+  // Push the resolved locale to this bot's live workers too. Cards render on the
+  // daemon (already switched above), but a few user-facing strings originate in
+  // the worker process (submit notices, CoCo adopt notes) — without this they'd
+  // stay in the spawn-time language until the session restarts.
+  const workerLocale: Locale = botLang ?? resolvedDefault;
+  const reg = getActiveSessionsRegistry();
+  if (cachedLarkAppId && reg) {
+    for (const ds of reg.values()) {
+      if (ds.larkAppId !== cachedLarkAppId || !ds.worker || ds.worker.killed) continue;
+      try { ds.worker.send({ type: 'set_locale', locale: workerLocale }); } catch { /* worker gone */ }
+    }
+  }
+
+  jsonRes(res, 200, { ok: true, defaultLocale: resolvedDefault, botLang });
 });
 
 ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {

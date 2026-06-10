@@ -21,6 +21,7 @@
 
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
+import { t, type Locale } from '../../i18n/index.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
 
@@ -266,12 +267,12 @@ export function hasMarkdown(text: string): boolean {
  * suppressed, else custom. When brand and recipient are both absent the whole
  * footer (HR included) is omitted.
  */
-export function buildMarkdownCard(md: string, recipientOpenId?: string, brand?: string): string {
+export function buildMarkdownCard(md: string, recipientOpenId?: string, brand?: string, locale?: Locale): string {
   const elements = md ? buildCardBodyElements(md) : [];
   const footerParts: string[] = [];
   const brandSeg = brandFooterSegment(brand);
   if (brandSeg) footerParts.push(brandSeg);
-  if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
+  if (recipientOpenId) footerParts.push(`${t('card.sent_to', undefined, locale)}<at id=${recipientOpenId}></at>`);
   // Empty brand + no recipient → no footer at all (skip the orphan HR too).
   if (footerParts.length > 0) {
     elements.push({ tag: 'hr' });
@@ -319,8 +320,9 @@ export function buildContextualReplyCard(opts: {
   assistantLabel: string;
   recipientOpenId?: string;
   brand?: string;
+  locale?: Locale;
 }): string {
-  const { title, userText, assistantText, assistantLabel, recipientOpenId, brand } = opts;
+  const { title, userText, assistantText, assistantLabel, recipientOpenId, brand, locale } = opts;
   const elements: any[] = [];
 
   elements.push({
@@ -333,7 +335,7 @@ export function buildContextualReplyCard(opts: {
     const u = userText.trim();
     elements.push({
       tag: 'markdown',
-      content: `**👤 你**\n\n${quoteLines(u || '(空)')}`,
+      content: `**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`,
     });
   }
 
@@ -345,13 +347,13 @@ export function buildContextualReplyCard(opts: {
 
   const bodyElements = assistantText.trim()
     ? buildCardBodyElements(assistantText)
-    : [{ tag: 'markdown', content: '*(空)*' }];
+    : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
 
   const footerParts: string[] = [];
   const brandSeg = brandFooterSegment(brand);
   if (brandSeg) footerParts.push(brandSeg);
-  if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
+  if (recipientOpenId) footerParts.push(`${t('card.sent_to', undefined, locale)}<at id=${recipientOpenId}></at>`);
   if (footerParts.length > 0) {
     elements.push({ tag: 'hr' });
     elements.push({

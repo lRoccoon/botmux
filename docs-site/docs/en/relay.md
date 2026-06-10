@@ -35,7 +35,7 @@ The streaming card in the source group freezes into an archive (buttons removed,
 
 ## Limitations
 
-- Picker mode is only available in **regular groups** (a one-on-one chat has no collaborators; topic groups route by topic and have no thread anchor).
+- Picker mode works in **regular groups / topic groups / inside threads / the bot's DM**: topic-group and in-thread targets land in the corresponding topic; DMs land per their mode — flat mode (p2pMode `chat`) continues the single flat DM session, thread mode seeds a new topic on the `/relay` message.
 - Only the **session initiator (owner)** can relay their own session.
 - A session **that is processing (mid-turn) cannot be relayed**; wait until the current turn is idle, then send.
 - An external tmux session brought in via `/adopt` cannot be relayed (the CLI lives on your computer and botmux doesn't control its lifecycle).

@@ -35,7 +35,7 @@ import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { t, localeForBot, isLocale } from '../../i18n/index.js';
+import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -76,12 +76,11 @@ const voicedCardIds = new Set<string>();
 // Instruction injected into the session when the voice button is clicked. The
 // model (which still has its just-sent reply in context) condenses it into
 // spoken prose and emits it via `botmux send --voice`. Kept terse and explicit
-// so the model produces ONE voice bubble and no stray text card.
-const VOICE_SUMMARY_INSTRUCTION =
-  '🔊【语音总结请求】把你上一条发给用户的回复，精简成不超过 5 句、适合朗读的口语：' +
-  '去掉代码、命令、文件路径、URL、英文缩写和 markdown 标记，只讲结论，第一句直接进正题。' +
-  '然后调用 `botmux send --voice "<精简后的口语>"` 把它作为语音发出来。' +
-  '只发这一条语音，不要再额外发文字说明。';
+// so the model produces ONE voice bubble and no stray text card. Resolved per
+// the bot's locale so an English-mode bot gets the English instruction.
+function voiceSummaryInstruction(locale?: Locale): string {
+  return t('card.voice.summary_instruction', undefined, locale);
+}
 
 function isLegacySelfHealAction(actionType?: string): boolean {
   return !!actionType && LEGACY_SELF_HEAL_ACTIONS.has(actionType);
@@ -184,10 +183,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sid: string = value.sessionId;
     const wd: string = value.workingDir;
     if (!sid || !wd) return JSON.parse(buildLandResultCard('failed', t('card.land.stale', undefined, loc), loc));
-    const d = computeSandboxDiff(config.session.dataDir, sid);
+    const d = computeSandboxDiff(config.session.dataDir, sid, loc);
     if (!d.ok) return JSON.parse(buildLandResultCard('failed', d.error, loc));
     if (d.empty) return JSON.parse(buildLandResultCard('discarded', '', loc));
-    const a = applySandboxDiff(wd, d.patch);
+    const a = applySandboxDiff(wd, config.session.dataDir, sid, loc);
     if (!a.ok) return JSON.parse(buildLandResultCard('failed', a.error, loc));
     logger.info(`Land applied: ${d.files} files (+${d.insertions}/-${d.deletions}) → ${wd}`);
     return JSON.parse(buildLandResultCard('applied', t('card.land.applied_body', { files: d.files, ins: d.insertions, del: d.deletions, dir: wd }, loc), loc));
@@ -327,8 +326,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
     // root_id IS the relay target anchor (chatId for chat-scope, 话题 root for
-    // thread-scope). target_scope tells the confirm/re-render which it is.
+    // thread-scope). target_scope tells the confirm/re-render which it is;
+    // target_chat_type (group | p2p) rides along so confirm can flip the
+    // session's chatType for DM targets. Default 'group' covers legacy cards.
     const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
+    const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!targetChatId || !targetRootId || !operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
@@ -390,6 +392,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         page: nextPage,
       },
       targetScope,
+      targetChatType,
     );
     // Return an updated card body — event-dispatcher wraps this as
     // { card: { type: 'raw', data: <body> } } so Lark patches the picker
@@ -494,7 +497,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const targetRootId = value.root_id;
     // root_id IS the target anchor for thread-scope (the 话题 root); for chat-
     // scope the anchor is chatId and root_id is unused for routing.
+    // target_chat_type tells transferSession whether the destination is a DM
+    // (p2p) so the session's chatType flips with it; legacy cards lack the
+    // field and default to 'group' (their pickers never offered DM targets).
     const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
+    const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
     const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootId;
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
@@ -568,9 +575,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return;
     }
     // Resolve a friendly source chat label for the M1 announcement — falls
-    // back to the raw chatId if Lark can't return a name.
+    // back to the raw chatId if Lark can't return a name. A p2p source has no
+    // chat name (chat.get often fails or returns empty for DMs) — use the
+    // locale-aware 单聊 label instead of leaking a raw oc_ id into the M1.
     const { getChatName } = await import('./client.js');
-    const sourceLabel = (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
+    const sourceLabel = sourceDs.chatType === 'p2p'
+      ? t('card.relay.type_p2p', undefined, loc)
+      : (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
     // Send the M1 announcement.
     //   chat-scope: a plain top-level message; its id becomes the (audit-only)
     //               rootMessageId after the transfer (mirrors /relay --create).
@@ -579,7 +590,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     //               话题 root (targetAnchor), NOT the M1 id.
     let m1MessageId: string;
     try {
-      const m1Text = t('cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc);
+      const m1Text = t(targetChatType === 'p2p' ? 'cmd.relay.m1_announce_dm' : 'cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc);
       m1MessageId = targetScope === 'thread'
         ? await replyMessage(larkAppId, targetAnchor, m1Text, 'text', /*replyInThread*/ true)
         : await sendMessage(larkAppId, targetChatId, m1Text, 'text');
@@ -590,8 +601,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // chat-scope → anchor on the M1 id (audit-only); thread-scope → anchor on
     // the 话题 root (targetAnchor) so future replies in the 话题 route here.
     const r = targetScope === 'thread'
-      ? await transferSession(sourceDs.session.sessionId, targetChatId, targetAnchor, 'group', 'thread')
-      : await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, 'group', 'chat');
+      ? await transferSession(sourceDs.session.sessionId, targetChatId, targetAnchor, targetChatType, 'thread')
+      : await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, targetChatType, 'chat');
     if (!r.ok) {
       // Best-effort: orphan M1 cleanup so a failed transfer doesn't leave a
       // misleading "已接力" message in the target chat (王皓's "明明失败了
@@ -670,7 +681,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
 
   if (isWorkflowApprovalAction(value?.action)) {
-    const result = await handleWorkflowApprovalAction(data, deps.workflowApprovalDeps);
+    const locWf = localeForBot(larkAppId);
+    const result = await handleWorkflowApprovalAction(data, deps.workflowApprovalDeps, locWf);
     const runId = value?.run_id;
     if (result?.ok && !result.duplicate && runId) {
       await deps.workflowApprovalResolved?.(runId);
@@ -678,7 +690,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // Non-approver: surface a toast so the clicker knows nothing happened
     // (instead of silently leaving the buttons active).
     if (result && !result.ok && result.error === 'not_approver') {
-      return { toast: { type: 'warning', content: '你不在该审批人名单里，无法操作' } };
+      return { toast: { type: 'warning', content: t('toast.not_in_approver_list', undefined, locWf) } };
     }
     // Successful resolve / reject / cancel: replace the clicked card with a
     // frozen "已通过/已拒绝/已取消" body so the buttons can't be re-submitted
@@ -724,9 +736,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       voicedCardIds.add(dedupeKey);
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
       if (ds.worker && !ds.worker.killed) {
-        ds.worker.send({ type: 'message', content: VOICE_SUMMARY_INSTRUCTION } as DaemonToWorker);
+        ds.worker.send({ type: 'message', content: voiceSummaryInstruction(locDs) } as DaemonToWorker);
       } else {
-        forkWorker(ds, VOICE_SUMMARY_INSTRUCTION, ds.hasHistory);
+        forkWorker(ds, voiceSummaryInstruction(locDs), ds.hasHistory);
       }
       logger.info(`[${tag(ds)}] voice_summary triggered by ${operatorOpenId ?? '?'}`);
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };

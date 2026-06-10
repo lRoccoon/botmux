@@ -850,6 +850,22 @@ describe('buildRelayPickerCard', () => {
     expect(containers(topic)[0].behaviors[0].value.root_id).toBe('om_topic_root');
   });
 
+  it('carries target_chat_type in interactive values (defaults to group, p2p when passed) and swaps DM copy', () => {
+    // Default → group (legacy behavior + legacy cards).
+    const grp = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'oc_target', 'ou_invoker_test'));
+    expect(searchInput(grp).behaviors[0].value.target_chat_type).toBe('group');
+    expect(containers(grp)[0].behaviors[0].value.target_chat_type).toBe('group');
+    expect(grp.header.title.content).toMatch(/本群|this group/);
+    // p2p → carried through so relay_confirm flips the session chatType; the
+    // header + confirm copy switch to the DM variants.
+    const dm = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_dm', 'om_dm_root', 'ou_invoker_test', undefined, { selectedSessionId: fixtureEntries(1)[0].sessionId }, 'thread', 'p2p'));
+    expect(searchInput(dm).behaviors[0].value.target_chat_type).toBe('p2p');
+    expect(containers(dm)[0].behaviors[0].value.target_chat_type).toBe('p2p');
+    expect(dm.header.title.content).toMatch(/单聊|DM/);
+    const confirmBtn = JSON.stringify(dm.body.elements);
+    expect(confirmBtn).toMatch(/接力到本单聊|into this DM/);
+  });
+
   it('renders "no relayable sessions" notice when entries empty (form still shown)', () => {
     const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root', 'ou_invoker_test'));
     const md = card.body.elements.find((e: any) => e.tag === 'markdown');

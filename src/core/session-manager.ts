@@ -1137,19 +1137,19 @@ export async function executeScheduledTask(
     const chatMode = await getChatMode(larkAppId, task.chatId, { forceRefresh: true });
     if (chatMode === 'topic' && task.rootMessageId) {
       try {
-        await replyMessage(larkAppId, task.rootMessageId, `🕐 定时任务「${task.name}」开始执行`, 'text', true);
+        await replyMessage(larkAppId, task.rootMessageId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)), 'text', true);
         anchor = task.rootMessageId;
         isContinuation = true;
       } catch (err: any) {
         logger.warn(`[scheduler] Failed to reply in converted topic chat ${task.rootMessageId} (${err.message}); falling back to new thread`);
-        anchor = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+        anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
       }
     } else if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
       const creatorAppId = task.creatorLarkAppId ?? larkAppId;
       replyMessage(
         creatorAppId,
         task.creatorRootMessageId,
-        `🕐 定时任务「${task.name}」已在目标群聊触发`,
+        t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
         'text',
         true,
       ).catch((err: any) => {
@@ -1158,7 +1158,7 @@ export async function executeScheduledTask(
     } else {
       // Same-chat: post the start banner to the chat as a plain message.
       try {
-        await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+        await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
       } catch (err: any) {
         logger.warn(`[scheduler] Failed to post start banner in chat ${task.chatId} (${err.message})`);
       }
@@ -1177,7 +1177,7 @@ export async function executeScheduledTask(
       replyMessage(
         creatorAppId,
         task.creatorRootMessageId!,
-        `🕐 定时任务「${task.name}」已在目标话题触发`,
+        t('scheduler.task_triggered_target_thread', { name: task.name }, localeForBot(creatorAppId)),
         'text',
         true,
       ).catch((err: any) => {
@@ -1190,7 +1190,7 @@ export async function executeScheduledTask(
         await replyMessage(
           larkAppId,
           task.rootMessageId,
-          `🕐 定时任务「${task.name}」开始执行`,
+          t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)),
           'text',
           true,
         );
@@ -1198,10 +1198,10 @@ export async function executeScheduledTask(
         isContinuation = true;
       } catch (err: any) {
         logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
-        anchor = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+        anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
       }
     } else {
-      anchor = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+      anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
     }
   }
 
