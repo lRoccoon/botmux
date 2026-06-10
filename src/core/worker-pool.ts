@@ -587,16 +587,19 @@ export interface WriteLinkOwnerDelivery {
  * a private DM in topic / p2p chats. The write token therefore only ever rides
  * these private channels — it is never returned to the CLI caller / stdout.
  */
-export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<WriteLinkOwnerDelivery> {
+/**
+ * Build the write-enabled session card (writable terminal URL + manage buttons)
+ * for `ds`, or null when the terminal isn't up yet (no worker port/token).
+ * Shared by the owner-fanout ({@link deliverWriteLinkCardToOwners}, behind
+ * `botmux term-link`) and the single-operator delivery
+ * ({@link deliverWritableTerminalCardTo}, behind the `/term` slash command).
+ */
+function buildWritableTerminalCard(ds: DaemonSession): string | null {
   const port = ds.workerPort ?? ds.session.webPort;
-  if (!port || !ds.workerToken) return { ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] };
-
-  const audience = resolvePrivateCardAudience(ds);
-  if (audience.length === 0) return { ok: false, error: 'no_owner', delivered: 0, total: 0, channels: [] };
-
+  if (!port || !ds.workerToken) return null;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const cardJson = buildSessionCard(
+  return buildSessionCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
     buildTerminalUrl(ds, { write: true }),
@@ -606,6 +609,14 @@ export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<W
     !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
     localeForBot(ds.larkAppId),
   );
+}
+
+export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<WriteLinkOwnerDelivery> {
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) return { ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] };
+
+  const audience = resolvePrivateCardAudience(ds);
+  if (audience.length === 0) return { ok: false, error: 'no_owner', delivered: 0, total: 0, channels: [] };
 
   const channels: Array<'ephemeral' | 'dm' | 'failed'> = [];
   // Cap concurrency like postPrivateSnapshotCard (Feishu ephemeral ~50/s total).
@@ -622,6 +633,21 @@ export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<W
     total: audience.length,
     channels,
   };
+}
+
+/**
+ * Deliver the writable-terminal card privately to a single operator — the `/term`
+ * slash command's payload (the owner who typed it; owner-gated in command-handler).
+ * Same private ephemeral→DM channel as the "🔑 获取操作链接" card button. Returns
+ * 'not_ready' when the terminal isn't up yet, else the channel actually used.
+ */
+export async function deliverWritableTerminalCardTo(
+  ds: DaemonSession,
+  operatorOpenId: string,
+): Promise<'ephemeral' | 'dm' | 'failed' | 'not_ready'> {
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) return 'not_ready';
+  return deliverWriteLinkCard(ds, operatorOpenId, cardJson);
 }
 
 /**

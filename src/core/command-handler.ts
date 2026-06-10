@@ -18,7 +18,7 @@ import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolv
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -44,7 +44,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash', '/land']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land']);
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -788,6 +788,51 @@ export async function handleCardCommand(
   }
 
   await reply(t('cmd.card.usage', undefined, loc));
+}
+
+/**
+ * Handle `/term` (owner-only) — the slash-command twin of the "🔑 获取操作链接"
+ * card button. Privately hands the owner a writable (token-bearing) terminal card:
+ * an in-chat visible-to-you ephemeral card in plain groups, auto-falling back to a
+ * DM in topic / p2p chats. The link rides only that private channel — never the
+ * group. Gated identically to /card (`senderOpenId === owner`), and strictly
+ * needs a live session whose terminal is up. Routed for both the new-topic path
+ * (daemon.ts) and the existing-session switch below.
+ */
+export async function handleTermLinkCommand(
+  rootId: string,
+  larkAppId: string,
+  _chatId: string,
+  senderOpenId: string | undefined,
+  _content: string,
+  deps: CommandHandlerDeps,
+): Promise<void> {
+  const loc = localeForBot(larkAppId);
+  const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
+
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  if (!ownerOpenId || !senderOpenId || senderOpenId !== ownerOpenId) {
+    await reply(t('cmd.term.owner_only', undefined, loc));
+    return;
+  }
+
+  const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+  if (!ds) {
+    await reply(t('cmd.term.no_session', undefined, loc));
+    return;
+  }
+
+  const channel = await deliverWritableTerminalCardTo(ds, senderOpenId);
+  if (channel === 'not_ready') {
+    await reply(t('cmd.term.not_ready', undefined, loc));
+  } else if (channel === 'failed') {
+    await reply(t('cmd.term.failed', undefined, loc));
+  } else if (channel === 'dm') {
+    // The card landed in DM (topic / p2p) — nothing showed in the topic, so drop a
+    // visible breadcrumb pointing the owner at their DM. (No token, safe to show.)
+    await reply(t('cmd.term.sent_dm', undefined, loc));
+  }
+  // channel === 'ephemeral': the visible-to-you card IS the response; no extra msg.
 }
 
 export async function handleCommand(
@@ -2008,6 +2053,18 @@ export async function handleCommand(
         break;
       }
 
+      case '/term': {
+        // Existing-session path. New topics route /term via handleTermLinkCommand
+        // at the router (daemon.ts) so no phantom worker=null session is created.
+        const appId = ds?.larkAppId ?? larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        await handleTermLinkCommand(rootId, appId, ds?.chatId ?? '', message.senderId, message.content, deps);
+        break;
+      }
+
       case '/list-slash-command':
       case '/slash': {
         // 列出本 bot 当前可用的 slash 命令，分三段：
@@ -2057,6 +2114,7 @@ export async function handleCommand(
           t('help.repo_path', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
+          t('help.term', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
           // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移

@@ -85,6 +85,9 @@ vi.mock('../src/bot-registry.js', () => ({
     },
   ]),
   getBotOpenId: vi.fn((id: string = 'app-1') => (id === 'app-2' ? 'ou_codex' : 'ou_claude')),
+  // /term (and /card) gate on this. Default owner is ou_owner; tests flip the
+  // sender to ou_owner / a non-owner to exercise the gate.
+  getOwnerOpenId: vi.fn(() => 'ou_owner'),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -214,6 +217,9 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // logic is genuinely exercised in every /relay --create scenario.
   isRelayableRealSession: (ds: any) =>
     !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
+  // /term payload. Default to the in-chat visible-to-you channel; tests override
+  // per-scenario (dm / failed / not_ready).
+  deliverWritableTerminalCardTo: vi.fn(async () => 'ephemeral'),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -312,7 +318,7 @@ vi.mock('../src/services/oncall-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
 import { writeTeamRoleFile, deleteTeamRoleFile, resolveRole } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
@@ -320,7 +326,8 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply } from '../src/core/worker-pool.js';
+import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
+import { getOwnerOpenId } from '../src/bot-registry.js';
 import { getSessionWorkingDir, buildNewTopicPrompt } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
@@ -463,9 +470,8 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 22 = 21 original + /land (added with the sandbox-landing feature; this
-    // assertion was left stale when it landed).
-    expect(DAEMON_COMMANDS.size).toBe(22);
+    // 23 = 21 original + /land (sandbox-landing) + /term (operable-terminal slash).
+    expect(DAEMON_COMMANDS.size).toBe(23);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -2563,5 +2569,64 @@ describe('/role subcommand routing', () => {
     expect(resolveRole).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('TEAMROLE_MARKER');
+  });
+});
+
+describe('/term — operable terminal slash command (owner-only)', () => {
+  const ownerMsg = (over: Partial<LarkMessage> = {}) => makeLarkMessage('/term', { senderId: 'ou_owner', ...over });
+
+  beforeEach(() => {
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_owner');
+    vi.mocked(deliverWritableTerminalCardTo).mockResolvedValue('ephemeral');
+  });
+
+  it('rejects a non-owner sender and never delivers a card', async () => {
+    const deps = makeDeps(makeDaemonSession({ workerPort: 41000, workerToken: 't' }));
+    await handleCommand('/term', ROOT_ID, makeLarkMessage('/term', { senderId: 'ou_random' }), deps, LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('仅 bot 主人');
+    expect(deliverWritableTerminalCardTo).not.toHaveBeenCalled();
+  });
+
+  it('owner with no active session gets the no-session notice (no delivery)', async () => {
+    const deps = makeDeps(); // no session in the map
+    await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('没有活跃会话');
+    expect(deliverWritableTerminalCardTo).not.toHaveBeenCalled();
+  });
+
+  it('owner with a live session: delivers to the owner; ephemeral needs no extra reply', async () => {
+    vi.mocked(deliverWritableTerminalCardTo).mockResolvedValue('ephemeral');
+    const ds = makeDaemonSession({ workerPort: 41000, workerToken: 'wtok' });
+    const deps = makeDeps(ds);
+    await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
+    expect(deliverWritableTerminalCardTo).toHaveBeenCalledWith(ds, 'ou_owner');
+    // the visible-to-you card IS the response — no breadcrumb message
+    expect(deps.sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('DM fallback (topic/p2p) drops a visible breadcrumb pointing at the DM', async () => {
+    vi.mocked(deliverWritableTerminalCardTo).mockResolvedValue('dm');
+    const deps = makeDeps(makeDaemonSession({ workerPort: 41000, workerToken: 'wtok' }));
+    await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('私信');
+  });
+
+  it('terminal not ready → not-ready notice', async () => {
+    vi.mocked(deliverWritableTerminalCardTo).mockResolvedValue('not_ready');
+    const deps = makeDeps(makeDaemonSession());
+    await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('终端还没就绪');
+  });
+
+  it('delivery failure → failure notice', async () => {
+    vi.mocked(deliverWritableTerminalCardTo).mockResolvedValue('failed');
+    const deps = makeDeps(makeDaemonSession({ workerPort: 41000, workerToken: 'wtok' }));
+    await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('发送失败');
   });
 });

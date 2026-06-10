@@ -46,7 +46,7 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-import { deliverWriteLinkCard, deliverWriteLinkCardToOwners } from '../src/core/worker-pool.js';
+import { deliverWriteLinkCard, deliverWriteLinkCardToOwners, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
 
 const OP = 'ou_operator';
 const CARD = '{"card":"json"}';
@@ -156,5 +156,31 @@ describe('deliverWriteLinkCardToOwners (botmux term-link backend)', () => {
     sendUserMessageMock.mockRejectedValueOnce(new Error('bot not in chat'));
     const r = await deliverWriteLinkCardToOwners(liveDs({ chatType: 'group' }));
     expect(r).toMatchObject({ ok: false, error: 'delivery_failed', delivered: 0, total: 1 });
+  });
+});
+
+describe('deliverWritableTerminalCardTo (/term slash command backend)', () => {
+  it('returns not_ready (and never sends) when the terminal has no token', async () => {
+    const r = await deliverWritableTerminalCardTo(liveDs({ workerToken: null }), 'ou_owner');
+    expect(r).toBe('not_ready');
+    expect(sendEphemeralCardMock).not.toHaveBeenCalled();
+    expect(sendUserMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('delivers a token-bearing card to the single operator (ephemeral in a plain group)', async () => {
+    const r = await deliverWritableTerminalCardTo(liveDs({ chatType: 'group' }), 'ou_owner');
+    expect(r).toBe('ephemeral');
+    expect(sendEphemeralCardMock).toHaveBeenCalledTimes(1);
+    const [, , who, card] = sendEphemeralCardMock.mock.calls[0];
+    expect(who).toBe('ou_owner');
+    expect(card).toContain('token=wtok-xyz');
+    // does NOT fan out to an audience — exactly one recipient
+    expect(sendUserMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to DM in a p2p/topic chat', async () => {
+    const r = await deliverWritableTerminalCardTo(liveDs({ chatType: 'p2p' }), 'ou_owner');
+    expect(r).toBe('dm');
+    expect(sendUserMessageMock).toHaveBeenCalledWith('app', 'ou_owner', expect.stringContaining('token=wtok-xyz'), 'interactive');
   });
 });

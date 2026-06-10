@@ -60,7 +60,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -2100,6 +2100,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
       return;
     }
+    // /term needs a live session's terminal; in a brand-new topic there's none.
+    // Route here (own owner-gate inside) so the generic block below doesn't
+    // pre-create a worker=null phantom session just to reply "no session".
+    if (cmd === '/term') {
+      await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
+      return;
+    }
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
       await sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
@@ -2706,6 +2713,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
+      // /term only hands out a writable link for an ALREADY-live session — it must
+      // never pre-create one. Special-case it before the canOperate gate + the
+      // pre-create block below (mirrors the new-topic route + /card). Its own
+      // owner gate (stricter than canOperate) is the sole authority; without this,
+      // /term in a thread with no existingDs would spawn a worker:null phantom
+      // session and pollute the dashboard before replying not_ready/owner_only.
+      if (cmd === '/term') {
+        await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, commandDeps);
+        return;
+      }
       // canOperate gate for thread-reply daemon commands — required in every chat
       // (see spawn-path gate above). Denies chat-granted users management commands.
       if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId)) {
