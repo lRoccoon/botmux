@@ -131,8 +131,11 @@ const EnvelopeBase = {
   budgetDelta: z.number().optional(),
 };
 
-// Helper to declare an event = envelope + {type, payload}.
-function event<T extends string, P extends z.ZodRawShape>(type: T, payload: z.ZodObject<P>) {
+// Helper to declare an event = envelope + {type, payload}. The payload is
+// usually a plain z.object; refined payloads (ZodEffects, e.g. cross-field
+// invariants via superRefine) are fine too — the discriminated union members
+// stay ZodObjects because the envelope is what carries the discriminator.
+function event<T extends string, P extends z.ZodTypeAny>(type: T, payload: P) {
   return z.object({
     ...EnvelopeBase,
     type: z.literal(type),
@@ -228,6 +231,16 @@ export const TaskProposalResolvedEventSchema = event('TaskProposalResolved', z.o
   /** Set on acceptance: the taskId the follow-up TaskCreated carries. */
   taskId: TaskIdSchema.optional(),
   reason: z.string().optional(),
+}).superRefine((p, ctx) => {
+  // acceptance must name the task it becomes; a rejection must not carry one —
+  // enforced here so non-control-plane writers (human/external) can't smuggle
+  // an inconsistent resolution past the log's authoritative validation.
+  if (p.resolution === 'accepted' && !p.taskId) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['taskId'], message: 'accepted resolution requires taskId' });
+  }
+  if (p.resolution === 'rejected' && p.taskId) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['taskId'], message: 'rejected resolution must not carry taskId' });
+  }
 }));
 
 // ── worker lease lifecycle (the kill/resume命题) ─────────────────────────────

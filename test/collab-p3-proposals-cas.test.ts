@@ -108,6 +108,24 @@ describe('P3 task proposals', () => {
     expect(snap.tasks).toHaveLength(1);
   });
 
+  it('resolution invariants: accepted requires taskId, rejected must not carry one', async () => {
+    const board = openCollabBoard(RUN, { baseDir });
+    await seedRun(board);
+    await board.append(draft({
+      type: 'TaskProposed', actor: 'worker', affectedPaths: ['proposals'], idempotencyKey: 'tp-i',
+      payload: { proposalId: 'prop-i', title: 't', spec: 's', why: 'w' },
+    }));
+    // the log validates authoritatively — an inconsistent resolution fails loud
+    await expect(board.append(draft({
+      type: 'TaskProposalResolved', affectedPaths: ['proposals'], idempotencyKey: 'tpr-i1',
+      payload: { proposalId: 'prop-i', resolution: 'accepted' }, // no taskId
+    }))).rejects.toThrow(/taskId/);
+    await expect(board.append(draft({
+      type: 'TaskProposalResolved', affectedPaths: ['proposals'], idempotencyKey: 'tpr-i2',
+      payload: { proposalId: 'prop-i', resolution: 'rejected', taskId: 'task-9' },
+    }))).rejects.toThrow(/taskId/);
+  });
+
   it('pre-P3 logs replay unchanged: proposals empty, task === tasks[0]', async () => {
     const board = openCollabBoard(RUN, { baseDir });
     await seedRun(board);
