@@ -19,7 +19,7 @@ import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, fin
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldWriteNow } from './utils/input-gate.js';
-import { ReadyGate } from './utils/ready-gate.js';
+import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -3727,16 +3727,22 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
 
-  // Arm the ready-gate for Claude-family CLIs (which inject the SessionStart
-  // hook via --settings; see claude-code.ts buildArgs). Until `botmux
-  // session-ready` fires (daemon → 'session_ready' IPC → releaseReadyGate) we
-  // hold the first prompt so a cjadk-style startup selector's ❯ can't eat it.
-  // Adopt panes aren't spawned with our --settings (can't get the hook), so we
-  // don't arm them — they'd only wait out the timeout. Fallback: release after
-  // READY_SIGNAL_TIMEOUT_MS and fall back to readyPattern + quiescence.
+  // Arm the ready-gate for FRESH Claude-family spawns (which inject the
+  // SessionStart hook via --settings; see claude-code.ts buildArgs). Until
+  // `botmux session-ready` fires (daemon → 'session_ready' IPC → releaseReadyGate)
+  // we hold the first prompt so a cjadk-style startup selector's ❯ can't eat it.
+  // shouldArmReadyGate() excludes adopt (pre-existing pane, no --settings) AND
+  // persistent-backend reattach (daemon restart re-attaches an already-running
+  // tmux/zellij/herdr Claude WITHOUT re-running its bin/args → no new
+  // SessionStart hook → arming would hold the first post-recovery message until
+  // the timeout). Fallback: release after READY_SIGNAL_TIMEOUT_MS → readyPattern.
   readyGate = new ReadyGate();
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
-  if (cliAdapter.injectsReadyHook && !cfg.adoptMode) {
+  if (shouldArmReadyGate({
+    injectsReadyHook: cliAdapter.injectsReadyHook === true,
+    adoptMode: cfg.adoptMode === true,
+    willReattachPersistent,
+  })) {
     readyGate.arm();
     log('Ready gate armed — holding first prompt until SessionStart ready signal');
     readySignalTimer = setTimeout(() => {

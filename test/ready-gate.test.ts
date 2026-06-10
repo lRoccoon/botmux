@@ -13,7 +13,34 @@
  * Run: pnpm vitest run test/ready-gate.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { ReadyGate } from '../src/utils/ready-gate.js';
+import { ReadyGate, shouldArmReadyGate } from '../src/utils/ready-gate.js';
+
+describe('shouldArmReadyGate', () => {
+  const base = { injectsReadyHook: true, adoptMode: false, willReattachPersistent: false };
+
+  it('arms a fresh Claude-family spawn (hook will fire)', () => {
+    expect(shouldArmReadyGate(base)).toBe(true);
+  });
+
+  it('does NOT arm a non-Claude CLI (no SessionStart hook injected)', () => {
+    expect(shouldArmReadyGate({ ...base, injectsReadyHook: false })).toBe(false);
+  });
+
+  it('does NOT arm adopt panes (pre-existing, never got our --settings)', () => {
+    expect(shouldArmReadyGate({ ...base, adoptMode: true })).toBe(false);
+  });
+
+  it('THE REATTACH REGRESSION: does NOT arm a persistent-backend reattach', () => {
+    // daemon restart re-attaches an already-running tmux/zellij/herdr Claude
+    // WITHOUT re-running its bin/args → no new SessionStart hook fires. Arming
+    // would hold the first post-recovery message until the fallback timeout.
+    expect(shouldArmReadyGate({ ...base, willReattachPersistent: true })).toBe(false);
+  });
+
+  it('reattach exclusion wins even for an otherwise-eligible fresh-looking spawn', () => {
+    expect(shouldArmReadyGate({ injectsReadyHook: true, adoptMode: false, willReattachPersistent: true })).toBe(false);
+  });
+});
 
 describe('ReadyGate', () => {
   it('not armed → never holds, receive() reports no flush needed (other CLIs / adopt)', () => {

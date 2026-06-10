@@ -31,6 +31,33 @@
  * Pure and self-contained (no timers, no IO) so the worker owns the fallback
  * timer and IPC wiring while the transition logic stays unit-testable.
  */
+/**
+ * Decide whether the worker should ARM the ready-gate for a given spawn. The
+ * gate is only valid when a SessionStart hook will actually fire — i.e. a FRESH
+ * Claude-family spawn that re-runs the CLI binary with our `--settings`:
+ *
+ *   - `injectsReadyHook`        — the adapter injects the hook (claude / seed).
+ *   - NOT `adoptMode`           — adopt panes are pre-existing, never spawned with
+ *                                 our `--settings`, so they can't get the hook.
+ *   - NOT `willReattachPersistent` — on daemon restart / worker recovery the
+ *                                 worker re-attaches to an existing tmux/zellij/
+ *                                 herdr session and does NOT re-run the CLI's
+ *                                 bin/args, so NO new SessionStart hook fires. An
+ *                                 already-idle Claude would otherwise have its
+ *                                 first post-recovery message held until the
+ *                                 fallback timeout — a user-visible regression.
+ *
+ * Any of the negatives → don't arm; the gate stays open and the spawn behaves
+ * exactly as before (readyPattern + quiescence).
+ */
+export function shouldArmReadyGate(state: {
+  injectsReadyHook: boolean;
+  adoptMode: boolean;
+  willReattachPersistent: boolean;
+}): boolean {
+  return state.injectsReadyHook && !state.adoptMode && !state.willReattachPersistent;
+}
+
 export class ReadyGate {
   private armed = false;
   private received = false;
