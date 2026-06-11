@@ -827,6 +827,13 @@ async function promptEditBotConfig(
   ]);
   input.allowedChatGroups = await ask(rl, `允许的群聊组 [${formatOptionalValue(bot.allowedChatGroups)}]: `);
 
+  printInputHelp('免 @ 自动回复群', [
+    '可选。仅这些普通群的非 @ 普通消息也会触发机器人；多个 chat_id 用逗号分隔。',
+    '强烈建议只配置少量明确群，避免刷屏/误触发。发送者仍需通过 canTalk 权限。',
+    '留空保留当前值；输入 - 清空。',
+  ]);
+  input.autoReplyWithoutMentionChats = await ask(rl, `免 @ 自动回复群 [${formatOptionalValue(bot.autoReplyWithoutMentionChats)}]: `);
+
   const edited = applyBotConfigEdits(bot, input);
   // 配了 allowedChatGroups 就必须有 owner，否则敏感操作对所有人关闭。抛错由调用方捕获并中止写盘。
   assertOwnerWhenChatGroups(edited);

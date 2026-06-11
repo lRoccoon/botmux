@@ -19,6 +19,7 @@
     "larkAppSecret": "secret_2",
     "cliId": "codex",
     "model": "gpt-5-codex",
+    "passthroughCommands": ["/doctor", "/agents"],
     "workingDir": "~/work"
   }
 ]
@@ -33,6 +34,7 @@
 | `name` | 否 | 进程名后缀，如 `claude-main` → `botmux-claude-main`；留空默认 `botmux-<序号>` |
 | `cliId` | 否 | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
 | `model` | 否 | 启动 CLI 用的模型名；留空走 CLI 默认 |
+| `passthroughCommands` | 否 | 额外字面送达底层 CLI 的 slash 命令数组，会追加到内置透传命令列表；例如 `["/doctor"]`。命令需以 `/` 开头，加载时会转小写、去重、忽略非法项 |
 | `cliPathOverride` | 否 | CLI 入口绝对路径，用于套 wrapper / router（ccr、claude-w、aiden-x-claude 等） |
 | `backendType` | 否 | 会话后端 `pty` / `tmux`（默认自动检测） |
 | `workingDir` | 否 | 默认工作目录，支持逗号分隔多个。从该目录**向下**递归找 git 仓库（最多 3 层），不向上扫 |

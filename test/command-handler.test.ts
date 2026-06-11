@@ -68,6 +68,7 @@ vi.mock('../src/bot-registry.js', () => ({
       cliId: id === 'app-2' ? ('codex' as const) : ('claude-code' as const),
       workingDir: '~/projects',
       workingDirs: ['~/projects'],
+      passthroughCommands: id === 'app-2' ? ['/doctor'] : undefined,
     },
   })),
   // Production runs ONE daemon per bot, so getAllBots() sees only this process's
@@ -339,6 +340,7 @@ function defaultGetBot(id: string = 'app-1') {
       cliId: id === 'app-2' ? ('codex' as const) : ('claude-code' as const),
       workingDir: '~/projects',
       workingDirs: ['~/projects'],
+      passthroughCommands: id === 'app-2' ? ['/doctor'] : undefined,
     },
   };
 }
@@ -493,6 +495,17 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     for (const cmd of PASSTHROUGH_COMMANDS) {
       expect(DAEMON_COMMANDS.has(cmd), `${cmd} must not be in both sets`).toBe(false);
     }
+  });
+});
+
+describe('passthroughCommandsForBot', () => {
+  it('merges built-in passthrough commands with per-bot configured commands', async () => {
+    const { passthroughCommandsForBot, isPassthroughCommandForBot } = await import('../src/core/command-handler.js');
+    const cmds = passthroughCommandsForBot('app-2');
+    expect(cmds.has('/compact')).toBe(true);
+    expect(cmds.has('/doctor')).toBe(true);
+    expect(isPassthroughCommandForBot('/doctor', 'app-2')).toBe(true);
+    expect(isPassthroughCommandForBot('/doctor', 'app-1')).toBe(false);
   });
 });
 
@@ -767,16 +780,18 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('Claude'); // CLI display name
     });
 
-    it('renders the passthrough list straight from PASSTHROUGH_COMMANDS (no drift)', async () => {
-      const ds = makeDaemonSession();
+    it('renders the passthrough list straight from built-ins plus bot config (no drift)', async () => {
+      const ds = makeDaemonSession({ larkAppId: 'app-2', session: makeSession({ cliId: 'codex' }) });
       const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey(ROOT_ID, 'app-2'), ds);
 
-      await handleCommand('/help', ROOT_ID, makeLarkMessage('/help'), deps, LARK_APP_ID);
+      await handleCommand('/help', ROOT_ID, makeLarkMessage('/help'), deps, 'app-2');
 
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      // /help renders [...PASSTHROUGH_COMMANDS].join(' '); guard against anyone
-      // re-hardcoding a stale list that drifts from the set.
+      // /help renders built-ins + per-bot passthroughCommands; guard against
+      // anyone re-hardcoding a stale list that drifts from effective config.
       expect(replyContent).toContain([...PASSTHROUGH_COMMANDS].join(' '));
+      expect(replyContent).toContain('/doctor');
     });
 
     it('should return help text when no session exists', async () => {

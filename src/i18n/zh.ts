@@ -10,6 +10,7 @@ export const messages: Record<string, string> = {
   'card.writable_terminal_link': '🔑 可操作终端（群内可见，任何人可直接操控）：[{url}]({url})',
   'card.btn.restart_cli': '🔄 重启 {cliName}',
   'card.btn.disconnect': '⏏ 断开',
+  'card.btn.interrupt_turn': '⏹ 中断本轮',
   'card.btn.close_session': '❌ 关闭会话',
   'card.btn.resume_session': '▶️ 恢复会话',
   'card.btn.show_output': '📖 显示输出',
@@ -22,6 +23,8 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_down': '⇟ 下半屏',
   'card.btn.send_custom': '📝 发送自定义回复',
   'card.btn.retry_last_task': '🔁 重发上一条任务',
+  'card.btn.keep_session': '继续保留',
+  'card.btn.remind_later': '稍后提醒',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': '启动中…',
@@ -53,6 +56,12 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开终端」查看实时画面。',
+  'card.idle_close.title': '⏰ 会话空闲提醒',
+  'card.idle_close.body': '这个会话已经 **{idleFor}** 没有新消息了。是否需要关闭以释放本机 CLI / tmux 资源？\n\n**{title}**\n{adoptNote}',
+  'card.idle_close.adopt_note': '\n这是 /adopt 接入的会话；关闭只会断开 Botmux 会话，原 CLI 会话不受影响。',
+  'card.idle_close.keep_result': '✅ 已继续保留该会话，{snoozeFor} 后如仍无消息会再次提醒。',
+  'card.idle_close.already_closed': '该会话已关闭，无需处理。',
+  'card.idle_close.toast_kept': '已保留，会稍后再提醒',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',

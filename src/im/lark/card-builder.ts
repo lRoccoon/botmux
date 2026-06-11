@@ -183,6 +183,74 @@ export function buildSessionClosedCard(
   return JSON.stringify(card);
 }
 
+export function buildIdleCloseReminderCard(
+  sessionId: string,
+  rootId: string,
+  title: string,
+  idleMs: number,
+  snoozeMs: number,
+  cliId?: CliId,
+  adoptMode?: boolean,
+  locale?: Locale,
+): string {
+  const effectiveCliId = cliId ?? 'claude-code';
+  const cliName = getCliDisplayName(effectiveCliId);
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
+  const body = t('card.idle_close.body', {
+    idleFor: formatDuration(idleMs),
+    title: escapeMd(title || cliName),
+    adoptNote: adoptMode ? t('card.idle_close.adopt_note', undefined, locale) : '',
+  }, locale);
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.idle_close.title', undefined, locale) },
+      template: 'orange',
+    },
+    elements: [
+      { tag: 'markdown', content: body },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
+            type: 'danger',
+            value: { action: 'close', ...actionBase },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.btn.keep_session', undefined, locale) },
+            type: 'primary',
+            value: { action: 'idle_close_keep', snooze_ms: String(snoozeMs), ...actionBase },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.btn.remind_later', undefined, locale) },
+            type: 'default',
+            value: { action: 'idle_close_keep', snooze_ms: String(snoozeMs), ...actionBase },
+          },
+        ],
+      },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
+export function buildIdleCloseKeptCard(title: string, snoozeMs: number, locale?: Locale): string {
+  const body = `**${escapeMd(title)}**\n${t('card.idle_close.keep_result', { snoozeFor: formatDuration(snoozeMs) }, locale)}`;
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.idle_close.title', undefined, locale) },
+      template: 'green',
+    },
+    elements: [
+      { tag: 'markdown', content: body },
+    ],
+  });
+}
+
 /** Build the lightweight placeholder shown while a no-streaming-card bot works. */
 export function buildPendingResponseCard(locale?: Locale): string {
   return JSON.stringify({
@@ -454,6 +522,12 @@ export function buildStreamingCard(
     text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
     type: 'default',
     value: { action: 'get_write_link', ...actionBase },
+  });
+  headerActions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.btn.interrupt_turn', undefined, locale) },
+    type: 'default' as const,
+    value: { action: 'term_action', ...actionBase, key: 'ctrlc' },
   });
   if (adoptMode) {
     if (showTakeover) {

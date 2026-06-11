@@ -113,6 +113,21 @@ describe('applyBotConfigEdits', () => {
     expect(cleared.allowedChatGroups).toBeUndefined();
   });
 
+  it('edits and clears autoReplyWithoutMentionChats', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      autoReplyWithoutMentionChats: ['oc_old'],
+    }, {
+      autoReplyWithoutMentionChats: 'oc_team, oc_project',
+    });
+    expect(edited.autoReplyWithoutMentionChats).toEqual(['oc_team', 'oc_project']);
+
+    const cleared = applyBotConfigEdits(edited, { autoReplyWithoutMentionChats: '-' });
+    expect(cleared.autoReplyWithoutMentionChats).toBeUndefined();
+  });
+
   it('rejects bare email prefixes in allowedUsers (only full email or ou_ accepted)', () => {
     expect(() => applyBotConfigEdits({
       larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',

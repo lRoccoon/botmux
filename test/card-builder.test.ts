@@ -509,10 +509,32 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
+    it('should include interrupt-turn button that sends Ctrl-C without closing the session', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', 'nonce_123'));
+      const actions = findActions(card);
+      const interruptBtn = actions.find((a: any) => a.value?.action === 'term_action' && a.value?.key === 'ctrlc');
+      expect(interruptBtn).toBeDefined();
+      expect(interruptBtn.text.content).toContain('中断本轮');
+      expect(interruptBtn.type).toBe('default');
+      expect(interruptBtn.value.root_id).toBe(ROOT);
+      expect(interruptBtn.value.session_id).toBe(SID);
+      expect(interruptBtn.value.cli_id).toBe('codex');
+      expect(interruptBtn.value.card_nonce).toBe('nonce_123');
+    });
+
+    it('should place interrupt-turn before close', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      const interruptIdx = actions.findIndex((a: any) => a.value?.action === 'term_action' && a.value?.key === 'ctrlc');
+      const closeIdx = actions.findIndex((a: any) => a.value?.action === 'close');
+      expect(interruptIdx).toBeGreaterThanOrEqual(0);
+      expect(closeIdx).toBeGreaterThan(interruptIdx);
+    });
+
+    it('should have exactly 5 buttons (toggle, terminal, get_write_link, interrupt, close)', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
+      const actions = findActions(card);
+      expect(actions).toHaveLength(5);
     });
   });
 

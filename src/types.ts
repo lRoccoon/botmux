@@ -24,6 +24,10 @@ export interface Session {
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
+  /** Last time botmux posted an idle-close reminder for this active session. */
+  idleCloseReminderSentAt?: string;
+  /** Do not post another idle-close reminder before this timestamp. */
+  idleCloseSnoozedUntil?: string;
   closedAt?: string;
   pid?: number;
   workingDir?: string;

@@ -53,7 +53,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, handleCommand, handleCardCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, isPassthroughCommandForBot, handleCommand, handleCardCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -99,6 +99,7 @@ import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/l
 import { serializeByAnchor } from './utils/anchor-serializer.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
+import { startIdleCloseReminderScanner } from './core/idle-close-reminder.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from './workflows/runtime.js';
 import { runLoop } from './workflows/loop.js';
@@ -1979,7 +1980,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
       return;
     }
-    if (PASSTHROUGH_COMMANDS.has(cmd)) {
+    if (isPassthroughCommandForBot(cmd, larkAppId)) {
       await sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
@@ -2536,7 +2537,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       await sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
-    if (PASSTHROUGH_COMMANDS.has(cmd)) {
+    if (isPassthroughCommandForBot(cmd, larkAppId)) {
       // 语义边界（刻意保留，非疏漏）：passthrough（/model /clear /compact 等）按
       // “发给 CLI 的对话输入”处理，因此不过下面 DAEMON_COMMANDS 的 oncall
       // canOperate 闸 —— oncall 放行的就是对话输入，canOperate 只管 botmux
@@ -3175,6 +3176,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   scheduler.setExecuteCallback((task) => executeScheduledTask(task, activeSessions, refreshCliVersion));
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
+  const idleCloseReminderTimer = startIdleCloseReminderScanner(activeSessions, { sessionReply });
 
   // Graceful shutdown. Sends SIGTERM (or `{type:'close'}` IPC via killWorker)
   // to every worker, then waits up to SHUTDOWN_GRACE_MS for them to exit
@@ -3195,6 +3197,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     workflowEventWatchers.clear();
     workflowRuns.clear();
     clearInterval(descriptorHeartbeat);
+    idleCloseReminderTimer?.stop();
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
@@ -3264,6 +3267,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // the descriptor so the dashboard doesn't see a phantom daemon.
   process.on('exit', () => {
     clearInterval(descriptorHeartbeat);
+    idleCloseReminderTimer?.stop();
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

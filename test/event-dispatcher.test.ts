@@ -89,7 +89,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
-import { canOperate, canTalk, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { canOperate, canTalk, checkGroupMessageAccess, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -661,6 +661,56 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     });
 
     expect(canTalk(MY_APP_ID, 'oc_other_chat', USER_OPEN_ID)).toBe(false);
+  });
+
+  it('allows non-mentioned group messages in autoReplyWithoutMentionChats when sender canTalk', async () => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockGetChatInfo.mockClear();
+    mockGetBot.mockReturnValue({
+      config: {
+        larkAppId: MY_APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: [USER_OPEN_ID],
+        autoReplyWithoutMentionChats: ['oc_team'],
+      },
+      botOpenId: MY_OPEN_ID,
+      resolvedAllowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'hello without mention' }),
+      chatId: 'oc_team',
+      chatType: 'group',
+    });
+
+    await expect(checkGroupMessageAccess(MY_APP_ID, event.message, 'oc_team', USER_OPEN_ID))
+      .resolves.toBe('allowed');
+    expect(mockGetChatInfo).not.toHaveBeenCalled();
+  });
+
+  it('does not let autoReplyWithoutMentionChats bypass canTalk', async () => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockGetBot.mockReturnValue({
+      config: {
+        larkAppId: MY_APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_someone_else'],
+        autoReplyWithoutMentionChats: ['oc_team'],
+      },
+      botOpenId: MY_OPEN_ID,
+      resolvedAllowedUsers: ['ou_someone_else'],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'hello without mention' }),
+      chatId: 'oc_team',
+      chatType: 'group',
+    });
+
+    await expect(checkGroupMessageAccess(MY_APP_ID, event.message, 'oc_team', USER_OPEN_ID))
+      .resolves.toBe('ignore');
   });
 
   it('does not grant sensitive operations from an allowedChatGroups chat', () => {

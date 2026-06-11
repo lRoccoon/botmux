@@ -78,6 +78,12 @@ export const config = {
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
   },
+  idleCloseReminder: {
+    enabled: (process.env.BOTMUX_IDLE_CLOSE_REMINDER_ENABLED ?? 'true').toLowerCase() !== 'false',
+    thresholdHours: Number(process.env.BOTMUX_IDLE_CLOSE_REMINDER_HOURS) || 24,
+    scanIntervalMs: Number(process.env.BOTMUX_IDLE_CLOSE_REMINDER_SCAN_INTERVAL_MS) || 30 * 60 * 1000,
+    snoozeHours: Number(process.env.BOTMUX_IDLE_CLOSE_REMINDER_SNOOZE_HOURS) || 24,
+  },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',
     get externalHost() { return getWebExternalHost(); },

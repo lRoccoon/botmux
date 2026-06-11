@@ -12,6 +12,8 @@ export function markSessionActivity(ds: DaemonSession, at: number = Date.now()):
   const iso = new Date(at).toISOString();
   if (ds.session.lastMessageAt !== iso) {
     ds.session.lastMessageAt = iso;
+    ds.session.idleCloseReminderSentAt = undefined;
+    ds.session.idleCloseSnoozedUntil = undefined;
     sessionStore.updateSession(ds.session);
   }
   dashboardEventBus.publish({

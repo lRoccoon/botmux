@@ -7,6 +7,7 @@ export const messages: Record<string, string> = {
   'card.writable_terminal_link': '🔑 Writable terminal (visible to everyone here — anyone can drive it): [{url}]({url})',
   'card.btn.restart_cli': '🔄 Restart {cliName}',
   'card.btn.disconnect': '⏏ Disconnect',
+  'card.btn.interrupt_turn': '⏹ Interrupt Turn',
   'card.btn.close_session': '❌ Close Session',
   'card.btn.resume_session': '▶️ Resume Session',
   'card.btn.show_output': '📖 Show Output',
@@ -19,6 +20,8 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
   'card.btn.retry_last_task': '🔁 Retry Last Task',
+  'card.btn.keep_session': 'Keep Session',
+  'card.btn.remind_later': 'Remind Later',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
@@ -50,6 +53,12 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Terminal for the live view.',
+  'card.idle_close.title': '⏰ Idle Session Reminder',
+  'card.idle_close.body': 'This session has had no new messages for **{idleFor}**. Close it to release local CLI / tmux resources?\n\n**{title}**\n{adoptNote}',
+  'card.idle_close.adopt_note': '\nThis is an /adopt session; closing only disconnects Botmux, leaving the original CLI untouched.',
+  'card.idle_close.keep_result': '✅ Kept this session. I will remind again after {snoozeFor} if it stays inactive.',
+  'card.idle_close.already_closed': 'This session is already closed.',
+  'card.idle_close.toast_kept': 'Kept; I will remind later',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',

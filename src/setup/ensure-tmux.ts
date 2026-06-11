@@ -94,10 +94,37 @@ function withTmuxSearchPath(pathValue: string | undefined): string {
   return merged.join(':');
 }
 
+function isUtf8Locale(value: string | undefined): boolean {
+  return !!value && /utf-?8/i.test(value);
+}
+
+function defaultUtf8Locale(): string {
+  // macOS typically lacks C.UTF-8; Linux distros used by botmux deployments do.
+  return process.platform === 'darwin' ? 'en_US.UTF-8' : 'C.UTF-8';
+}
+
+function withUtf8Locale(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  const fallback = defaultUtf8Locale();
+
+  // tmux decides whether a client is UTF-8 capable from the client locale. If
+  // botmux was launched from a service/non-interactive shell with LC_ALL=C (or
+  // no locale), attaching via `botmux ls` renders CJK as placeholder glyphs
+  // such as "_____" even though the pane bytes are valid UTF-8. Keep an
+  // explicit user UTF-8 locale, otherwise force a UTF-8 locale for tmux only.
+  if (out.LC_ALL !== undefined) {
+    if (!isUtf8Locale(out.LC_ALL)) out.LC_ALL = fallback;
+    return out;
+  }
+  if (!isUtf8Locale(out.LC_CTYPE)) out.LC_CTYPE = fallback;
+  if (!out.LANG) out.LANG = fallback;
+  return out;
+}
+
 export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const { TMUX: _tmux, TMUX_PANE: _pane, ...rest } = env;
   return {
-    ...rest,
+    ...withUtf8Locale(rest),
     PATH: withTmuxSearchPath(rest.PATH),
   };
 }

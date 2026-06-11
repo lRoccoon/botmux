@@ -64,6 +64,17 @@ describe('tmuxEnv()', () => {
     const stripped = tmuxEnv({ PATH: '/usr/bin' });
     expect(stripped.PATH).toBe('/usr/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/bin:/usr/sbin:/sbin');
   });
+
+  it('forces a UTF-8 client locale for tmux when the inherited locale is C/ASCII', () => {
+    const stripped = tmuxEnv({ PATH: '/usr/bin', LANG: 'C', LC_ALL: 'C' });
+    expect(stripped.LC_ALL).toMatch(/UTF-8|UTF8/i);
+  });
+
+  it('preserves an explicit UTF-8 locale', () => {
+    const stripped = tmuxEnv({ PATH: '/usr/bin', LANG: 'zh_CN.UTF-8', LC_ALL: 'zh_CN.UTF-8' });
+    expect(stripped.LANG).toBe('zh_CN.UTF-8');
+    expect(stripped.LC_ALL).toBe('zh_CN.UTF-8');
+  });
 });
 
 describe('tmux subcommand with stale $TMUX', () => {

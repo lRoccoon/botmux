@@ -8,7 +8,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, buildIdleCloseKeptCard, getCliDisplayName, truncateContent } from './card-builder.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied, getPendingQuota, getPendingReplay, type PendingGrantReplay } from './grant-pending.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
@@ -500,7 +500,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'idle_close_keep', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -581,6 +581,25 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : activeSessions.get(rootId);
 
     if (ds && !validateCardCliBinding(ds, value)) return;
+
+    if (actionType === 'idle_close_keep') {
+      const targetSessionId = value.session_id;
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'info', content: t('card.idle_close.already_closed', undefined, loc) } };
+      }
+      const snoozeMs = Number(value.snooze_ms) > 0 ? Number(value.snooze_ms) : 24 * 60 * 60 * 1000;
+      const now = Date.now();
+      ds.session.idleCloseSnoozedUntil = new Date(now + snoozeMs).toISOString();
+      ds.session.idleCloseReminderSentAt = new Date(now).toISOString();
+      sessionStore.updateSession(ds.session);
+      logger.info(`[${tag(ds)}] idle-close reminder snoozed by ${operatorOpenId ?? '?'} for ${Math.round(snoozeMs / 1000)}s`);
+      if (targetSessionId && targetSessionId !== ds.session.sessionId) {
+        logger.warn(`[${tag(ds)}] idle-close keep payload session mismatch: ${targetSessionId}`);
+      }
+      try { return JSON.parse(buildIdleCloseKeptCard(ds.session.title, snoozeMs, loc)); } catch { /* fall through */ }
+      return { toast: { type: 'success', content: t('card.idle_close.toast_kept', undefined, loc) } };
+    }
 
     // 🔊 语音总结 — no permission gate (任意人可点). Inject a condense-and-speak
     // instruction into the session; the model emits the voice via

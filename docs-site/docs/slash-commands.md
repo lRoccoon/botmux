@@ -20,6 +20,8 @@
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` —— 字面送达底层 CLI，交给它的内置命令处理。
 
+如需增加额外透传命令，可在对应 bot 的 `~/.botmux/bots.json` 里配置 `passthroughCommands`，例如 `"passthroughCommands": ["/doctor", "/agents"]`。改完执行 `botmux restart` 生效。
+
 ## 📡 会话接入
 
 | 命令 | 说明 |

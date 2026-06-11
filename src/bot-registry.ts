@@ -58,6 +58,8 @@ export interface BotConfig {
   workingDirs?: string[];
   allowedUsers?: string[];
   allowedChatGroups?: string[];
+  /** Explicit chat_id whitelist: regular groups where non-@ ordinary messages are treated as addressed to this bot. */
+  autoReplyWithoutMentionChats?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
@@ -114,6 +116,12 @@ export interface BotConfig {
    * `/` 开头的文本"，避免误伤讨论命令用法的普通对话）。默认 false（保持现状：被授权人可用透传）。
    */
   restrictGrantCommands?: boolean;
+  /**
+   * Extra slash commands to forward verbatim to the underlying CLI, in addition
+   * to botmux's built-in passthrough commands. Values are normalized to
+   * lowercase `/cmd` tokens when loading bots.json; invalid entries are ignored.
+   */
+  passthroughCommands?: string[];
   /**
    * Custom footer brand label for cards this bot sends. Three states:
    *   • `undefined` (unset)  → default `[botmux](github)` link
@@ -462,6 +470,25 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .map((x: string) => x.trim());
     }
 
+    let autoReplyWithoutMentionChats: string[] | undefined;
+    if (Array.isArray(entry.autoReplyWithoutMentionChats)) {
+      autoReplyWithoutMentionChats = entry.autoReplyWithoutMentionChats
+        .filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0)
+        .map((x: string) => x.trim());
+    }
+
+    let passthroughCommands: string[] | undefined;
+    if (Array.isArray(entry.passthroughCommands)) {
+      const seen = new Set<string>();
+      for (const raw of entry.passthroughCommands) {
+        if (typeof raw !== 'string') continue;
+        const cmd = raw.trim().toLowerCase();
+        if (!/^\/\S+$/.test(cmd) || cmd === '/') continue;
+        if (!seen.has(cmd)) seen.add(cmd);
+      }
+      if (seen.size > 0) passthroughCommands = [...seen];
+    }
+
     // defaultOncall: per-bot default for auto-binding new group chats.
     // Tolerate missing fields: an entry with `enabled:true` but no workingDir
     // is treated as disabled (dashboard PUT enforces workingDir on save, but
@@ -563,6 +590,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       workingDirs,
       allowedUsers: entry.allowedUsers,
       allowedChatGroups,
+      autoReplyWithoutMentionChats,
       oncallChats,
       defaultOncall,
       defaultOncallAutoboundChats,
@@ -574,6 +602,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       messageQuota,
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
+      passthroughCommands,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.

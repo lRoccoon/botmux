@@ -665,6 +665,13 @@ export async function checkGroupMessageAccess(
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
+  // No @mention — explicit per-bot chat whitelist can opt regular groups into
+  // auto-replying without changing canTalk/canOperate permission semantics.
+  if (isAllowed && getBot(larkAppId).config.autoReplyWithoutMentionChats?.includes(chatId)) {
+    logger.debug(`[${larkAppId}] autoReplyWithoutMentionChats matched ${chatId}; allowing non-mentioned group message`);
+    return 'allowed';
+  }
+
   // No @mention — only allow if sender is the sole human in the group
   // AND this is the only bot in the chat. With multiple bots, require @mention
   // to disambiguate.

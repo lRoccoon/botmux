@@ -114,6 +114,7 @@ export interface BotConfigEditInput {
   workingDir?: string;
   allowedUsers?: string;
   allowedChatGroups?: string;
+  autoReplyWithoutMentionChats?: string;
 }
 
 /**
@@ -332,6 +333,15 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
       delete out.allowedChatGroups;
     } else if (allowedChatGroups) {
       out.allowedChatGroups = allowedChatGroups.split(',').map(s => s.trim()).filter(Boolean);
+    }
+  }
+
+  if (input.autoReplyWithoutMentionChats !== undefined) {
+    const autoReplyWithoutMentionChats = input.autoReplyWithoutMentionChats.trim();
+    if (autoReplyWithoutMentionChats === '-') {
+      delete out.autoReplyWithoutMentionChats;
+    } else if (autoReplyWithoutMentionChats) {
+      out.autoReplyWithoutMentionChats = autoReplyWithoutMentionChats.split(',').map(s => s.trim()).filter(Boolean);
     }
   }
 

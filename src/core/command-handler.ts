@@ -63,6 +63,24 @@ export const PASSTHROUGH_COMMANDS = new Set([
   '/btw',
 ]);
 
+/** Per-bot effective passthrough commands: built-ins plus bots.json extras. */
+export function passthroughCommandsForBot(larkAppId?: string): Set<string> {
+  const out = new Set(PASSTHROUGH_COMMANDS);
+  if (!larkAppId) return out;
+  let extras: string[] | undefined;
+  try {
+    extras = getBot(larkAppId).config.passthroughCommands;
+  } catch {
+    return out;
+  }
+  for (const cmd of extras ?? []) out.add(cmd);
+  return out;
+}
+
+export function isPassthroughCommandForBot(cmd: string, larkAppId?: string): boolean {
+  return passthroughCommandsForBot(larkAppId).has(cmd.toLowerCase());
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 export interface SlashCommandInvocation {
@@ -1753,8 +1771,8 @@ export async function handleCommand(
           t('help.card', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
-          // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移
-          [...PASSTHROUGH_COMMANDS].join(' '),
+          // 直接从集合渲染，保证文案与默认 + bot 自定义透传命令不漂移
+          [...passthroughCommandsForBot(ds?.larkAppId ?? larkAppId)].join(' '),
           '',
           t('help.heading_schedule', undefined, loc),
           t('help.schedule_create', undefined, loc),
