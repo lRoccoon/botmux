@@ -5,7 +5,8 @@
 import { fork, execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { installHook } from '../adapters/hook-installer.js';
@@ -828,7 +829,9 @@ function removeJsonKey(configPath: string, pathSegments: string[], keyToRemove: 
     }
     if (!node || typeof node !== 'object' || !(keyToRemove in node)) return false;
     delete node[keyToRemove];
-    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    // 原子写：这里改的是外部 CLI 自己的热配置文件（如 ~/.claude.json），
+    // 裸写半截会弄坏 CLI 的状态。
+    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
     return true;
   } catch {
     return false;
@@ -957,7 +960,9 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
     if (entry.hasTrustDialogAccepted === true) return; // already trusted — skip write
 
     entry.hasTrustDialogAccepted = true;
-    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    // 原子写：~/.claude.json 是 Claude Code 的热状态文件，所有并发 claude
+    // 实例都在读写，裸写半截会弄坏它们的状态。
+    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
     logger.info(`[claude-trust] Pre-accepted folder trust for ${canonical}`);
   } catch (err) {
     logger.debug(`[claude-trust] seed failed (ignored): ${err}`);
@@ -2580,7 +2585,7 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
 
   try {
     mkdirSync(config.session.dataDir, { recursive: true });
-    writeFileSync(cliIdFile, currentCliId);
+    atomicWriteFileSync(cliIdFile, currentCliId);
   } catch (err) {
     logger.warn(`Failed to write ${cliIdFile}: ${err}`);
   }

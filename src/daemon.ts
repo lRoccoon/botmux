@@ -1,5 +1,6 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
-import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -579,12 +580,12 @@ function writePidFile(): void {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
-  writeFileSync(getPidFile(), String(process.pid), 'utf-8');
+  atomicWriteFileSync(getPidFile(), String(process.pid));
   // Write breadcrumb so CLI tools (botmux list/delete) can find the active data dir
   const breadcrumb = join(homedir(), '.botmux', '.data-dir');
   try {
     mkdirSync(join(homedir(), '.botmux'), { recursive: true });
-    writeFileSync(breadcrumb, config.session.dataDir, 'utf-8');
+    atomicWriteFileSync(breadcrumb, config.session.dataDir);
   } catch { /* best effort */ }
 
   // Write a thin wrapper script so `botmux` is always in PATH for CLI sessions,
@@ -599,7 +600,9 @@ function writePidFile(): void {
     let existing = '';
     try { existing = readFileSync(wrapper, 'utf-8'); } catch { /* doesn't exist yet */ }
     if (existing !== content) {
-      writeFileSync(wrapper, content, { mode: 0o755 });
+      // 原子写：并发会话随时在 exec 这个 wrapper，半截脚本会让它们的
+      // `botmux send` 全体失败。
+      atomicWriteFileSync(wrapper, content, { mode: 0o755 });
       logger.info(`Wrapper script written: ${wrapper} → ${cliScript}`);
     }
   } catch (err: any) {
@@ -647,7 +650,8 @@ interface DaemonDescriptor {
 function writeDaemonDescriptor(d: DaemonDescriptor): void {
   mkdirSync(DAEMON_REGISTRY_DIR, { recursive: true });
   const fp = join(DAEMON_REGISTRY_DIR, `${d.larkAppId}.json`);
-  writeFileSync(fp, JSON.stringify(d), { mode: 0o600 });
+  // 原子写：dashboard 进程并发轮询读这些描述符（30s 心跳高频重写）。
+  atomicWriteFileSync(fp, JSON.stringify(d), { mode: 0o600 });
 }
 
 function removeDaemonDescriptor(larkAppId: string): void {

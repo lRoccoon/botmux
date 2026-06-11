@@ -14,6 +14,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, createWriteStream, type FSWatcher, type WriteStream } from 'node:fs';
+import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { isAbsolute, join } from 'node:path';
 import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
@@ -119,7 +120,9 @@ let zellijAttachCfgPath: string | null = null;
 function ensureZellijAttachConfig(): string {
   if (zellijAttachCfgPath) return zellijAttachCfgPath;
   const p = join(process.env.SESSION_DATA_DIR ?? '/tmp', '.zellij-web-attach.kdl');
-  try { writeFileSync(p, ZELLIJ_CONFIG_KDL); } catch { /* best effort */ }
+  // 原子写：同一 data dir 下多个 worker 进程会写同一路径（内容相同），
+  // 裸写并发互踩会让 attach 客户端读到半截 kdl。
+  try { atomicWriteFileSync(p, ZELLIJ_CONFIG_KDL); } catch { /* best effort */ }
   zellijAttachCfgPath = p;
   return p;
 }
@@ -164,7 +167,8 @@ let currentBotmuxTurnId: string | undefined;
 function writeCliPidMarker(): void {
   if (!cliPidMarker || !sessionId) return;
   try {
-    writeFileSync(cliPidMarker, JSON.stringify({ sessionId, turnId: currentBotmuxTurnId ?? null }));
+    // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
+    atomicWriteFileSync(cliPidMarker, JSON.stringify({ sessionId, turnId: currentBotmuxTurnId ?? null }));
   } catch (err: any) {
     log(`Failed to update CLI PID marker: ${err?.message ?? err}`);
   }

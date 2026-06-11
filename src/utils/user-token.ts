@@ -8,7 +8,8 @@
  * OAuth login via /login command writes to botmux's own token file.
  * Auto-refreshes expired access_token using refresh_token.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { atomicWriteFileSync } from './atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -86,7 +87,7 @@ function saveTokenForApp(token: TokenStore, appId: string): void {
   const path = tokenPathForApp(appId);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(path, JSON.stringify(token, null, 2));
+  atomicWriteFileSync(path, JSON.stringify(token, null, 2));
 }
 
 function isValid(isoDate: string): boolean {
