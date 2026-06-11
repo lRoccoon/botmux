@@ -481,6 +481,18 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   // Seed CLI（Claude Code fork）的数据根目录。worker 为 seed 注入它指向 seed 自己的
   // `.claude-runtime`，bridge 才能盯对文件；不进白名单 tmux pane 就拿不到。
   'CLAUDE_CONFIG_DIR',
+  // Mira runner 的登录/API/模型配置。tmux/zellij 后端不会透传 daemon 的任意
+  // process.env；Linux 上 Mira 通常靠 MIRA_COOKIE_HEADER / MIRA_SESSION /
+  // MIRA_COOKIE_DB 注入登录态，而不是读取 macOS Mira.app cookie DB。
+  'MIRA_COOKIE_HEADER',
+  'MIRA_SESSION',
+  'MIRA_COOKIE_DB',
+  'MIRA_MODEL',
+  'MIRA_API_BASE_URL',
+  'MIRA_MODEL_METADATA_URL',
+  'MIRA_DATA_SOURCES',
+  'MIRA_ONLINE',
+  'MIRA_MODE',
 ] as const;
 
 /**

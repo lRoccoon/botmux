@@ -72,6 +72,33 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
+  it('forwards Mira runner env so Linux cookie/model configuration reaches tmux and zellij panes', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      MIRA_COOKIE_HEADER: 'mira_session=secret',
+      MIRA_SESSION: 'session-token',
+      MIRA_COOKIE_DB: '/home/u/.config/mira/Cookies',
+      MIRA_MODEL: 'kimi-k2.5',
+      MIRA_API_BASE_URL: 'https://mira.example/api',
+      MIRA_MODEL_METADATA_URL: 'https://mira.example/meta',
+      MIRA_DATA_SOURCES: 'manus,web',
+      MIRA_ONLINE: '0',
+      MIRA_MODE: 'quick',
+      PATH: '/usr/bin',
+    });
+
+    expect(out).toContain('MIRA_COOKIE_HEADER=mira_session=secret');
+    expect(out).toContain('MIRA_SESSION=session-token');
+    expect(out).toContain('MIRA_COOKIE_DB=/home/u/.config/mira/Cookies');
+    expect(out).toContain('MIRA_MODEL=kimi-k2.5');
+    expect(out).toContain('MIRA_API_BASE_URL=https://mira.example/api');
+    expect(out).toContain('MIRA_MODEL_METADATA_URL=https://mira.example/meta');
+    expect(out).toContain('MIRA_DATA_SOURCES=manus,web');
+    expect(out).toContain('MIRA_ONLINE=0');
+    expect(out).toContain('MIRA_MODE=quick');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
   it('skips entries whose value is undefined (e.g. IS_SANDBOX outside root mode)', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',

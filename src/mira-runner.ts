@@ -27,8 +27,6 @@ const API_BASE_URL = process.env.MIRA_API_BASE_URL ?? `${MIRA_DOMAIN}/mira/api/v
 const MODEL_METADATA_URL = process.env.MIRA_MODEL_METADATA_URL ?? `${MIRA_DOMAIN}/api/v1/model/metadata`;
 const DEFAULT_DATA_SOURCES = ['manus'];
 const LAST_ROUND_RETRY_DELAYS_MS = [0, 250, 750];
-const COOKIE_DB_PATH = process.env.MIRA_COOKIE_DB
-  ?? join(homedir(), 'Library', 'Application Support', 'mira', 'Cookies');
 const OSC_PREFIX = '\x1b]777;botmux:';
 const OSC_END = '\x07';
 
@@ -88,26 +86,58 @@ function runSqliteCookieQuery(dbPath: string): string {
   });
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
+}
+
+function defaultCookieDbCandidates(): string[] {
+  const home = homedir();
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config');
+  return uniqueStrings([
+    // macOS Mira.app / Electron default used by the original runner.
+    join(home, 'Library', 'Application Support', 'mira', 'Cookies'),
+    // Linux XDG config locations. Some Electron apps preserve the package name
+    // casing, and Chromium-based profiles may put cookies under Default/.
+    join(xdgConfigHome, 'mira', 'Cookies'),
+    join(xdgConfigHome, 'Mira', 'Cookies'),
+    join(xdgConfigHome, 'mira', 'Default', 'Cookies'),
+    join(xdgConfigHome, 'Mira', 'Default', 'Cookies'),
+  ]);
+}
+
+function cookieDbCandidates(): string[] {
+  const explicitPath = process.env.MIRA_COOKIE_DB?.trim();
+  if (explicitPath) return [explicitPath];
+  return defaultCookieDbCandidates();
+}
+
+function formatCookieDbNotFoundMessage(candidates: string[]): string {
+  const searched = candidates.length > 0 ? candidates.join(', ') : '(none)';
+  return [
+    `Mira cookie database not found. Searched: ${searched}.`,
+    'Set MIRA_COOKIE_HEADER, MIRA_SESSION, or MIRA_COOKIE_DB.',
+    'On Linux, make sure these MIRA_* variables are exported in the environment used to start botmux.',
+  ].join(' ');
+}
+
 function readCookieHeader(): string {
   if (process.env.MIRA_COOKIE_HEADER?.trim()) return process.env.MIRA_COOKIE_HEADER.trim();
   if (process.env.MIRA_SESSION?.trim()) return `mira_session=${process.env.MIRA_SESSION.trim()}`;
-  if (!existsSync(COOKIE_DB_PATH)) {
-    throw new Error(
-      `Mira cookie database not found at ${COOKIE_DB_PATH}. Open Mira.app and sign in, or set MIRA_COOKIE_HEADER.`,
-    );
-  }
+  const candidates = cookieDbCandidates();
+  const cookieDbPath = candidates.find(path => existsSync(path));
+  if (!cookieDbPath) throw new Error(formatCookieDbNotFoundMessage(candidates));
 
   let output: string;
   try {
-    output = runSqliteCookieQuery(COOKIE_DB_PATH);
+    output = runSqliteCookieQuery(cookieDbPath);
   } catch (err: any) {
     const detail = err?.stderr ? String(err.stderr).trim() : errorMessage(err);
-    throw new Error(`Failed to read Mira cookies via sqlite3: ${detail}`);
+    throw new Error(`Failed to read Mira cookies via sqlite3 from ${cookieDbPath}: ${detail}`);
   }
 
   const cookies = output.split('\n').map(s => s.trim()).filter(Boolean);
   if (!cookies.some(c => c.startsWith('mira_session='))) {
-    throw new Error('Mira login cookie mira_session was not found. Open Mira.app and sign in, then try again.');
+    throw new Error('Mira login cookie mira_session was not found. Set MIRA_COOKIE_HEADER or MIRA_SESSION, or sign in to Mira and set MIRA_COOKIE_DB.');
   }
   return cookies.join('; ');
 }
