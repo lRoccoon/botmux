@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
@@ -2306,7 +2306,9 @@ async function closeTerminalCollabSession(ds: DaemonSession, snapshot: BoardSnap
 }
 
 function taskIdForProposal(proposal: TaskProposalEntry): string {
-  return `task-proposal-${proposal.proposalId.replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 48) || 'untitled'}`;
+  const slug = proposal.proposalId.replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 40) || 'untitled';
+  const hash = createHash('sha1').update(proposal.proposalId).digest('hex').slice(0, 8);
+  return `task-proposal-${slug}-${hash}`;
 }
 
 export async function acceptPendingTaskProposals(
@@ -2317,8 +2319,8 @@ export async function acceptPendingTaskProposals(
   tag: string,
 ): Promise<number> {
   let accepted = 0;
-  for (const proposal of snapshot.proposals.filter((p) => p.status === 'pending')) {
-    const taskId = taskIdForProposal(proposal);
+  for (const proposal of snapshot.proposals.filter((p) => p.status !== 'rejected')) {
+    const taskId = proposal.taskId ?? taskIdForProposal(proposal);
     await board.append({
       type: 'TaskProposalResolved',
       runId: snapshot.runId,
@@ -2363,7 +2365,7 @@ export async function acceptPendingTaskProposals(
         workerId,
       },
     });
-    accepted++;
+    if (proposal.status === 'pending') accepted++;
   }
   if (accepted > 0) logger.info(`[${tag}] collab accepted ${accepted} task proposal(s)`);
   return accepted;

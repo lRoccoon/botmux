@@ -169,11 +169,11 @@ describe('collab control-plane integration seam', () => {
     expect(snapshot.proposals[0]).toMatchObject({
       proposalId: 'p-extra',
       status: 'accepted',
-      taskId: 'task-proposal-p-extra',
+      taskId: 'task-proposal-p-extra-0b67d96f',
     });
     expect(snapshot.tasks).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        taskId: 'task-proposal-p-extra',
+        taskId: 'task-proposal-p-extra-0b67d96f',
         title: 'Add extra report',
         spec: 'Write extra-report.md',
         assignedWorkerId: first.workerId,
@@ -183,6 +183,132 @@ describe('collab control-plane integration seam', () => {
 
     const types = (await board.history()).map((e) => e.type);
     expect(types.slice(-3)).toEqual(['TaskProposalResolved', 'TaskCreated', 'TaskAssigned']);
+  });
+
+  it('repairs partially accepted task proposals and avoids sanitized taskId collisions', async () => {
+    await handleCollabControlMessage(
+      rawTextEvent('/collab initial task | test: test -f done.txt', 'om_seed_proposal_repair'),
+      ctx('om_proposal_repair'),
+    );
+    const first = spawns[0];
+    const board = openCollabBoard(first.runId, { baseDir: first.baseDir });
+    const longA = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX';
+    const longB = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaY';
+    await board.append({
+      runId: first.runId,
+      type: 'TaskProposed',
+      actor: 'worker',
+      idempotencyKey: 'proposal:long-a',
+      affectedPaths: ['proposals'],
+      topicId: first.topicId,
+      taskId: first.taskId,
+      workerId: first.workerId,
+      payload: {
+        proposalId: longA,
+        title: 'Long A',
+        spec: 'Write a.md',
+        why: 'A',
+        parentTaskId: first.taskId,
+      },
+    });
+    await board.append({
+      runId: first.runId,
+      type: 'TaskProposed',
+      actor: 'worker',
+      idempotencyKey: 'proposal:long-b',
+      affectedPaths: ['proposals'],
+      topicId: first.topicId,
+      taskId: first.taskId,
+      workerId: first.workerId,
+      payload: {
+        proposalId: longB,
+        title: 'Long B',
+        spec: 'Write b.md',
+        why: 'B',
+        parentTaskId: first.taskId,
+      },
+    });
+
+    const accepted = await acceptPendingTaskProposals(board, await board.snapshot(), first.workerId, first.topicId, 'test');
+    expect(accepted).toBe(2);
+    let snapshot = await board.snapshot();
+    const taskIds = snapshot.proposals.map((p) => p.taskId);
+    expect(taskIds).toEqual([
+      'task-proposal-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-8ca8e4c2',
+      'task-proposal-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a9e2a589',
+    ]);
+    expect(new Set(taskIds).size).toBe(2);
+
+    const repairedOnly = openCollabBoard('run-repair-only', { baseDir: first.baseDir });
+    await repairedOnly.append({
+      runId: 'run-repair-only',
+      type: 'RunCreated',
+      actor: 'control-plane',
+      idempotencyKey: 'rc',
+      affectedPaths: ['goal', 'budget', 'status'],
+      topicId: first.topicId,
+      payload: {
+        goal: 'repair',
+        acceptanceCriteria: { command: 'true', doneWhen: 'exitZero' },
+        budgetLimit: 100,
+        budgetUnit: 'turns',
+        controlTopicId: first.topicId,
+      },
+    });
+    await repairedOnly.append({
+      runId: 'run-repair-only',
+      type: 'TaskCreated',
+      actor: 'control-plane',
+      idempotencyKey: 'tc',
+      affectedPaths: ['task'],
+      taskId: 'task-1',
+      payload: { taskId: 'task-1', title: 'Initial', spec: 'Initial' },
+    });
+    await repairedOnly.append({
+      runId: 'run-repair-only',
+      type: 'TaskProposed',
+      actor: 'worker',
+      idempotencyKey: 'proposal:partial',
+      affectedPaths: ['proposals'],
+      topicId: first.topicId,
+      taskId: 'task-1',
+      workerId: first.workerId,
+      payload: {
+        proposalId: 'partial',
+        title: 'Partial',
+        spec: 'Write partial.md',
+        why: 'repair',
+        parentTaskId: 'task-1',
+      },
+    });
+    await repairedOnly.append({
+      runId: 'run-repair-only',
+      type: 'TaskProposalResolved',
+      actor: 'control-plane',
+      idempotencyKey: 'proposal-accepted:partial',
+      affectedPaths: ['proposals'],
+      topicId: first.topicId,
+      taskId: 'task-proposal-partial-355705cf',
+      workerId: first.workerId,
+      payload: {
+        proposalId: 'partial',
+        resolution: 'accepted',
+        taskId: 'task-proposal-partial-355705cf',
+        reason: 'auto-accepted by P3 deterministic planner v1',
+      },
+    });
+
+    const repaired = await acceptPendingTaskProposals(repairedOnly, await repairedOnly.snapshot(), first.workerId, first.topicId, 'test');
+    expect(repaired).toBe(0);
+    snapshot = await repairedOnly.snapshot();
+    expect(snapshot.tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        taskId: 'task-proposal-partial-355705cf',
+        title: 'Partial',
+        assignedWorkerId: first.workerId,
+      }),
+    ]));
+    expect((await repairedOnly.history()).slice(-2).map((e) => e.type)).toEqual(['TaskCreated', 'TaskAssigned']);
   });
 
   it('strips /t before collab intake when a regular group forces a new topic', async () => {
