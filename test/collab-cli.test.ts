@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openCollabBoard } from '../src/collab/board.js';
 import { cmdCollab } from '../src/collab/cli.js';
+import { getWorkerProtocolText } from '../src/collab/worker-protocol.js';
 import type { CollabEventDraft } from '../src/collab/contract.js';
 import {
   addCollabWorker,
@@ -77,6 +78,56 @@ describe('collab CLI (worker board access)', () => {
     log.mockRestore();
     const hist = await board.history();
     expect(hist.filter((e) => e.type === 'InterventionReceiptUpdated')).toHaveLength(1);
+  });
+
+  it('propose writes TaskProposed from env context; resolution lands in snapshot.proposals', async () => {
+    const board = openCollabBoard(RUN, { baseDir });
+    await board.append(d({ type: 'RunCreated', idempotencyKey: 'rc', topicId: 't1', affectedPaths: ['goal'], payload: { goal: 'g', budgetLimit: 1000, budgetUnit: 'tokens', controlTopicId: 't1', acceptanceCriteria: { command: 'true', doneWhen: 'exitZero' } } }));
+    await board.append(d({ type: 'TaskCreated', idempotencyKey: 'tc', taskId: 'task-1', affectedPaths: ['task'], payload: { taskId: 'task-1', title: 't', spec: 's' } }));
+
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await cmdCollab('propose', ['--title', 'split parser', '--spec', 'extract tokenizer into its own module', '--why', 'goal needs it', '--deps', 'a, b']);
+    const out = JSON.parse(log.mock.calls.at(-1)?.[0] as string);
+    log.mockRestore();
+    expect(out.ok).toBe(true);
+    expect(out.proposalId).toBeTruthy();
+
+    let snap = await board.snapshot();
+    expect(snap.proposals).toHaveLength(1);
+    expect(snap.proposals[0]).toMatchObject({
+      proposalId: out.proposalId,
+      title: 'split parser',
+      why: 'goal needs it',
+      parentTaskId: 'task-1', // defaults to the worker's own task from env
+      deps: ['a', 'b'],
+      status: 'pending',
+    });
+
+    // planner resolution (stands in for codex's control-plane slice)
+    await board.append(d({ type: 'TaskProposalResolved', actor: 'control-plane', idempotencyKey: 'res', affectedPaths: ['proposals'], payload: { proposalId: out.proposalId, resolution: 'accepted', taskId: 'task-2' } }));
+    snap = await board.snapshot();
+    expect(snap.proposals[0]).toMatchObject({ status: 'accepted', taskId: 'task-2' });
+    expect(snap.task).toMatchObject({ taskId: 'task-1' }); // initial task untouched
+  });
+
+  it('propose with explicit --id is retry-idempotent', async () => {
+    const board = openCollabBoard(RUN, { baseDir });
+    await board.append(d({ type: 'RunCreated', idempotencyKey: 'rc', topicId: 't1', affectedPaths: ['goal'], payload: { goal: 'g', budgetLimit: 1000, budgetUnit: 'tokens', controlTopicId: 't1', acceptanceCriteria: { command: 'true', doneWhen: 'exitZero' } } }));
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await cmdCollab('propose', ['--id', 'p-fixed', '--title', 't', '--spec', 's', '--why', 'w']);
+    await cmdCollab('propose', ['--id', 'p-fixed', '--title', 't', '--spec', 's', '--why', 'w']); // crash-retry
+    const retry = JSON.parse(log.mock.calls.at(-1)?.[0] as string);
+    log.mockRestore();
+    expect(retry.deduped).toBe(true);
+    const hist = await board.history();
+    expect(hist.filter((e) => e.type === 'TaskProposed')).toHaveLength(1);
+    expect((await board.snapshot()).proposals).toHaveLength(1);
+  });
+
+  it('worker protocol teaches propose-not-create', () => {
+    const text = getWorkerProtocolText();
+    expect(text).toContain('botmux collab propose');
+    expect(text).toContain('never self-create or switch');
   });
 
   it('pool add validates collab-worker config and writes the pool store', async () => {

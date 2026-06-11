@@ -136,6 +136,32 @@ export async function cmdCollab(sub: string, args: string[]): Promise<void> {
       return;
     }
 
+    case 'propose': {
+      const { board, runId, workerId, taskId } = resolveCtx(flags);
+      const title = str(flags.title) ?? fail('propose: --title required');
+      const spec = str(flags.spec) ?? fail('propose: --spec required');
+      const why = str(flags.why) ?? fail('propose: --why required');
+      const rev = await board.revision();
+      const proposalId = str(flags.id) ?? `${workerId ?? 'w'}-p${rev}`;
+      const deps = str(flags.deps)?.split(',').map((s) => s.trim()).filter(Boolean);
+      const res = await board.append(workerDraft({
+        type: 'TaskProposed', runId, workerId, taskId,
+        // explicit --id gives a stable key (true retry idempotency); the rev-based
+        // default mirrors `artifact` — distinct sequential proposes get distinct revs
+        idem: str(flags.idem) ?? `propose:${proposalId}`,
+        paths: ['proposals'],
+        payload: {
+          proposalId, title, spec, why,
+          parentTaskId: str(flags.parent) ?? taskId,
+          expectedArtifact: str(flags['expected-artifact']),
+          doneCriteria: str(flags['done-criteria']),
+          deps: deps && deps.length ? deps : undefined,
+        },
+      }));
+      console.log(JSON.stringify({ ok: res.ok, proposalId, eventId: res.event.eventId, revision: res.revision, deduped: res.deduped }));
+      return;
+    }
+
     case 'append': {
       const { board, runId } = resolveCtx(flags);
       const file = str(flags.file);
@@ -149,12 +175,14 @@ export async function cmdCollab(sub: string, args: string[]): Promise<void> {
 
     default:
       console.error(
-        'usage: botmux collab <pool|snapshot|revision|history|artifact|status|receipt|append> [flags]\n' +
+        'usage: botmux collab <pool|snapshot|revision|history|artifact|status|receipt|propose|append> [flags]\n' +
         '  pool: pool add|list|remove|status\n' +
         '  read:  snapshot [--compact] | revision | history\n' +
         '  write: artifact --path <p> [--kind file|diff|log|note] [--sha <h>] [--note <s>]\n' +
         '         status --status <open|in_progress|blocked|done|failed> [--note <s>]\n' +
         '         receipt --intervention <eventId> --state <delivered|read|applied|superseded>\n' +
+        '         propose --title <t> --spec <s> --why <w> [--parent <taskId>] [--deps a,b]\n' +
+        '                 [--expected-artifact <p>] [--done-criteria <c>] [--id <proposalId>]\n' +
         '         append --file <draft.json>   (generic)\n' +
         '  context: --run/--worker/--task/--base-dir override BOTMUX_COLLAB_* env',
       );
