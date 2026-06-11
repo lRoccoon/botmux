@@ -307,10 +307,27 @@ describe('referee', () => {
     const board = openCollabBoard(RUN, { baseDir });
     await board.append(d({ type: 'RunCreated', idempotencyKey: 'rc', topicId: 't1', affectedPaths: ['budget'], payload: { goal: 'g', budgetLimit: 100, budgetUnit: 'tokens', controlTopicId: 't1', acceptanceCriteria: { command: 'true', doneWhen: 'exitZero' } } }));
     await board.append(d({ type: 'TaskCreated', idempotencyKey: 'tc', taskId: 'task-1', affectedPaths: ['task'], payload: { taskId: 'task-1', title: 't', spec: 's' } }));
+    await board.append(d({
+      type: 'TaskProposed', actor: 'worker', idempotencyKey: 'prop-budget-pending', affectedPaths: ['proposals'],
+      taskId: 'task-1', workerId: 'w1',
+      payload: {
+        proposalId: 'proposal-after-budget',
+        title: 'extra',
+        spec: 'extra work',
+        why: 'nice to have',
+        parentTaskId: 'task-1',
+      },
+    }));
     await board.append(d({ type: 'BudgetExhausted', actor: 'system', idempotencyKey: 'be', budgetDelta: -100, affectedPaths: ['budget'], payload: { limit: 100, spent: 100 } }));
 
     const r = await runReferee(board, { cwd });
     expect(r.verdict).toBe('budget-exhausted');
-    expect((await board.snapshot()).status).toBe('failed'); // budget-exhausted maps to failed
+    const snap = await board.snapshot();
+    expect(snap.status).toBe('failed'); // budget-exhausted maps to failed
+    expect(snap.proposals.find((p) => p.proposalId === 'proposal-after-budget')).toMatchObject({
+      status: 'rejected',
+      reason: 'run-closed',
+    });
+    expect((await board.history()).slice(-2).map((e) => e.type)).toEqual(['TaskProposalResolved', 'RunFinished']);
   });
 });

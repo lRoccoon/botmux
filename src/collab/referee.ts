@@ -125,6 +125,7 @@ export async function runReferee(board: CollabBoard, opts: RefereeOptions = {}):
   // Budget breaker first — it is the incorruptible circuit-breaker and outranks
   // any verdict the referee might otherwise reach.
   if (snap.budget?.exhausted && snap.status === 'running') {
+    await rejectPendingProposalsOnRunClose(board, snap, idem);
     await board.append(finish(snap.runId, idem, 'budget-exhausted', 'budget exhausted before evaluation'));
     return { verdict: 'budget-exhausted' };
   }
@@ -237,8 +238,13 @@ export async function runReferee(board: CollabBoard, opts: RefereeOptions = {}):
 
 async function closeDerivedTasksOnRunAcceptance(board: CollabBoard, snap: BoardSnapshot, idem: string): Promise<void> {
   const note = 'closed by run acceptance PASS (not individually verified)';
+  const acceptedDerivedTaskIds = new Set(
+    snap.proposals
+      .filter((p) => p.status === 'accepted' && p.taskId)
+      .map((p) => p.taskId as string),
+  );
   for (const task of snap.tasks) {
-    if (!task.taskId.startsWith('task-proposal-')) continue;
+    if (!acceptedDerivedTaskIds.has(task.taskId)) continue;
     if (task.status !== 'open' && task.status !== 'in_progress') continue;
     await board.append({
       type: 'TaskStatusChanged',
