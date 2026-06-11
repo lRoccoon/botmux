@@ -18,6 +18,7 @@ import {
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
+  resolveDispatchTarget,
   resolveReportTarget,
   resolveSendTarget,
 } from '../src/core/dispatch.js';
@@ -269,5 +270,22 @@ describe('resolveSendTarget — destination routing', () => {
   it('--into <root> replies into that topic (overrides everything)', () => {
     expect(resolveSendTarget({ ...base, into: 'om_topic' })).toEqual({ mode: 'reply', root: 'om_topic' });
     expect(resolveSendTarget({ ...base, into: 'om_topic', topLevel: true, chatScope: true })).toEqual({ mode: 'reply', root: 'om_topic' });
+  });
+});
+
+describe('resolveDispatchTarget — default placement', () => {
+  it('explicit --into appends to that topic', () => {
+    expect(resolveDispatchTarget({ into: 'om_topic', sessionScope: 'chat', rootMessageId: 'om_current' }))
+      .toEqual({ mode: 'into', root: 'om_topic', implicit: false });
+  });
+
+  it('thread-scope sessions append to the current topic by default', () => {
+    expect(resolveDispatchTarget({ sessionScope: 'thread', rootMessageId: 'om_current' }))
+      .toEqual({ mode: 'into', root: 'om_current', implicit: true });
+  });
+
+  it('chat-scope sessions still create a new topic by default', () => {
+    expect(resolveDispatchTarget({ sessionScope: 'chat', rootMessageId: 'om_first' }))
+      .toEqual({ mode: 'new' });
   });
 });

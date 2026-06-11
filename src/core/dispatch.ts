@@ -227,6 +227,29 @@ export function resolveReportTarget(input: {
 }
 
 /**
+ * Decide where `botmux dispatch` should place the assignment.
+ *
+ * - `--into <root>` is always explicit: append to that existing topic.
+ * - Otherwise, when dispatch is invoked from an existing thread-scope session,
+ *   append to the current topic. This matches the human mental model for
+ *   topic-group/oncall usage: "I asked in this topic, so keep dispatch here".
+ * - Chat-scope sessions (regular flat groups) still create a new sub-topic by
+ *   default; there is no current topic to append to.
+ */
+export function resolveDispatchTarget(input: {
+  into?: string;
+  sessionScope?: 'thread' | 'chat';
+  rootMessageId?: string;
+}): { mode: 'into'; root: string; implicit: boolean } | { mode: 'new' } {
+  const explicitInto = input.into?.trim();
+  if (explicitInto) return { mode: 'into', root: explicitInto, implicit: false };
+  if (input.sessionScope === 'thread' && input.rootMessageId) {
+    return { mode: 'into', root: input.rootMessageId, implicit: true };
+  }
+  return { mode: 'new' };
+}
+
+/**
  * The footgun check shared by `botmux send`'s explicit-mention guard AND its
  * prose `@Name` auto-injection: returns the sub-topic seed if `mentionOpenId` is
  * a dispatched sub-bot in an active topic that is NOT reachable in the current
