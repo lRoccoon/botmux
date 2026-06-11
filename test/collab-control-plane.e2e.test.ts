@@ -12,6 +12,7 @@ import {
   type PushCollabWorkerInput,
   type SpawnCollabWorkerInput,
 } from '../src/core/control-plane.js';
+import { acceptPendingTaskProposals } from '../src/core/worker-pool.js';
 import { openCollabBoard } from '../src/collab/index.js';
 import { addCollabWorker, readCollabWorkerPool } from '../src/collab/worker-pool-store.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
@@ -132,6 +133,56 @@ describe('collab control-plane integration seam', () => {
 
     const index = JSON.parse(readFileSync(join(dataDir, 'collab/control-topic-index.json'), 'utf-8'));
     expect(index.topics['cli_control::om_topic_root']).toBe(spawns[0].runId);
+  });
+
+  it('auto-accepts pending task proposals into created and assigned tasks', async () => {
+    await handleCollabControlMessage(
+      rawTextEvent('/collab initial task | test: test -f done.txt', 'om_seed_proposal'),
+      ctx('om_proposal'),
+    );
+    const first = spawns[0];
+    const board = openCollabBoard(first.runId, { baseDir: first.baseDir });
+    await board.append({
+      runId: first.runId,
+      type: 'TaskProposed',
+      actor: 'worker',
+      idempotencyKey: 'proposal:p-extra',
+      affectedPaths: ['proposals'],
+      topicId: first.topicId,
+      taskId: first.taskId,
+      workerId: first.workerId,
+      payload: {
+        proposalId: 'p-extra',
+        title: 'Add extra report',
+        spec: 'Write extra-report.md',
+        why: 'The goal needs an explicit follow-up artifact',
+        parentTaskId: first.taskId,
+      },
+    });
+
+    const accepted = await acceptPendingTaskProposals(board, await board.snapshot(), first.workerId, first.topicId, 'test');
+    const acceptedAgain = await acceptPendingTaskProposals(board, await board.snapshot(), first.workerId, first.topicId, 'test');
+
+    expect(accepted).toBe(1);
+    expect(acceptedAgain).toBe(0);
+    const snapshot = await board.snapshot();
+    expect(snapshot.proposals[0]).toMatchObject({
+      proposalId: 'p-extra',
+      status: 'accepted',
+      taskId: 'task-proposal-p-extra',
+    });
+    expect(snapshot.tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        taskId: 'task-proposal-p-extra',
+        title: 'Add extra report',
+        spec: 'Write extra-report.md',
+        assignedWorkerId: first.workerId,
+      }),
+    ]));
+    expect(snapshot.task?.taskId).toBe('task-1');
+
+    const types = (await board.history()).map((e) => e.type);
+    expect(types.slice(-3)).toEqual(['TaskProposalResolved', 'TaskCreated', 'TaskAssigned']);
   });
 
   it('strips /t before collab intake when a regular group forces a new topic', async () => {

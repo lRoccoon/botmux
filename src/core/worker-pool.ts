@@ -40,7 +40,7 @@ import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
-import { openCollabBoard, runReferee, type BoardSnapshot } from '../collab/index.js';
+import { openCollabBoard, runReferee, type BoardSnapshot, type CollabBoard, type TaskProposalEntry } from '../collab/index.js';
 import { releaseCollabWorker } from '../collab/worker-pool-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -2256,6 +2256,70 @@ async function closeTerminalCollabSession(ds: DaemonSession, snapshot: BoardSnap
   return true;
 }
 
+function taskIdForProposal(proposal: TaskProposalEntry): string {
+  return `task-proposal-${proposal.proposalId.replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 48) || 'untitled'}`;
+}
+
+export async function acceptPendingTaskProposals(
+  board: CollabBoard,
+  snapshot: BoardSnapshot,
+  workerId: string,
+  topicId: string | undefined,
+  tag: string,
+): Promise<number> {
+  let accepted = 0;
+  for (const proposal of snapshot.proposals.filter((p) => p.status === 'pending')) {
+    const taskId = taskIdForProposal(proposal);
+    await board.append({
+      type: 'TaskProposalResolved',
+      runId: snapshot.runId,
+      actor: 'control-plane',
+      idempotencyKey: `proposal-accepted:${proposal.proposalId}`,
+      affectedPaths: ['proposals'],
+      topicId,
+      taskId,
+      workerId,
+      payload: {
+        proposalId: proposal.proposalId,
+        resolution: 'accepted',
+        taskId,
+        reason: 'auto-accepted by P3 deterministic planner v1',
+      },
+    });
+    await board.append({
+      type: 'TaskCreated',
+      runId: snapshot.runId,
+      actor: 'control-plane',
+      idempotencyKey: `task-created-from-proposal:${proposal.proposalId}`,
+      affectedPaths: ['task'],
+      topicId,
+      taskId,
+      payload: {
+        taskId,
+        title: proposal.title,
+        spec: proposal.spec,
+      },
+    });
+    await board.append({
+      type: 'TaskAssigned',
+      runId: snapshot.runId,
+      actor: 'control-plane',
+      idempotencyKey: `task-assigned-from-proposal:${proposal.proposalId}`,
+      affectedPaths: ['task'],
+      topicId,
+      taskId,
+      workerId,
+      payload: {
+        taskId,
+        workerId,
+      },
+    });
+    accepted++;
+  }
+  if (accepted > 0) logger.info(`[${tag}] collab accepted ${accepted} task proposal(s)`);
+  return accepted;
+}
+
 async function handleCollabTurnFinished(
   ds: DaemonSession,
   signal: CollabTurnFinishSignal,
@@ -2299,6 +2363,8 @@ async function handleCollabTurnFinished(
     },
   });
   const cwd = ds.workingDir ?? requireCallbacks().getSessionWorkingDir(ds);
+  const afterTurn = await board.snapshot();
+  await acceptPendingTaskProposals(board, afterTurn, collab.workerId, snapshot.worker.topicId, tag);
   const result = await runReferee(board, { cwd, idemSuffix: idem });
   logger.info(`[${tag}] collab referee verdict=${result.verdict}${result.exitCode !== undefined ? ` exit=${result.exitCode}` : ''}`);
   const after = await board.snapshot();

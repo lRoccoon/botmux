@@ -219,6 +219,17 @@ export function buildCollabControlCard(snapshot: BoardSnapshot, locale?: Locale)
   const task = snapshot.task
     ? `${snapshot.task.title} · ${snapshot.task.status}`
     : 'no task';
+  const taskList = snapshot.tasks.length > 1
+    ? snapshot.tasks
+      .map(t => `- ${t.taskId}: ${t.title} · ${t.status}${t.assignedWorkerId ? ` · ${t.assignedWorkerId}` : ''}`)
+      .join('\n')
+    : '';
+  const proposalList = snapshot.proposals.length > 0
+    ? snapshot.proposals
+      .slice(-5)
+      .map(p => `- ${p.proposalId}: ${p.title} · ${p.status}${p.taskId ? ` → ${p.taskId}` : ''}`)
+      .join('\n')
+    : '';
   const lastProgress = snapshot.progressLog.at(-1);
   const progress = lastProgress
     ? `${lastProgress.verdict}${lastProgress.summary ? ` · ${lastProgress.summary}` : ''}`
@@ -238,6 +249,8 @@ export function buildCollabControlCard(snapshot: BoardSnapshot, locale?: Locale)
     `**Budget** ${escapeMd(budget)}\n` +
     `**Progress** ${escapeMd(progress)}` +
     stall +
+    (taskList ? `\n\n**Tasks**\n${escapeMd(taskList)}` : '') +
+    (proposalList ? `\n\n**Proposals**\n${escapeMd(proposalList)}` : '') +
     (pendingInterventions ? `\n\n**Interventions**\n${escapeMd(pendingInterventions)}` : '');
 
   const actions: any[] = [

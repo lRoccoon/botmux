@@ -10,6 +10,8 @@ function snap(status: RunStatus, over: Partial<BoardSnapshot> = {}): BoardSnapsh
     goal: 'do the thing',
     acceptanceCriteria: { command: 'true', doneWhen: 'exitZero' },
     task: { taskId: 'task-1', title: 'T', spec: 'do the thing', status: 'in_progress', assignedWorkerId: 'w1' },
+    tasks: [{ taskId: 'task-1', title: 'T', spec: 'do the thing', status: 'in_progress', assignedWorkerId: 'w1' }],
+    proposals: [],
     worker: { workerId: 'w1', taskId: 'task-1', phase: 'running', larkAppId: 'cli_worker', topicId: 'ocworker1' },
     artifacts: [],
     progressLog: [],
@@ -64,5 +66,30 @@ describe('collab control card gating', () => {
     const body = card.elements.find((e: any) => e.tag === 'markdown').content;
     expect(body).toContain('**Stall**');
     expect(body).toContain('3 no-improvement checks');
+  });
+
+  it('surfaces proposals and additional tasks', () => {
+    const card = parse(buildCollabControlCard(snap('running', {
+      tasks: [
+        { taskId: 'task-1', title: 'T', spec: 'do the thing', status: 'in_progress', assignedWorkerId: 'w1' },
+        { taskId: 'task-proposal-p-extra', title: 'Extra', spec: 'write extra', status: 'open', assignedWorkerId: 'w1' },
+      ],
+      proposals: [{
+        proposalId: 'p-extra',
+        title: 'Extra',
+        spec: 'write extra',
+        why: 'needed',
+        status: 'accepted',
+        taskId: 'task-proposal-p-extra',
+        proposedAtSeq: 8,
+        resolvedAtSeq: 10,
+      }],
+    })));
+    const body = card.elements.find((e: any) => e.tag === 'markdown').content;
+    expect(body).toContain('**Tasks**');
+    expect(body).toContain('task-proposal-p-extra');
+    expect(body).toContain('**Proposals**');
+    expect(body).toContain('p-extra');
+    expect(body).toContain('accepted');
   });
 });
