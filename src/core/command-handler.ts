@@ -2296,8 +2296,9 @@ export async function handleCommand(
           t('help.term', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
-          // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移
-          [...PASSTHROUGH_COMMANDS].join(' '),
+          // 直接从生效集合渲染（内置 + adapter 默认 + customPassthroughCommands），
+          // 保证文案与实际放行清单不漂移。
+          [...resolvePassthroughCommands(ds?.larkAppId ?? larkAppId)].join(' '),
           '',
           t('help.heading_schedule', undefined, loc),
           t('help.schedule_create', undefined, loc),

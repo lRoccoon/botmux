@@ -36,20 +36,6 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].autoReplyWithoutMentionChats).toEqual(['oc_a', 'oc_b']);
   });
 
-  it('parseBotConfigsFromText normalizes & filters passthroughCommands', () => {
-    const cfgs = parseBotConfigsFromText(JSON.stringify([{
-      larkAppId: 'pt1', larkAppSecret: 's',
-      passthroughCommands: [' /FOO ', '/bar', '/foo', 'no-slash', '/', '/with space', 123],
-    }]));
-    expect(cfgs[0].passthroughCommands).toEqual(['/foo', '/bar']);
-  });
-
-  it('parseBotConfigsFromText leaves passthroughCommands undefined when absent / all-invalid', () => {
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'pt2', larkAppSecret: 's' }]))[0].passthroughCommands).toBeUndefined();
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'pt3', larkAppSecret: 's', passthroughCommands: ['bad', '/', 1] }]))[0].passthroughCommands).toBeUndefined();
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'pt4', larkAppSecret: 's', passthroughCommands: 'nope' }]))[0].passthroughCommands).toBeUndefined();
-  });
-
   it('parseBotConfigsFromText preserves & filters globalGrants (open_id strings only)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'gg1', larkAppSecret: 's',

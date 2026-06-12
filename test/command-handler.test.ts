@@ -68,7 +68,7 @@ vi.mock('../src/bot-registry.js', () => ({
       cliId: id === 'app-2' ? ('codex' as const) : ('claude-code' as const),
       workingDir: '~/projects',
       workingDirs: ['~/projects'],
-      passthroughCommands: id === 'app-2' ? ['/doctor'] : undefined,
+      customPassthroughCommands: id === 'app-2' ? ['/doctor'] : undefined,
     },
   })),
   // Production runs ONE daemon per bot, so getAllBots() sees only this process's
@@ -379,7 +379,7 @@ function defaultGetBot(id: string = 'app-1') {
       cliId: id === 'app-2' ? ('codex' as const) : ('claude-code' as const),
       workingDir: '~/projects',
       workingDirs: ['~/projects'],
-      passthroughCommands: id === 'app-2' ? ['/doctor'] : undefined,
+      customPassthroughCommands: id === 'app-2' ? ['/doctor'] : undefined,
     },
   };
 }
@@ -595,17 +595,6 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(PASSTHROUGH_COMMANDS.has('/goal')).toBe(false);
     expect(resolvePassthroughCommands('app-1').has('/goal')).toBe(true);
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
-  });
-});
-
-describe('passthroughCommandsForBot', () => {
-  it('merges built-in passthrough commands with per-bot configured commands', async () => {
-    const { passthroughCommandsForBot, isPassthroughCommandForBot } = await import('../src/core/command-handler.js');
-    const cmds = passthroughCommandsForBot('app-2');
-    expect(cmds.has('/compact')).toBe(true);
-    expect(cmds.has('/doctor')).toBe(true);
-    expect(isPassthroughCommandForBot('/doctor', 'app-2')).toBe(true);
-    expect(isPassthroughCommandForBot('/doctor', 'app-1')).toBe(false);
   });
 });
 
