@@ -63,6 +63,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 |------|------|
 | `allowedUsers` | The operate-permission list (**full email** or `ou_xxx`). When `allowedChatGroups` is configured, at least one is required to serve as owner |
 | `allowedChatGroups` | Conversable groups (`oc_xxx`). Any member of the group can converse (only `canTalk`); sensitive operations are still controlled by `allowedUsers` |
+| `autoReplyWithoutMentionChats` | Whitelist of regular groups (`oc_xxx` array) that auto-reply without an @mention. In listed chats, non-@ messages from talk-allowed senders also trigger the bot (equivalent to a per-chat "Never require @" tier); recommended only for a few dedicated / on-call groups. Other chats and permission semantics are unaffected |
 | `oncallChats` | Oncall bindings, `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`. See [oncall](/en/oncall) |
 | `defaultOncall` | The bot's default: the first new topic in a new group chat is automatically bound to oncall. `{ "enabled": true, "workingDir": "~/foo", "since": <epoch ms> }`; older groups that already existed before `since` are unaffected |
 | `globalGrants` | Global conversable list (`ou_xxx`, people or bots). Can converse in any group, only `canTalk` |

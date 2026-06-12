@@ -52,10 +52,17 @@ export type GroupMentionMode = 'always' | 'topic' | 'never';
  *   • always — @ required everywhere (incl. inside shared topics).
  *   • topic  — @ required at top level, but non-@ continues inside shared topics.
  *   • never  — non-@ messages are answered too (where the bot has talk access).
+ *
+ * `chatId`（可选）: 命中 bots.json 的 `autoReplyWithoutMentionChats` 白名单的群
+ * 等效 per-chat 'never' —— 与 bot 级 'never' 走完全相同的 relax 闸（仍受
+ * canTalk/isAllowed 门控），只是作用域收窄到指定群，避免为单个值班群把整个
+ * bot 全局放开。
  */
-export function resolveGroupMentionMode(larkAppId: string): GroupMentionMode {
+export function resolveGroupMentionMode(larkAppId: string, chatId?: string): GroupMentionMode {
   try {
-    const m = getBot(larkAppId).config.regularGroupMentionMode;
+    const cfg = getBot(larkAppId).config;
+    if (chatId && cfg.autoReplyWithoutMentionChats?.includes(chatId)) return 'never';
+    const m = cfg.regularGroupMentionMode;
     return m === 'topic' || m === 'never' ? m : 'always';
   } catch {
     return 'always';

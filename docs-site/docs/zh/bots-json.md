@@ -63,6 +63,7 @@
 |------|------|
 | `allowedUsers` | 操作权名单（**完整邮箱**或 `ou_xxx`）。配了 `allowedChatGroups` 时至少要有一个作为 owner |
 | `allowedChatGroups` | 可对话群（`oc_xxx`）。群内任何成员可对话（仅 `canTalk`），敏感操作仍由 `allowedUsers` 控制 |
+| `autoReplyWithoutMentionChats` | 免 @ 自动回复的普通群白名单（`oc_xxx` 数组）。命中的群里、有对话权限的发送者发的非 @ 消息也会触发机器人（等效该群单独生效的「所有消息都不需要 @」档）；只建议配置少量专用 / 值班群。其他群与权限语义不受影响 |
 | `oncallChats` | oncall 绑定，`[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`。见 [oncall](/oncall) |
 | `defaultOncall` | 该 bot 的默认：新群聊首条新话题自动绑定 oncall。`{ "enabled": true, "workingDir": "~/foo", "since": <epoch ms> }`；`since` 之前已存在的老群不受影响 |
 | `globalGrants` | 全局可对话名单（`ou_xxx`，人或 bot）。任意群可对话，仅 `canTalk` |

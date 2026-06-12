@@ -881,13 +881,6 @@ export async function checkGroupMessageAccess(
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
-  // No @mention — explicit per-bot chat whitelist can opt regular groups into
-  // auto-replying without changing canTalk/canOperate permission semantics.
-  if (isAllowed && getBot(larkAppId).config.autoReplyWithoutMentionChats?.includes(chatId)) {
-    logger.debug(`[${larkAppId}] autoReplyWithoutMentionChats matched ${chatId}; allowing non-mentioned group message`);
-    return 'allowed';
-  }
-
   // No @mention — only allow if sender is the sole human in the group
   // AND this is the only bot in the chat. With multiple bots, require @mention
   // to disambiguate.
@@ -1048,7 +1041,7 @@ async function maybeApplySharedTopicSeed(input: {
   // mention policy a non-@ message is also answered — and in shared mode it must
   // still OPEN a topic (reply in a thread reusing the chat session), not fall
   // back to a flat top-level reply. So allow non-@ seeding only when never.
-  if (!isBotMentioned(larkAppId, message, senderOpenId) && resolveGroupMentionMode(larkAppId) !== 'never') return undefined;
+  if (!isBotMentioned(larkAppId, message, senderOpenId) && resolveGroupMentionMode(larkAppId, message.chat_id) !== 'never') return undefined;
   const freshMode = routing.scope === 'thread'
     ? await getChatMode(larkAppId, chatId, { forceRefresh: true })
     : (getCachedChatMode(larkAppId, chatId) ?? 'group');
@@ -1426,7 +1419,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // through to the gate below and is ignored — only an explicit @ continues
         // a shared topic); 'topic' and 'never' enable the seamless no-@ fold-back.
         if (!explicitlyMentionedThisBot
-            && resolveGroupMentionMode(larkAppId) !== 'always'
+            && resolveGroupMentionMode(larkAppId, chatId) !== 'always'
             && routing.scope === 'thread' && message.root_id && message.thread_id && chatType === 'group') {
           const alias = handlers.resolveReplyThreadAlias?.(message.root_id, chatId, larkAppId) ?? null;
           if (alias) {
@@ -1557,7 +1550,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // Both gated on isAllowed so restricted groups still only react to
           // permitted senders. (The shared fold-back's replyRootId is already
           // handled by the first clause.)
-          const mentionMode = resolveGroupMentionMode(larkAppId);
+          const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
           const relax = (!!replyRootId && isAllowed)
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id)

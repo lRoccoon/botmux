@@ -100,7 +100,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, canOperate, canTalk, checkGroupMessageAccess, decideRouting, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -122,6 +122,7 @@ function setupBotState(opts?: {
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared';
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
+  autoReplyWithoutMentionChats?: string[];
   autoStartOnNewTopic?: boolean;
   chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared'>;
   p2pMode?: 'thread' | 'chat';
@@ -136,6 +137,7 @@ function setupBotState(opts?: {
       restrictGrantCommands: opts?.restrictGrantCommands,
       regularGroupReplyMode: opts?.regularGroupReplyMode,
       regularGroupMentionMode: opts?.regularGroupMentionMode,
+      autoReplyWithoutMentionChats: opts?.autoReplyWithoutMentionChats,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       chatReplyModes: opts?.chatReplyModes,
       p2pMode: opts?.p2pMode,
@@ -937,56 +939,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(canTalk(MY_APP_ID, 'oc_other_chat', USER_OPEN_ID)).toBe(false);
   });
 
-  it('allows non-mentioned group messages in autoReplyWithoutMentionChats when sender canTalk', async () => {
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
-    mockGetChatInfo.mockClear();
-    mockGetBot.mockReturnValue({
-      config: {
-        larkAppId: MY_APP_ID,
-        larkAppSecret: 'secret',
-        cliId: 'claude-code',
-        allowedUsers: [USER_OPEN_ID],
-        autoReplyWithoutMentionChats: ['oc_team'],
-      },
-      botOpenId: MY_OPEN_ID,
-      resolvedAllowedUsers: [USER_OPEN_ID],
-    });
-    const event = makeUserMessageEvent({
-      senderOpenId: USER_OPEN_ID,
-      content: JSON.stringify({ text: 'hello without mention' }),
-      chatId: 'oc_team',
-      chatType: 'group',
-    });
-
-    await expect(checkGroupMessageAccess(MY_APP_ID, event.message, 'oc_team', USER_OPEN_ID))
-      .resolves.toBe('allowed');
-    expect(mockGetChatInfo).not.toHaveBeenCalled();
-  });
-
-  it('does not let autoReplyWithoutMentionChats bypass canTalk', async () => {
-    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
-    mockGetBot.mockReturnValue({
-      config: {
-        larkAppId: MY_APP_ID,
-        larkAppSecret: 'secret',
-        cliId: 'claude-code',
-        allowedUsers: ['ou_someone_else'],
-        autoReplyWithoutMentionChats: ['oc_team'],
-      },
-      botOpenId: MY_OPEN_ID,
-      resolvedAllowedUsers: ['ou_someone_else'],
-    });
-    const event = makeUserMessageEvent({
-      senderOpenId: USER_OPEN_ID,
-      content: JSON.stringify({ text: 'hello without mention' }),
-      chatId: 'oc_team',
-      chatType: 'group',
-    });
-
-    await expect(checkGroupMessageAccess(MY_APP_ID, event.message, 'oc_team', USER_OPEN_ID))
-      .resolves.toBe('ignore');
-  });
-
   it('does not grant sensitive operations from an allowedChatGroups chat', () => {
     mockGetBot.mockReturnValue({
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
@@ -1422,6 +1374,67 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       anchor: 'chat-never',
       larkAppId: MY_APP_ID,
     }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('autoReplyWithoutMentionChats: a whitelisted chat behaves like per-chat mention mode never', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], autoReplyWithoutMentionChats: ['chat-whitelist'] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'no at-mention, whitelisted chat' }),
+      messageId: 'msg-wl-toplevel',
+      chatId: 'chat-whitelist',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-whitelist',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('autoReplyWithoutMentionChats: a NON-whitelisted chat still requires @', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], autoReplyWithoutMentionChats: ['chat-whitelist'] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'no at-mention, other chat' }),
+      messageId: 'msg-wl-other',
+      chatId: 'chat-other',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('autoReplyWithoutMentionChats: does not bypass canTalk — a non-allowed sender stays gated', async () => {
+    setupBotState({ allowedUsers: ['ou_someone_else'], autoReplyWithoutMentionChats: ['chat-whitelist'] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'no at-mention, not allowed' }),
+      messageId: 'msg-wl-denied',
+      chatId: 'chat-whitelist',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
