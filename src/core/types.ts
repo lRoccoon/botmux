@@ -47,10 +47,24 @@ export interface DaemonSession {
   lastMessageAt: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
-  initConfig?: DaemonToWorker;   // stored for restart
+  initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
+  worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** One-shot CLI slash command to send literally after the worker reports
+   *  prompt_ready. Used when a new topic starts with an adapter-default
+   *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a
+   *  botmux-wrapped `<user_message>`. In-memory only to avoid replaying after
+   *  daemon restart. */
+  pendingRawInput?: string;
+  /** Wrapped prompt for messages buffered while a pendingRawInput session
+   *  waited for repo selection (pendingFollowUps / attachments). Built at the
+   *  fork site (where prompt-building context lives) and delivered right
+   *  after the raw input on prompt_ready, so the buffered messages queue as
+   *  the next turn instead of being dropped. In-memory only, like
+   *  pendingRawInput. */
+  pendingFollowUpInput?: { userPrompt: string; cliInput: string };
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
   /** Sender (open_id + type + resolved name) of the initial message — stashed
@@ -62,6 +76,12 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  /** Set on sessions restored after a daemon restart: suppresses the automatic
+   *  card post/patch from the recovery re-fork so a restart stays silent in the
+   *  group (the owner gets a private DM summary instead). Cleared on the first
+   *  real CLI input (rememberLastCliInput) — the next turn posts a card normally.
+   *  In-memory only. See core/restart-report.ts. */
+  suppressRecoveryCard?: boolean;
   /** Session-scoped override: when true, the streaming card is posted/patched
    *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
    *  command so a user can manually summon a live card in an otherwise-quiet
@@ -77,6 +97,8 @@ export interface DaemonSession {
   usageLimitRetryTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
+  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   pendingResponseCardId?: string; // placeholder card patched by the first botmux send when streaming cards are disabled
   pendingResponseCardState?: 'open' | 'patched';
   lastPatchedResponseCardId?: string;
@@ -91,6 +113,15 @@ export interface DaemonSession {
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
   tuiToggledIndices?: number[];  // tracks toggled options for multi-select card PATCH
+  /** Agent-raised "needs human" signal (`botmux send --attention`). Non-blocking:
+   *  the agent flags it hit a blocker only a human can clear (authorization,
+   *  an irreversible decision, missing access) and goes on to end its turn.
+   *  Feeds the dashboard needs-you column with the human-readable `reason`.
+   *  Cleared when the user next replies to the session or when the session
+   *  closes. Distinct from tuiPromptCardId (which is a
+   *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
+   *  agent-initiated, and carries no rendered options. */
+  agentAttention?: { kind: string; reason: string; at: number };
   /** Last assistant uuid emitted via the adopt bridge final_output pipeline.
    *  Used by the daemon to dedupe successive `final_output` IPCs (e.g. when
    *  the worker re-drains the transcript after a noisy idle). */

@@ -16,6 +16,8 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '13': 'seed',
   '14': 'traex',
   '15': 'pi',
+  '16': 'copilot',
+  '17': 'oh-my-pi',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -41,11 +43,13 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'seed': 'Seed',
   'traex': 'TRAE',
   'pi': 'Pi',
+  'copilot': 'Copilot',
+  'oh-my-pi': 'Oh My Pi',
 };
 
 /**
  * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号
- * 1..15) 一致. dashboard "添加机器人" 的 CLI 下拉直接读这里, 避免再抄一份
+ * 1..16) 一致. dashboard "添加机器人" 的 CLI 下拉直接读这里, 避免再抄一份
  * 列表. 单一事实源: CLI_ID_CHOICES 的值序.
  */
 export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
@@ -54,7 +58,7 @@ export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
  *   - 空 → undefined (调用方决定 "preserve current" 还是套默认 'claude-code')
- *   - "1".."15" → CLI_ID_CHOICES 映射
+ *   - "1".."16" → CLI_ID_CHOICES 映射
  *   - 已是合法 cliId 字面值 → 原样返回
  *   - 其它 → throw (typo 不该静默落盘成 cliId)
  */
@@ -65,7 +69,7 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
   throw new Error(
-    `Unknown CLI 适配器 "${raw}"。请输入序号 1-15 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
+    `Unknown CLI 适配器 "${raw}"。请输入序号 1-17 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
 }
 
@@ -104,8 +108,9 @@ export interface BotConfigEditInput {
   cliChoice?: string;
   cliPathOverride?: string;
   /**
-   * Model 字段三态语义：
-   *   - undefined → 这次编辑没问过 model（adapter 没声明 modelChoices 自动跳过），保持原值
+   * Model 字段三态语义（setup 不再交互式询问 model，此字段仅由切换 CLI 时的
+   * 强制清空逻辑设 null；改 model 走 /config 卡片或手动编辑 bots.json）：
+   *   - undefined → 这次编辑不动 model，保持原值
    *   - string    → 设为这个 model
    *   - null      → 清空（删字段，回到 CLI 默认）
    */
@@ -286,8 +291,7 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
 
   applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
 
-  // Model 字段：null = 清空，string = 设置，undefined = 不动。promptModel 已经
-  // 把"adapter 不支持 model"折叠成 undefined 直接跳过；这里不再去查 adapter。
+  // Model 字段：null = 清空，string = 设置，undefined = 不动。
   if (input.model === null) {
     delete out.model;
   } else if (typeof input.model === 'string') {

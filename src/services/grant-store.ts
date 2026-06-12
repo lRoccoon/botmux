@@ -173,16 +173,25 @@ export async function removeGlobalGrant(
  * 已达/超上限 → allow:false（应拦本条 + 自愈 revoke）。
  * 正常递增 → allow:true，exhausted=（used 恰好达 limit），调用方放行本条、若 exhausted 则处理后 revoke。
  * 基础设施失败（getBot / RMW）会 throw —— 调用方 catch 后 fail-closed（拒发以保硬上限）。
+ *
+ * defaultLimit>0 且 quotaKey 对应记录不存在时：懒初始化 {limit:defaultLimit, used:1}
+ * （oncall 群默认额度场景，避免每条消息都要显式 /grant 才落记录）。
  */
 export async function consumeQuota(
-  larkAppId: string, quotaKey: string,
+  larkAppId: string, quotaKey: string, defaultLimit?: number,
 ): Promise<{ tracked: boolean; allow: boolean; exhausted: boolean; used: number; limit: number }> {
   const bot = getBot(larkAppId); // throw → 调用方 fail-closed
   type Res = { tracked: boolean; allow: boolean; exhausted: boolean; used: number; limit: number };
+  const initLimit = typeof defaultLimit === 'number' && Number.isInteger(defaultLimit) && defaultLimit > 0 ? defaultLimit : 0;
   const r = await rmwBotEntry<Res>(larkAppId, (entry) => {
     const qs = getQuotaMap(entry);
     const rec = qs?.[quotaKey];
-    if (!rec) return { write: false, result: { tracked: false, allow: true, exhausted: false, used: 0, limit: 0 } };
+    if (!rec) {
+      if (!initLimit) return { write: false, result: { tracked: false, allow: true, exhausted: false, used: 0, limit: 0 } };
+      // 懒初始化：defaultLimit 生效，首次命中即 used=1
+      entry.quotaState = { ...(qs ?? {}), [quotaKey]: { limit: initLimit, used: 1 } };
+      return { write: true, result: { tracked: true, allow: true, exhausted: 1 >= initLimit, used: 1, limit: initLimit } };
+    }
     if (rec.used >= rec.limit) {
       return { write: false, result: { tracked: true, allow: false, exhausted: true, used: rec.used, limit: rec.limit } };
     }

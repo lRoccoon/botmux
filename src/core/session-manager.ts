@@ -9,15 +9,13 @@ import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
-import { downloadMessageResource, listChatBotMembers } from '../im/lark/client.js';
+import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
-import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
-import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
+import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, killPersistentSession } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
-import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
@@ -123,11 +121,15 @@ export async function downloadResources(larkAppId: string, messageId: string, re
       await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath);
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
-      // Download failure usually means missing User Token scope or a
-      // legitimately revoked attachment — the caller surfaces `needLogin`
-      // to the user. Per-failure log stays at info to aid retries.
+      // Per-failure log stays at info to aid retries.
       logger.info(`Failed to download ${res.type} ${res.key}: ${err.message}`);
-      if (err.message?.includes('User Token')) needLogin = true;
+      // Only prompt /login when the token is genuinely missing or rejected
+      // (UserTokenMissingError). A plain download failure — cross-tenant /
+      // card-image / withdrawn resource that 4xx/5xx's even WITH a valid token
+      // — must NOT be misreported as "missing User Token". (Previously this was
+      // a substring match on the error message, which caught downloadWithUserToken's
+      // own "User Token download failed" text and produced a false /login prompt.)
+      if (err instanceof UserTokenMissingError) needLogin = true;
     }
   }
 
@@ -545,6 +547,8 @@ export function persistStreamCardState(ds: DaemonSession): void {
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
+    JSON.stringify(s.replyThreadAliases ?? {}) === JSON.stringify(ds.replyThreadAliases ?? {}) &&
+    JSON.stringify(s.currentReplyTarget ?? null) === JSON.stringify(ds.currentReplyTarget ?? null) &&
     s.pendingResponseCardId === ds.pendingResponseCardId &&
     s.pendingResponseCardState === ds.pendingResponseCardState &&
     s.lastPatchedResponseCardId === ds.lastPatchedResponseCardId
@@ -557,6 +561,8 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.usageLimit = ds.usageLimit;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
+  s.replyThreadAliases = ds.replyThreadAliases;
+  s.currentReplyTarget = ds.currentReplyTarget;
   s.pendingResponseCardId = ds.pendingResponseCardId;
   s.pendingResponseCardState = ds.pendingResponseCardState;
   s.lastPatchedResponseCardId = ds.lastPatchedResponseCardId;
@@ -566,29 +572,65 @@ export function persistStreamCardState(ds: DaemonSession): void {
 }
 
 export function rememberLastCliInput(ds: DaemonSession, userPrompt: string, cliInput: string): void {
+  // A real CLI input means the post-restart silence is over — let the normal
+  // card flow resume for this and subsequent turns.
+  ds.suppressRecoveryCard = undefined;
   ds.lastUserPrompt = userPrompt;
   ds.lastCliInput = cliInput;
   ds.session.lastUserPrompt = userPrompt;
   ds.session.lastCliInput = cliInput;
+  ds.session.replyThreadAliases = ds.replyThreadAliases;
+  ds.session.currentReplyTarget = ds.currentReplyTarget;
   sessionStore.updateSession(ds.session);
 }
 
 // ─── Session restore ─────────────────────────────────────────────────────────
 
 /**
- * Whether daemon restore should eagerly re-fork workers to re-attach surviving
- * tmux panes (which re-renders — or re-posts — each session's streaming card in
- * its Lark thread). True only on the tmux backend, and suppressed by
- * quiet-restart (`BOTMUX_QUIET_RESTART=1`) so local-dev restarts don't re-push
- * cards for unfinished sessions. When suppressed, sessions are still registered
- * and resume lazily — re-attaching the surviving tmux on the next real message
- * via `selectSessionBackend` — exactly like the pty backend already does.
+ * Whether daemon restore should eagerly re-fork a worker to re-attach a
+ * surviving backing pane. True for every persistent backend (tmux/herdr/zellij);
+ * the pty backend has nothing to re-attach to, so it stays lazy.
+ *
+ * Eager re-attach is what makes a session actually come back after a restart —
+ * otherwise a killed worker leaves the session dead until its next message, and
+ * a pane whose CLI died in the meantime never gets healed, so the transcript
+ * fallback can't fire. The old `BOTMUX_QUIET_RESTART` gate that suppressed this
+ * (to avoid re-pushing cards on dev restarts) is gone: restored sessions now
+ * carry `suppressRecoveryCard`, so the recovery re-fork stays silent in the
+ * Lark thread without having to skip recovery altogether.
  */
-export function shouldAutoForkOnRestore(
-  backendType: BackendType,
-  quietRestart: boolean,
-): boolean {
-  return backendType !== 'pty' && !quietRestart;
+export function shouldAutoForkOnRestore(backendType: BackendType): boolean {
+  return backendType !== 'pty';
+}
+
+const RECOVERY_FORK_BATCH_SIZE = config.daemon.recoveryForkBatchSize ?? 5;
+const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
+
+/**
+ * Re-fork the given restored sessions to re-attach their surviving panes, but
+ * staggered to avoid a thundering-herd CPU/IO spike when many sessions survive a
+ * restart: spawn `batchSize` workers, wait `delayMs`, repeat.
+ *
+ * Sessions whose worker is already live are skipped — a real message can arrive
+ * (the Lark dispatcher is up before restore finishes) and lazily fork the worker
+ * during one of our `delayMs` pauses; re-forking it here would kill that live
+ * worker mid-turn via `forkWorker`'s double-fork guard.
+ */
+export async function staggeredRecoveryFork(
+  sessions: readonly DaemonSession[],
+  fork: (ds: DaemonSession) => void,
+  batchSize: number = RECOVERY_FORK_BATCH_SIZE,
+  delayMs: number = RECOVERY_FORK_DELAY_MS,
+): Promise<void> {
+  let spawnedInBatch = 0;
+  for (const ds of sessions) {
+    if (ds.worker) continue; // already woken by a real message — don't clobber it
+    fork(ds);
+    if (++spawnedInBatch >= batchSize) {
+      spawnedInBatch = 0;
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
 }
 
 export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
@@ -652,9 +694,15 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         usageLimit: session.usageLimit,
         lastUserPrompt: session.lastUserPrompt,
         lastCliInput: session.lastCliInput,
+        replyThreadAliases: session.replyThreadAliases,
+        currentReplyTarget: session.currentReplyTarget,
         pendingResponseCardId: session.pendingResponseCardId,
         pendingResponseCardState: session.pendingResponseCardState,
         lastPatchedResponseCardId: session.lastPatchedResponseCardId,
+        // Restart stays silent for adopt sessions too: forkAdoptWorker shares
+        // setupWorkerHandlers, so the recovery ready/screen_update would post a
+        // card without this. Cleared on the first real CLI input.
+        suppressRecoveryCard: true,
       };
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
@@ -704,9 +752,14 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       usageLimit: session.usageLimit,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
+      replyThreadAliases: session.replyThreadAliases,
+      currentReplyTarget: session.currentReplyTarget,
       pendingResponseCardId: session.pendingResponseCardId,
       pendingResponseCardState: session.pendingResponseCardState,
       lastPatchedResponseCardId: session.lastPatchedResponseCardId,
+      // Restart stays silent in the group: the recovery re-fork won't post or
+      // patch a streaming card. Cleared on the first real CLI input.
+      suppressRecoveryCard: true,
     };
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
@@ -717,14 +770,38 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
   }
 
-  // Persistent backends: auto-fork workers for sessions whose backing session survived daemon restart.
+  // Persistent backends: auto-fork workers for sessions whose backing session
+  // survived daemon restart. Probe + zombie-close runs synchronously here; the
+  // actual re-fork is deferred into `toReattach` and staggered below so a box
+  // with dozens of surviving sessions doesn't spike on restart.
+  const toReattach: DaemonSession[] = [];
   for (const [, ds] of activeSessions) {
     const backendType = getSessionPersistentBackendType(ds);
     if (!backendType) continue;
-    if (!shouldAutoForkOnRestore(backendType, config.daemon.quietRestart)) continue;
+    if (!shouldAutoForkOnRestore(backendType)) continue;
 
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
-    if (!persistentSessionExists(backendType, backendName)) continue;
+    const probe = probePersistentSession(backendType, backendName);
+    if (probe === 'missing') {
+      // Probe succeeded and authoritatively says the backing pane/agent is gone
+      // — this is a true zombie. Close it (evicts the active record + marks the
+      // store row closed) so the next message starts a clean session.
+      const tag = ds.session.sessionId.substring(0, 8);
+      logger.warn(`[${tag}] ${backendType} backing session "${backendName}" is gone — closing zombie active session`);
+      await closeSession(ds.session.sessionId);
+      continue;
+    }
+    if (probe === 'unknown') {
+      // Probe FAILED (CLI error / timeout / unparseable output) — e.g. a herdr
+      // server still warming up on restart. We can't tell whether the session
+      // survived, so we must NOT close it: a transient failure would otherwise
+      // permanently tear down a still-alive session (context lost, pane leaked,
+      // store closed → no lazy recovery). Keep the worker-less active record and
+      // let it re-attach on the next message, exactly like the old behaviour.
+      const tag = ds.session.sessionId.substring(0, 8);
+      logger.warn(`[${tag}] ${backendType} backing session "${backendName}" probe inconclusive — keeping active session for lazy recovery`);
+      continue;
+    }
 
     // Guard against re-attaching to a persistent session that was started with a
     // different CLI than the bot is currently configured for. Persistent backend
@@ -741,50 +818,25 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       continue;
     }
 
-    logger.info(`[${tag}] ${backendType} session alive, auto-forking worker to re-attach`);
-    forkWorker(ds, '', true);
+    logger.info(`[${tag}] ${backendType} session alive, queued for re-attach`);
+    toReattach.push(ds);
   }
 
+  // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
+  // only, no new turn — same as the old per-session eager fork.
+  await staggeredRecoveryFork(toReattach, (ds) => forkWorker(ds, '', true));
+
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
-  const autoForkEnabled = [...activeSessions.values()].some(ds => {
-    const backendType = getSessionPersistentBackendType(ds);
-    return !!backendType && shouldAutoForkOnRestore(backendType, config.daemon.quietRestart);
-  });
-  logger.info(`Restored ${active.length} session(s)${hasPersistentBackend && autoForkEnabled ? '' : ', waiting for messages to resume'}`);
-}
-
-function getSessionPersistentBackendType(ds: DaemonSession): Exclude<BackendType, 'pty'> | undefined {
-  let backendType = config.daemon.backendType;
-  try {
-    backendType = getBot(ds.larkAppId).config.backendType ?? backendType;
-  } catch { /* bot deregistered */ }
-  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij' ? backendType : undefined;
-}
-
-function persistentSessionName(backendType: Exclude<BackendType, 'pty'>, sessionId: string): string {
-  if (backendType === 'tmux') return TmuxBackend.sessionName(sessionId);
-  if (backendType === 'zellij') return ZellijBackend.sessionName(sessionId);
-  return HerdrBackend.sessionName(sessionId);
-}
-
-function persistentSessionExists(backendType: Exclude<BackendType, 'pty'>, name: string): boolean {
-  if (backendType === 'tmux') return TmuxBackend.hasSession(name);
-  if (backendType === 'zellij') return ZellijBackend.hasSession(name);
-  return HerdrBackend.hasSession(name);
-}
-
-function killPersistentSession(backendType: Exclude<BackendType, 'pty'>, name: string): void {
-  if (backendType === 'tmux') TmuxBackend.killSession(name);
-  else if (backendType === 'zellij') ZellijBackend.killSession(name);
-  else HerdrBackend.killSession(name);
+  logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
 }
 
 /**
  * Resolve a session's live web-terminal worker port, WAKING the worker on demand
  * if needed.
  *
- * After a quiet restart (`BOTMUX_QUIET_RESTART=1`) workers are registered but not
- * eagerly re-forked — they re-attach lazily on the next message. The terminal
+ * A session can be active with no live worker — a pty session that resumes
+ * lazily, or a persistent-backend session whose staggered restart re-fork
+ * hasn't reached it yet (or whose worker died since). The terminal
  * reverse-proxy, however, needs the worker's HTTP port to serve `/s/{id}`, so a
  * surviving-but-worker-less session would otherwise 502 ("session not running")
  * even though its tmux/zellij pane is alive. This bridges that gap: if the
@@ -804,7 +856,11 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
 
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return undefined;
-  if (!persistentSessionExists(backendType, persistentSessionName(backendType, ds.session.sessionId))) {
+  // Non-destructive read path: only wake a worker when the backing pane is
+  // CONFIRMED alive. 'missing' or 'unknown' both bail (a 502 the terminal
+  // retries) — same conservative stance as the old boolean check, with no risk
+  // of closing anything.
+  if (probePersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId)) !== 'exists') {
     return undefined;
   }
 
@@ -954,6 +1010,8 @@ export async function resumeSession(
     usageLimit: session.usageLimit,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,
+    replyThreadAliases: session.replyThreadAliases,
+    currentReplyTarget: session.currentReplyTarget,
     pendingResponseCardId: session.pendingResponseCardId,
     pendingResponseCardState: session.pendingResponseCardState,
     lastPatchedResponseCardId: session.lastPatchedResponseCardId,
@@ -1023,19 +1081,19 @@ export async function executeScheduledTask(
     const chatMode = await getChatMode(larkAppId, task.chatId, { forceRefresh: true });
     if (chatMode === 'topic' && task.rootMessageId) {
       try {
-        await replyMessage(larkAppId, task.rootMessageId, `🕐 定时任务「${task.name}」开始执行`, 'text', true);
+        await replyMessage(larkAppId, task.rootMessageId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)), 'text', true);
         anchor = task.rootMessageId;
         isContinuation = true;
       } catch (err: any) {
         logger.warn(`[scheduler] Failed to reply in converted topic chat ${task.rootMessageId} (${err.message}); falling back to new thread`);
-        anchor = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+        anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
       }
     } else if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
       const creatorAppId = task.creatorLarkAppId ?? larkAppId;
       replyMessage(
         creatorAppId,
         task.creatorRootMessageId,
-        `🕐 定时任务「${task.name}」已在目标群聊触发`,
+        t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
         'text',
         true,
       ).catch((err: any) => {
@@ -1044,7 +1102,7 @@ export async function executeScheduledTask(
     } else {
       // Same-chat: post the start banner to the chat as a plain message.
       try {
-        await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+        await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
       } catch (err: any) {
         logger.warn(`[scheduler] Failed to post start banner in chat ${task.chatId} (${err.message})`);
       }
@@ -1063,7 +1121,7 @@ export async function executeScheduledTask(
       replyMessage(
         creatorAppId,
         task.creatorRootMessageId!,
-        `🕐 定时任务「${task.name}」已在目标话题触发`,
+        t('scheduler.task_triggered_target_thread', { name: task.name }, localeForBot(creatorAppId)),
         'text',
         true,
       ).catch((err: any) => {
@@ -1076,7 +1134,7 @@ export async function executeScheduledTask(
         await replyMessage(
           larkAppId,
           task.rootMessageId,
-          `🕐 定时任务「${task.name}」开始执行`,
+          t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)),
           'text',
           true,
         );
@@ -1084,10 +1142,10 @@ export async function executeScheduledTask(
         isContinuation = true;
       } catch (err: any) {
         logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
-        anchor = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+        anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
       }
     } else {
-      anchor = await sendMessage(larkAppId, task.chatId, `🕐 定时任务「${task.name}」开始执行`);
+      anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
     }
   }
 

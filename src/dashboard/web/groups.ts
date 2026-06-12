@@ -2,7 +2,7 @@
 // The aggregator at /api/groups fans out to all online daemons and merges chats
 // by chatId; the dashboard displays this as a matrix where each cell shows
 // whether a bot is a member of a given chat.
-import { escapeHtml, t } from './ui.js';
+import { chatAvatarHtml, escapeHtml, loadingHtml, t } from './ui.js';
 
 let cache: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
 
@@ -21,10 +21,13 @@ function pageHtml(): string {
   <button type="button" id="g-refresh">${t('groups.refresh')}</button>
   <button type="button" id="g-create" class="primary">${t('groups.create')}</button>
 </form>
-<table>
-  <thead id="g-head"></thead>
-  <tbody id="g-body"></tbody>
-</table>
+<div id="g-loading">${loadingHtml()}</div>
+<div class="table-scroll matrix-scroll" id="g-table-wrap" hidden>
+  <table>
+    <thead id="g-head"></thead>
+    <tbody id="g-body"></tbody>
+  </table>
+</div>
 <dialog id="g-drawer"></dialog>
 </section>`;
 }
@@ -89,7 +92,15 @@ export async function renderGroupsPage(root: HTMLElement) {
   const createBtn = root.querySelector<HTMLButtonElement>('#g-create')!;
   createBtn.onclick = () => openCreateModal();
 
-  await loadGroups();
+  // /api/groups 要扇出到所有 daemon、逐群查成员，慢——先亮 loading，回来再换表格。
+  const loadingEl = root.querySelector<HTMLElement>('#g-loading')!;
+  const tableWrap = root.querySelector<HTMLElement>('#g-table-wrap')!;
+  try {
+    await loadGroups();
+  } finally {
+    loadingEl.remove();
+    tableWrap.hidden = false;
+  }
 
   function openCreateModal() {
     const allBots = cache.bots;
@@ -224,7 +235,12 @@ export async function renderGroupsPage(root: HTMLElement) {
 
   function renderCreateSuccess(resp: any) {
     const chatId = String(resp.chatId);
-    const appLink = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+    // 优先用服务端返回的 shareLink（由 Lark/飞书建群 API 给出，天然带正确品牌域名）；
+    // 仅当缺失（share-link API 失败）时回退到 applink。浏览器侧拿不到 brand，这个
+    // 回退默认 feishu host——属极少触发的兜底，不影响 Lark 正常建群（有 shareLink）。
+    const appLink = typeof resp.shareLink === 'string' && resp.shareLink
+      ? resp.shareLink
+      : `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
     const invalidBots = (resp.invalidBotIds ?? []) as string[];
     const invalidUsers = (resp.invalidUserIds ?? []) as string[];
     const auto = resp.autoInvitedOpenId as string | null | undefined;
@@ -316,8 +332,13 @@ export async function renderGroupsPage(root: HTMLElement) {
     }
     body.innerHTML = filtered.map(c => `<tr data-chat="${escapeHtml(c.chatId)}">
       <td>
-        <strong>${escapeHtml(c.name ?? c.chatId)}</strong><br>
-        <small><code>${escapeHtml(c.chatId)}</code></small>
+        <div class="g-chat-cell">
+          ${chatAvatarHtml({ chatId: c.chatId, name: c.name, avatarUrl: c.avatar, size: 'sm' })}
+          <div class="g-chat-meta">
+            <strong>${escapeHtml(c.name ?? c.chatId)}</strong><br>
+            <small><code>${escapeHtml(c.chatId)}</code></small>
+          </div>
+        </div>
       </td>
       ${cache.bots.map(b => {
         const m = c.memberBots.find((m: any) => m.larkAppId === b.larkAppId);

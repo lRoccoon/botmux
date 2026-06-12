@@ -148,23 +148,26 @@ describe('message quota enforcement', () => {
     expect(mocks.consumeQuota).not.toHaveBeenCalled();
   });
 
-  it('allows the exhausting chat-grant message, then removes chat grant and notifies', async () => {
+  it('allows the exhausting chat-grant message but defers revoke/notify to the next message', async () => {
+    // exhausted=true 表示「本条刚好用完额度」——依旧放行给 AI 处理，但不在此时 revoke/notify
+    // （避免给用户「本条已被拒绝」的错觉）；revoke + 通知推迟到下一条被 allow=false 拦截时再做。
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true, exhausted: true, used: 5, limit: 5 });
     await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_chat', 'om_2', 'om_anchor'))
       .resolves.toBe(true);
-    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'chat:oc_1:ou_chat');
+    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'chat:oc_1:ou_chat', undefined);
     expect(mocks.commitCharge).toHaveBeenCalledWith('quota_app', 'om_2');
-    expect(mocks.removeChatGrant).toHaveBeenCalledWith('quota_app', 'oc_1', 'ou_chat');
+    // 延迟通知：耗尽这一条不再立即 revoke / 发卡 / 通知
+    expect(mocks.removeChatGrant).not.toHaveBeenCalled();
     expect(mocks.removeGlobalGrant).not.toHaveBeenCalled();
-    expect(mocks.buildQuotaExhaustedCard).toHaveBeenCalledWith('ou_chat', 5, expect.any(String));
-    expect(mocks.replyMessage).toHaveBeenCalledWith('quota_app', 'om_anchor', 'quota-card', 'interactive', true);
+    expect(mocks.buildQuotaExhaustedCard).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
   });
 
   it('drops already-exhausted global-grant messages and self-heals the grant', async () => {
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
     await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_9', 'ou_global', 'om_3', 'om_anchor'))
       .resolves.toBe(false);
-    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'global:ou_global');
+    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'global:ou_global', undefined);
     expect(mocks.removeGlobalGrant).toHaveBeenCalledWith('quota_app', 'ou_global');
     expect(mocks.replyMessage).toHaveBeenCalled();
   });

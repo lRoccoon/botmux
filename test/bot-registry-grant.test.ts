@@ -2,6 +2,19 @@ import { describe, it, expect } from 'vitest';
 import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
 
 describe('bot-registry grant additions', () => {
+  it('parseBotConfigsFromText preserves & filters chatReplyModes (tri-state)', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'rm1', larkAppSecret: 's',
+      chatReplyModes: { oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_3: 'bad', '': 'shared' },
+    }]));
+    expect(cfgs[0].chatReplyModes).toEqual({ oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic' });
+  });
+
+  it('parseBotConfigsFromText leaves chatReplyModes undefined when absent/all-invalid', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm2', larkAppSecret: 's' }]))[0].chatReplyModes).toBeUndefined();
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm3', larkAppSecret: 's', chatReplyModes: { oc_1: 'nope' } }]))[0].chatReplyModes).toBeUndefined();
+  });
+
   it('parseBotConfigsFromText preserves & filters chatGrants', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'a1', larkAppSecret: 's',
@@ -114,5 +127,40 @@ describe('bot-registry grant additions', () => {
       expect(c[0].restrictGrantCommands).toBeUndefined();
     }
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rc3', larkAppSecret: 's' }]))[0].restrictGrantCommands).toBeUndefined();
+  });
+
+  it('parses regularGroupReplyMode: keeps new-topic|shared, drops chat/invalid/absent to undefined', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyMode: 'new-topic' }]))[0].regularGroupReplyMode).toBe('new-topic');
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1b', larkAppSecret: 's', regularGroupReplyMode: 'shared' }]))[0].regularGroupReplyMode).toBe('shared');
+    // 'chat' is the default → normalized to undefined so bots.json stays clean.
+    for (const bad of ['chat', 'bad', true, 1, undefined]) {
+      const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg2', larkAppSecret: 's', regularGroupReplyMode: bad }]));
+      expect(c[0].regularGroupReplyMode).toBeUndefined();
+    }
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg3', larkAppSecret: 's' }]))[0].regularGroupReplyMode).toBeUndefined();
+  });
+
+  it('parses regularGroupMentionMode: keeps topic|never, drops always/invalid/absent to undefined', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm1', larkAppSecret: 's', regularGroupMentionMode: 'topic' }]))[0].regularGroupMentionMode).toBe('topic');
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm1b', larkAppSecret: 's', regularGroupMentionMode: 'never' }]))[0].regularGroupMentionMode).toBe('never');
+    // 'always' is the default → normalized to undefined so bots.json stays clean.
+    for (const bad of ['always', 'bad', true, 1, undefined]) {
+      const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm2', larkAppSecret: 's', regularGroupMentionMode: bad }]));
+      expect(c[0].regularGroupMentionMode).toBeUndefined();
+    }
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm3', larkAppSecret: 's' }]))[0].regularGroupMentionMode).toBeUndefined();
+  });
+
+  it('parses p2pMode only as literal chat (else undefined = thread default)', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'p1', larkAppSecret: 's', p2pMode: 'chat' },
+      { larkAppId: 'p2', larkAppSecret: 's', p2pMode: 'thread' },
+      { larkAppId: 'p3', larkAppSecret: 's' },
+      { larkAppId: 'p4', larkAppSecret: 's', p2pMode: 'invalid' },
+    ]));
+    expect(cfgs[0].p2pMode).toBe('chat');
+    expect(cfgs[1].p2pMode).toBeUndefined(); // 'thread' normalizes to undefined
+    expect(cfgs[2].p2pMode).toBeUndefined();
+    expect(cfgs[3].p2pMode).toBeUndefined();
   });
 });

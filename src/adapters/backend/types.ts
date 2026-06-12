@@ -1,5 +1,20 @@
 export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij';
 
+/**
+ * Tri-state result of probing whether a named backing session exists.
+ *
+ *   - 'exists'  — the probe command succeeded and confirmed a live session.
+ *   - 'missing' — the probe command succeeded and confirmed no such live session.
+ *   - 'unknown' — the probe command FAILED (error / timeout / unparseable output),
+ *                 so we could not determine existence either way.
+ *
+ * The distinction matters wherever a `false`/`missing` answer drives a
+ * destructive action (e.g. closing an active session on restore): a transient
+ * 'unknown' must never be treated as 'missing', or one flaky probe could
+ * permanently tear down a still-alive session.
+ */
+export type SessionProbe = 'exists' | 'missing' | 'unknown';
+
 export interface SpawnOpts {
   cwd: string;
   cols: number;
@@ -41,6 +56,14 @@ export interface ObserveBackend extends SessionBackend {
   getPaneSize(): { cols: number; rows: number } | null;
   /** Cheap liveness probe. */
   isPaneAlive(): boolean;
+  /**
+   * True while a live web-attach client is connected and this backend has
+   * paused its change-emission poller (ZellijObserveBackend does this to avoid
+   * attach flicker — see setLiveAttach). During that window the pane can keep
+   * changing without ever reaching onData, so a snapshot watermark fed by
+   * onData/onPtyData goes stale. Backends that never pause emission omit this.
+   */
+  isLiveAttachActive?(): boolean;
 }
 
 /** Duck-typed guard — true for any backend exposing the ObserveBackend surface. */

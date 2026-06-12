@@ -1,13 +1,15 @@
 // src/dashboard.ts
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import {
-  readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, statSync,
+  readFileSync, existsSync, chmodSync, mkdirSync, statSync,
 } from 'node:fs';
+import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname } from 'node:path';
 import { homedir } from 'node:os';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHmac } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
+import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, decideDashboardAuth,
   loadPersistedToken, persistToken,
@@ -19,6 +21,7 @@ import { planGroupCreator } from './dashboard/team-group.js';
 import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships } from './dashboard/federation-spoke-api.js';
@@ -26,20 +29,26 @@ import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { CLI_OPTIONS, resolveCliId } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
+import { mergeDashboardConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig } from './global-config.js';
+import { isLocale } from './i18n/types.js';
+import { isLocalDevInstall } from './utils/install-info.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
-import type { WebhookLifecycleRecord } from './services/webhook-lifecycle-store.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
+// The dashboard probes upward if its configured port is busy (e.g. a second
+// botmux instance on this host). The actually-bound port is persisted here so
+// the `botmux dashboard` CLI can reach /__cli/rotate without guessing.
+const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
 
 function loadOrCreateSecret(): string {
   if (existsSync(SECRET_PATH)) return readFileSync(SECRET_PATH, 'utf8').trim();
   const s = randomBytes(32).toString('base64url');
   mkdirSync(dirname(SECRET_PATH), { recursive: true });
-  writeFileSync(SECRET_PATH, s, { mode: 0o600 });
+  atomicWriteFileSync(SECRET_PATH, s, { mode: 0o600 });
   chmodSync(SECRET_PATH, 0o600);
   logger.info(`[dashboard] Generated dashboard secret at ${SECRET_PATH}`);
   return s;
@@ -48,15 +57,60 @@ function loadOrCreateSecret(): string {
 // The active dashboard token is persisted to disk so a previously-issued
 // dashboard URL survives `botmux restart`; only `botmux dashboard` (the
 // /__cli/rotate endpoint) rotates it and thereby invalidates the old link.
+// The start/restart hint reads it via the non-rotating /__cli/current endpoint
+// so it can show the live link without invalidating it.
 let activeToken: string | null = loadPersistedToken(TOKEN_PATH);
 
+// The port we actually bound (may differ from config.dashboard.port after an
+// EADDRINUSE probe). Used for the rotation-URL and persisted for the CLI.
+let boundDashboardPort = config.dashboard.port;
+
 const SECRET = loadOrCreateSecret();
+
+/** Sign a loopback request to a daemon's write-link route. The daemon verifies
+ *  with the same .dashboard-secret, so only a caller that can read the secret —
+ *  the dashboard — can mint write tokens; a bare local process that only knows
+ *  the ipcPort can't. Same scheme as the `botmux dashboard` → /__cli/rotate
+ *  HMAC. */
+function signDaemonTokenHeaders(): Record<string, string> {
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const nonce = randomBytes(8).toString('hex');
+  const sig = createHmac('sha256', SECRET).update(`${ts}:${nonce}`).digest('base64url');
+  return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
+}
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
 const botOnboarding = new BotOnboardingManager({ botsJsonPath: BOTS_JSON_PATH });
 const subs = new Map<string, () => void>();
 const attaching = new Set<string>();   // dedup concurrent attaches per appId
+
+interface ResolvedDashboardSettings {
+  publicReadOnly: boolean;
+  openTerminalInFeishu: boolean;
+  /** Auto-update / auto-restart schedule (off by default). */
+  maintenance: MaintenanceConfig;
+  /** True when running from a source checkout — the Settings UI greys out the
+   *  auto-update toggle (npm-global only). */
+  localDevInstall: boolean;
+}
+
+function resolveDashboardSettings(): ResolvedDashboardSettings {
+  const dashboard = readGlobalConfig().dashboard ?? {};
+  return {
+    publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
+    openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
+    maintenance: readGlobalConfig().maintenance ?? {},
+    localDevInstall: isLocalDevInstall(),
+  };
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  const raw = Buffer.concat(chunks).toString('utf8').trim();
+  return raw ? JSON.parse(raw) : {};
+}
 
 /**
  * Attach to one daemon: hydrate its sessions/schedules into the aggregator,
@@ -135,6 +189,10 @@ const MIME: Record<string, string> = {
   '.css': 'text/css',
   '.svg': 'image/svg+xml',
   '.woff2': 'font/woff2',
+  '.webp': 'image/webp',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
 };
 
 function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
@@ -247,12 +305,22 @@ async function createLifecycleGroupForWebhook(
   if (!pick) throw new Error('no_online_daemon');
   const creator = registry.getByAppId(pick.creatorLarkAppId);
   if (!creator) throw new Error('creator_daemon_offline');
+  // Pull the creator bot's authorized humans (allowedUsers) into the auto-created
+  // group so a person — not just bots — is in the room. allowedUsers stores both
+  // union_ids (on_, tenant-stable) and legacy open_ids (ou_, creator-app-scoped);
+  // route each to the matching invite channel. @-notify the first open_id if any.
+  const allowed = creator.resolvedAllowedUsers ?? [];
+  const ownerUnionIds = allowed.filter(u => u.startsWith('on_'));
+  const userOpenIds = allowed.filter(u => u.startsWith('ou_'));
   const upstream = await fetch(`http://127.0.0.1:${creator.ipcPort}/api/groups/create`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       name: lifecycleGroupName(connector, args.dedupKey),
       larkAppIds: selectedIds,
+      ...(ownerUnionIds.length > 0 ? { ownerUnionIds } : {}),
+      ...(userOpenIds.length > 0 ? { userOpenIds } : {}),
+      ...(userOpenIds[0] ? { notifyOwnerOpenId: userOpenIds[0] } : {}),
     }),
   });
   const text = await upstream.text();
@@ -262,31 +330,6 @@ async function createLifecycleGroupForWebhook(
     throw new Error(parsed?.error ?? `group_create_http_${upstream.status}`);
   }
   return { chatId: parsed.chatId, creatorLarkAppId: parsed.creator ?? pick.creatorLarkAppId };
-}
-
-async function closeLifecycleGroupForWebhook(
-  connector: ConnectorDefinition,
-  record: WebhookLifecycleRecord,
-): Promise<{ ok: boolean; error?: string }> {
-  if (!record.chatId) return { ok: true };
-  const candidates = Array.from(new Set([
-    record.creatorLarkAppId,
-    ...lifecycleBotIds(connector),
-  ].filter((x): x is string => typeof x === 'string' && x.length > 0)));
-  let lastError = 'no_candidate_bot';
-  for (const appId of candidates) {
-    try {
-      const upstream = await proxyToDaemon(appId, `/api/groups/${encodeURIComponent(record.chatId)}/disband`, { method: 'POST' });
-      const text = await upstream.text();
-      let parsed: any = null;
-      try { parsed = JSON.parse(text); } catch { /* tolerate */ }
-      if (upstream.ok && parsed?.ok) return { ok: true };
-      lastError = parsed?.error ?? `group_disband_http_${upstream.status}`;
-    } catch (e: any) {
-      lastError = e?.message ?? String(e);
-    }
-  }
-  return { ok: false, error: lastError };
 }
 
 /**
@@ -320,6 +363,30 @@ async function closeSessionsMatching(
   }));
 }
 
+/**
+ * Shared loopback-HMAC gate for the `/__cli/*` endpoints. Returns `{ ok: true }`
+ * on success, or a ready-to-send `{ status, body }` error otherwise.
+ */
+function verifyCliRequest(req: IncomingMessage):
+  | { ok: true }
+  | { ok: false; status: number; body: Record<string, unknown> } {
+  const ts = req.headers['x-botmux-cli-ts'];
+  const nonce = req.headers['x-botmux-cli-nonce'];
+  const sig = req.headers['x-botmux-cli-auth'];
+  if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') {
+    return { ok: false, status: 400, body: { error: 'missing_headers' } };
+  }
+  const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+  const r = verifyHmac(SECRET, { ts, nonce, sig }, remote);
+  if (!r.ok) return { ok: false, status: 401, body: { error: 'unauthorized', reason: r.reason } };
+  return { ok: true };
+}
+
+/** Build the dashboard URL for a token, using the actually-bound port. */
+function dashboardUrlFor(token: string): string {
+  return `http://${config.dashboard.externalHost}:${boundDashboardPort}/?t=${token}`;
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -332,7 +399,6 @@ const server = createServer(async (req, res) => {
     if (await handleWebhookRoute(req, res, url, {
       proxyToDaemon,
       createLifecycleGroup: createLifecycleGroupForWebhook,
-      closeLifecycleGroup: closeLifecycleGroupForWebhook,
     })) {
       return;
     }
@@ -348,34 +414,40 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // CLI rotate (HMAC + loopback only) — for `botmux dashboard`
+    // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
+    // token, invalidating any previously-issued link.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
-      const ts = req.headers['x-botmux-cli-ts'];
-      const nonce = req.headers['x-botmux-cli-nonce'];
-      const sig = req.headers['x-botmux-cli-auth'];
-      if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') {
-        return jsonRes(res, 400, { error: 'missing_headers' });
-      }
-      const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
-      const r = verifyHmac(SECRET, { ts, nonce, sig }, remote);
-      if (!r.ok) return jsonRes(res, 401, { error: 'unauthorized', reason: r.reason });
+      const gate = verifyCliRequest(req);
+      if (!gate.ok) return jsonRes(res, gate.status, gate.body);
       activeToken = generateToken();
       try {
         persistToken(TOKEN_PATH, activeToken);
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
       }
-      const fullUrl = `http://${config.dashboard.externalHost}:${config.dashboard.port}/?t=${activeToken}`;
-      return jsonRes(res, 200, { url: fullUrl });
+      return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
+    }
+
+    // CLI read current URL (HMAC + loopback only) — for the start/restart hint.
+    // Unlike /__cli/rotate this does NOT mint a token, so an already-issued
+    // dashboard link survives restart untouched. 404 → no token has ever been
+    // minted (caller falls back to suggesting `botmux dashboard`).
+    if (req.method === 'POST' && url.pathname === '/__cli/current') {
+      const gate = verifyCliRequest(req);
+      if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
+      return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
     }
 
     const presentedToken = authedToken(req, url);
+    const dashboardSettings = resolveDashboardSettings();
     const decision = decideDashboardAuth({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
       presentedToken,
       activeToken: activeToken ?? '',
+      publicReadOnly: dashboardSettings.publicReadOnly,
     });
     // `authed` is consumed by route handlers that need to distinguish
     // "request got in via public-read carve-out" from "request has a
@@ -414,7 +486,77 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { sessions: aggregator.getSessions() });
     }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
-      return jsonRes(res, 200, { schedules: aggregator.getSchedules() });
+      // Public-read carve-out: the row carries CONTENT (prompt = business
+      // instructions) and a bound `workingDir` (repo/customer path) — strip
+      // both for anonymous visitors. The schedules page only renders
+      // name/timing/status, so nothing degrades.
+      const schedules = authed
+        ? aggregator.getSchedules()
+        : redactSchedulesForPublic(aggregator.getSchedules());
+      return jsonRes(res, 200, { schedules });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/settings') {
+      // `authed` lets the Settings page disable toggles for read-only
+      // visitors up front, instead of letting them flip a switch that
+      // 401s + rolls back on save.
+      // `lang` is the global UI locale (single source of truth shared with
+      // `botmux lang` and the Feishu cards) — the web UI reads it as its
+      // authoritative initial language when set.
+      return jsonRes(res, 200, { settings: dashboardSettings, lang: readGlobalConfig().lang ?? null, authed });
+    }
+    if (req.method === 'PUT' && url.pathname === '/api/settings') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+      const patch: DashboardGlobalConfig = {};
+      if ('publicReadOnly' in body) {
+        if (typeof body.publicReadOnly !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_publicReadOnly' });
+        patch.publicReadOnly = body.publicReadOnly;
+      }
+      if ('openTerminalInFeishu' in body) {
+        if (typeof body.openTerminalInFeishu !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_openTerminalInFeishu' });
+        patch.openTerminalInFeishu = body.openTerminalInFeishu;
+      }
+      let touched = false;
+      if (Object.keys(patch).length > 0) { mergeDashboardConfig(patch); touched = true; }
+      if ('maintenance' in body) {
+        const r = parseMaintenancePatch(body.maintenance);
+        if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.error });
+        // Auto-update is npm-global only; refuse enabling it on a source checkout.
+        if (r.patch.autoUpdate?.enabled && isLocalDevInstall()) {
+          return jsonRes(res, 400, { ok: false, error: 'local_dev_no_autoupdate' });
+        }
+        // Auto-restart only applies an auto-update — it's meaningless without it.
+        // Refuse enabling auto-restart unless auto-update is (or is being) on.
+        if (r.patch.autoRestart?.enabled) {
+          const autoUpdateOn = r.patch.autoUpdate?.enabled
+            ?? readGlobalConfig().maintenance?.autoUpdate?.enabled
+            ?? false;
+          if (!autoUpdateOn) return jsonRes(res, 400, { ok: false, error: 'autoupdate_required' });
+        }
+        mergeMaintenanceConfig(r.patch);
+        touched = true;
+      }
+      if ('lang' in body) {
+        // Global UI locale — single source of truth shared with `botmux lang`
+        // and the Feishu cards. Persist to ~/.botmux/config.json, then fan out
+        // to every online daemon over the same IPC bus the per-bot config
+        // writes use, so running cards switch language live (no restart).
+        const v = body.lang;
+        if (v === null) setGlobalLocale(null);
+        else if (isLocale(v)) setGlobalLocale(v);
+        else return jsonRes(res, 400, { ok: false, error: 'invalid_lang' });
+        await Promise.all(registry.list().map(d =>
+          fetch(`http://127.0.0.1:${d.ipcPort}/api/locale/reload`, { method: 'POST' }).catch(() => undefined),
+        ));
+        touched = true;
+      }
+      if (!touched) return jsonRes(res, 400, { ok: false, error: 'empty_patch' });
+      return jsonRes(res, 200, { ok: true, settings: resolveDashboardSettings() });
     }
 
     if (await handleConnectorApi(req, res, url)) {
@@ -479,6 +621,39 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, { method: 'POST' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Writable web-terminal link (token-bearing). Not in any public allow-list,
+    // so decideDashboardAuth has already 401'd unauthenticated callers before we
+    // get here — the token only reaches authenticated dashboard sessions.
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/write-link$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/write-link`, { method: 'GET', headers: signDaemonTokenHeaders() });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Sandbox landing: review the clone's diff (GET) then apply/discard (POST).
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/sandbox-diff$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/sandbox-diff`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/sandbox-land\/(apply|discard)$/))) {
+      const sid = decodeURIComponent(m[1]); const action = m[2];
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/sandbox-land/${action}`, { method: 'POST' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -566,9 +741,14 @@ const server = createServer(async (req, res) => {
           return (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId);
         })
         .map(({ _firstSeenAt, ...rest }) => rest);
+      // Public-read carve-out: oncall bindings carry workingDir (repo/customer
+      // paths). The read-only board only needs chat/bot names; the oncall
+      // editor that consumes oncallChat is authed-only. Strip for anon so the
+      // bound dirs don't leak via /api/groups (mirrors the /api/schedules
+      // prompt strip + keeps /api/bots oncall removal honest).
       return jsonRes(res, 200, {
-        chats: sorted,
-        bots: onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName })),
+        chats: authed ? sorted : redactGroupsForPublic(sorted),
+        bots: onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName, botAvatarUrl: b.botAvatarUrl })),
       });
     }
 
@@ -787,6 +967,7 @@ const server = createServer(async (req, res) => {
             defaultOncall: j.defaultOncall,
             autoboundChatCount: j.autoboundChatCount ?? 0,
             brandLabel: j.brandLabel ?? null,
+            sandbox: j.sandbox === true,
             disableStreamingCard: j.disableStreamingCard === true,
             writableTerminalLinkInCard: j.writableTerminalLinkInCard === true,
             privateCard: j.privateCard === true,
@@ -794,8 +975,15 @@ const server = createServer(async (req, res) => {
             autoStartOnGroupJoinPrompt: typeof j.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
             autoStartOnNewTopic: j.autoStartOnNewTopic === true,
             autoStartOnNewTopicFromBots: j.autoStartOnNewTopicFromBots === true,
+            regularGroupReplyMode: (j.regularGroupReplyMode === 'new-topic' || j.regularGroupReplyMode === 'shared')
+              ? j.regularGroupReplyMode
+              : 'chat',
+            regularGroupMentionMode: (j.regularGroupMentionMode === 'topic' || j.regularGroupMentionMode === 'never')
+              ? j.regularGroupMentionMode
+              : 'always',
             restrictGrantCommands: j.restrictGrantCommands === true,
             messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
+            p2pMode: j.p2pMode === 'chat' ? 'chat' : 'thread',
           };
         } catch (e: any) {
           return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
@@ -838,8 +1026,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/sandbox — proxy to that bot's daemon. Body `{ enabled: boolean }`.
+    let mBotSandbox: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSandbox = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox$/))) {
+      const appId = decodeURIComponent(mBotSandbox[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-sandbox`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/card-prefs — proxy to that bot's daemon. Body carries
-    // either/both `{ disableStreamingCard?, writableTerminalLinkInCard? }` booleans.
+    // any subset of per-bot behavior booleans / prompt strings.
     let mBotCardPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotCardPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/card-prefs$/))) {
       const appId = decodeURIComponent(mBotCardPrefs[1]);
@@ -847,6 +1052,25 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/p2p-mode — proxy to that bot's daemon. Body
+    // `{ p2pMode: 'chat' | 'thread' }` ('chat' = flat continuous DM session;
+    // anything else clears back to the per-message thread default).
+    let mBotP2pMode: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotP2pMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/p2p-mode$/))) {
+      const appId = decodeURIComponent(mBotP2pMode[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-p2p-mode`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -967,7 +1191,20 @@ const server = createServer(async (req, res) => {
       });
       res.write('retry: 5000\n\n');
       const off = aggregator.on(ev => {
-        res.write(`event: ${ev.type}\ndata: ${JSON.stringify({ larkAppId: ev.larkAppId, body: ev.body })}\n\n`);
+        // Mirror the GET /api/schedules carve-out: schedule events carry the
+        // full task object — strip the prompt AND workingDir for anonymous SSE
+        // listeners, or the REST-side scrub would be trivially bypassed by
+        // `/events`.
+        let body = ev.body;
+        if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
+          const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
+          body = {
+            ...b,
+            ...(b.schedule ? { schedule: { ...b.schedule, prompt: undefined, workingDir: undefined } } : {}),
+            ...(b.patch ? { patch: { ...b.patch, prompt: undefined, workingDir: undefined } } : {}),
+          } as typeof ev.body;
+        }
+        res.write(`event: ${ev.type}\ndata: ${JSON.stringify({ larkAppId: ev.larkAppId, body })}\n\n`);
       });
       const hb = setInterval(() => {
         res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
@@ -984,8 +1221,24 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(config.dashboard.port, config.dashboard.host, () => {
-  logger.info(`[dashboard] listening on ${config.dashboard.host}:${config.dashboard.port}`);
+// Probe upward on EADDRINUSE rather than crashing with an unhandled 'error':
+// a second botmux instance on this host (or a stray process) holding the
+// configured port would otherwise tear the dashboard process down on bind.
+// The bound port is persisted so `botmux dashboard` can still reach us.
+listenWithProbe({
+  server,
+  port: config.dashboard.port,
+  host: config.dashboard.host,
+  log: (m) => logger.warn(`[dashboard] ${m}`),
+}).then((port) => {
+  boundDashboardPort = port;
+  try { atomicWriteFileSync(PORT_PATH, String(port)); } catch (e) {
+    logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
+  }
+  logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+}).catch((err) => {
+  logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
+  process.exit(1);
 });
 
 // Federation: periodically push this deployment's bots + heartbeat to every hub

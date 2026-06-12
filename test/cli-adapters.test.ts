@@ -30,14 +30,17 @@ import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'pi'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'traex', 'pi', 'copilot', 'oh-my-pi'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -71,7 +74,7 @@ describe('createCliAdapterSync factory', () => {
 describe('lazy binary resolution', () => {
   // Adapters whose resolvedBin is the resolved CLI (codex-app/mira use
   // process.execPath and never probe, so they're excluded).
-  const PROBING_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes'];
+  const PROBING_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot'];
 
   it.each(PROBING_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -137,11 +140,19 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
-  it('omits dangerous permission flags/settings when disableCliBypass is true', () => {
+  it('omits dangerous permission flags/keys when disableCliBypass is true (but keeps the SessionStart ready hook)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--dangerously-skip-permissions');
-    expect(args).not.toContain('--settings');
     expect(args).toContain('--disallowed-tools');
+    // --settings is still emitted — it now also carries the SessionStart真就绪
+    // hook, which must be injected unconditionally (else the worker ready-gate
+    // would wait out its fallback timeout). But the bypass keys are gone.
+    const idx = args.indexOf('--settings');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(args[idx + 1]);
+    expect(parsed.skipDangerousModePermissionPrompt).toBeUndefined();
+    expect(parsed.permissions).toBeUndefined();
+    expect(parsed.hooks?.SessionStart?.[0]?.hooks?.[0]?.command).toContain('session-ready');
   });
 
   it('ignores initialPrompt (not passed via args)', () => {
@@ -236,6 +247,10 @@ describe('coco buildArgs', () => {
     const idx = args.indexOf('--config');
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(args[idx + 1]).toBe('model.name=Doubao-Seed-2.0-Code');
+  });
+
+  it('uses Trae skill root for filesystem skill discovery', () => {
+    expect(adapter.skillsDir).toBe('~/.trae/skills');
   });
 });
 
@@ -336,6 +351,53 @@ describe('mira buildArgs', () => {
   });
 });
 
+describe('copilot buildArgs', () => {
+  const adapter = createCopilotAdapter('/usr/bin/copilot');
+
+  it('fresh session passes --allow-all-tools without resume flags', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: false });
+    expect(args).toContain('--allow-all-tools');
+    expect(args).not.toContain('--resume');
+    expect(args).not.toContain('--continue');
+    expect(args).not.toContain('sess-cp');
+  });
+
+  it('resume with cliSessionId passes --resume <id>', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cp',
+      resume: true,
+      resumeSessionId: 'copilot-sess-abc',
+    });
+    expect(args).toContain('--resume');
+    const idx = args.indexOf('--resume');
+    expect(args[idx + 1]).toBe('copilot-sess-abc');
+  });
+
+  it('resume without cliSessionId falls back to --continue', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: true });
+    expect(args).toContain('--continue');
+    expect(args).not.toContain('--resume');
+  });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: false, model: 'gpt-5' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('gpt-5');
+  });
+
+  it('does not bake initialPrompt into args', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: false, initialPrompt: 'hello copilot' });
+    expect(args).not.toContain('hello copilot');
+    expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
+  });
+
+  it('surfaces curated model choices for setup', () => {
+    expect(adapter.modelChoices).toContain('claude-sonnet-4');
+    expect(adapter.modelChoices).toContain('gpt-5');
+  });
+});
+
 describe('gemini buildArgs', () => {
   const adapter = createGeminiAdapter('/usr/bin/gemini');
 
@@ -411,16 +473,69 @@ describe('opencode buildArgs', () => {
 describe('pi buildArgs', () => {
   const adapter = createPiAdapter('/usr/bin/pi');
 
-  it('launches Pi native TUI with session id and tools', () => {
+  it('launches Pi native TUI with session id, no --tools restriction (keeps MCP usable)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false, initialPrompt: 'hello pi' });
     expect(adapter.resolvedBin).toBe('/usr/bin/pi');
     expect(args).toContain('--session-id');
     expect(args[args.indexOf('--session-id') + 1]).toBe('sess-pi');
-    expect(args).toContain('--tools');
-    expect(args[args.indexOf('--tools') + 1]).toBe('read,bash,edit,write,grep,find,ls');
+    // Pi must NOT receive a --tools allowlist: pinning the built-in tools shadows
+    // MCP tools. Let Pi use its default tool set so MCP servers stay usable.
+    expect(args).not.toContain('--tools');
     expect(args.at(-1)).toBe('hello pi');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
     expect(adapter.altScreen).toBe(true);
+  });
+});
+
+describe('oh-my-pi buildArgs', () => {
+  const adapter = createOhMyPiAdapter('/usr/bin/omp');
+
+  it('launches omp TUI with tools, approval-mode, and no-title', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, initialPrompt: 'hello omp' });
+    expect(adapter.resolvedBin).toBe('/usr/bin/omp');
+    expect(args).toContain('--tools');
+    expect(args).toContain('read,bash,edit,write,browser,web_search,ast_grep,ast_edit,lsp,debug,find,eval,search,task,ask');
+    expect(args).toContain('--approval-mode');
+    expect(args[args.indexOf('--approval-mode') + 1]).toBe('yolo');
+    expect(args).toContain('--no-title');
+    expect(args.at(-1)).toBe('hello omp');
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.altScreen).toBe(true);
+  });
+
+  it('does not include --session-id (oh-my-pi has none)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false });
+    expect(args).not.toContain('--session-id');
+    expect(args).not.toContain('sess-omp');
+  });
+
+  it('omits --approval-mode yolo when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--approval-mode');
+    expect(args).not.toContain('yolo');
+    expect(args).toContain('--no-title');
+  });
+
+  it('passes configured model with --model', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, model: 'opus' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('opus');
+  });
+
+  it('passes working directory with --cwd', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, workingDir: '/repo/root' });
+    const idx = args.indexOf('--cwd');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('/repo/root');
+  });
+
+  it('skillsDir points to ~/.omp/agent/skills', () => {
+    expect(adapter.skillsDir).toBe('~/.omp/agent/skills');
+  });
+
+  it('has no modelChoices (setup skips model prompt)', () => {
+    expect(adapter.modelChoices).toBeUndefined();
   });
 });
 
@@ -629,6 +744,10 @@ describe('completionPattern', () => {
   it('pi has no completionPattern', () => {
     expect(createPiAdapter('/bin/pi').completionPattern).toBeUndefined();
   });
+
+  it('copilot has no completionPattern', () => {
+    expect(createCopilotAdapter('/bin/copilot').completionPattern).toBeUndefined();
+  });
 });
 
 describe('readyPattern', () => {
@@ -651,6 +770,14 @@ describe('readyPattern', () => {
     expect(adapter.readyPattern).toBeDefined();
     expect(adapter.readyPattern!.test('›')).toBe(true);
     expect(adapter.readyPattern!.test('97% left')).toBe(true);
+  });
+
+  it('traex matches prompt and context indicators', () => {
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('›')).toBe(true);
+    expect(adapter.readyPattern!.test('❯ Run /review on my current changes')).toBe(true);
+    expect(adapter.readyPattern!.test('GPT-5.5 · Context 100% left')).toBe(true);
   });
 
   it('codex-app matches runner prompt indicator', () => {
@@ -692,6 +819,10 @@ describe('readyPattern', () => {
   it('pi has no readyPattern', () => {
     expect(createPiAdapter('/bin/pi').readyPattern).toBeUndefined();
   });
+
+  it('copilot has no readyPattern', () => {
+    expect(createCopilotAdapter('/bin/copilot').readyPattern).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -724,6 +855,7 @@ describe('systemHints', () => {
     ['mtr', () => createMtrAdapter('/bin/mtr')],
     ['hermes', () => createHermesAdapter('/bin/hermes')],
     ['pi', () => createPiAdapter('/bin/pi')],
+    ['copilot', () => createCopilotAdapter('/bin/copilot')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -751,6 +883,7 @@ describe('id property', () => {
     ['hermes', () => createHermesAdapter('/bin/hermes')],
     ['mira', () => createMiraAdapter()],
     ['pi', () => createPiAdapter('/bin/pi')],
+    ['copilot', () => createCopilotAdapter('/bin/copilot')],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -809,6 +942,10 @@ describe('altScreen property', () => {
 
   it('pi native TUI uses alt screen', () => {
     expect(createPiAdapter('/bin/pi').altScreen).toBe(true);
+  });
+
+  it('copilot uses alt screen (Ink TUI)', () => {
+    expect(createCopilotAdapter('/bin/copilot').altScreen).toBe(true);
   });
 });
 
@@ -897,6 +1034,19 @@ describe('buildResumeCommand', () => {
     const a = createPiAdapter('/bin/pi');
     expect(a.buildResumeCommand?.({ sessionId: 'bm-pi', cliSessionId: 'ignored' }))
       .toBe('pi --session-id bm-pi');
+  });
+
+  it('oh-my-pi emits `omp --continue` (best-effort, ignores sessionId)', () => {
+    const a = createOhMyPiAdapter('/bin/omp');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-omp', cliSessionId: 'ignored' }))
+      .toBe('omp --continue');
+  });
+
+  it('copilot emits `copilot --resume <cliSessionId>` when known, null otherwise', () => {
+    const a = createCopilotAdapter('/bin/copilot');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-cp', cliSessionId: 'copilot-sess-1' }))
+      .toBe('copilot --resume copilot-sess-1');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-cp' })).toBeNull();
   });
 
 });

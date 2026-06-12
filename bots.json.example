@@ -8,7 +8,8 @@
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"],
     "autoReplyWithoutMentionChats": ["oc_xxx_oncall"],
-    "workingDir": "~/projects"
+    "workingDir": "~/projects",
+    "customPassthroughCommands": ["/goal", "/export"]
   },
   {
     "larkAppId": "cli_xxx_bot2",
@@ -22,7 +23,6 @@
     "larkAppSecret": "your_secret_3",
     "cliId": "gemini",
     "model": "gemini-2.5-pro",
-    "passthroughCommands": ["/doctor"],
     "allowedUsers": ["charlie@company.com"],
     "workingDir": "~/projects"
   },

@@ -5,11 +5,14 @@ import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
+import { emitHookEvent } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
+import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
+import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -39,7 +42,7 @@ function getAllBotClients() {
     allBotClients = loadBotConfigs().map((cfg) => ({
       appId: cfg.larkAppId,
       cliId: cfg.cliId,
-      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, loggerLevel: LoggerLevel.error }),
+      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand)), loggerLevel: LoggerLevel.error }),
     }));
   }
   return allBotClients;
@@ -52,6 +55,21 @@ export class MessageWithdrawnError extends Error {
   constructor(messageId: string) {
     super(`Message ${messageId} has been withdrawn`);
     this.name = 'MessageWithdrawnError';
+  }
+}
+
+/**
+ * Thrown ONLY when a resource download genuinely needs (re-)authorization: no
+ * usable User Token on disk, or the User Token was rejected as unauthorized
+ * (HTTP 401). Callers gate the "/login" prompt on `instanceof` this — NOT on a
+ * substring of the message — so an ordinary download failure (4xx/5xx for a
+ * cross-tenant / card-image / withdrawn resource) is no longer misreported as
+ * "missing User Token, please /login" even though a valid token was used.
+ */
+export class UserTokenMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UserTokenMissingError';
   }
 }
 
@@ -72,7 +90,7 @@ const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
  * idempotencyKey here so retries don't re-send.  Existing callers omit
  * the param and get exactly the pre-Step-6 behavior.
  */
-export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text', uuid?: string): Promise<string> {
+export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text', uuid?: string, hookContext?: Record<string, unknown>): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -102,6 +120,15 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
   const messageId = res.data?.message_id;
   if (!messageId) throw new Error('No message_id in response');
   logger.info(`Sent message ${messageId} to chat ${chatId}`);
+  emitHookEvent('outbound.send', {
+    ...hookContext,
+    larkAppId,
+    chatId,
+    messageId,
+    msgType,
+    uuid,
+    content,
+  });
   return messageId;
 }
 
@@ -112,7 +139,7 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
  * spike report §1.4 for the reply-specific test results, including the
  * cross-parent dedupe behavior that informs the inputHash design.
  */
-export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false, uuid?: string): Promise<string> {
+export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false, uuid?: string, hookContext?: Record<string, unknown>): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -142,6 +169,16 @@ export async function replyMessage(larkAppId: string, messageId: string, content
   const replyId = res.data?.message_id;
   if (!replyId) throw new Error('No message_id in reply response');
   logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
+  emitHookEvent('outbound.reply', {
+    ...hookContext,
+    larkAppId,
+    messageId,
+    replyId,
+    msgType,
+    replyInThread,
+    uuid,
+    content,
+  });
   return replyId;
 }
 
@@ -332,7 +369,9 @@ export async function getChatName(larkAppId: string, chatId: string): Promise<st
  * chat) which the user perceives as a loading spinner. Mirrors the TTL
  * cache `getChatMode` already has. */
 interface ChatInfoCacheEntry { name: string | null; mode: ChatMode; cachedAt: number }
-const chatInfoCache = new Map<string, ChatInfoCacheEntry>();
+// Bounded: keyed per (appId, chatId); TTL handles freshness on read, the cap
+// stops the entry count growing with every distinct chat the bot ever touches.
+const chatInfoCache = new BoundedMap<string, ChatInfoCacheEntry>(1000);
 const CHAT_INFO_TTL_MS = 5 * 60 * 1000;
 
 export async function getChatNameAndMode(
@@ -384,7 +423,7 @@ export async function getChatNameAndMode(
  *                perspective (chat-scope by default) */
 export type ChatMode = 'group' | 'topic' | 'p2p';
 
-const chatModeCache = new Map<string, { mode: ChatMode; cachedAt: number }>();
+const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number }>(1000);
 const CHAT_MODE_TTL_MS = 5 * 60 * 1000; // 5 min — chat_mode can change when a group is converted to topic mode
 
 /** Resolve the conversational topology of a chat (话题群 vs 普通群 vs p2p).
@@ -443,6 +482,12 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
     logger.warn(`getChatModeStrict(${chatId}) errored: ${err?.message ?? err}`);
     return 'unknown';
   }
+}
+
+export function getCachedChatMode(larkAppId: string, chatId: string): ChatMode | undefined {
+  const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
+  if (cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
+  return undefined;
 }
 
 export async function getChatMode(
@@ -587,15 +632,16 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
 
   // Fallback: User Token from botmux OAuth (/login)
   const bot = getBot(larkAppId);
-  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret);
+  const brand = normalizeBrand(bot.config.brand);
+  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
   if (!userToken) {
-    throw new Error(
+    throw new UserTokenMissingError(
       `App Token 无法下载此资源，且未找到可用的 User Token。` +
       `请在话题中发送 /login 完成授权后重试。`
     );
   }
 
-  await downloadWithUserToken(userToken, messageId, fileKey, type, savePath);
+  await downloadWithUserToken(userToken, messageId, fileKey, type, savePath, brand);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
@@ -614,14 +660,21 @@ async function downloadWithAppToken(larkAppId: string, messageId: string, fileKe
   await writeResourceToDisk(res, savePath);
 }
 
-async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
-  const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
+async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu'): Promise<void> {
+  const url = `${larkHosts(brand).openApi}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${userToken}` },
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`User Token download failed: HTTP ${res.status} ${body}`);
+    // 401 = the token itself was rejected (expired / wrong scope) → genuinely
+    // needs re-login. Any other status (403/404/4xx/5xx) means the token is
+    // fine but THIS resource can't be fetched (cross-tenant, card image,
+    // withdrawn) — surface as a plain failure so it does NOT trigger /login.
+    if (res.status === 401) {
+      throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login 重新授权后重试。`);
+    }
+    throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
   writeFileSync(savePath, buf);
@@ -1106,6 +1159,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   //   2) Otherwise (no/ambiguous match) → append as an external bot.
   try {
     const observedList = listObservedBots(config.session.dataDir, larkAppId, chatId);
+    const latestObservedByName = new Map<string, (typeof observedList)[number]>();
+    for (const o of observedList) {
+      const existing = latestObservedByName.get(o.name);
+      if (!existing || o.lastSeenAt > existing.lastSeenAt) {
+        latestObservedByName.set(o.name, o);
+      }
+    }
     const seenOpenIds = new Set(configured.map(b => b.openId));
     const norm = (s: string) => s.trim().toLowerCase();
     const byName = new Map<string, number[]>();
@@ -1115,7 +1175,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
       if (arr) arr.push(i); else byName.set(k, [i]);
     });
 
-    for (const o of observedList) {
+    for (const o of latestObservedByName.values()) {
       if (seenOpenIds.has(o.openId)) continue;
       const matches = byName.get(norm(o.name)) ?? [];
       if (matches.length === 1) {

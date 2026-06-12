@@ -8,7 +8,10 @@
 import type { DaemonSession } from './types.js';
 import type { Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { getTerminalProxyPort } from './terminal-url.js';
+import { getTerminalAdvertisedPort } from './terminal-url.js';
+import { getBotBrand } from '../bot-registry.js';
+import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
+import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -24,19 +27,40 @@ export interface SessionRow {
   chatId: string;
   rootMessageId: string;
   threadId?: string;
+  /** Conversation unit ('thread' = topic-anchored, 'chat' = plain chat scope).
+   *  Drives the board's locate button: chat-scope sessions have no topic to
+   *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
+   *  Absent on rows from older daemons → callers keep the locate behavior. */
+  scope?: 'thread' | 'chat';
   title?: string;
   ownerOpenId?: string;
   webPort: number | null;
-  /** Owning daemon's reverse-proxy port (0/undefined if the proxy isn't up).
-   *  When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}. */
+  /** Owning daemon's advertised reverse-proxy port — WEB_EXTERNAL_PORT + botIndex
+   *  when configured, else the bound proxy port (0/undefined if the proxy isn't
+   *  up). When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}.
+   *  Mirrors the port buildTerminalUrl puts in card links so both agree. */
   proxyPort?: number;
   cliVersion?: string;
   hasHistory?: boolean;
   feishuChatLink: string;
+  /** Repo-selection card is waiting for a click — the CLI has not spawned yet.
+   *  Feeds the board view's needs-you column. */
+  pendingRepo?: boolean;
+  /** A TUI prompt card is open and waiting for the user's choice.
+   *  Feeds the board view's needs-you column. */
+  tuiPromptActive?: boolean;
+  /** The agent raised a hand (`botmux send --attention`) — it hit a blocker
+   *  needing human intervention. Carries the human-readable reason so the
+   *  board/overview can show *why* at a glance, plus `at` (epoch ms when it
+   *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
+   *  which a silent raise never bumps. Feeds the needs-you column. */
+  agentAttention?: { kind: string; reason: string; at: number };
+  /** Native Agent CLI token usage for this session. Null means unavailable. */
+  tokenUsage?: SessionTokenUsage | null;
 }
 
-export function feishuChatLink(chatId: string): string {
-  return `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
+  return chatAppLink(chatId, brand);
 }
 
 let cachedBotName = '';
@@ -57,6 +81,15 @@ export function sessionLastActivityAtMs(s: Session): number {
   return parseSessionTime(s.lastMessageAt) ?? sessionCreatedAtMs(s);
 }
 
+function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage | null {
+  return getSessionTokenUsage({
+    cliId: s.cliId ?? 'unknown',
+    sessionId: s.sessionId,
+    cliSessionId: s.cliSessionId,
+    cwd: workingDir ?? s.workingDir,
+  });
+}
+
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
   return {
     sessionId: ds.session.sessionId,
@@ -70,6 +103,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     workingDir: ds.workingDir,
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,
+    scope: ds.session.scope,
     title: ds.session.title,
     // Read from the persisted Session — single source of truth.
     // ds.ownerOpenId is a parallel in-memory copy that gets cleared on
@@ -78,10 +112,16 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     // both fresh and restored sessions.
     ownerOpenId: ds.session.ownerOpenId,
     webPort: ds.workerPort ?? null,
-    proxyPort: getTerminalProxyPort() || undefined,
+    proxyPort: getTerminalAdvertisedPort() || undefined,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
-    feishuChatLink: feishuChatLink(ds.chatId),
+    feishuChatLink: feishuChatLink(ds.chatId, getBotBrand(ds.larkAppId)),
+    pendingRepo: !!ds.pendingRepo,
+    tuiPromptActive: !!ds.tuiPromptCardId,
+    agentAttention: ds.agentAttention
+      ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+      : undefined,
+    tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
   };
 }
 
@@ -99,9 +139,11 @@ export function composeRowFromClosed(s: Session): SessionRow {
     workingDir: s.workingDir,
     chatId: s.chatId,
     rootMessageId: s.rootMessageId,
+    scope: s.scope,
     title: s.title,
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
-    feishuChatLink: feishuChatLink(s.chatId),
+    feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
+    tokenUsage: sessionTokenUsage(s),
   };
 }

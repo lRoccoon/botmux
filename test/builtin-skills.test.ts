@@ -123,6 +123,48 @@ describe('built-in botmux-handoff skill', () => {
   });
 });
 
+describe('built-in botmux-worker-budget skill', () => {
+  it('teaches agents to use the CLI command instead of hand-editing JSON', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux worker-budget status');
+    expect(skill!.content).toContain('botmux worker-budget set --max-live-workers');
+    expect(skill!.content).toContain('botmux worker-budget unset');
+    expect(skill!.content).toContain('不要直接编辑 `~/.botmux/config.json`');
+    expect(skill!.content).toContain('maxLiveWorkers');
+    expect(skill!.content).toContain('idleSuspendMs');
+  });
+});
+
+describe('agent raise-hand folded into botmux-send (--attention)', () => {
+  it('botmux-needs-help is retired, not a standalone skill', () => {
+    expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-needs-help')).toBeUndefined();
+    expect(RETIRED_SKILL_NAMES).toContain('botmux-needs-help');
+  });
+
+  it('botmux-send description mentions --attention so a blocked agent discovers it', () => {
+    const send = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
+    expect(send).toBeDefined();
+    // Skills are matched by DESCRIPTION — the blocked-scenario trigger must live
+    // in the frontmatter, or a stuck agent won't realize send has --attention.
+    const fm = send!.content.split('---')[1] ?? '';
+    expect(fm).toContain('--attention');
+    expect(fm).toMatch(/硬阻碍|需要人|授权/);
+  });
+
+  it('botmux-send body teaches --attention usage + abuse boundaries', () => {
+    const send = BUILTIN_SKILLS.find(s => s.name === 'botmux-send')!;
+    expect(send.content).toContain('botmux send --attention');
+    expect(send.content).toContain('--attention=decision');
+    // non-blocking + auto-clear contract, and steer to ask for option-choices
+    expect(send.content).toContain('非阻塞');
+    expect(send.content).toContain('自动撤下');
+    expect(send.content).toContain('botmux ask');
+    // guards documented: not with --top-level/--chat-id/--into
+    expect(send.content).toContain('--top-level');
+  });
+});
+
 describe('botmux-ask skill 条件兜底（hook 优先 + 非 hook CLI 保留）', () => {
   it('不在 BUILTIN_SKILLS（不再无条件装到所有 CLI）', () => {
     expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-ask')).toBeUndefined();

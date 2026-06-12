@@ -6,7 +6,10 @@
  *
  * Run:  pnpm vitest run test/card-builder.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import {
   buildSessionCard,
   buildStreamingCard,
@@ -18,6 +21,23 @@ import {
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
+import { globalConfigPath } from '../src/global-config.js';
+
+// The terminal button's URL wrapping now depends on the global dashboard
+// setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
+// default → direct URL, opt-in → Feishu sidebar wrapper. Isolate HOME to an
+// empty temp dir so these tests see the DEFAULT (no config.json → direct),
+// independent of whatever the test runner's real ~/.botmux/config.json holds.
+let cardTestHome: string;
+beforeEach(() => {
+  cardTestHome = mkdtempSync(join(tmpdir(), 'botmux-card-builder-'));
+  vi.stubEnv('HOME', cardTestHome);
+  mkdirSync(dirname(globalConfigPath()), { recursive: true });
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(cardTestHome, { recursive: true, force: true });
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -45,6 +65,17 @@ function expectSidebarUrl(actual: string, targetUrl: string): void {
   expect(u.searchParams.get('max_width')).toBe('1200');
   expect(u.searchParams.get('reload')).toBe('false');
   expect(u.searchParams.get('url')).toBe(targetUrl);
+}
+
+/** Default mode: the terminal button links straight to the terminal URL on
+ *  every platform field (no Feishu sidebar wrapper). */
+function expectDirectUrl(actual: string, targetUrl: string): void {
+  expect(actual).toBe(targetUrl);
+}
+
+/** Opt into the Feishu sidebar wrapper for the current (isolated) HOME. */
+function enableOpenTerminalInFeishu(): void {
+  writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { openTerminalInFeishu: true } }));
 }
 
 // ─── getCliDisplayName ────────────────────────────────────────────────────
@@ -140,8 +171,19 @@ describe('buildSessionCard', () => {
       const terminalBtn = actions[0];
       expect(terminalBtn.type).toBe('primary');
       expect(terminalBtn.text.content).toContain('打开终端');
+      expectDirectUrl(terminalBtn.multi_url.url, URL);
+      expectDirectUrl(terminalBtn.multi_url.pc_url, URL);
+      expect(terminalBtn.multi_url.android_url).toBe(URL);
+      expect(terminalBtn.multi_url.ios_url).toBe(URL);
+    });
+
+    it('wraps the terminal link in the Feishu sidebar when openTerminalInFeishu is on', () => {
+      enableOpenTerminalInFeishu();
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
+      const terminalBtn = findActions(card)[0];
       expectSidebarUrl(terminalBtn.multi_url.url, URL);
       expectSidebarUrl(terminalBtn.multi_url.pc_url, URL);
+      // mobile fields stay direct in both modes
       expect(terminalBtn.multi_url.android_url).toBe(URL);
       expect(terminalBtn.multi_url.ios_url).toBe(URL);
     });
@@ -485,8 +527,8 @@ describe('buildStreamingCard', () => {
       const actions = findActions(card);
       const termBtn = actions.find((a: any) => a.multi_url);
       expect(termBtn).toBeDefined();
-      expectSidebarUrl(termBtn.multi_url.url, URL);
-      expectSidebarUrl(termBtn.multi_url.pc_url, URL);
+      expectDirectUrl(termBtn.multi_url.url, URL);
+      expectDirectUrl(termBtn.multi_url.pc_url, URL);
       expect(termBtn.multi_url.android_url).toBe(URL);
       expect(termBtn.multi_url.ios_url).toBe(URL);
       expect(termBtn.type).toBe('primary');
@@ -696,13 +738,52 @@ describe('buildRepoSelectCard', () => {
   // ── Element structure ─────────────────────────────────────────────────
 
   describe('element structure', () => {
-    it('should have 4 top-level elements: div, hr, action, note', () => {
+    it('should have 5 top-level elements: div, hr, action, worktree action, note', () => {
       const card = parse(buildRepoSelectCard(projects));
-      expect(card.elements).toHaveLength(4);
+      expect(card.elements).toHaveLength(5);
       expect(card.elements[0].tag).toBe('div');
       expect(card.elements[1].tag).toBe('hr');
       expect(card.elements[2].tag).toBe('action');
-      expect(card.elements[3].tag).toBe('note');
+      expect(card.elements[3].tag).toBe('action');
+      expect(card.elements[4].tag).toBe('note');
+    });
+  });
+
+  // ── Worktree-open dropdown ─────────────────────────────────────────────
+
+  describe('worktree-open dropdown', () => {
+    function worktreeSelect(card: any): any {
+      const actionEls = card.elements.filter((e: any) => e.tag === 'action');
+      for (const el of actionEls) {
+        const sel = el.actions.find((a: any) => a.value?.key === 'repo_worktree');
+        if (sel) return sel;
+      }
+      return undefined;
+    }
+
+    it('should list only main repos (no existing worktrees)', () => {
+      const card = parse(buildRepoSelectCard(projects));
+      const sel = worktreeSelect(card);
+      expect(sel.options).toHaveLength(2);
+      const labels = sel.options.map((o: any) => o.text.content);
+      expect(labels.join()).toContain('alpha');
+      expect(labels.join()).toContain('gamma');
+      expect(labels.join()).not.toContain('beta');
+    });
+
+    it('should carry the repo path as the option value and root_id in value', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const sel = worktreeSelect(card);
+      expect(sel.options[0].value).toBe('/home/user/alpha');
+      expect(sel.value.root_id).toBe('om_root');
+    });
+
+    it('should be omitted when no main repos exist', () => {
+      const onlyWorktrees: ProjectInfo[] = [
+        { name: 'beta', path: '/home/user/beta', type: 'worktree', branch: 'feat-x' },
+      ];
+      const card = parse(buildRepoSelectCard(onlyWorktrees));
+      expect(worktreeSelect(card)).toBeUndefined();
     });
   });
 
@@ -816,6 +897,34 @@ describe('buildRelayPickerCard', () => {
     expect(input.behaviors[0].type).toBe('callback');
     expect(input.behaviors[0].value.action).toBe('relay_search');
     expect(input.behaviors[0].value.target_chat_id).toBe('oc_target');
+  });
+
+  it('carries target_scope in interactive values (defaults to chat, thread when passed)', () => {
+    // Default → chat-scope (legacy普通群-flat behavior).
+    const flat = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'oc_target', 'ou_invoker_test'));
+    expect(searchInput(flat).behaviors[0].value.target_scope).toBe('chat');
+    expect(containers(flat)[0].behaviors[0].value.target_scope).toBe('chat');
+    // Explicit thread → carried through so the confirm handler routes 话题.
+    const topic = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'om_topic_root', 'ou_invoker_test', undefined, undefined, 'thread'));
+    expect(searchInput(topic).behaviors[0].value.target_scope).toBe('thread');
+    expect(containers(topic)[0].behaviors[0].value.target_scope).toBe('thread');
+    expect(containers(topic)[0].behaviors[0].value.root_id).toBe('om_topic_root');
+  });
+
+  it('carries target_chat_type in interactive values (defaults to group, p2p when passed) and swaps DM copy', () => {
+    // Default → group (legacy behavior + legacy cards).
+    const grp = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'oc_target', 'ou_invoker_test'));
+    expect(searchInput(grp).behaviors[0].value.target_chat_type).toBe('group');
+    expect(containers(grp)[0].behaviors[0].value.target_chat_type).toBe('group');
+    expect(grp.header.title.content).toMatch(/本群|this group/);
+    // p2p → carried through so relay_confirm flips the session chatType; the
+    // header + confirm copy switch to the DM variants.
+    const dm = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_dm', 'om_dm_root', 'ou_invoker_test', undefined, { selectedSessionId: fixtureEntries(1)[0].sessionId }, 'thread', 'p2p'));
+    expect(searchInput(dm).behaviors[0].value.target_chat_type).toBe('p2p');
+    expect(containers(dm)[0].behaviors[0].value.target_chat_type).toBe('p2p');
+    expect(dm.header.title.content).toMatch(/单聊|DM/);
+    const confirmBtn = JSON.stringify(dm.body.elements);
+    expect(confirmBtn).toMatch(/接力到本单聊|into this DM/);
   });
 
   it('renders "no relayable sessions" notice when entries empty (form still shown)', () => {
@@ -1027,8 +1136,8 @@ describe('buildPrivateSnapshotCard', () => {
     expect(actions.sort()).toEqual(['close', 'get_write_link']);
     // open-terminal is a URL button (no callback action)
     const link = btns.find((b: any) => b.multi_url);
-    expectSidebarUrl(link.multi_url.url, 'https://t.example/ro');
-    expectSidebarUrl(link.multi_url.pc_url, 'https://t.example/ro');
+    expectDirectUrl(link.multi_url.url, 'https://t.example/ro');
+    expectDirectUrl(link.multi_url.pc_url, 'https://t.example/ro');
     expect(link.multi_url.android_url).toBe('https://t.example/ro');
     expect(link.multi_url.ios_url).toBe('https://t.example/ro');
     // none of the patch-driven / quick-key controls leak in

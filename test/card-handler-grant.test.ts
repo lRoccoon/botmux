@@ -39,6 +39,11 @@ vi.mock('../src/services/observed-bots-store.js', async (importOriginal) => {
 let configPath: string;
 const deps = { activeSessions: new Map(), sessionReply: vi.fn(async () => 'mid'), lastRepoScan: new Map() } as any;
 
+// 授权成功后，通知卡 / 撤回原卡现在走 fire-and-forget 后台：handleCardAction 先同步返回
+// 「已授权」终态卡（in-place patch），避免 callback 等太久或 deleteMessage 竞态 → 飞书 300000。
+// 一次宏任务（setTimeout 0）会等整条后台微任务链排空，再断言后台副作用（reply/delete）。
+const flushBackground = () => new Promise(resolve => setTimeout(resolve, 0));
+
 async function fresh() {
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
@@ -82,11 +87,12 @@ describe('card-handler grant actions', () => {
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
   });
 
-  it('owner grant_chat WITH card id → @notify + withdraw + persists, returns nothing', async () => {
+  it('owner grant_chat WITH card id → 同步返回终态卡 patch + 后台 @notify + withdraw + persists', async () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(res).toBeUndefined();
+    expect(res?.elements).toBeTruthy();           // 同步先回「已授权」终态卡（避免 callback 超时/竞态 → 300000）
+    await flushBackground();                       // 通知 + 撤卡走后台 fire-and-forget
     expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
     expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
     expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
@@ -175,11 +181,12 @@ describe('card-handler grant actions', () => {
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
   });
 
-  it('owner grant_global → writes globalGrants (not chatGrants/allowedUsers), notifies + withdraws', async () => {
+  it('owner grant_global → writes globalGrants (not chatGrants/allowedUsers), 终态卡 patch + 后台 notify + withdraw', async () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_global', { nonce }, 'om_card'), deps, 'h1');
-    expect(res).toBeUndefined();
+    expect(res?.elements).toBeTruthy();
+    await flushBackground();
     expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
     expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
     const cfg = registry.getBot('h1').config;
@@ -203,11 +210,12 @@ describe('card-handler grant actions', () => {
     return data;
   }
 
-  it('multi grant_chat: 一次授权全部目标 + @通知全部 + 撤卡 + 清 pending', async () => {
+  it('multi grant_chat: 一次授权全部目标 + 终态卡 patch + 后台 @通知全部 + 撤卡 + 清 pending', async () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_a', 'ou_b', 'ou_c']);
     const res = await handler.handleCardAction(multiAction('grant_chat', ['ou_a', 'ou_b', 'ou_c'], nonce, 'om_card'), deps, 'h1');
-    expect(res).toBeUndefined();
+    expect(res?.elements).toBeTruthy();
+    await flushBackground();
     // 通知 @ 了全部三人
     const notify = replyMock.mock.calls.at(-1)![2] as string;
     expect(notify).toContain('ou_a'); expect(notify).toContain('ou_b'); expect(notify).toContain('ou_c');

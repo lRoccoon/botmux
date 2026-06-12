@@ -1,9 +1,13 @@
 export interface PtyHandle {
   write(data: string): void;
-  /** Send text literally via tmux send-keys -l (tmux mode only). */
-  sendText?(text: string): void;
-  /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only). */
-  sendSpecialKeys?(...keys: string[]): void;
+  /** Send text literally via tmux send-keys -l (tmux mode only).
+   *  Returns `false` when the write was dropped (e.g. send-keys failed while the
+   *  pane is still alive) so callers can surface a non-submission; `void`/`true`
+   *  means the write was issued. Backends that can't tell return void. */
+  sendText?(text: string): void | boolean;
+  /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
+   *  Returns `false` on a dropped write (see sendText). */
+  sendSpecialKeys?(...keys: string[]): void | boolean;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
@@ -132,8 +136,15 @@ export interface CliAdapter {
   };
 
   /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
-   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件）。 */
+   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件、
+   *  CoCo 走 ensureAskHook 装插件）。 */
   readonly asksViaHook?: boolean;
+
+  /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
+   *  （CoCo 需要 `coco plugin install`）。声明式写文件的 CLI 用 `hookInstall`；本方法
+   *  与 `hookInstall` 互斥。每个 daemon 生命周期由 ensureCliSkills 调用一次。
+   *  实现内部自行 try/catch，失败只 warn 不抛。 */
+  ensureAskHook?(): void;
 
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
@@ -145,6 +156,15 @@ export interface CliAdapter {
    *
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
+
+  /** Claude-family CLIs only. When true, the adapter injects a `SessionStart`
+   *  hook at spawn (process-level `--settings`) that calls `botmux session-ready`
+   *  once the CLI's input box is genuinely rendered. The worker arms a ready-gate
+   *  on this flag and holds the FIRST prompt until the signal arrives (or a
+   *  fallback timeout), so a startup launcher's selector `❯` — which falsely
+   *  matches `readyPattern` — can't trip an early flush that the selector eats.
+   *  undefined/false → no gate (every other CLI behaves exactly as before). */
+  readonly injectsReadyHook?: boolean;
 
   /** CLI-specific system hints injected into the initial prompt.
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */
@@ -190,14 +210,59 @@ export interface CliAdapter {
    *  data root for forks that set CLAUDE_CONFIG_DIR. */
   readonly claudeStateJsonPath?: string;
 
+  /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
+   *  REAL + writable inside the file sandbox. The sandbox isolates writes (so the
+   *  agent's project edits are reviewable), but a CLI's token refresh / login
+   *  must PERSIST to the real auth — otherwise the sandboxed CLI loses its login
+   *  (see seed's `bytecloud-auth`). The sandbox binds each existing path rw over
+   *  the isolated overlay so auth reads/refreshes/logins hit the real files.
+   *  `~` is expanded. Keep NARROW (auth only) so session history stays isolated.
+   *  undefined / empty → no carve-out. */
+  readonly authPaths?: readonly string[];
+
   /** Extra env merged into the spawned child's environment. Used by Claude-family
    *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).
    *  Keys placed here are also forwarded through the tmux backend (see
    *  BOTMUX_INJECTED_ENV_KEYS). undefined → inherit the worker env unchanged. */
   readonly spawnEnv?: Readonly<Record<string, string>>;
 
+  /** Optional: pre-flight check for resume targets.
+   *
+   *  Called with `resume=true` before spawn so a missing conversation JSONL /
+   *  rollout / DB entry does not produce a CLI-level "No conversation found"
+   *  exit code 1 — which would otherwise be amplified into an auto-restart
+   *  crash loop by the daemon's claude_exit handler.
+   *
+   *  Return `true` = resume target looks present (spawn normally with --resume).
+   *  Return `false` = target is provably missing → worker will fall back to a
+   *  FRESH session (resume=false, drop cliSessionId, log + user_notify once).
+   *  Return `undefined` / omit = adapter cannot tell cheaply → rely on the
+   *  worker's SECONDARY guard (2nd restart forces fresh) so unknown-shape CLIs
+   *  still degrade without crash-looping.
+   *
+   *  Must be synchronous, cheap, and conservative. An adapter that can verify
+   *  the resume target without spawning a subprocess implements this; others
+   *  simply leave it undefined (the secondary guard is always active). */
+  checkResumeTargetExists?(opts: {
+    sessionId: string;
+    /** CLI-native session id from session.cliSessionId, when available. */
+    cliSessionId?: string;
+    /** Working directory the CLI will spawn in. Used by Claude-family to
+     *  locate <projects>/<cwdHash>/<id>.jsonl. */
+    workingDir?: string;
+    /** Claude-family data dir (~/.claude, ~/.claude-runtime, …) so the probe
+     *  targets the SAME root the adapter will actually write into. */
+    dataDir?: string;
+  }): boolean | undefined;
+
   /** Optional CLI version command override. Defaults to `[resolvedBin, '--version']`. */
   versionCommand?(): { bin: string; args: string[] };
+
+  /** Slash commands this CLI natively supports and botmux should pass through
+   *  by default for this adapter. Unlike the global passthrough allowlist, these
+   *  are scoped to the current CLI so unsupported commands do not leak to other
+   *  adapters. */
+  readonly defaultPassthroughCommands?: readonly string[];
 }
 
-export type CliId = 'claude-code' | 'seed' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'traex' | 'pi';
+export type CliId = 'claude-code' | 'seed' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi';

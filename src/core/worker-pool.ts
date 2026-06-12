@@ -5,7 +5,8 @@
 import { fork, execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { installHook } from '../adapters/hook-installer.js';
@@ -13,7 +14,8 @@ import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
-import { persistStreamCardState } from './session-manager.js';
+import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
+import { fallbackTurnId } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -26,10 +28,15 @@ import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession } from './persistent-backend.js';
 import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
+import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import { composeRowFromActive } from './dashboard-rows.js';
+import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
+import { publishAttentionPatch } from './session-activity.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
+import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
+import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
@@ -45,7 +52,7 @@ const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
 export interface WorkerPoolCallbacks {
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
@@ -190,11 +197,26 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
 }
 
-function daemonCardFooterRecipientOpenId(ds: DaemonSession): string | undefined {
+function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
   const owner = ds.session.ownerOpenId;
-  if (!owner) return undefined;
+  if (!owner) {
+    // Mira runs through botmux's API runner and cannot execute `botmux send`
+    // itself. For bot-to-bot handoffs, address the daemon fallback card back
+    // to the original dispatcher so orchestration resumes.
+    if (effectiveCliId === 'mira' && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+      return ds.session.creatorOpenId;
+    }
+    return undefined;
+  }
   try {
-    return loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner) ? undefined : owner;
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner)) {
+      // `/repo`-primed dispatch records the dispatching bot as owner (unlike
+      // the @-mention auto-create path, which nulls ownerOpenId for bot
+      // senders). Same Mira constraint applies: the daemon fallback is Mira's
+      // only reply channel, so address the dispatcher bot here too.
+      return effectiveCliId === 'mira' ? owner : undefined;
+    }
+    return owner;
   } catch {
     return owner;
   }
@@ -387,7 +409,7 @@ export function recallFrozenCards(ds: DaemonSession): void {
  */
 export async function postFreshStreamingCard(
   ds: DaemonSession,
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>,
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
 ): Promise<boolean> {
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port) return false;
@@ -427,7 +449,7 @@ export async function postFreshStreamingCard(
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
-    ds.streamCardId = await sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
+    ds.streamCardId = await sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId, ds.currentReplyTarget?.turnId);
     // This card is now the live one for the current turn. Clear the new-turn
     // pending flag so the next screen_update PATCHes it instead of POSTing a
     // duplicate (the gate above only suppresses cards when disabled+unforced;
@@ -548,12 +570,104 @@ export async function deliverWriteLinkCard(
   }
 }
 
+export interface WriteLinkOwnerDelivery {
+  ok: boolean;
+  error?: 'terminal_unavailable' | 'no_owner' | 'delivery_failed';
+  delivered: number;
+  total: number;
+  channels: Array<'ephemeral' | 'dm' | 'failed'>;
+}
+
+/**
+ * Build the write-enabled session card (writable terminal URL + manage buttons)
+ * for `ds`, or null when the terminal isn't up yet (no worker port/token).
+ * Shared by the owner-fanout ({@link deliverWriteLinkCardToOwners}, behind
+ * `botmux term-link`) and the single-operator delivery
+ * ({@link deliverWritableTerminalCardTo}, behind the `/term` slash command).
+ */
+function buildWritableTerminalCard(ds: DaemonSession): string | null {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port || !ds.workerToken) return null;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  return buildSessionCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    buildTerminalUrl(ds, { write: true }),
+    ds.session.title || getCliDisplayName(effectiveCliId),
+    effectiveCliId,
+    true,             // showManageButtons — write-link card includes restart & close
+    !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+    localeForBot(ds.larkAppId),
+  );
+}
+
+/**
+ * Build the write-enabled session card for `ds` and deliver it privately to the
+ * bot's owner(s) — the payload behind the `botmux term-link` CLI command.
+ *
+ * Mirrors the in-chat "🔑 获取操作链接" button flow ({@link deliverWriteLinkCard}),
+ * but fans out to the owner audience ({@link resolvePrivateCardAudience}) instead
+ * of a single click-operator: a CLI caller has no Lark identity, so "deliver to
+ * the owner(s)" is the closest equivalent of "deliver to the person who asked".
+ * Each owner gets an in-chat visible-to-you ephemeral card, auto-falling back to
+ * a private DM in topic / p2p chats. The write token therefore only ever rides
+ * these private channels — it is never returned to the CLI caller / stdout.
+ */
+export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<WriteLinkOwnerDelivery> {
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) return { ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] };
+
+  const audience = resolvePrivateCardAudience(ds);
+  if (audience.length === 0) return { ok: false, error: 'no_owner', delivered: 0, total: 0, channels: [] };
+
+  const channels: Array<'ephemeral' | 'dm' | 'failed'> = [];
+  // Cap concurrency like postPrivateSnapshotCard (Feishu ephemeral ~50/s total).
+  const CONCURRENCY = 5;
+  for (let i = 0; i < audience.length; i += CONCURRENCY) {
+    const batch = audience.slice(i, i + CONCURRENCY);
+    channels.push(...await Promise.all(batch.map(openId => deliverWriteLinkCard(ds, openId, cardJson))));
+  }
+  const delivered = channels.filter(c => c !== 'failed').length;
+  return {
+    ok: delivered > 0,
+    error: delivered > 0 ? undefined : 'delivery_failed',
+    delivered,
+    total: audience.length,
+    channels,
+  };
+}
+
+/**
+ * Deliver the writable-terminal card privately to a single operator — the `/term`
+ * slash command's payload (the owner who typed it; owner-gated in command-handler).
+ * Same private ephemeral→DM channel as the "🔑 获取操作链接" card button. Returns
+ * 'not_ready' when the terminal isn't up yet, else the channel actually used.
+ */
+export async function deliverWritableTerminalCardTo(
+  ds: DaemonSession,
+  operatorOpenId: string,
+): Promise<'ephemeral' | 'dm' | 'failed' | 'not_ready'> {
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) return 'not_ready';
+  return deliverWriteLinkCard(ds, operatorOpenId, cardJson);
+}
+
 /**
  * Deliver a status confirmation (restart / session-closed / resume) as a
  * "visible-to-the-operator-only" ephemeral message in a plain group; on failure
  * (topic groups reject with 18053) or in p2p, fall back to the normal visible
  * reply (`reply`). `content` is the card JSON when msgType==='interactive',
  * otherwise the plain text. Topic-group / p2p behavior is unchanged.
+ *
+ * IMPORTANT: ephemeral is only attempted for flat **chat-scope** sessions. The
+ * ephemeral API (`ephemeral/v1/send`) takes a `chat_id` only — it has no
+ * thread/root anchoring — so for a **thread-scope** session (a 话题 inside a
+ * 普通群, or a 话题群 topic) an ephemeral card would escape the topic and land at
+ * the group top-level. 话题群 happened to reject ephemeral with 18053 and fall
+ * back to the in-thread reply, but a 话题 inside a 普通群 succeeds and leaks the
+ * card out of the thread. So thread-scope sessions always take the visible
+ * `reply()` path, which routes back into the thread (`reply_in_thread`).
  */
 export async function deliverEphemeralOrReply(
   ds: DaemonSession,
@@ -562,7 +676,7 @@ export async function deliverEphemeralOrReply(
   msgType: 'text' | 'interactive',
   reply: () => Promise<unknown>,
 ): Promise<void> {
-  if (operatorOpenId && ds.chatType !== 'p2p') {
+  if (operatorOpenId && ds.chatType !== 'p2p' && ds.scope === 'chat') {
     try {
       // The ephemeral API is card-only (msg_type=text → 10003), so wrap a plain
       // confirmation line into a minimal markdown card.
@@ -677,6 +791,12 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
     catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   }
+  // 命令式 hook 安装（CoCo 走 `coco plugin install`，纯写文件搞不定）。内部自带
+  // try/catch，失败只 warn；与 hookInstall 互斥。
+  if (adapter.ensureAskHook) {
+    try { adapter.ensureAskHook(); }
+    catch (err) { logger.warn(`[hook] ensureAskHook failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+  }
   // botmux-ask 落在与其它 skill 同一目录：plugin 模式下是 {pluginDir}/skills。
   const askSkillsDir = adapter.pluginDir ? join(adapter.pluginDir, 'skills') : adapter.skillsDir;
   ensureAskSkill(cliId, askSkillsDir, !adapter.asksViaHook);
@@ -710,7 +830,9 @@ function removeJsonKey(configPath: string, pathSegments: string[], keyToRemove: 
     }
     if (!node || typeof node !== 'object' || !(keyToRemove in node)) return false;
     delete node[keyToRemove];
-    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    // 原子写：这里改的是外部 CLI 自己的热配置文件（如 ~/.claude.json），
+    // 裸写半截会弄坏 CLI 的状态。
+    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
     return true;
   } catch {
     return false;
@@ -839,7 +961,9 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
     if (entry.hasTrustDialogAccepted === true) return; // already trusted — skip write
 
     entry.hasTrustDialogAccepted = true;
-    writeFileSync(configPath, JSON.stringify(data, null, 2));
+    // 原子写：~/.claude.json 是 Claude Code 的热状态文件，所有并发 claude
+    // 实例都在读写，裸写半截会弄坏它们的状态。
+    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
     logger.info(`[claude-trust] Pre-accepted folder trust for ${canonical}`);
   } catch (err) {
     logger.debug(`[claude-trust] seed failed (ignored): ${err}`);
@@ -850,7 +974,16 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(ds: DaemonSession): void {
   clearUsageLimitState(ds);
-  if (!ds.worker || ds.worker.killed) return;
+  if (!ds.worker || ds.worker.killed) {
+    // No live worker to receive {type:'close'}, so its destroySession() — which
+    // tears down the persistent backing session (tmux/herdr/zellij) — never
+    // fires. Those sessions survive a worker exit BY DESIGN (idle-suspend /
+    // lazy-restore keep the CLI alive for later resume), so /close on such a
+    // session would leave an orphaned CLI running in tmux that still replies.
+    // Destroy the backing session directly here so /close always terminates it.
+    destroyOrphanedBackingSession(ds);
+    return;
+  }
   try {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
   } catch { /* IPC already closed */ }
@@ -859,6 +992,58 @@ export function killWorker(ds: DaemonSession): void {
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+}
+
+/**
+ * Tear down a persistent backing session (tmux/herdr/zellij) directly from the
+ * daemon when there is no live worker to do it via the 'close' IPC. The session
+ * name is deterministic from the session UUID, and each killSession() is a no-op
+ * if the session is already gone.
+ *
+ * Adopt sessions are skipped: botmux never owned the user's pane (ownsSession is
+ * false worker-side too), so killing it would violate the bridge invariant of
+ * leaving the user's own CLI untouched.
+ */
+function destroyOrphanedBackingSession(ds: DaemonSession): void {
+  if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
+  const backendType = getSessionPersistentBackendType(ds);
+  if (!backendType) return;
+  try {
+    killPersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId));
+    logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
+  } catch (err) {
+    logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
+  }
+}
+
+export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
+  if (!ds.worker || ds.worker.killed) return false;
+  if (!isSuspendableBackendType(ds.initConfig?.backendType)) return false;
+
+  const w = ds.worker;
+  try {
+    w.send({ type: 'suspend' } as DaemonToWorker);
+  } catch {
+    try { w.kill('SIGTERM'); } catch { /* already gone */ }
+  }
+  armWorkerKillBackstop(w, tag(ds));
+
+  ds.worker = null;
+  ds.workerPort = null;
+  ds.workerToken = null;
+  ds.session.webPort = undefined;
+  sessionStore.updateSessionPid(ds.session.sessionId, null);
+  sessionStore.updateSession(ds.session);
+
+  if (!ds.exitEventEmitted) {
+    ds.exitEventEmitted = true;
+    dashboardEventBus.publish({
+      type: 'session.exited',
+      body: { sessionId: ds.session.sessionId, reason },
+    });
+  }
+  logger.info(`[${tag(ds)}] Worker suspended (${reason}); session remains active`);
+  return true;
 }
 
 function armWorkerKillBackstop(w: ChildProcess, label: string): void {
@@ -896,7 +1081,13 @@ export async function closeSession(
 ): Promise<{ ok: true; alreadyClosed: boolean }> {
   const ds = findActiveBySessionId(sessionId);
   let killedLive = false;
+  // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
+  // 生命周期内永久占位（restartCounts 此前无任何 delete）。
+  restartCounts.delete(sessionId);
   if (ds) {
+    // Usage ledger: flush the final delta before the worker goes away (a
+    // crash/limited turn may never have reached an idle edge).
+    recordUsageForDaemonSession(ds);
     killWorker(ds);
     activeSessionsRegistry?.delete(sessionKey(sessionAnchorId(ds), ds.larkAppId));
     killedLive = true;
@@ -906,6 +1097,7 @@ export async function closeSession(
         type: 'session.exited',
         body: { sessionId, reason: 'dashboard_close' },
       });
+      emitSessionLifecycleHook(ds, 'session.exit', { reason: 'dashboard_close' });
     }
   }
 
@@ -922,6 +1114,7 @@ export async function closeSession(
         patch: {
           status: 'closed',
           closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
+          tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
         },
       },
     });
@@ -1007,15 +1200,30 @@ export async function transferSession(
   targetChatId: string,
   targetRootMessageId: string,
   /**
-   * Target chat type — narrowed to `'group'` at the type level. The picker-
-   * mode entry guard in command-handler.ts refuses p2p and topic chats
-   * upfront; `/relay --create` builds the target by createGroupWithBots so
-   * it's a regular group by construction; the cross-daemon migrate-to-chat
-   * IPC inherits the same target. Every call site can vouch — TS prevents
-   * any non-'group' literal from reaching here, and the runtime check just
-   * below catches mock data / future bypasses.
+   * Target chat type.
+   *   'group' → topic groups are supported via `targetScope: 'thread'`;
+   *             `/relay --create` builds the target by createGroupWithBots so
+   *             it's a regular group by construction; the cross-daemon
+   *             migrate-to-chat IPC inherits the same target.
+   *   'p2p'   → the bot's DM. Flat DMs (p2pMode 'chat') land chat-scope on the
+   *             chatId anchor; thread-mode DMs land thread-scope on a DM 话题
+   *             root. The session's chatType flips with the move so post-relay
+   *             inbound routing / picker labels / reply targeting treat it as
+   *             a DM. Carried from the picker card's `target_chat_type`.
+   * The runtime check just below catches raw-string casting at module
+   * boundaries (mocks, HTTP body parses, future bypasses).
    */
-  targetChatType: 'group',
+  targetChatType: 'group' | 'p2p',
+  /**
+   * Target routing scope for the relayed session.
+   *   'chat'   → anchor = chatId (flat top-level; `/relay --create`, migrate
+   *              IPC, and普通群 flat-mode picker all use this — current behavior).
+   *   'thread' → anchor = `targetRootMessageId` (a Lark 话题/thread); replies
+   *              go reply_in_thread. Picker computes this via
+   *              resolveRelayTargetRouting for 话题群 / new-topic / shared /
+   *              线程内回复.
+   */
+  targetScope: 'thread' | 'chat',
   opts?: {
     /** @internal Override for tests — the real implementation forks a child
      *  process and tries to attach to tmux, neither of which is appropriate
@@ -1027,12 +1235,19 @@ export async function transferSession(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   // Depth defense — unreachable per TS narrowing above, but guards against
   // raw-string casting at module boundaries (mocks, HTTP body parses, etc.).
-  if ((targetChatType as string) !== 'group') {
+  if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
   }
   const ds = findActiveBySessionId(sessionId);
   if (!ds) return { ok: false, error: 'session_not_active' };
-  if (targetChatId === ds.chatId) return { ok: false, error: 'same_chat' };
+  // Anchor-based identity. A thread-scope session in the SAME chat (different
+  // root) is a legitimate cross-topic move, so we refuse only when the target
+  // anchor equals the source anchor (relaying a session onto itself). Replaces
+  // the old `targetChatId === ds.chatId → same_chat` check, which would have
+  // blocked同群话题间搬运.
+  const sourceAnchor = sessionAnchorId(ds);
+  const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootMessageId;
+  if (targetAnchor === sourceAnchor) return { ok: false, error: 'same_anchor' };
 
   // pendingRepo: the user created a session via M0 but hasn't picked a repo
   // yet, so worker is null and the CLI has never run. Relaying produces an
@@ -1066,8 +1281,8 @@ export async function transferSession(
     return { ok: false, error: 'worker_busy' };
   }
 
-  // Existing-session guard: a chat-scope session at the target chatId would
-  // collide on sessionKey(targetChatId, larkAppId) after the rewrite, and
+  // Existing-session guard: a session sharing the *target anchor* would
+  // collide on sessionKey(targetAnchor, larkAppId) after the rewrite, and
   // Map.set would silently orphan the prior entry's worker. We split the
   // collision predicate two ways:
   //   - real session (worker !== null): refuse the transfer
@@ -1078,15 +1293,15 @@ export async function transferSession(
   //     transfer Map.set doesn't silently overwrite it (which leaves the
   //     scratch as a ghost-active on next daemon restart — exact bug we're
   //     fixing).
-  // We only check chat-scope entries — thread-scope sessions in the same
-  // chat are keyed by rootMessageId, so they don't collide.
+  // Anchor-based: chat-scope anchors on chatId, thread-scope on rootMessageId.
+  // Only a session at the target anchor collides — same-chat other-topic
+  // sessions have a different anchor and are fine (enables同群话题间搬运).
   const scratchesToClose: string[] = [];
   if (activeSessionsRegistry) {
     for (const existing of activeSessionsRegistry.values()) {
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
-      if (existing.chatId !== targetChatId) continue;
-      if (existing.scope !== 'chat') continue;
+      if (sessionAnchorId(existing) !== targetAnchor) continue;
       if (!existing.worker) {
         scratchesToClose.push(existing.session.sessionId);
         continue;
@@ -1135,12 +1350,16 @@ export async function transferSession(
   kw(ds);
   activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
 
-  // Rewrite routing fields. Target chat is always chat-scope: leader posts a
-  // notification message (M1) used as `targetRootMessageId` for trace, but
-  // chat-scope routes by chatId anyway, so M1 is purely audit/UX.
+  // Rewrite routing fields per the requested target scope.
+  //   chat-scope:   routes by chatId; `targetRootMessageId` (e.g. an M1 id) is
+  //                 stored on rootMessageId but is purely audit/UX.
+  //   thread-scope: routes by rootMessageId; `targetRootMessageId` IS the
+  //                 routing anchor (the Lark 话题 root) — replies reply_in_thread
+  //                 to it, and future inbound messages in that 话题 resolve to
+  //                 the same anchor.
   ds.session.chatId = targetChatId;
   ds.session.rootMessageId = targetRootMessageId;
-  ds.session.scope = 'chat';
+  ds.session.scope = targetScope;
   ds.session.chatType = targetChatType;
   ds.session.lastMessageAt = new Date().toISOString();
   // Card state was pinned to the source chat — clear so the new worker posts
@@ -1153,7 +1372,7 @@ export async function transferSession(
   // Mirror onto runtime DaemonSession.
   ds.chatId = targetChatId;
   ds.chatType = targetChatType;
-  ds.scope = 'chat';
+  ds.scope = targetScope;
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
   ds.currentImageKey = undefined;
@@ -1172,7 +1391,7 @@ export async function transferSession(
       patch: {
         chatId: targetChatId,
         rootMessageId: targetRootMessageId,
-        scope: 'chat',
+        scope: targetScope,
         chatType: targetChatType,
       },
     },
@@ -1204,6 +1423,22 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const rawCwd = cb.getSessionWorkingDir(ds);
   const cwd = rawCwd && existsSync(rawCwd) ? rawCwd : homedir();
   if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — falling back to ${cwd}`);
+
+  // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
+  // restore — so toggling the live bot flag never retroactively (un)sandboxes a
+  // historical session. A brand-new session (resume=false) with no recorded
+  // decision adopts the live bot flag; a restore (resume=true) with no recorded
+  // decision predates the sandbox feature → stays NOT sandboxed.
+  if (ds.session.sandbox === undefined) {
+    if (!resume) {
+      ds.session.sandbox = botCfg.sandbox === true;
+      ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
+    } else {
+      ds.session.sandbox = false;
+      ds.session.sandboxHidePaths = [];
+    }
+    sessionStore.updateSession(ds.session);
+  }
 
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
@@ -1278,6 +1513,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     cliPathOverride: botCfg.cliPathOverride,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    // Use the decision recorded on the session (above), NOT the live bot flag, so
+    // historical sessions never get retroactively sandboxed on restart.
+    sandbox: ds.session.sandbox === true,
+    sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
@@ -1286,9 +1525,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
+    brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
+    turnId: ds.currentReplyTarget?.turnId,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -1319,6 +1560,17 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  emitSessionLifecycleHook(ds, 'session.start', {
+    reason: resume ? 'resume' : 'worker_spawn',
+    pid: worker.pid ?? null,
+  });
+  // Usage ledger: fresh spawns anchor the baseline so pre-existing transcript
+  // history is never billed. Restores reconcile instead — an in-flight turn
+  // may have completed inside tmux while the daemon was down, and that work
+  // was submitted by botmux (anchoring would swallow it).
+  if (resume) reconcileUsageForDaemonSession(ds);
+  else anchorUsageForDaemonSession(ds);
+  recordOwnershipForDaemonSession(ds);
 }
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
@@ -1326,6 +1578,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  // Worker messages without a turn of their own (first streaming card, crash
+  // notices) anchor to the session's current reply-target turn so a shared
+  // fold-back topic keeps them in-thread instead of leaking top-level.
+  const scopedReply = (content: string, msgType?: string, turnId?: string) =>
+    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, fallbackTurnId(ds, turnId));
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
@@ -1366,6 +1623,16 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // terminal + dashboard keep working.)
         if (streamingCardDisabled(ds)) {
           logger.info(`[${t}] Streaming card disabled for this bot — skipping card post`);
+          break;
+        }
+
+        // Restart recovery: stay silent in the group. The session was restored
+        // after a daemon restart; don't auto-post/patch a streaming card here.
+        // The owner gets a private DM summary instead, and the surviving card
+        // (if any) is left untouched. The next real user turn clears this flag
+        // (rememberLastCliInput) and the normal card flow resumes.
+        if (ds.suppressRecoveryCard) {
+          logger.info(`[${t}] Restored session — suppressing recovery streaming card (silent restart)`);
           break;
         }
 
@@ -1458,7 +1725,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             initStatus === 'limited' ? ds.usageLimit : undefined,
             writableTerminalLinkFor(ds),
           );
-          ds.streamCardId = await cb.sessionReply(sessionAnchorId(ds), streamCardJson, 'interactive', ds.larkAppId);
+          ds.streamCardId = await scopedReply(streamCardJson, 'interactive', msg.turnId);
           // This card IS the current turn's live card — clear the new-turn flag
           // so subsequent screen_updates PATCH it (starting → working) instead of
           // POSTing a second card. Without this, a re-fork that happens while
@@ -1500,7 +1767,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               !!ds.adoptedFrom,
               loc,
             );
-            await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
+            await scopedReply(cardJson, 'interactive', msg.turnId);
           } catch (fallbackErr) {
             if (fallbackErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -1517,12 +1784,34 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
+        if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
+          const rawInput = ds.pendingRawInput;
+          ds.pendingRawInput = undefined;
+          // Input buffered while the repo card was pending rides on the SAME
+          // IPC: worker message handlers run concurrently (async handlers
+          // don't serialize), so a separate `message` IPC could write into
+          // the PTY during raw_input's 200ms text→Enter beat. The worker
+          // enqueues followUpContent only after the Enter landed.
+          const followUp = ds.pendingFollowUpInput;
+          ds.pendingFollowUpInput = undefined;
+          ds.worker.send({
+            type: 'raw_input',
+            content: rawInput,
+            followUpContent: followUp?.cliInput,
+          } as DaemonToWorker);
+          logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
+          if (followUp) rememberLastCliInput(ds, followUp.userPrompt, followUp.cliInput);
+        }
         break;
       }
 
       case 'cli_session_id': {
         ds.session.cliSessionId = msg.cliSessionId;
         sessionStore.updateSession(ds.session);
+        // Usage ledger: publish ownership the moment the CLI-native session id
+        // is known, so consumers exclude this session from native parsers
+        // before its first positive-delta record exists.
+        recordOwnershipForDaemonSession(ds);
         break;
       }
 
@@ -1546,14 +1835,29 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               patch: {
                 status: ds.lastScreenStatus,
                 lastMessageAt: ds.lastMessageAt,
+                tokenUsage: composeRowFromActive(ds).tokenUsage,
               },
             },
           });
+          emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
+            source: 'screen_update',
+            content: msg.content,
+          });
+          // Usage ledger: idle/limited edges are turn boundaries — append the
+          // token delta accrued during the turn that just finished.
+          if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
+            recordUsageForDaemonSession(ds);
+          }
         }
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card.
         if (streamingCardDisabled(ds)) break;
+
+        // Restart recovery: a restored worker may emit screen updates as the CLI
+        // redraws on resume. Stay silent (no post/patch) until the first real
+        // user turn clears the flag. Dashboard SSE above still reflects status.
+        if (ds.suppressRecoveryCard) break;
 
         const readUrl = buildTerminalUrl(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
@@ -1591,7 +1895,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // not POSTed as duplicate cards.
           ds.streamCardPending = false;
           ds.streamCardId = CARD_POSTING_SENTINEL;
-          cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId)
+          scopedReply(cardJson, 'interactive', msg.turnId)
             .then(msgId => {
               ds.streamCardId = msgId;
               persistStreamCardState(ds);
@@ -1645,8 +1949,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
         ds.currentImageKey = msg.imageKey;
+        const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
+          source: 'screenshot_uploaded',
+          imageKey: msg.imageKey,
+          content: ds.lastScreenContent ?? '',
+        });
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
@@ -1684,6 +1994,18 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         ds.tuiPromptOptions = msg.options;
         ds.tuiPromptMultiSelect = msg.multiSelect;
         ds.tuiToggledIndices = [];
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'tui_prompt',
+          description: msg.description,
+          optionsCount: msg.options.length,
+          optionsPreview: msg.options.slice(0, 5).map(option => ({
+            text: option.text,
+            label: option.label,
+            type: option.type,
+            selected: option.selected,
+          })),
+          multiSelect: msg.multiSelect,
+        });
         const prevTuiTurnTitle = ds.currentTurnTitle;
         ds.currentTurnTitle = msg.description;  // store for card PATCH on toggle
         if (prevTuiTurnTitle !== ds.currentTurnTitle) {
@@ -1705,8 +2027,9 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             undefined,
             loc,
           );
-          const cardMsgId = await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
+          const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
           ds.tuiPromptCardId = cardMsgId;
+          publishAttentionPatch(ds);
         } catch (err) {
           logger.warn(`[${t}] Failed to post TUI prompt card: ${err}`);
         }
@@ -1723,6 +2046,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           );
           ds.tuiPromptCardId = undefined;
           ds.tuiPromptOptions = undefined;
+          publishAttentionPatch(ds);
         }
         break;
       }
@@ -1754,7 +2078,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // leave status='active' and still get the notice.
           if (ds.session.status !== 'closed') {
             try {
-              await cb.sessionReply(sessionAnchorId(ds), tr('worker.adopted_session_exited', undefined, loc), 'text', ds.larkAppId);
+              await scopedReply(tr('worker.adopted_session_exited', undefined, loc), 'text', undefined);
             } catch { /* best effort */ }
           }
           break;
@@ -1787,7 +2111,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           killWorker(ds);
           const cliName = getCliDisplayName(effectiveCliId);
           try {
-            await cb.sessionReply(sessionAnchorId(ds), tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc), 'text', ds.larkAppId);
+            await scopedReply(tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc), 'text', undefined);
           } catch (replyErr) {
             if (replyErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -1812,8 +2136,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'user_notify',
+          message: msg.message,
+        });
         try {
-          await cb.sessionReply(sessionAnchorId(ds), msg.message, 'text', ds.larkAppId);
+          await scopedReply(msg.message, 'text', msg.turnId);
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
         }
@@ -1849,16 +2177,17 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           break;
         }
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
-        const recipientOpenId = daemonCardFooterRecipientOpenId(ds);
+        const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         const cardJson = buildContextualReplyCard({
-          title: '📜 /adopt 前最后一轮',
+          title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
           assistantText: msg.assistantText,
           assistantLabel: getCliDisplayName(effectiveCliId),
           recipientOpenId,
           brand: resolveBrandLabel(ds.larkAppId),
+          locale: localeForBot(ds.larkAppId),
         });
-        cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId).catch((err: any) => {
+        scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
         });
         break;
@@ -1886,6 +2215,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           reason: code === 0 ? 'graceful' : `exit_code_${code}`,
         },
       });
+      emitSessionLifecycleHook(ds, 'session.exit', {
+        reason: code === 0 ? 'graceful' : `exit_code_${code}`,
+        code,
+      });
     }
   });
 }
@@ -1909,6 +2242,8 @@ function deliverFinalOutput(
 ): void {
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const scopedReply = (content: string, msgType?: string, turnId?: string) =>
+    cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, fallbackTurnId(ds, turnId));
   setTimeout(async () => {
     let pendingCardId: string | undefined;
     let pendingQuoteTargetId: string | undefined;
@@ -1931,26 +2266,27 @@ function deliverFinalOutput(
       // they use the contextual card so the user prompt sits in a
       // blockquote and only the assistant body goes through full markdown
       // rendering.
-      const recipientOpenId = daemonCardFooterRecipientOpenId(ds);
+      const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
-              ? '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）'
-              : '🖥️ 终端本地对话（在 adopted pane 中直接输入，已同步至飞书）',
+              ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
+              : tr('card.local_turn', undefined, localeForBot(ds.larkAppId)),
             userText: msg.kind === 'local-turn' ? msg.userText ?? '' : undefined,
             assistantText: msg.content,
             assistantLabel: getCliDisplayName(effectiveCliId),
             recipientOpenId,
             brand: resolveBrandLabel(ds.larkAppId),
+            locale: localeForBot(ds.larkAppId),
           })
-        : buildMarkdownCard(msg.content, recipientOpenId, resolveBrandLabel(ds.larkAppId));
+        : buildMarkdownCard(msg.content, recipientOpenId, resolveBrandLabel(ds.larkAppId), localeForBot(ds.larkAppId));
 
       pendingCardId = lockedPendingCardId ?? claimPendingResponseCard(ds.session);
       pendingQuoteTargetId = lockedQuoteTargetId ?? ds.session.quoteTargetId;
       if (pendingCardId) {
         try {
           if (ds.session.pendingResponseCardId !== pendingCardId) {
-            await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
+            await scopedReply(cardJson, 'interactive', msg.turnId);
           } else {
             writePendingResponsePatchMarker(ds.session.sessionId, pendingCardId);
             await updateMessage(ds.larkAppId, pendingCardId, cardJson);
@@ -1968,13 +2304,13 @@ function deliverFinalOutput(
           clearPendingResponsePatchMarker(ds.session.sessionId);
           if (!(err instanceof MessageWithdrawnError)) throw err;
           logger.warn(`[${t}] Pending response card withdrawn while forwarding final_output; sending a new reply`);
-          await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
+          await scopedReply(cardJson, 'interactive', msg.turnId);
           markPendingResponseCardPatchedIfCurrent(ds.session, pendingCardId);
           syncPendingResponseState(ds, ds.session);
           sessionStore.updateSession(ds.session);
         }
       } else {
-        await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
+        await scopedReply(cardJson, 'interactive', msg.turnId);
       }
       ds.lastBridgeEmittedUuid = msg.lastUuid;
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
@@ -2073,12 +2409,17 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //   - codex: worker resolves the rollout path either from cliSessionId
   //     (passed below when known) or by reading the Codex pid's open fds
   //     in /proc — so we always pass the pid for codex adopt.
+  //   - traex: same rollout strategy as codex (byte-identical JSONL format),
+  //     only the directory layout (~/.trae/cli/sessions) and finders differ.
   //   - coco: events.jsonl path is `~/.cache/coco/sessions/<sid>/events.jsonl`,
   //     deterministic from cliSessionId. PID is the fallback when discovery
   //     missed (events.jsonl isn't held open continuously, so worker may need
   //     to re-probe via session.log / traces.jsonl fds).
   //   - mtr: worker tails MTR's sqlite transcript, resolving by native sid
   //     when discovery has one or by adopted cwd as a fallback.
+  //   - cursor: worker maps the adopt pid → its open store.db fd → chatId →
+  //     the append-only agent-transcript JSONL, then harvests final replies
+  //     from there (cursor-agent never calls `botmux send`).
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   if (adopted.source === 'herdr' && adoptedCliId === 'claude-code' && !adopted.sessionId) {
@@ -2097,7 +2438,11 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     adoptedCliId === 'claude-code' && adopted.sessionId
       ? claudeJsonlPathForSession(adopted.sessionId, adopted.cwd)
       : undefined;
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr';
+  // cursor: worker resolves the agent-transcript JSONL from the adopt pid's
+  // open store.db fd (chatId), or from cliSessionId (= chatId) when discovery
+  // captured it — so adopt must forward the pid + cwd like the other
+  // transcript-backed CLIs.
+  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'traex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
   const initMsg: DaemonToWorker = {
@@ -2116,6 +2461,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
+    brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
@@ -2184,6 +2530,14 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  emitSessionLifecycleHook(ds, 'session.start', {
+    reason: opts?.restoredFromMetadata ? 'adopt_restore' : 'adopt',
+    pid: worker.pid ?? null,
+    adoptedFrom: adopted.tmuxTarget,
+  });
+  // Adopted CLIs come with pre-botmux history — anchor it out of the ledger.
+  anchorUsageForDaemonSession(ds);
+  recordOwnershipForDaemonSession(ds);
 }
 
 // ─── Kill stale PIDs ────────────────────────────────────────────────────────
@@ -2255,7 +2609,7 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
 
   try {
     mkdirSync(config.session.dataDir, { recursive: true });
-    writeFileSync(cliIdFile, currentCliId);
+    atomicWriteFileSync(cliIdFile, currentCliId);
   } catch (err) {
     logger.warn(`Failed to write ${cliIdFile}: ${err}`);
   }
