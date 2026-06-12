@@ -82,7 +82,9 @@ export const config = {
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
   },
   idleCloseReminder: {
-    enabled: (process.env.BOTMUX_IDLE_CLOSE_REMINDER_ENABLED ?? 'true').toLowerCase() !== 'false',
+    // Opt-in（默认关）。线上单机常驻数百个长期闲置的 active 会话，若默认开，
+    // 升级重启后的首轮扫描会一次性向所有旧话题群发提醒卡（必撞限流且极扰人）。
+    enabled: (process.env.BOTMUX_IDLE_CLOSE_REMINDER_ENABLED ?? '').toLowerCase() === 'true',
     thresholdHours: Number(process.env.BOTMUX_IDLE_CLOSE_REMINDER_HOURS) || 24,
     scanIntervalMs: Number(process.env.BOTMUX_IDLE_CLOSE_REMINDER_SCAN_INTERVAL_MS) || 30 * 60 * 1000,
     snoozeHours: Number(process.env.BOTMUX_IDLE_CLOSE_REMINDER_SNOOZE_HOURS) || 24,

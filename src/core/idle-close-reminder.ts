@@ -9,6 +9,10 @@ import type { DaemonSession } from './types.js';
 
 const STARTUP_SCAN_DELAY_MS = 10_000;
 const MIN_SCAN_INTERVAL_MS = 60_000;
+/** 单轮扫描最多发出的提醒卡数。存量闲置会话可能数以百计（生产单机 ~290 个
+ *  active），不设上限的首轮扫描等于向所有旧话题群发卡片：撞飞书限流且极扰人。
+ *  超出的会话留给后续扫描轮（默认 30min 一轮）逐步消化。 */
+const MAX_REMINDERS_PER_SCAN = 10;
 
 export interface IdleCloseReminderOptions {
   enabled?: boolean;
@@ -75,6 +79,10 @@ export async function scanIdleCloseReminders(
   const now = opts.now ?? Date.now();
   let sent = 0;
   for (const ds of activeSessions.values()) {
+    if (sent >= MAX_REMINDERS_PER_SCAN) {
+      logger.info(`[idle-close-reminder] per-scan cap (${MAX_REMINDERS_PER_SCAN}) reached; remaining sessions deferred to the next scan`);
+      break;
+    }
     if (!shouldSendIdleCloseReminder(ds, { ...opts, now })) continue;
     const larkAppId = ds.larkAppId;
     const cliId = ds.session.cliId ?? getBot(larkAppId).config.cliId;

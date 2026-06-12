@@ -404,7 +404,9 @@ export function buildIdleCloseReminderCard(
             tag: 'button',
             text: { tag: 'plain_text', content: t('card.btn.keep_session', undefined, locale) },
             type: 'primary',
-            value: { action: 'idle_close_keep', snooze_ms: String(snoozeMs), ...actionBase },
+            // 「保留会话」= 长歇（7 天），与「稍后提醒」的短歇（配置值，默认 24h）
+            // 区分开 —— 两个按钮共用 idle_close_keep 动作，仅 snooze 时长不同。
+            value: { action: 'idle_close_keep', snooze_ms: String(7 * 24 * 60 * 60 * 1000), ...actionBase },
           },
           {
             tag: 'button',
