@@ -232,6 +232,9 @@ export function resolveReportTarget(input: {
  * Decide where `botmux dispatch` should place the assignment.
  *
  * - `--into <root>` is always explicit: append to that existing topic.
+ * - `--new-topic` is the explicit escape hatch back to seeding a brand-new
+ *   sub-topic — without it, a thread-scope orchestrator could never fan out
+ *   (the implicit current-topic default below would capture every dispatch).
  * - Otherwise, when dispatch is invoked from an existing thread-scope session,
  *   append to the current topic. This matches the human mental model for
  *   topic-group/oncall usage: "I asked in this topic, so keep dispatch here".
@@ -240,11 +243,13 @@ export function resolveReportTarget(input: {
  */
 export function resolveDispatchTarget(input: {
   into?: string;
+  forceNewTopic?: boolean;
   sessionScope?: 'thread' | 'chat';
   rootMessageId?: string;
 }): { mode: 'into'; root: string; implicit: boolean } | { mode: 'new' } {
   const explicitInto = input.into?.trim();
   if (explicitInto) return { mode: 'into', root: explicitInto, implicit: false };
+  if (input.forceNewTopic) return { mode: 'new' };
   if (input.sessionScope === 'thread' && input.rootMessageId) {
     return { mode: 'into', root: input.rootMessageId, implicit: true };
   }

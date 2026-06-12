@@ -3713,6 +3713,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
 说明:
   默认:    在话题会话内调用时追加到当前话题；在普通群 chat-scope 会话内调用时新开话题。
+           话题会话里要 fan-out 新子话题，显式传 --new-topic。
   新开话题: 发一条顶层「子项目」种子消息，在它线程里把 bot @ 进来各起独立会话。
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 派具体任务。
@@ -3727,6 +3728,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到指定话题线程追加（与 --title/种子互斥）
+  --new-topic           强制新开话题种子（覆盖话题会话默认的「追加当前话题」）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
   --session-id <id>     指定来源会话（默认自动推断）`);
     return;
@@ -3739,6 +3741,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const overrideChatId = argValue(rest, '--chat-id');
   const repo = argValue(rest, '--repo');
   const intoRoot = argValue(rest, '--into');
+  const forceNewTopic = rest.includes('--new-topic');
   const standby = rest.includes('--standby');
   const botSpecs = argValues(rest, '--bot');
 
@@ -3762,6 +3765,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   // ── Flag validation ──
   if (botSpecs.length === 0) {
     console.error('至少要用 --bot 指派一个 bot。用法见 botmux dispatch --help');
+    process.exit(1);
+  }
+  if (forceNewTopic && intoRoot) {
+    console.error('--new-topic 与 --into 不能同用。');
     process.exit(1);
   }
   if (standby && !repo) {
@@ -3802,7 +3809,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }
 
-  const target = resolveDispatchTarget({ into: intoRoot, sessionScope: s.scope ?? 'thread', rootMessageId: s.rootMessageId });
+  const target = resolveDispatchTarget({ into: intoRoot, forceNewTopic, sessionScope: s.scope ?? 'thread', rootMessageId: s.rootMessageId });
   if (target.mode === 'new' && !title.trim()) {
     console.error('新开话题需要 --title；在当前话题追加请从话题会话里运行，或显式传 --into <root_id>。');
     process.exit(1);
@@ -3847,7 +3854,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         kickoffId = await replyMessage(appId, target.root, briefJson, 'post', true);
       }
       console.log(JSON.stringify({
-        success: true, mode: target.implicit ? 'current-thread' : (standby ? 'standby-into' : 'into'), threadRootId: target.root,
+        success: true,
+        mode: target.implicit
+          ? (standby ? 'standby-current-thread' : 'current-thread')
+          : (standby ? 'standby-into' : 'into'),
+        threadRootId: target.root,
         primeMessageId: primeId, kickoffMessageId: kickoffId, repo: repo ?? null,
         chatId: targetChatId, bots: built.mentionedOpenIds,
       }));

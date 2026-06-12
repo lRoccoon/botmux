@@ -316,4 +316,14 @@ describe('resolveDispatchTarget — default placement', () => {
     expect(resolveDispatchTarget({ sessionScope: 'chat', rootMessageId: 'om_first' }))
       .toEqual({ mode: 'new' });
   });
+
+  it('--new-topic forces a fresh seed even from a thread-scope session (fan-out escape hatch)', () => {
+    expect(resolveDispatchTarget({ forceNewTopic: true, sessionScope: 'thread', rootMessageId: 'om_current' }))
+      .toEqual({ mode: 'new' });
+  });
+
+  it('explicit --into wins over --new-topic at the resolver level (CLI rejects the combo upstream)', () => {
+    expect(resolveDispatchTarget({ into: 'om_topic', forceNewTopic: true, sessionScope: 'thread', rootMessageId: 'om_current' }))
+      .toEqual({ mode: 'into', root: 'om_topic', implicit: false });
+  });
 });
