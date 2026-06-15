@@ -170,6 +170,46 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   return a;
 }
 
+/**
+ * After `buildSandboxArgs` masks `/run` with a fresh tmpfs, any executable whose
+ * resolved path lives UNDER `/run` (the common case: fnm/nvm/volta expose the
+ * active toolchain's bin dir as a per-session symlink farm under
+ * `/run/user/<uid>/fnm_multishells/<hash>/bin`, and `which codex` / the daemon's
+ * own `process.execPath` for node land there) would VANISH inside the sandbox →
+ * bwrap `execvp` fails → the CLI exits instantly → Botmux's crash-loop guard
+ * trips after 4 retries. This re-exposes each such bin dir read-only at its real
+ * path so the binary (and the node interpreter its `#!/usr/bin/env node` shebang
+ * needs, which lives in the same fnm bin dir) survive the tmpfs.
+ *
+ * The caller feeds in EVERY path that will be exec'd inside the sandbox, not just
+ * the direct bwrap target: the cliBin, the daemon's own node (process.execPath),
+ * AND each adapter-declared SECOND-STAGE executable (CliAdapter.sandboxExtraExecPaths)
+ * — e.g. the codex-app adapter's resolved `codex` (its resolvedBin is the daemon
+ * node running the runner, which spawns the real codex later for the app-server,
+ * so without this the codex path would still be masked). We deliberately do NOT
+ * scan raw cliArgs: a path arg like `--cwd /run/user/<uid>/proj` would re-bind its
+ * PARENT `/run/user/<uid>`, shadowing the project overlay mounted there and
+ * exposing sibling files / IPC sockets — re-exposing must be limited to declared
+ * executables.
+ *
+ * Pure: returns the `--ro-bind-try <dir> <dir>` args (deduped, `/run/`-subpaths
+ * only — NEVER `/run` itself, which would clobber the tmpfs and the relay shim
+ * mounted at /run/sbxbin). `-try` so a stale/racing path can't fail the spawn.
+ * Returns [] for binaries already outside /run (system node, npm/pnpm globals) —
+ * non-fnm users are unaffected.
+ */
+export function reexposeRunBinArgs(binPaths: (string | undefined)[]): string[] {
+  const dirs = new Set<string>();
+  for (const p of binPaths) {
+    if (!p || typeof p !== 'string') continue;
+    const d = dirname(p);
+    if (d.startsWith('/run/')) dirs.add(d); // startsWith('/run/') excludes '/run' itself
+  }
+  const out: string[] = [];
+  for (const d of dirs) out.push('--ro-bind-try', d, d);
+  return out;
+}
+
 // ───────────────────────────── orchestration ─────────────────────────────────
 
 /** Absolute path to this build's compiled cli.js (dist/cli.js), derived from
@@ -244,6 +284,10 @@ export function prepareSandbox(opts: {
   /** This CLI's auth/login paths (CliAdapter.authPaths) to keep real+writable so
    *  token refresh / login persists. `~` expanded; missing paths skipped. */
   authPaths?: readonly string[];
+  /** Adapter-declared SECOND-STAGE executables (CliAdapter.sandboxExtraExecPaths)
+   *  spawned inside the sandbox beyond cliBin — re-exposed if under /run. ONLY
+   *  executable paths (never cwd/path args). undefined → none. */
+  extraExecPaths?: readonly string[];
 }): SandboxSpawn | null {
   if (!opts.enabled) return null;
   if (process.platform !== 'linux') return null; // overlayfs + bwrap are Linux-only
@@ -350,6 +394,15 @@ export function prepareSandbox(opts: {
   // botmux-send etc. skills, no secrets). Re-exposed read-only at its real path.
   const pluginDir = join(home, '.botmux', 'claude-plugin');
   args.push('--ro-bind-try', pluginDir, pluginDir);
+  // Re-expose any bin dir living under /run (fnm/nvm/volta symlink farms) that the
+  // `--tmpfs /run` above just masked — else the resolved cliBin / the node its
+  // shebang needs / an adapter's declared second-stage binary vanish in-sandbox
+  // and the CLI crash-loops on spawn. ONLY executable paths (never cwd/path args):
+  //  - opts.cliBin: the direct bwrap target
+  //  - process.execPath: the daemon's own node (under /run too when fnm-managed)
+  //  - opts.extraExecPaths: adapter-declared second-stage execs, e.g. codex-app's
+  //    real codex (its resolvedBin is the daemon node, so cliBin alone misses it).
+  args.push(...reexposeRunBinArgs([opts.cliBin, process.execPath, ...(opts.extraExecPaths ?? [])]));
 
   // Authoritative child env via bwrap --setenv (works on pty AND tmux — the tmux
   // backend only forwards a fixed whitelist, which excludes HOME/PATH/relay).

@@ -11,7 +11,8 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync } from 'node:fs';
-import { buildSandboxArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
@@ -109,6 +110,81 @@ describe('buildSandboxArgs (overlay model)', () => {
     for (const flag of ['--unshare-user', '--unshare-pid', '--unshare-ipc']) {
       expect(a).toContain(flag);
     }
+  });
+});
+
+// ── reexposeRunBinArgs: restore fnm/nvm bin dirs masked by --tmpfs /run ──
+// Regression for "file sandbox can't start" on fnm/nvm/volta machines: the
+// resolved CLI binary (and the daemon's own node) live under /run/user/.../bin,
+// which --tmpfs /run masks → bwrap execvp fails → crash-loop.
+describe('reexposeRunBinArgs (fnm/nvm /run bin dirs)', () => {
+  it('re-binds the containing dir of a /run-resident binary read-only at its real path', () => {
+    const a = reexposeRunBinArgs(['/run/user/1001/fnm_multishells/abc_123/bin/codex']);
+    expect(tripleIdx(a, '--ro-bind-try', '/run/user/1001/fnm_multishells/abc_123/bin', '/run/user/1001/fnm_multishells/abc_123/bin')).toBe(0);
+  });
+
+  it('dedupes when the binary and node share one /run bin dir', () => {
+    const dir = '/run/user/1001/fnm_multishells/abc_123/bin';
+    const a = reexposeRunBinArgs([`${dir}/codex`, `${dir}/node`]);
+    expect(a).toEqual(['--ro-bind-try', dir, dir]);
+  });
+
+  it('handles distinct /run dirs for the binary and node', () => {
+    const a = reexposeRunBinArgs(['/run/a/bin/codex', '/run/b/bin/node']);
+    expect(tripleIdx(a, '--ro-bind-try', '/run/a/bin', '/run/a/bin')).toBeGreaterThanOrEqual(0);
+    expect(tripleIdx(a, '--ro-bind-try', '/run/b/bin', '/run/b/bin')).toBeGreaterThanOrEqual(0);
+  });
+
+  it('ignores binaries outside /run (system node, npm/pnpm globals) — non-fnm users unaffected', () => {
+    expect(reexposeRunBinArgs(['/usr/bin/node', '/usr/local/bin/codex', undefined])).toEqual([]);
+  });
+
+  it('NEVER re-binds /run itself (would clobber the tmpfs + the /run/sbxbin relay shim)', () => {
+    // A binary directly at /run/node has dirname '/run' — must be skipped.
+    expect(reexposeRunBinArgs(['/run/node'])).toEqual([]);
+  });
+
+  it('skips empty/non-string entries', () => {
+    expect(reexposeRunBinArgs([undefined, '', '/run/user/1/bin/x'])).toEqual(['--ro-bind-try', '/run/user/1/bin', '/run/user/1/bin']);
+  });
+
+  it('covers a SECOND-STAGE /run binary (codex-app real codex) when cliBin+node are OUTSIDE /run', () => {
+    // codex-app: resolvedBin = daemon node (stable fnm install, NOT /run); the real
+    // codex (spawned inside the sandbox for app-server) is declared via
+    // sandboxExtraExecPaths. prepareSandbox feeds [cliBin, process.execPath, ...extra].
+    const stableNode = '/root/.local/share/fnm/node-versions/v24.16.0/installation/bin/node';
+    const runCodex = '/run/user/1001/fnm_multishells/abc_123/bin/codex';
+    const a = reexposeRunBinArgs([stableNode, stableNode, runCodex]);
+    // only the fnm bin dir is re-bound (stable node ignored, never the cwd)
+    expect(a).toEqual(['--ro-bind-try', '/run/user/1001/fnm_multishells/abc_123/bin', '/run/user/1001/fnm_multishells/abc_123/bin']);
+  });
+
+  it('DANGER it guards against: a /run working-dir path would re-bind its parent (so the wiring must NOT feed cwd/cliArgs in)', () => {
+    // This documents WHY prepareSandbox passes ONLY declared exec paths, never raw
+    // cliArgs: a `--cwd /run/user/1001/proj` would re-bind PARENT /run/user/1001,
+    // shadowing the project overlay mounted there + exposing siblings/IPC sockets.
+    expect(reexposeRunBinArgs(['/run/user/1001/proj'])).toEqual(['--ro-bind-try', '/run/user/1001', '/run/user/1001']);
+  });
+});
+
+// ── codex-app adapter declares ONLY the second-stage executable, never the cwd ──
+// Negative regression for Codex's blocker: sandboxExtraExecPaths must return the
+// resolved codex binary and NOTHING path-like (the working dir), so the sandbox
+// never re-binds a /run cwd's parent.
+describe('codex-app sandboxExtraExecPaths', () => {
+  it('returns exactly the resolved codex bin and never the working dir', () => {
+    // pathOverride is absolute → resolveCommand short-circuits (no shell-out / flake).
+    const runCodex = '/run/user/1001/fnm_multishells/abc_123/bin/codex';
+    const adapter = createCodexAppAdapter(runCodex);
+    // build args with a /run working dir — must NOT leak into the exec-path list.
+    adapter.buildArgs({ sessionId: 's1', resume: false, workingDir: '/run/user/1001/proj' });
+    const extra = adapter.sandboxExtraExecPaths?.();
+    expect(extra).toEqual([runCodex]);
+    expect(extra).not.toContain('/run/user/1001/proj');
+    // and the resulting re-expose hits only the codex bin dir, not the cwd parent.
+    const a = reexposeRunBinArgs([adapter.resolvedBin, process.execPath, ...(extra ?? [])]);
+    expect(a).toContain('/run/user/1001/fnm_multishells/abc_123/bin');
+    expect(a).not.toContain('/run/user/1001');
   });
 });
 

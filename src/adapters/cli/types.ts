@@ -243,6 +243,23 @@ export interface CliAdapter {
    *  undefined / empty → no carve-out. */
   readonly authPaths?: readonly string[];
 
+  /** Absolute paths of ADDITIONAL executables this adapter spawns as a SECOND
+   *  stage INSIDE the file sandbox, beyond `resolvedBin` (the bwrap target). The
+   *  sandbox masks `/run` with a fresh tmpfs; any such binary living under
+   *  `/run/...` (fnm/nvm/volta bin symlink farms) would then vanish and crash-loop
+   *  the CLI, so the sandbox re-exposes their containing dirs read-only.
+   *
+   *  Most adapters omit this — their `resolvedBin` IS the binary that runs. It is
+   *  for adapters whose `resolvedBin` is a launcher: codex-app's `resolvedBin` is
+   *  node running the runner, while the REAL `codex` (spawned later for the
+   *  app-server) is the one that must survive `--tmpfs /run`.
+   *
+   *  Return ONLY executable paths — never plain path args like the working dir,
+   *  whose parent dir re-bind would shadow the project overlay and widen exposure.
+   *  Resolved lazily / read AFTER buildArgs() (so a lazily-resolved bin is cached).
+   *  Missing/empty → no extra re-expose. */
+  sandboxExtraExecPaths?(): readonly string[];
+
   /** Extra env merged into the spawned child's environment. Used by Claude-family
    *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).
    *  Keys placed here are also forwarded through the tmux backend (see
