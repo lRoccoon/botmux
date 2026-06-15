@@ -144,6 +144,9 @@ interface DriveCallOpts {
   data?: unknown;
   /** true 时禁用 tenant 回退（评论事件订阅必须 user 身份才收得到推送时用）。 */
   userOnly?: boolean;
+  /** true 时**优先 tenant（应用身份）**，失败再回退 user。用于发评论——这样 bot 的
+   *  回复显示为机器人本身，而非授权用户。bot 对该文档无访问权时回退 user 身份保证落地。 */
+  preferTenant?: boolean;
 }
 
 function buildQuery(params?: DriveCallOpts['params']): string {
@@ -164,32 +167,48 @@ function buildQuery(params?: DriveCallOpts['params']): string {
 async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any> {
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
-  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
 
+  // tenant（应用身份）：走 SDK client.request（带 token/缓存/GET 空 body 守卫）。
+  const callTenant = async () => {
+    const c = getBotClient(larkAppId);
+    return c.request({
+      method: opts.method,
+      url: opts.path,
+      params: opts.params,
+      ...(opts.data !== undefined ? { data: opts.data } : {}),
+    });
+  };
+  const callUser = async () => {
+    const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
+    if (!userToken) throw new UserTokenMissingError('该操作需要 User Token（请在话题中 /login 授权）。');
+    return fetchWithUserToken(brand, userToken, opts);
+  };
+
+  if (opts.userOnly) return callUser();
+
+  // 发评论：优先应用身份（回复显示为 bot），bot 无访问权（抛错或 code!=0）时回退用户身份。
+  if (opts.preferTenant) {
+    try {
+      const res = await callTenant();
+      if (res?.code === 0) return res;
+      logger.debug(`[doc-comment] tenant call code=${res?.code} (${opts.path})；回退 user 身份`);
+    } catch (err) {
+      logger.debug(`[doc-comment] tenant call threw (${opts.path})；回退 user 身份：${err instanceof Error ? err.message : err}`);
+    }
+    return callUser();
+  }
+
+  // 默认：优先 user（有 token），401/403 回退 tenant。
+  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
   if (userToken) {
     try {
       return await fetchWithUserToken(brand, userToken, opts);
     } catch (err) {
-      if (opts.userOnly) throw err;
-      if (err instanceof UserTokenMissingError) {
-        if (opts.userOnly) throw err;
-        logger.debug(`[doc-comment] user token rejected (${opts.path}); falling back to tenant`);
-      } else {
-        throw err;
-      }
+      if (!(err instanceof UserTokenMissingError)) throw err;
+      logger.debug(`[doc-comment] user token rejected (${opts.path}); falling back to tenant`);
     }
-  } else if (opts.userOnly) {
-    throw new UserTokenMissingError('该操作需要 User Token（请在话题中 /login 授权）。');
   }
-
-  // tenant 回退：走 SDK 的 client.request（带 token/缓存/GET 空 body 守卫）
-  const c = getBotClient(larkAppId);
-  return c.request({
-    method: opts.method,
-    url: opts.path,
-    params: opts.params,
-    ...(opts.data !== undefined ? { data: opts.data } : {}),
-  });
+  return callTenant();
 }
 
 async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCallOpts): Promise<any> {
@@ -335,6 +354,7 @@ export async function replyToDocComment(
       path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/${encodeURIComponent(commentId)}/replies`,
       params: { file_type: file.fileType, user_id_type: 'open_id' },
       data: { content: { elements } },
+      preferTenant: true, // 回复显示为 bot 本身（应用身份）；bot 无访问权时回退 user
     });
   } catch (err) {
     // 有的评论不允许被回复（飞书 1069302：全文评论 / 已解决 / 文档评论设置受限）。
@@ -382,6 +402,7 @@ export async function createDocComment(
     path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments`,
     params: { file_type: file.fileType, user_id_type: 'open_id' },
     data: { reply_list: { replies: [{ content: { elements } }] } },
+    preferTenant: true, // 评论显示为 bot 本身（应用身份）；bot 无访问权时回退 user
   });
   const data = ensureOk(res, '发表评论');
   const commentId: string = data?.comment_id ?? '';

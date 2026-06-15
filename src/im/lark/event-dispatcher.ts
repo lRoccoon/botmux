@@ -1287,15 +1287,16 @@ async function processCommentEvent(
     ? comment.replies.find(r => r.replyId === parsed.replyId) ?? comment.replies[comment.replies.length - 1]
     : comment.replies[comment.replies.length - 1];
 
-  // 3) 自触发过滤：bot 用 user token 发的评论作者=授权用户本人，无法靠作者区分。
-  //    用 reply_id 集合 + 文本隐形哨兵双保险跳过自己的评论，防死循环。
-  if (isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
+  // 3) 自触发过滤（防死循环）：bot 的回复可能以应用身份（作者=bot open_id）或回退
+  //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
+  //    ②reply_id 在 bot 创建集合 ③文本含隐形哨兵。任一命中即跳过。
+  const selfBotOpenId = getBot(larkAppId).botOpenId;
+  if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
 
   // 4) 触发范围：mention-only 要求评论 @ 到本 bot。优先用事件自带的 is_mentioned
   //    （飞书已判好），拿不到再回退按评论正文里的 @person 列表比对 bot open_id。
   if (sub.commentTriggerMode === 'mention-only') {
-    const botOpenId = getBot(larkAppId).botOpenId;
-    const mentioned = parsed.isMentioned === true || (!!botOpenId && trigger.mentions.includes(botOpenId));
+    const mentioned = parsed.isMentioned === true || (!!selfBotOpenId && trigger.mentions.includes(selfBotOpenId));
     if (!mentioned) {
       logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)})`);
       return;
