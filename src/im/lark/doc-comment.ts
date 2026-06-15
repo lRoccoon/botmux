@@ -239,9 +239,10 @@ export async function subscribeDocFile(larkAppId: string, file: ResolvedDocFile)
 /** 退订文档事件。best-effort：失败只告警不抛。 */
 export async function unsubscribeDocFile(larkAppId: string, file: ResolvedDocFile): Promise<void> {
   try {
+    // 飞书取消订阅是 DELETE .../delete_subscribe（不是 DELETE .../subscribe，后者 404）。
     const res = await driveApiCall(larkAppId, {
       method: 'DELETE',
-      path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/subscribe`,
+      path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/delete_subscribe`,
       params: { file_type: file.fileType },
     });
     ensureOk(res, '退订文档');

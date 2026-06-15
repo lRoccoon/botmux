@@ -1514,6 +1514,7 @@ export async function handleCommand(
             fileToken: file.fileToken,
             fileType: file.fileType,
             sessionAnchor: anchor,
+            sessionId: ds.session.sessionId,
             scope: ds.scope,
             chatId: ds.chatId,
             commentTriggerMode: mode,

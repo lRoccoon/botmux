@@ -27,6 +27,9 @@ export interface DocSubscription {
   fileType: string;
   /** 绑定会话的路由锚点：thread-scope=rootMessageId / chat-scope=chatId。 */
   sessionAnchor: string;
+  /** 绑定会话的 sessionId。daemon 重启恢复时据此查持久化会话状态判定保留/退订
+   *  （不依赖内存 activeSessions，避免误删活跃会话的订阅）。旧订阅可能缺此字段。 */
+  sessionId?: string;
   /** 会话 scope —— 重订阅 / 落点路由时要知道。 */
   scope: 'thread' | 'chat';
   /** 会话所在群（回飞书侧卡片、dashboard 展示用）。 */

@@ -3404,22 +3404,29 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
  * daemon 启动恢复文档订阅：飞书订阅可能在停机期间失效，给仍活跃的会话重新
  * 订阅；其会话没被恢复（已 /close 或丢失）的订阅则退订 + 清注册表。best-effort。
  */
-async function restoreDocSubscriptions(sessions: Map<string, DaemonSession>): Promise<void> {
+async function restoreDocSubscriptions(_sessions: Map<string, DaemonSession>): Promise<void> {
   for (const bot of getAllBots()) {
     const appId = bot.config.larkAppId;
     let subs;
     try { subs = listAllDocSubscriptions(config.session.dataDir, appId); } catch { continue; }
     for (const sub of subs) {
-      const active = sessions.has(sessionKey(sub.sessionAnchor, appId));
       const file = { fileToken: sub.fileToken, fileType: sub.fileType };
-      if (!active) {
+      // 判定保留/退订以**持久化的会话状态**为准（不看内存 activeSessions，避免恢复
+      // 时序 / keying 差异误删活跃会话的订阅）。只有「明确已关闭」才退订清表：
+      //   • 有 sessionId 且其会话 status==='closed' → 真的关了 → 退订 + 删表
+      //   • 会话不存在（被清理）→ 同上
+      //   • 会话 active / 缺 sessionId（老订阅，无从判定）→ 保留 + 重订阅（保守，不误删）
+      const stored = sub.sessionId ? sessionStore.getSession(sub.sessionId) : undefined;
+      const definitelyClosed = sub.sessionId && (!stored || stored.status === 'closed');
+      if (definitelyClosed) {
         await unsubscribeDocFile(appId, file);
         removeDocSubscription(config.session.dataDir, appId, sub.fileToken);
-        logger.info(`[doc-comment] restore: dropped orphan subscription ${sub.fileToken.slice(0, 12)} (no active session)`);
+        logger.info(`[doc-comment] restore: dropped subscription ${sub.fileToken.slice(0, 12)} (session ${sub.sessionId?.slice(0, 8)} closed)`);
         continue;
       }
       try {
         await subscribeDocFile(appId, file);
+        logger.info(`[doc-comment] restore: re-subscribed ${sub.fileToken.slice(0, 12)} (session ${sub.sessionId?.slice(0, 8) ?? '?'})`);
       } catch (err: any) {
         logger.warn(`[doc-comment] restore: re-subscribe ${sub.fileToken.slice(0, 12)} failed: ${err?.message ?? err}`);
       }
