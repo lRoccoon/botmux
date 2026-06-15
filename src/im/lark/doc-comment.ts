@@ -319,20 +319,46 @@ export async function replyToDocComment(
   file: ResolvedDocFile,
   commentId: string,
   text: string,
-): Promise<{ replyId?: string }> {
+): Promise<{ replyId?: string; commentId?: string }> {
   // 末尾追加隐形哨兵 → 事件侧 hasBotSentinel 兜底跳过自触发。
   const elements: CommentElement[] = [{ type: 'text_run', text_run: { text: text + BOT_REPLY_SENTINEL } }];
-  const res = await driveApiCall(larkAppId, {
-    method: 'POST',
-    path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/${encodeURIComponent(commentId)}/replies`,
-    params: { file_type: file.fileType, user_id_type: 'open_id' },
-    data: { content: { elements } },
-  });
-  const data = ensureOk(res, '回复评论');
-  const replyId: string | undefined = data?.reply_id;
+  let res: any;
+  try {
+    res = await driveApiCall(larkAppId, {
+      method: 'POST',
+      path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments/${encodeURIComponent(commentId)}/replies`,
+      params: { file_type: file.fileType, user_id_type: 'open_id' },
+      data: { content: { elements } },
+    });
+  } catch (err) {
+    // 有的评论不允许被回复（飞书 1069302：全文评论 / 已解决 / 文档评论设置受限）。
+    // 退回新建一条全文评论，保证 bot 的答复总能落到文档（不嵌套但仍在评论区）。
+    if (isReplyNotAllowed(err)) {
+      logger.warn(`[doc-comment] comment=${commentId.slice(0, 12)} 不允许回复，退回新建全文评论`);
+      const c = await createDocComment(larkAppId, file, text);
+      return { replyId: c.replyId, commentId: c.commentId };
+    }
+    throw err;
+  }
+  // ensureOk 对 code!==0 抛错；同样要识别"不允许回复"并退回新建。
+  if (res?.code !== 0) {
+    if (isReplyNotAllowed(res)) {
+      logger.warn(`[doc-comment] comment=${commentId.slice(0, 12)} 不允许回复(code=${res?.code})，退回新建全文评论`);
+      const c = await createDocComment(larkAppId, file, text);
+      return { replyId: c.replyId, commentId: c.commentId };
+    }
+    throw new Error(`回复评论 失败: ${res?.msg ?? 'unknown'} (code: ${res?.code})`);
+  }
+  const replyId: string | undefined = res.data?.reply_id;
   if (replyId) markBotAuthoredReply(replyId);
   logger.info(`[doc-comment] replied to comment=${commentId.slice(0, 12)} reply=${String(replyId ?? '').slice(0, 12)} on file=${file.fileToken.slice(0, 12)} (${text.length} chars)`);
   return { replyId };
+}
+
+/** 识别飞书"该评论不允许回复"的错误（code 1069302 或消息含 does not allow replies）。 */
+function isReplyNotAllowed(errOrRes: unknown): boolean {
+  const s = errOrRes instanceof Error ? errOrRes.message : JSON.stringify(errOrRes ?? '');
+  return s.includes('1069302') || /does not allow replies|不允许回复/.test(s);
 }
 
 /**
