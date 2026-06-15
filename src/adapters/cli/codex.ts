@@ -2,7 +2,8 @@ import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { codexHistoryPath } from '../../services/codex-paths.js';
+import { codexHistoryPath, codexSessionsRoot } from '../../services/codex-paths.js';
+import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 
 /** Global submit log — Codex appends one JSON line here on every successful
@@ -154,6 +155,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const sid = cliSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
       if (!sid) return null;
       return `codex resume ${sid}`;
+    },
+
+    /** Import path: scan the rollout files under `<CODEX_HOME>/sessions` for
+     *  resumable sessions (session_meta carries the resume id + cwd). */
+    listResumableSessions({ limit, exclude }) {
+      return discoverRolloutSessions(codexSessionsRoot(), limit, exclude);
     },
 
     async writeInput(pty: PtyHandle, content: string) {

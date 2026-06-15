@@ -20,7 +20,7 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
-import { emitHookEvent, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
+import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
@@ -139,11 +139,12 @@ import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 import { AttemptResumeManager } from './workflows/attempt-resume.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
+  setCanTalkChecker as setAskCanTalkChecker,
   registerAsk as registerAskBroker,
   findPendingAskByAnchor,
   submitCustomReply,
 } from './core/ask-broker.js';
-import { parseAskBody, resolveAskApprovers } from './core/ask-api.js';
+import { parseAskBody } from './core/ask-api.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { configureCollabControlPlane, handleCollabControlMessage, handleCollabWorkerLost, type PushCollabWorkerInput, type SpawnCollabWorkerInput } from './core/control-plane.js';
@@ -1918,32 +1919,13 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   const parsed = parseAskBody(raw);
   if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
 
-  const approvers = resolveAskApprovers({
-    larkAppId: parsed.larkAppId,
-    sessionId: parsed.sessionId,
-    explicit: parsed.approvers,
-    getBotAllowedUsers: (id) => {
-      try { return getBot(id).resolvedAllowedUsers; } catch { return []; }
-    },
-    getSessionOwner: (sid) => {
-      for (const ds of activeSessions.values()) {
-        if (ds.session.sessionId === sid) return ds.ownerOpenId;
-      }
-      return undefined;
-    },
-  });
-  if (approvers.size === 0) {
-    // Nobody can answer — fail loud rather than registering a
-    // guaranteed-timeout. CLI side maps this to exit 2.
-    return jsonRes(res, 400, { ok: false, error: 'no_approvers' });
-  }
-
+  // 谁能答复 = 谁能在该 chat 跟 bot 说话（canTalk）。鉴权在 broker 点击时按注入的
+  // canTalkChecker 判定（见下方 setAskCanTalkChecker），daemon 这里不再预解析 approver。
   const result = await registerAskBroker({
     larkAppId: parsed.larkAppId,
     chatId: parsed.chatId,
     rootMessageId: parsed.rootMessageId,
     sessionId: parsed.sessionId,
-    approvers,
     questions: parsed.questions,
     timeoutMs: parsed.timeoutMs,
   });
@@ -2052,8 +2034,10 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
 // CLI side（botmux send 等）调用 emitHookEvent 时，把事件转发到 daemon 这条
 // 接口；daemon 在自己的长寿命事件循环里负责 spawn hook、跑 timeout、超时杀
 // 整个进程组。短命 CLI 进程的 timer.unref 会让超时承诺失效、跑飞的 hook 留
-// 孤儿，让 daemon 接管根治这一缺口。daemon 进程自身不带 BOTMUX_SESSION_ID
-// 环境变量，所以这里调 emitHookEvent 不会再触发转发回退（无递归）。
+// 孤儿，让 daemon 接管根治这一缺口。这里必须调 emitHookEventLocal（只跑本地、
+// 永不转发）：若调 emitHookEvent，一旦会话级环境变量泄进 daemon（如在 botmux
+// 会话内执行 `botmux restart`，pm2 会把调用方环境注入新 daemon），事件会被
+// 无限自转发回本端口，烧满一核且日志静默。
 ipcRoute('POST', '/api/hooks/emit', async (req, res) => {
   let raw: unknown;
   try {
@@ -2071,7 +2055,7 @@ ipcRoute('POST', '/api/hooks/emit', async (req, res) => {
   if (!payload || typeof payload !== 'object') {
     return jsonRes(res, 400, { ok: false, error: 'bad_payload' });
   }
-  emitHookEvent(event as HookEvent, payload as Record<string, unknown>);
+  emitHookEventLocal(event as HookEvent, payload as Record<string, unknown>);
   return jsonRes(res, 202, { ok: true });
 });
 
@@ -3151,17 +3135,17 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     }
   }
 
-  // 自定义回复拦截：该话题有未结的 ask 且发送者有答复权限 → 把这条文字当答案，
-  // 走 submitCustomReply settle 掉 ask（替代选项语义），不再当作新一轮指令喂给 CLI。
-  // 此时发起 ask 的 CLI 正阻塞等结果，回什么都得先等 ask 结束，故无副作用。
-  // 仅拦截纯文字（slash 命令 / 回调 URL / workflow 已在上方各自 return，可用来中止）；
-  // 外部 bot 的 open_id 不在 approvers 里，天然不会命中。非授权人 / 空文字则落到正常
-  // 路由。卡片由 broker.onSettle 自动 PATCH 反映答案，无需额外回消息。
+  // 自定义回复拦截：该话题有未结的 ask 时，把这条文字当答案，走 submitCustomReply
+  // settle 掉 ask（替代选项语义），不再当作新一轮指令喂给 CLI。此时发起 ask 的 CLI
+  // 正阻塞等结果，回什么都得先等 ask 结束，故无副作用。仅拦截纯文字（slash 命令 /
+  // 回调 URL / workflow 已在上方各自 return，可用来中止）。答复权限 = canTalk，由
+  // broker 在 submitCustomReply 内按注入的 canTalkChecker 判定：非授权人返回
+  // 'unauthorized'，这里 fall through 到正常路由。卡片由 broker.onSettle 自动 PATCH。
   if (threadSenderOpenId && threadChatId) {
     const askReplyText = cmdContent.trim();
     if (askReplyText) {
       const pendingAsk = findPendingAskByAnchor({ larkAppId, chatId: threadChatId, anchor });
-      if (pendingAsk && pendingAsk.approvers.has(threadSenderOpenId)) {
+      if (pendingAsk) {
         const outcome = submitCustomReply({
           askId: pendingAsk.askId,
           by: threadSenderOpenId,
@@ -3568,6 +3552,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       pushWorker: pushCollabWorker,
     });
   }
+  // Honour the bot's canTalk gate for `botmux ask` answers: a clicker who may
+  // address the bot in this chat may answer an implicit-approver ask.
+  setAskCanTalkChecker((appId, chatId, openId) => evaluateTalk(appId, chatId, openId).allowed);
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();

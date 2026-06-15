@@ -140,19 +140,14 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
-  it('omits dangerous permission flags/keys when disableCliBypass is true (but keeps the SessionStart ready hook)', () => {
+  it('omits dangerous permission flags/keys AND --settings entirely when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--dangerously-skip-permissions');
     expect(args).toContain('--disallowed-tools');
-    // --settings is still emitted — it now also carries the SessionStart真就绪
-    // hook, which must be injected unconditionally (else the worker ready-gate
-    // would wait out its fallback timeout). But the bypass keys are gone.
-    const idx = args.indexOf('--settings');
-    expect(idx).toBeGreaterThanOrEqual(0);
-    const parsed = JSON.parse(args[idx + 1]);
-    expect(parsed.skipDangerousModePermissionPrompt).toBeUndefined();
-    expect(parsed.permissions).toBeUndefined();
-    expect(parsed.hooks?.SessionStart?.[0]?.hooks?.[0]?.command).toContain('session-ready');
+    // SessionStart 就绪 hook 改走全局 settings.json（见 hookInstall.sessionStartCommand），
+    // 不再注入进程级 --settings；bypass 键也没有 → 没东西可传 → 干脆不带 --settings。
+    expect(args).not.toContain('--settings');
+    expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
   it('ignores initialPrompt (not passed via args)', () => {

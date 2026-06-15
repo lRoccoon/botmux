@@ -28,6 +28,23 @@ export type SubmitRecheckResult = boolean | {
   cliSessionId?: string;
 };
 
+/** A session discovered on disk that botmux can resume (import) into a topic —
+ *  surfaced by `/adopt`'s second filter. Unlike an AdoptableSession (a live
+ *  tmux/zellij pane botmux *observes*), this is a stored transcript botmux
+ *  re-spawns via `<cli> --resume <cliSessionId>` in `cwd`; the original CLI need
+ *  not be running. */
+export interface ResumableSession {
+  /** CLI-native session id passed to `--resume` (jsonl basename / rollout
+   *  session_meta id / antigravity conversationId). */
+  cliSessionId: string;
+  /** Working directory the session ran in — where botmux re-spawns the CLI. */
+  cwd: string;
+  /** Human title (first real user prompt, truncated). */
+  title: string;
+  /** Epoch ms of last activity (transcript mtime / last submit), for sort + display. */
+  lastActivityAt: number;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -133,6 +150,12 @@ export interface CliAdapter {
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
     readonly format: 'claude-settings' | 'opencode-plugin';
+    /** 可选（仅 claude-settings）：同时把 SessionStart「真就绪」hook 命令写进**全局**
+     *  settings.json。进程级 --settings 也带一份（见 buildArgs），二者幂等（worker 的
+     *  session_ready 处理对重复触发 no-op）。装全局是为了 wrapperCli=`aiden x claude`
+     *  这类会剥掉 --settings 的启动器——它们拿不到进程级 hook，只能靠全局这条拿就绪信号，
+     *  否则首条 prompt 会空等 45s 超时。命令缺 BOTMUX_* env 时静默 exit 0，不扰独立 claude。 */
+    readonly sessionStartCommand?: string;
   };
 
   /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
@@ -254,6 +277,20 @@ export interface CliAdapter {
      *  targets the SAME root the adapter will actually write into. */
     dataDir?: string;
   }): boolean | undefined;
+
+  /** Optional: discover sessions resumable from this CLI's on-disk transcript
+   *  store (powers `/adopt`'s second filter — paseo-style import). Daemon-side,
+   *  pure filesystem (no PTY / subprocess), most-recent first, capped to `limit`.
+   *  undefined = this CLI has no discoverable per-session store (resume only via
+   *  botmux's own id, an opaque store, or no per-session resume at all). */
+  listResumableSessions?(opts: {
+    limit: number;
+    /** CLI-native session ids to skip (sessions botmux already runs live). Applied
+     *  BEFORE truncating to `limit` — and, where the id is the on-disk filename
+     *  (claude-family), before parsing — so a host with many live sessions still
+     *  surfaces `limit` resumable ones instead of being starved by exclusion. */
+    exclude?: ReadonlySet<string>;
+  }): Promise<ResumableSession[]>;
 
   /** Optional CLI version command override. Defaults to `[resolvedBin, '--version']`. */
   versionCommand?(): { bin: string; args: string[] };

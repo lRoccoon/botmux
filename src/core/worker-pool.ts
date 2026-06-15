@@ -1527,6 +1527,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     workingDir: cwd,
     cliId: botCfg.cliId,
     cliPathOverride: botCfg.cliPathOverride,
+    wrapperCli: botCfg.wrapperCli,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
     // Use the decision recorded on the session (above), NOT the live bot flag, so

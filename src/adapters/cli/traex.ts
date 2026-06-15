@@ -2,7 +2,8 @@ import { existsSync } from 'node:fs';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { traeStateDbPath } from '../../services/traex-paths.js';
+import { traeStateDbPath, traeSessionsRoot } from '../../services/traex-paths.js';
+import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
 
 /**
@@ -168,6 +169,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const sid = cliSessionId ?? latestTraeSessionForBotmuxSession(sessionId);
       if (!sid) return null;
       return `traex resume ${sid}`;
+    },
+
+    /** Import path: TRAE writes Codex-shaped rollout files under
+     *  `<TRAE_HOME>/cli/sessions` — same parser as Codex. */
+    listResumableSessions({ limit, exclude }) {
+      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude);
     },
 
     async writeInput(pty: PtyHandle, content: string) {

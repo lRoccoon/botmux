@@ -102,6 +102,7 @@ vi.mock('../src/services/session-store.js', () => ({
     chatType,
   })),
   updateSession: vi.fn(),
+  collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
 
 vi.mock('../src/services/schedule-store.js', () => ({

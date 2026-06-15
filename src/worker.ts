@@ -56,6 +56,7 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
+import { buildWrappedLaunch } from './setup/cli-selection.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './adapters/cli/types.js';
@@ -167,13 +168,52 @@ let readySignalTimer: ReturnType<typeof setTimeout> | null = null;
  *  back. The real signal lands within ~ms of the input box rendering, so this is
  *  pure insurance against a missing/failed hook — generous but bounded. */
 const READY_SIGNAL_TIMEOUT_MS = 45_000;
+/** Epoch ms of the most recent PTY output — used to settle for quiescence
+ *  before the first flush (see settleThenFlush). */
+let lastPtyOutputAtMs = 0;
+/** After the SessionStart signal fires, the input box has appeared but Ink's
+ *  startup render isn't fully drained yet — typing immediately trips Claude's
+ *  paste-burst heuristic and the `\` soft-newline markers (claude-code
+ *  writeInput) get kept literally. This is pronounced under wrapperCli launchers
+ *  (e.g. `aiden x claude`) whose Claude renders more at startup. So we wait for
+ *  the PTY to fall quiet for SETTLE_MS before the first flush — the signal still
+ *  gates readiness (anti-selector), the settle just lets the render drain. */
+const READY_FLUSH_SETTLE_MS = 1_000;
+/** Upper bound on the settle so a chatty startup (spinners, periodic redraw)
+ *  can't stall the first prompt indefinitely. */
+const READY_FLUSH_SETTLE_CAP_MS = 6_000;
+let readyFlushSettleTimer: ReturnType<typeof setTimeout> | null = null;
+/** True while the post-signal quiescence settle is in progress — flushPending
+ *  holds (just like the gate) so a message arriving mid-settle can't type-ahead
+ *  past the settle and re-trigger paste-burst. */
+let isSettlingFirstFlush = false;
+
+/** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
+ *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt. */
+function settleThenFlush(startedAtMs: number): void {
+  readyFlushSettleTimer = null;
+  const now = Date.now();
+  const quietForMs = now - lastPtyOutputAtMs;
+  if (quietForMs >= READY_FLUSH_SETTLE_MS || now - startedAtMs >= READY_FLUSH_SETTLE_CAP_MS) {
+    isSettlingFirstFlush = false;
+    log(`Ready-gate settle done (quiet ${quietForMs}ms); delivering held first prompt`);
+    void flushPending();
+    return;
+  }
+  const wait = Math.min(READY_FLUSH_SETTLE_MS - quietForMs, READY_FLUSH_SETTLE_CAP_MS - (now - startedAtMs));
+  readyFlushSettleTimer = setTimeout(() => settleThenFlush(startedAtMs), Math.max(50, wait));
+  readyFlushSettleTimer.unref?.();
+}
+
 /** Release the ready-gate and flush anything it held. No-op when the gate was
  *  never armed (other CLIs / adopt) or already released (idempotent). */
 function releaseReadyGate(reason: string): void {
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyGate.receive()) {
-    log(`Ready gate released (${reason}); delivering held first prompt`);
-    flushPending();
+    log(`Ready gate released (${reason}); settling for PTY quiescence before first flush`);
+    if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
+    isSettlingFirstFlush = true;
+    settleThenFlush(Date.now());
   }
 }
 const pendingMessages: Array<{ content: string; turnId?: string }> = [];
@@ -2692,7 +2732,9 @@ function onPtyData(data: string): void {
     }
   }
 
-  // Delegate idle detection to IdleDetector
+  // Track last PTY output time for the ready-gate quiescence settle (see
+  // settleThenFlush) and delegate idle detection to IdleDetector.
+  lastPtyOutputAtMs = Date.now();
   idleDetector?.feed(data);
 }
 
@@ -2878,6 +2920,12 @@ async function flushPending(): Promise<void> {
   // the signal (or fallback timeout) lands. No-op for non-armed gates / other CLIs.
   if (readyGate.shouldHold()) {
     log(`Holding ${pendingMessages.length} pending message(s) until SessionStart ready signal`);
+    return;
+  }
+  // Post-signal quiescence settle in progress — hold so the first write lands
+  // after Ink's startup render has drained (else paste-burst keeps `\` literal).
+  if (isSettlingFirstFlush) {
+    log(`Holding ${pendingMessages.length} pending message(s) until ready-gate settle completes`);
     return;
   }
   // Type-ahead adapters flush even while the CLI is busy; others wait for
@@ -3332,7 +3380,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
     const observeBe: ObserveBackend = cfg.adoptZellijPaneId
       ? new ZellijObserveBackend(cfg.adoptZellijSession ?? '', cfg.adoptZellijPaneId, { cliPid: cfg.adoptCliPid })
-      : new TmuxPipeBackend(cfg.adoptTmuxTarget!);
+      : new TmuxPipeBackend(cfg.adoptTmuxTarget!, { cliPid: cfg.adoptCliPid });
     effectiveBackendType = cfg.adoptZellijPaneId ? 'zellij' : 'tmux';
     backend = observeBe;
     observeBe.spawn('', [], {
@@ -3707,6 +3755,23 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
 
+  // 通用启动前缀（wrapperCli）：把启动命令重写成 `<wrapperCli> <CLI 参数>`（首 token 当
+  // bin 走 PATH 解析），无需 wrapper 脚本、跨系统。aiden x claude 形态会剥掉 aiden 拒收的
+  // --settings（见 buildWrappedLaunch）。与文件沙盒互斥：沙盒已把命令重写成 bwrap，叠加
+  // 前缀会破坏隔离，故 sandboxOn 时跳过并告警（网关 + oncall 沙盒本就不是合理组合）。
+  if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
+    if (sandboxOn) {
+      log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with bwrap)`);
+    } else {
+      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b);
+      if (launch.bin) {
+        spawnBin = launch.bin;
+        spawnArgs = launch.args;
+        log(`Launch prefix: spawning ${spawnBin} ${spawnArgs.slice(0, 2).join(' ')} … (cliId=${cfg.cliId})`);
+      }
+    }
+  }
+
   backend.spawn(spawnBin, spawnArgs, {
     cwd: spawnCwd,
     cols: PTY_COLS,
@@ -3869,6 +3934,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the timeout). Fallback: release after READY_SIGNAL_TIMEOUT_MS → readyPattern.
   readyGate = new ReadyGate();
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
+  if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
+  isSettlingFirstFlush = false;
+  // Reset quiescence baseline so the settle measures silence from THIS spawn.
+  lastPtyOutputAtMs = Date.now();
   if (shouldArmReadyGate({
     injectsReadyHook: cliAdapter.injectsReadyHook === true,
     adoptMode: cfg.adoptMode === true,
@@ -3945,8 +4014,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 function killCli(): void {
   idleDetector?.dispose();
   idleDetector = null;
-  // Cancel any pending ready-gate fallback timer; spawnCli re-arms on respawn.
+  // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
+  if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
+  isSettlingFirstFlush = false;
   stopScreenAnalyzer();
   stopScreenUpdates();
   backend?.kill();

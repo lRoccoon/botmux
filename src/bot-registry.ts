@@ -12,6 +12,15 @@ import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
 export type BotHandler = 'cli' | 'control-plane' | 'collab-worker';
 
+function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'chat') return 'chat';
+  if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
+  if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
+  return undefined;
+}
+
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
   chatId: string;
@@ -59,6 +68,16 @@ export interface BotConfig {
   name?: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /**
+   * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
+   * `<wrapperCli> <CLI 参数>`（首 token 当 bin 走 PATH 解析），无需 wrapper 脚本、跨系统。
+   * 典型值 `"aiden x claude"` / `"aiden x codex"`（内网网关 aiden-aiproxy + SSO），也能
+   * 承载 ccr / claude-w 等任意启动器。`cliId` 仍是底层适配器（claude→claude-code、
+   * codex→codex），所有适配器机制（hook / bridge / resume）照常工作；设了 wrapperCli 后
+   * 它的首 token 取代 cliId 的默认 bin（cliPathOverride 不再生效）。检测到前缀是
+   * `aiden x claude` 时自动剥掉 aiden 拒收的 --settings。见 src/setup/cli-selection.ts。
+   */
+  wrapperCli?: string;
   /**
    * Optional model name passed to the CLI at spawn time (e.g. `claude --model
    * opus`). Each adapter decides how to inject it — adapters whose CLI has no
@@ -584,7 +603,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       const out: { [chatId: string]: ChatReplyMode } = {};
       for (const [cid, mode] of Object.entries(entry.chatReplyModes)) {
         if (typeof cid !== 'string' || !cid.trim()) continue;
-        if (mode === 'chat' || mode === 'new-topic' || mode === 'shared') out[cid] = mode;
+        const normalizedMode = normalizeChatReplyModeConfig(mode);
+        if (normalizedMode) out[cid] = normalizedMode;
       }
       if (Object.keys(out).length > 0) chatReplyModes = out;
     }
@@ -679,6 +699,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
+      wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
+        ? entry.wrapperCli.trim()
+        : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
@@ -728,9 +751,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are
       // meaningful; 'chat' (the flat default) and anything else normalize to
       // undefined so bots.json stays clean.
-      regularGroupReplyMode: entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared'
-        ? entry.regularGroupReplyMode
-        : undefined,
+      regularGroupReplyMode: (() => {
+        const mode = normalizeChatReplyModeConfig(entry.regularGroupReplyMode);
+        return mode === 'new-topic' || mode === 'shared' ? mode : undefined;
+      })(),
       // 3-tier @ policy. Only 'topic' | 'never' are meaningful; 'always' (the
       // default) and anything else normalize to undefined so bots.json stays clean.
       regularGroupMentionMode: entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never'

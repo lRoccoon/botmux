@@ -40,6 +40,13 @@ describe('shouldArmReadyGate', () => {
   it('reattach exclusion wins even for an otherwise-eligible fresh-looking spawn', () => {
     expect(shouldArmReadyGate({ injectsReadyHook: true, adoptMode: false, willReattachPersistent: true })).toBe(false);
   });
+
+  it('KEEPS arming for aiden x claude: --settings is stripped but the SessionStart hook is installed globally', () => {
+    // wrapperCli "aiden x claude" drops process-level --settings, yet the ready
+    // hook is ALSO in ~/.claude/settings.json (hookInstall.sessionStartCommand),
+    // which aiden's real Claude still reads → the signal fires → keep the gate.
+    expect(shouldArmReadyGate(base)).toBe(true);
+  });
 });
 
 describe('ReadyGate', () => {

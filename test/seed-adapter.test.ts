@@ -75,10 +75,11 @@ describe('createSeedAdapter', () => {
   });
 
   it('hookInstall targets the data root settings.json (isolated from ~/.claude)', () => {
-    expect(adapter.hookInstall).toEqual({
+    expect(adapter.hookInstall).toMatchObject({
       configPath: join(expectedDataDir, 'settings.json'),
       format: 'claude-settings',
     });
+    expect(adapter.hookInstall?.sessionStartCommand).toMatch(/session-ready$/);
   });
 
   it('prints a `seed --resume` handoff, preferring the CLI-native session id', () => {

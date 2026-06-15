@@ -2,10 +2,13 @@
 
 > High-frequency, battle-tested pitfalls from the community group, sorted by how often they occur and their impact.
 
+## Bot permissions / app creation (most common)
+
+- **Reusing a bot created from an old app / not using the latest `botmux setup` QR-code creation / incomplete permissions**: symptoms vary — the CLI looks like it "exits mid-session", the group receives no messages, `botmux history` returns 400, and so on; the root cause is usually incomplete bot permissions. → Use the latest `botmux setup` to **recreate** the app by QR code (it auto-configures all permissions and publishes a version); don't reuse a bot created from an old app, and don't miss permissions when creating one manually.
+
 ## Environment / Installation
 
 - **Node too old**: v18 and similar lack a built-in global `fetch`, so `botmux setup` throws `fetch is not defined` / `fetch failed` and won't write `bots.json`. → Upgrade to **Node ≥ 22**.
-- **Newer tmux causing the CLI to exit mid-session**: Homebrew / source-compiled 3.6a and the like. The symptom is that after creating a new session, the CLI exits when input reaches a newline, and `tmux send-keys ... Enter` errors out. → Uninstall the Homebrew tmux and switch to the stable version that ships with your system (e.g., 3.3a).
 - **First launch stuck on a manual confirmation**: On first run, a CLI (such as Claude Code) pops up a "trust this directory / bypass permissions" confirmation. If nobody has clicked through it, it hangs and reports a `tmux send-keys` error. → Confirm it manually once, and it won't appear again.
 
 ## Lost environment variables (high frequency)

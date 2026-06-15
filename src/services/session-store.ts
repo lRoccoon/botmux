@@ -232,6 +232,41 @@ export function countActiveSessionsOnDisk(dataDir: string = config.session.dataD
   return n;
 }
 
+/**
+ * Collect every CLI session identity botmux has ever recorded — across ALL bot
+ * store files, ANY status (active or closed). Returns both each session's
+ * botmux `sessionId` (which, for claude-family, IS the on-disk jsonl filename
+ * since botmux spawns with `--session-id <id>`) and its `cliSessionId` (the
+ * CLI-native id after any resume/rotation, e.g. a codex/traex rollout id).
+ *
+ * Used by `/adopt`'s resume-import discovery to hide sessions botmux already
+ * manages — live OR closed — so the picker surfaces only genuinely external
+ * sessions (a CLI the user ran standalone). Closed botmux sessions remain
+ * resumable via their own session-closed cards.
+ */
+export function collectBotmuxSessionIdentities(dataDir: string = config.session.dataDir): Set<string> {
+  const ids = new Set<string>();
+  const add = (s: Session | undefined) => {
+    if (!s) return;
+    if (s.sessionId) ids.add(s.sessionId);
+    if (s.cliSessionId) ids.add(s.cliSessionId);
+  };
+  // In-memory first (freshest — covers ids not yet flushed to disk).
+  load();
+  for (const s of sessions.values()) add(s);
+  // Then every bot's persisted store file (other daemons own their own files).
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (!file.startsWith('sessions') || !file.endsWith('.json')) continue;
+      try {
+        const data: Record<string, Session> = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
+        for (const s of Object.values(data)) add(s);
+      } catch { continue; }
+    }
+  } catch { /* missing dir → in-memory only */ }
+  return ids;
+}
+
 function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session[] {
   load();
   const matches: Session[] = [];

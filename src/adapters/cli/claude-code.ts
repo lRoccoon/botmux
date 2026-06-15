@@ -7,6 +7,7 @@ import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { t } from '../../i18n/index.js';
 import { delay, scaleMs } from '../../utils/timing.js';
+import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -480,6 +481,13 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return `${variant.resumeBin} --resume ${cliSessionId ?? sessionId}`;
     },
 
+    /** Import path: scan this variant's data root (`<dataDir>/projects/<hash>/<id>.jsonl`)
+     *  for resumable sessions. The session id is the jsonl basename; cwd + first
+     *  prompt come from the transcript. */
+    listResumableSessions({ limit, exclude }) {
+      return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
+    },
+
     buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
@@ -493,29 +501,29 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (!disableCliBypass) {
         args.push('--dangerously-skip-permissions');
       }
-      // 进程级 --settings JSON：作用域仅限本次 spawn，不写入用户全局 ~/.claude/settings.json，
-      // 并与用户自有 settings.json 合并（Claude 把多个 settings 源按事件 **合并** hooks 数组，
-      // 不互相覆盖——所以用户自己的 SessionStart hook 不会失效）。承载两件事：
-      //   1. SessionStart hook → `botmux session-ready`：CLI「真就绪」信号。cjadk 之类自定义
-      //      launcher 的启动选择器光标 ❯ 会误命中 readyPattern → IdleDetector 误判就绪 → 首条
-      //      prompt 被选择器整条吞掉。SessionStart 在真输入框渲染时才触发（卡在选择器期间不
-      //      触发），是无歧义的就绪信号；worker 收到前不投首条 prompt（见 worker ready-gate）。
-      //      无条件注入（即便 disableCliBypass）：否则 worker 的就绪门控会空等到超时兜底。
-      //   2. bypass 权限相关键（仅 !disableCliBypass）。
-      // 注意：askUserQuestion hook 不在这里——它要写全局 settings.json（见下方 hookInstall），
-      // 这样 adopt 模式（接管的别处 claude 会话拿不到本 --settings）才能读到那条 hook。
-      // SessionStart 就绪信号无需兼容 adopt（adopt 会话不走 botmux 投首条的门控），故只走
-      // 进程级注入足矣。
-      const inlineSettings: Record<string, unknown> = {
-        hooks: {
-          SessionStart: [{ hooks: [{ type: 'command', command: sessionReadyHookCommand() }] }],
-        },
-      };
+      // 进程级 --settings JSON：作用域仅限本次 spawn，与用户自有 settings.json 合并
+      // （Claude 把多个 settings 源按事件 **合并** hooks 数组，不互相覆盖）。这里只承载
+      // bypass 权限相关键（仅 !disableCliBypass）。
+      //
+      // SessionStart 就绪 hook（→ `botmux session-ready`）**不**再注入这里，改走全局
+      // settings.json（见下方 hookInstall.sessionStartCommand）。原因有二：
+      //   1. wrapperCli=`aiden x claude` 会剥掉本 --settings（aiden 硬拒），进程级那份它拿
+      //      不到；全局是它唯一能读到就绪 hook 的渠道。
+      //   2. 若进程级和全局**同时**注入 SessionStart，Claude 会等两条 hook 都退出才渲染输入框，
+      //      但 worker 在第一条 hook 发来的信号就放行首条 prompt → 首条 prompt 抢在输入框渲染前
+      //      落地 → 触发 Claude 的 paste-burst 启发式 → 多行里的软换行 `\` 被当字面量保留。
+      //      单一来源（全局）消除这个竞态，恢复原先单 hook 的时序。
+      // 全局即足够：Claude（含 cjadk / aiden 等启动器跑的真 claude）默认读 ~/.claude/settings.json，
+      // 与 askUserQuestion hook 同源同渠道，比进程级更稳（还覆盖 adopt / 剥 --settings 的场景）。
+      const inlineSettings: Record<string, unknown> = {};
       if (!disableCliBypass) {
         inlineSettings.skipDangerousModePermissionPrompt = true;
         inlineSettings.permissions = { defaultMode: 'bypassPermissions' };
       }
-      args.push('--settings', JSON.stringify(inlineSettings));
+      // 仅在有内容（bypass 键）时才传 --settings；disableCliBypass 下没东西可传就不传。
+      if (Object.keys(inlineSettings).length > 0) {
+        args.push('--settings', JSON.stringify(inlineSettings));
+      }
       args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
@@ -852,6 +860,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     hookInstall: {
       configPath: join(variant.dataDir, 'settings.json'),
       format: 'claude-settings',
+      // SessionStart 就绪 hook 也写全局：进程级 --settings 那份会被 wrapperCli=`aiden x
+      // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
+      // 避免首条 prompt 空等 45s。原生 claude 会同时收到进程级+全局两份，幂等无害。
+      sessionStartCommand: sessionReadyHookCommand(),
     },
     asksViaHook: true,
   };

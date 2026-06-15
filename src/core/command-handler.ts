@@ -15,6 +15,7 @@ import { createRepoWorktree } from '../services/git-worktree.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -33,6 +34,7 @@ import {
   applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, type ConfigEffect,
 } from '../services/bot-config-store.js';
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
+import { decorateResumeForWrapper } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
@@ -903,10 +905,11 @@ export async function handleCommand(
           const cliResumeCommand = (() => {
             try {
               const adapter = createCliAdapterSync(closedCliId, botCfg.cliPathOverride);
-              return adapter.buildResumeCommand?.({
+              const raw = adapter.buildResumeCommand?.({
                 sessionId: closedSessionId,
                 cliSessionId: ds.session.cliSessionId,
               }) ?? null;
+              return raw ? decorateResumeForWrapper(raw, botCfg.wrapperCli) : null;
             } catch { return null; }
           })();
           killWorker(ds);
@@ -1481,7 +1484,13 @@ export async function handleCommand(
           ...discoverAdoptableZellijSessions(botCliId),
         ];
 
-        if (sessions.length === 0) {
+        // Second filter: sessions resumable from disk (paseo-style import).
+        // Only the bot's OWN CLI is offered (resume needs that CLI's binary).
+        const resumable = botCliId
+          ? await discoverResumableSessionsForBot(botCliId, botCfgForAdopt?.cliPathOverride, activeSessions)
+          : [];
+
+        if (sessions.length === 0 && resumable.length === 0) {
           await sessionReply(rootId, t('cmd.adopt.no_sessions', undefined, loc));
           break;
         }
@@ -1496,15 +1505,21 @@ export async function handleCommand(
               ? `${s.zellijSession}:${s.zellijPaneId}` === zellijNorm
               : adoptTargetLabel(s) === directTarget || adoptTargetKey(s) === directTarget || s.tmuxTarget === directTarget || s.herdrPaneId === directTarget,
           );
-          if (!target) {
-            await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
+          if (target) {
+            if (ds) await startAdoptSession(target, ds, deps, larkAppId);
             break;
           }
-          if (ds) await startAdoptSession(target, ds, deps, larkAppId);
+          // Fall back to a resumable session matched by its CLI-native id.
+          const resumeTarget = resumable.find(r => r.cliSessionId === directTarget);
+          if (resumeTarget) {
+            if (ds) await startResumeImportSession(resumeTarget, ds, deps, larkAppId);
+            break;
+          }
+          await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
           break;
         }
 
-        const cardJson = buildAdoptSelectCard(sessions, rootId, loc);
+        const cardJson = buildAdoptSelectCard(sessions, rootId, loc, resumable);
         await sessionReply(rootId, cardJson, 'interactive');
         break;
       }
@@ -2473,4 +2488,68 @@ export async function startAdoptSession(
 
   const cliName = getCliDisplayName(target.cliId);
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane }, loc));
+}
+
+/** Discover the sessions resumable from disk for `cliId`, excluding any whose
+ *  CLI-native id is already live in a botmux session (so a session botmux
+ *  already runs isn't offered for re-import). Returns [] when the adapter has
+ *  no on-disk store. */
+export async function discoverResumableSessionsForBot(
+  cliId: CliId,
+  cliPathOverride: string | undefined,
+  activeSessions: Map<string, DaemonSession>,
+  limit = 20,
+): Promise<ResumableSession[]> {
+  let adapter: ReturnType<typeof createCliAdapterSync>;
+  try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }
+  if (!adapter.listResumableSessions) return [];
+  // Exclude every session botmux already manages — live OR closed — so the
+  // picker surfaces only genuinely external sessions (a CLI the user ran
+  // standalone). botmux's own closed sessions stay resumable via their
+  // session-closed cards, so hiding them here avoids a redundant, confusing
+  // duplicate. The identity set spans all bot stores and includes both the
+  // botmux sessionId (= the claude jsonl filename) and the cliSessionId
+  // (codex/traex rollout id), covering every CLI's id shape. Passed INTO the
+  // adapter so exclusion happens BEFORE the `limit` truncation.
+  const exclude = sessionStore.collectBotmuxSessionIdentities() ?? new Set<string>();
+  // Belt-and-suspenders: also fold in the in-memory active map (freshest).
+  for (const ds of activeSessions.values()) {
+    if (ds.session.sessionId) exclude.add(ds.session.sessionId);
+    if (ds.session.cliSessionId) exclude.add(ds.session.cliSessionId);
+  }
+  try {
+    return await adapter.listResumableSessions({ limit, exclude });
+  } catch {
+    return [];
+  }
+}
+
+/** Import (resume) a stored session into the current topic: re-spawn the bot's
+ *  CLI via `--resume <cliSessionId>` in `cwd`. Mirrors the manual resume path —
+ *  the worker owns the CLI (NOT an observe-adopt), so no `adoptedFrom` is set. */
+export async function startResumeImportSession(
+  target: ResumableSession,
+  ds: DaemonSession,
+  deps: CommandHandlerDeps,
+  larkAppId?: string,
+): Promise<void> {
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
+  const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  const project = target.cwd.split('/').pop() || target.cwd;
+
+  ds.workingDir = target.cwd;
+  ds.session.workingDir = target.cwd;
+  ds.session.cliSessionId = target.cliSessionId;
+  ds.session.title = target.title || `Import: ${project}`;
+  // Resume sandbox decision is left to forkWorker (resume=true → not sandboxed,
+  // matching restore semantics). Mark history so the session is treated as a
+  // resume, not a fresh spawn.
+  ds.hasHistory = true;
+  sessionStore.updateSession(ds.session);
+
+  forkWorker(ds, '', true);
+
+  const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+  await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
 }

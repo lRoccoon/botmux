@@ -6,10 +6,12 @@
  *   而是声明 hookInstall 写全局 ~/.claude/settings.json —— 这样 adopt 模式（botmux 接管
  *   别处已启动、拿不到 --settings 的 claude 会话）也能让那条会话读到 hook（即 --settings
  *   里 **不含** PreToolUse / AskUserQuestion）。
- * - 进程级 --settings 仅保留 bypassPermissions / skipDangerousMode，不被挤掉。
- * - SessionStart hook（真就绪信号 → `botmux session-ready`）**走**进程级 --settings：
- *   它无需兼容 adopt（adopt 会话不走 botmux 投首条的门控），故只进程级注入；且无条件
- *   注入（即便 disableCliBypass）否则 worker 就绪门控会空等到超时兜底。
+ * - 进程级 --settings 仅保留 bypassPermissions / skipDangerousMode；没有这些键时干脆不传 --settings。
+ * - SessionStart hook（真就绪信号 → `botmux session-ready`）**改走全局** settings.json
+ *   （hookInstall.sessionStartCommand），不再注入进程级 --settings。原因：① wrapperCli=aiden x
+ *   claude 会剥掉 --settings，全局是其唯一渠道；② 进程级+全局同时注入会让 Claude 等两条 hook
+ *   退出才渲染输入框、而 worker 在第一条信号就放行首条 prompt → 抢跑触发 paste-burst → 软换行
+ *   `\` 字面残留。单一全局来源消除竞态。
  */
 import { describe, it, expect, vi } from 'vitest';
 import { homedir } from 'node:os';
@@ -31,10 +33,13 @@ function settingsOf(args: string[]): any {
 describe('claude-code —— hook 注入策略（adopt 兼容 + SessionStart 真就绪信号）', () => {
   const adapter = createClaudeCodeAdapter('/usr/bin/claude');
 
-  it('--settings 含 SessionStart hook → botmux session-ready', () => {
+  it('SessionStart 就绪 hook 改走全局 hookInstall，不再注入进程级 --settings', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, locale: 'zh' });
+    // 默认 !disableCliBypass → --settings 仍在（带 bypass 键），但 **不含** SessionStart
     const parsed = settingsOf(args);
-    const cmd = parsed.hooks?.SessionStart?.[0]?.hooks?.[0]?.command as string;
+    expect(parsed.hooks?.SessionStart).toBeUndefined();
+    // 就绪 hook 由全局 settings.json 注入（hookInstall.sessionStartCommand）
+    const cmd = adapter.hookInstall?.sessionStartCommand as string;
     expect(typeof cmd).toBe('string');
     expect(cmd).toContain('cli.js');
     expect(cmd).not.toContain('index-daemon');
@@ -54,16 +59,14 @@ describe('claude-code —— hook 注入策略（adopt 兼容 + SessionStart 真
     expect(parsed.skipDangerousModePermissionPrompt).toBe(true);
   });
 
-  it('disableCliBypass=true 时仍注入 SessionStart hook，但不带 bypass 键', () => {
+  it('disableCliBypass=true 时无 bypass 键 → 干脆不传进程级 --settings（就绪 hook 走全局）', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     // bypass 关闭 → 不加 --dangerously-skip-permissions
     expect(args).not.toContain('--dangerously-skip-permissions');
-    const parsed = settingsOf(args);
-    // SessionStart hook 仍在（否则 worker 就绪门控空等超时）
-    expect(parsed.hooks?.SessionStart?.[0]?.hooks?.[0]?.command).toContain('session-ready');
-    // 但 bypass 相关键缺席
-    expect(parsed.skipDangerousModePermissionPrompt).toBeUndefined();
-    expect(parsed.permissions).toBeUndefined();
+    // 没有 bypass 键、SessionStart 已移走 → 不再传 --settings
+    expect(args).not.toContain('--settings');
+    // 就绪 hook 仍由全局 hookInstall 提供
+    expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
   it('adapter 标记 injectsReadyHook（驱动 worker 武装 ready-gate）', () => {
@@ -72,10 +75,12 @@ describe('claude-code —— hook 注入策略（adopt 兼容 + SessionStart 真
 
   it('adapter 声明 hookInstall 指向全局 ~/.claude/settings.json', () => {
     // 家族工厂从 dataDir 统一拼绝对路径（= ~/.claude/settings.json 经 expandHome 的等价形式）。
-    expect(adapter.hookInstall).toEqual({
+    expect(adapter.hookInstall).toMatchObject({
       configPath: join(homedir(), '.claude', 'settings.json'),
       format: 'claude-settings',
     });
+    // 同时把 SessionStart 就绪 hook 写全局（为 aiden x claude 这类剥 --settings 的启动器供信号）
+    expect(adapter.hookInstall?.sessionStartCommand).toMatch(/session-ready$/);
     // 仍标记 asksViaHook（驱动「不装 botmux-ask skill 兜底」）
     expect(adapter.asksViaHook).toBe(true);
   });

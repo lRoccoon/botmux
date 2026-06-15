@@ -2,10 +2,13 @@
 
 > 来自社区交流群的高频实战坑，按出现频率与影响排序。
 
+## 机器人权限 / 应用创建（最常见）
+
+- **复用了旧应用创建的机器人 / 没走最新 `botmux setup` 扫码创建 / 权限没配全**：症状五花八门——CLI 像是"中途退出"、群里收不到消息、`botmux history` 报 400 等，根因大多是机器人权限不全。→ 用最新版 `botmux setup` 扫码**重新创建**应用（会自动配齐全部权限并发版），别复用旧应用创建的机器人，也别手动建时漏了权限。
+
 ## 环境 / 安装
 
 - **Node 太老**：v18 等没内置全局 `fetch`，`botmux setup` 会报 `fetch is not defined` / `fetch failed` 且不写 `bots.json`。→ 升级到 **Node ≥ 22**。
-- **高版本 tmux 导致 CLI 中途退出**：Homebrew / 源码编译的 3.6a 等，症状是新建会话后输入到换行时 CLI 退出、`tmux send-keys ... Enter` 报错。→ 卸载 Homebrew tmux，改用系统自带稳定版（如 3.3a）。
 - **首次启动卡在人工确认**：CLI（如 Claude Code）首次会弹"信任目录 / bypass 权限"确认，没人工点过会卡住、报 `tmux send-keys` 错。→ 首次手动确认一次，之后不再出现。
 
 ## 环境变量丢失（高频）

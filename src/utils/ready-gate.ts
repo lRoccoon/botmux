@@ -49,6 +49,12 @@
  *
  * Any of the negatives → don't arm; the gate stays open and the spawn behaves
  * exactly as before (readyPattern + quiescence).
+ *
+ * NB: `wrapperCli=aiden x claude` strips our process-level `--settings`, but the
+ * SessionStart hook is ALSO installed globally (~/.claude/settings.json — see
+ * claude-code.ts hookInstall.sessionStartCommand), which aiden's Claude still
+ * reads. So the real signal fires there too → we KEEP arming for that case
+ * (no readyPattern fallback, which could misjudge).
  */
 export function shouldArmReadyGate(state: {
   injectsReadyHook: boolean;

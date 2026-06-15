@@ -27,6 +27,8 @@ An interactive wizard; just follow the prompts:
 
 > ✅ **Both Feishu (feishu.cn) and Lark (international, larksuite.com) are supported**: when creating the app by QR code, the tenant type is detected automatically; when pasting manually, you can choose it. You can mix both on the same machine.
 
+> 🔧 **Creating by QR code auto-configures all permissions and publishes a version** — no manual steps needed. Only if you add `botmux setup --no-open-platform-auto` (skip auto-config) or create the app manually do you need to import the permission JSON yourself in the Open Platform (setup writes the full set to `~/.botmux/lark-scopes.json` and prints a one-click copy command) and create/publish a version; choosing availability "Visible to me only" gets auto-approved.
+
 ## Step 3 · Start
 
 ```bash
@@ -34,24 +36,7 @@ botmux start            # Start the daemon
 botmux autostart enable # Start on boot (recommended; survives machine restarts, no sudo needed)
 ```
 
-## Step 4 · Apply for permissions
-
-After setup finishes, the complete permission JSON is written to `~/.botmux/lark-scopes.json` and a one-click copy command is printed. Copy it to your clipboard, then go to the Open Platform's "Permissions → Batch import/export permissions" and paste to submit. Choosing the availability scope "Visible to me only" gets it approved automatically.
-
-```bash
-# macOS
-cat ~/.botmux/lark-scopes.json | pbcopy
-# Linux desktop
-cat ~/.botmux/lark-scopes.json | xclip -selection clipboard
-# SSH / no DISPLAY: just cat it, then select with the mouse in your local terminal
-cat ~/.botmux/lark-scopes.json
-```
-
-## Step 5 · Publish a version
-
-In the Open Platform, go to "Version management & release → Create version" and publish; choosing the availability scope "Visible to me only" passes review automatically.
-
-## Step 6 · Create a group and start chatting
+## Step 4 · Create a group and start chatting
 
 1. Create a **topic group** in Lark (regular groups are also supported).
 2. Group settings → Group bots → add the bot you just created.
@@ -61,9 +46,31 @@ You can also **DM the bot** to start chatting directly, or use `botmux dashboard
 
 ## Not receiving messages? Self-check
 
-PersonalAgent has subscriptions pre-configured, so normally you don't need to touch anything. If the bot **receives no messages at all**:
+Most "no messages" cases are **local config or network issues**, not a botmux bug. botmux already wires up an AI agent — so **run a one-shot headless self-check with your CLI** and let it read the logs, check the config, and give you a verdict.
 
-- **Event subscriptions**: Open Platform → Events & callbacks → should subscribe to `im.message.receive_v1` + `card.action.trigger`, with the delivery method set to "Long connection (WebSocket)", and the daemon should be running.
-- **Bot capability**: Open Platform → App features → Bot should be enabled.
+First save the diagnostic task into a variable (single line, so you don't have to paste it repeatedly):
+
+```bash
+DIAG='botmux is not receiving messages in the Lark group. Diagnose read-only (do NOT change anything), run these in order and give the most likely cause + fix: botmux status (is the daemon running); botmux logs --lines 150 (look for WebSocket connection failures, token/auth errors, permission errors 401/403/411/400, CLI spawn failures); cat ~/.botmux/bots.json (check AppID/Secret/CLI config); judge whether the long-lived WebSocket is blocked by a corporate network/proxy/firewall. Conclude at the end.'
+```
+
+Pick one line for the CLI you have installed (all non-interactive; they print the verdict and exit):
+
+```bash
+claude -p "$DIAG" --allowedTools "Bash"   # Claude Code
+codex exec "$DIAG"                         # Codex
+gemini -p "$DIAG" --yolo                   # Gemini
+coco  -p "$DIAG" --yolo                    # Trae / CoCo (aliases trae-agent / ta)
+cursor-agent -p "$DIAG"                    # Cursor
+```
+
+> The trailing flags (`--allowedTools` / `--yolo`, etc.) just let the agent actually run commands and read logs — it's a read-only check. `botmux logs` can pinpoint almost any problem; it's the gold standard.
+
+Still stuck? Check manually (usually local-side):
+
+- **Daemon not running / config changed without restart** → `botmux status`, then `botmux restart`.
+- **Incomplete bot permissions / reusing a bot created from an old app** (most common) → see [Common Pitfalls](/en/pitfalls); recreate via the latest `botmux setup` QR flow.
+- **Event subscriptions / bot capability** (only needed for manually-created apps): in the Open Platform, subscribe to `im.message.receive_v1` + `card.action.trigger` (long-lived WebSocket), and enable App features → Bot.
+- **Network**: the long-lived WebSocket can't get out (corporate network / proxy / firewall) → the agent will see the connection errors in the logs.
 
 After confirming, run `botmux restart`. See [FAQ / Troubleshooting](/en/faq) for more.
