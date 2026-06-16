@@ -42,6 +42,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
+    supportsTypeAhead: true,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
     skillsDir: '~/.pi/agent/skills',
