@@ -172,6 +172,12 @@ export interface CliAdapter {
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
 
+  /** Busy marker regex — matches when the CLI is explicitly rendering a
+   *  still-running state. Used for re-attached persistent sessions where there
+   *  may be no new PTY output: if the current screen does NOT match this marker,
+   *  the worker may safely let quiescence mark the session idle. */
+  readonly busyPattern?: RegExp;
+
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
    *  until this pattern appears in the PTY output.  Checked every cycle (reset

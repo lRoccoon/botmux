@@ -497,6 +497,12 @@ describe('supportsTypeAhead flag', () => {
     expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBe(true);
   });
 
+  it('pi: exposes Working... as the explicit busy marker', () => {
+    const adapter = createPiAdapter('/bin/pi');
+    expect(adapter.busyPattern?.test('⠙ Working...')).toBe(true);
+    expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
+  });
+
   it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
   });

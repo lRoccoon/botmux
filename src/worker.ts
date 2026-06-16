@@ -3320,6 +3320,25 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
   }
 }
 
+function scheduleReattachIdleProbe(source: string, be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): void {
+  setTimeout(() => {
+    if (!awaitingFirstPrompt || isPromptReady || pendingMessages.length > 0) return;
+    try {
+      const content = be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? '';
+      if (!content) return;
+      if (cliAdapter?.busyPattern) {
+        if (cliAdapter.busyPattern.test(content)) return;
+        log(`${source} idle probe: busy marker absent, marking prompt ready`);
+        markPromptReady();
+        return;
+      }
+      onPtyData(content);
+    } catch (err: any) {
+      log(`${source} idle probe captureCurrentScreen failed: ${err.message}`);
+    }
+  }, 3_500).unref?.();
+}
+
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // Re-deliver inputs that were in-flight when the previous CLI died (see
   // backend.onExit). killCli() already wiped pendingMessages, so these go to
@@ -3995,6 +4014,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (isPipeMode && backend && 'isReattach' in backend && backend.isReattach) {
     log(`Re-attached to existing ${effectiveBackendType} session via pipe backend: ${persistentSessionName}`);
     seedBackendScreen(`${effectiveBackendType} reattach`, backend);
+    scheduleReattachIdleProbe(`${effectiveBackendType} reattach`, backend);
   }
 
   // Fallback: if the CLI takes too long to show its prompt (e.g. slow

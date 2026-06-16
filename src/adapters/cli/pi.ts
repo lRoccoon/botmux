@@ -41,6 +41,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    busyPattern: /Working\.\.\./,
     readyPattern: undefined,
     supportsTypeAhead: true,
     systemHints: BOTMUX_SHELL_HINTS,
