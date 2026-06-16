@@ -312,13 +312,64 @@ export function getLoadedConfigPath(): string | undefined {
 // traces, etc.); without DEBUG=1 those become no-ops in the CLI path and
 // stay in daemon.log on the daemon path — pm2's error.log no longer sees
 // "[lark:info] client ready" floods.
+// Cap raw dumps so an unrecognized error shape can never flood the log the way
+// the SDK's full AxiosError blob (stack + config + headers) did — that bloated
+// pm2's error.log past 1GB and, worse, leaked the `Authorization: Bearer t-…`
+// access token on every request failure.
+const MAX_FALLBACK_LEN = 300;
 function safeStringify(v: unknown): string {
   if (typeof v === 'string') return v;
-  try { return JSON.stringify(v); } catch { return String(v); }
+  let s: string;
+  try { s = JSON.stringify(v) ?? String(v); } catch { s = String(v); }
+  return s.length > MAX_FALLBACK_LEN ? `${s.slice(0, MAX_FALLBACK_LEN)}…(+${s.length - MAX_FALLBACK_LEN})` : s;
 }
-const fmtLark = (msg: any[]) => msg.map(safeStringify).join(' ');
+
+// Drop the protocol+host (and `/open-apis/` prefix) so the line shows just the
+// API path that matters for triage, never the bearer token in the URL/headers.
+function shortLarkPath(url: unknown): string {
+  if (typeof url !== 'string' || !url) return '';
+  const path = url.replace(/^https?:\/\/[^/]+/, '').replace(/^\/open-apis\//, '');
+  return path || url;
+}
+
+/**
+ * Condense a Lark SDK error into one readable line, preserving just the fields
+ * needed to triage (HTTP status + business `code`/`msg`/`log_id`). Returns null
+ * when the value isn't an axios-shaped error, so callers fall back to
+ * length-capped stringify. Never serializes `config`/`headers`/`stack`, so the
+ * access token can't leak.
+ */
+export function formatLarkError(v: any): string | null {
+  if (!v || typeof v !== 'object') return null;
+  const isAxios = v.isAxiosError === true || v.name === 'AxiosError' || (v.config && (v.response || v.status != null));
+  if (!isAxios) return null;
+  const method = String(v.config?.method ?? '').toUpperCase();
+  const path = shortLarkPath(v.config?.url);
+  const httpStatus = v.response?.status ?? v.status;
+  // Lark business error lives in the response body; some shapes surface it on
+  // the error object directly.
+  const data = v.response?.data ?? {};
+  const code = data.code ?? v.code;
+  const msg = data.msg ?? v.msg;
+  const logId = data.log_id ?? data.logId;
+  const parts: string[] = [];
+  if (method) parts.push(method);
+  if (path) parts.push(path);
+  if (httpStatus != null || method || path) parts.push(`→ ${httpStatus ?? '?'}`);
+  if (typeof code === 'number') parts.push(`code=${code}`);
+  if (typeof msg === 'string' && msg) parts.push(`"${msg}"`);
+  if (logId) parts.push(`log_id=${logId}`);
+  if (!parts.length) return null;
+  return parts.join(' ');
+}
+
+const fmtLark = (msg: any[]) => msg.map((m) => formatLarkError(m) ?? safeStringify(m)).join(' ');
 const larkLogger = {
-  error: (...msg: any[]) => logger.error(`[lark] ${fmtLark(msg)}`),
+  // SDK request failures arrive here as raw AxiosError objects — condense to a
+  // single triage line (status + lark code/msg/log_id) instead of dumping the
+  // stack/config blob. Demoted to warn: nearly all are environmental and already
+  // handled at the call site (rate limits, bot-not-in-chat, stale threads).
+  error: (...msg: any[]) => logger.warn(`[lark] ${fmtLark(msg)}`),
   warn:  (...msg: any[]) => logger.warn(`[lark] ${fmtLark(msg)}`),
   info:  (...msg: any[]) => logger.info(`[lark] ${fmtLark(msg)}`),
   debug: (...msg: any[]) => logger.debug(`[lark] ${fmtLark(msg)}`),

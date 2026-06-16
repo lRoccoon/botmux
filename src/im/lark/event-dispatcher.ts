@@ -1348,6 +1348,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     'drive.file.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     'drive.notice.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     'card.action.trigger': (data: any) => handleCardActionAckSafe(data, larkAppId, handlers),
+    // 表情回复事件——一旦在开发者后台订阅了 reaction，SDK 每收到一次都会因
+    // 没有 handler 打 "no im.message.reaction.created_v1 handle" 警告刷屏。
+    // botmux 不消费表情事件，注册显式 no-op 把这条噪声静默掉。
+    'im.message.reaction.created_v1': () => {},
+    'im.message.reaction.deleted_v1': () => {},
     'im.message.receive_v1': (data: any) => {
       const messageIdForKey = data?.message?.message_id;
       const eventKey = `im.message.receive_v1:${larkAppId}:${eventIdForKey(data) ?? messageIdForKey ?? unkeyableEventKey()}`;

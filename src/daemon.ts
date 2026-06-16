@@ -253,7 +253,10 @@ function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
   if (!raw) return 0;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  // `0` is the documented "off" sentinel that the daemon spawn always passes
+  // (`BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0'`) — treat it as a silent no-op, only
+  // warn on genuinely malformed values (non-numeric / negative).
+  if (!Number.isFinite(parsed) || parsed < 0) {
     logger.warn(`[memdiag] ignoring invalid ${name}=${JSON.stringify(raw)}`);
     return 0;
   }
