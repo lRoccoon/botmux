@@ -55,6 +55,9 @@ import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
+import { buildPm2SpawnCommand } from './cli/pm2-command.js';
+import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { rejectLikelyWindowsStdinMojibake } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
@@ -1180,10 +1183,17 @@ function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
             env: pm2Env(home),
             timeout: 10_000,
           });
-        } catch { /* */ }
+        } catch (e) {
+          // Don't swallow silently — a failed delete here used to leave the
+          // restart half-done with no trace. Surface it (the auto-restart
+          // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
+          console.error(`[restart] pm2 delete ${app.name} failed: ${e instanceof Error ? e.message : e}`);
+        }
       }
     }
-  } catch { /* pm2 not running or no apps */ }
+  } catch (e) {
+    console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
+  }
 }
 
 function killPm2GodDaemon(home: string = PM2_HOME): void {
@@ -1362,8 +1372,10 @@ function cmdLogs(): void {
     target = `/^${PM2_NAME}/`;
   }
 
-  // Use spawn for streaming output
-  const child = spawn(pm2Bin(), ['logs', target, '--lines', lines], {
+  // Use spawn for streaming output. Windows cannot spawn a .js CLI script
+  // directly, so run the bundled pm2 script through the current node.exe.
+  const pm2 = buildPm2SpawnCommand(pm2Bin(), ['logs', target, '--lines', lines]);
+  const child = spawn(pm2.command, pm2.args, {
     stdio: 'inherit',
     env: pm2Env(),
   });
@@ -1388,50 +1400,18 @@ function cmdUpgrade(): void {
 }
 
 /**
- * Call one of the dashboard's loopback HMAC `/__cli/*` endpoints.
- * - `/__cli/rotate` mints a fresh token and returns its URL, invalidating the
- *   previously-issued link.
- * - `/__cli/current` returns the existing token's URL WITHOUT rotating (404 →
- *   no token has ever been minted → `no-active-token`).
- * Returns { ok: true, url } on success, or { ok: false, reason } so callers can
- * decide how to surface the failure (hard error vs soft hint).
+ * Call one of the dashboard's loopback HMAC `/__cli/*` endpoints. Thin wrapper
+ * over {@link callDashboard}, which handles 404 disambiguation and self-heals a
+ * stale `.dashboard-port` that points at the wrong service (e.g. daemon IPC).
+ * See `src/cli/dashboard-endpoint.ts` for the why.
  */
-async function callDashboardEndpoint(
-  path: '/__cli/rotate' | '/__cli/current',
-): Promise<
-  | { ok: true; url: string }
-  | { ok: false; reason: 'no-secret' | 'unreachable' | 'http-error' | 'no-active-token'; detail?: string }
-> {
-  const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
-  if (!existsSync(SECRET_PATH)) return { ok: false, reason: 'no-secret' };
-  const secret = readFileSync(SECRET_PATH, 'utf8').trim();
-  const ts = Math.floor(Date.now() / 1000).toString();
-  const nonce = randomBytes(8).toString('hex');
-  const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
-  const portFile = join(CONFIG_DIR, '.dashboard-port');
-  const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
-    || process.env.BOTMUX_DASHBOARD_PORT
-    || '7891';
-
-  let res: Response;
-  try {
-    res = await fetch(`http://127.0.0.1:${port}${path}`, {
-      method: 'POST',
-      headers: {
-        'X-Botmux-Cli-Ts': ts,
-        'X-Botmux-Cli-Nonce': nonce,
-        'X-Botmux-Cli-Auth': sig,
-      },
-    });
-  } catch {
-    return { ok: false, reason: 'unreachable' };
-  }
-  if (res.status === 404) return { ok: false, reason: 'no-active-token' };
-  if (!res.ok) {
-    return { ok: false, reason: 'http-error', detail: `${res.status} ${await res.text()}` };
-  }
-  const body = await res.json() as { url: string };
-  return { ok: true, url: body.url };
+async function callDashboardEndpoint(path: DashboardEndpoint): Promise<DashboardResult> {
+  return callDashboard({
+    configDir: CONFIG_DIR,
+    defaultPort: 7891,
+    envPort: process.env.BOTMUX_DASHBOARD_PORT,
+    path,
+  });
 }
 
 /**
@@ -1452,8 +1432,10 @@ async function printDashboardHintWithRetry(): Promise<void> {
       return;
     }
     // Terminal states — file-backed secret/token won't appear mid-poll, unlike
-    // a not-yet-listening port. Don't spin on them.
-    if (last.reason === 'no-secret' || last.reason === 'no-active-token') break;
+    // a not-yet-listening port. `wrong-service` means the port file points at a
+    // non-dashboard server and discovery already failed to find it, so retrying
+    // won't help either. Don't spin on any of them.
+    if (last.reason === 'no-secret' || last.reason === 'no-active-token' || last.reason === 'wrong-service') break;
     await new Promise(r => setTimeout(r, stepMs));
   }
   // Soft fallback
@@ -1461,6 +1443,8 @@ async function printDashboardHintWithRetry(): Promise<void> {
     console.log('   面板: 运行 `botmux dashboard` 获取链接');
   } else if (last?.reason === 'no-secret') {
     console.log('   面板: dashboard 凭证未就绪，启动后可用 `botmux dashboard` 获取链接');
+  } else if (last?.reason === 'wrong-service') {
+    console.log('   面板: `botmux dashboard`（端口文件可能已失效，必要时 `botmux restart` 刷新）');
   } else {
     console.log('   面板: `botmux dashboard`（daemon 启动中，稍后可获取链接）');
   }
@@ -1477,16 +1461,25 @@ async function cmdDashboard(): Promise<void> {
     console.log(r.url);
     return;
   }
+  const portFile = join(CONFIG_DIR, '.dashboard-port');
+  const recordedPort = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+    || process.env.BOTMUX_DASHBOARD_PORT
+    || '7891';
   if (r.reason === 'no-secret') {
     console.error('Dashboard not initialised. Run `botmux restart` first.');
   } else if (r.reason === 'unreachable') {
-    const portFile = join(CONFIG_DIR, '.dashboard-port');
-    const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
-      || process.env.BOTMUX_DASHBOARD_PORT
-      || '7891';
     console.error(
-      `dashboard process not reachable on 127.0.0.1:${port} — \`botmux restart\` will start it`,
+      `dashboard process not reachable on 127.0.0.1:${recordedPort} — \`botmux restart\` will start it`,
     );
+  } else if (r.reason === 'wrong-service') {
+    // 127.0.0.1:<port> answered, but it isn't the dashboard (typically the
+    // daemon IPC server holding a port the stale .dashboard-port points at),
+    // and rediscovery across the probe range found no dashboard either.
+    console.error(
+      `127.0.0.1:${recordedPort} 上的服务不是 dashboard（端口文件 ~/.botmux/.dashboard-port 已失效，可能指向了 daemon IPC）。` +
+      '运行 `botmux restart` 重启 dashboard 并刷新端口文件。',
+    );
+    if (r.detail) console.error(`  详情: ${r.detail}`);
   } else {
     // `no-active-token` can't occur on rotate (it always mints); fall through.
     console.error('Rotation failed:', r.detail ?? r.reason);
@@ -3261,6 +3254,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
+  if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
 
   if (!content.trim() && images.length === 0 && files.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png');
@@ -4096,6 +4090,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     const pos = positionals(rest);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
+  if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
   if (!content.trim()) {
     console.error('没有回报内容。用法: botmux report "子项目X 完成 + 产出位置"');
     process.exit(1);

@@ -13,6 +13,7 @@
  * a future client that adds a setting we don't know about doesn't lose it.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import type { ProjectScanOptions } from './services/project-scanner.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
@@ -23,8 +24,14 @@ export interface WorkerConfig {
   idleSuspendMs?: number;
 }
 
+export type RepoPickerMode = 'all' | 'repos';
+
 export interface GlobalConfig {
   lang?: Locale;
+  /** Machine-wide repo picker display mode. Missing / 'all' preserves legacy
+   *  behavior (repos + linked worktrees). 'repos' lists only main worktrees in
+   *  selection cards; explicit /repo /abs/path/to/worktree still works. */
+  repoPickerMode?: RepoPickerMode;
   /** Machine-wide dashboard settings. These are intentionally global rather
    *  than per-bot: they govern the dashboard security boundary and the default
    *  terminal-opening behavior of cards emitted by all daemons on this host. */
@@ -39,6 +46,11 @@ export interface GlobalConfig {
   /** Machine-wide auto-update / auto-restart schedule. Off unless explicitly
    *  enabled. Only the primary daemon (bot-0) acts on it — see core/maintenance.ts. */
   maintenance?: MaintenanceConfig;
+  /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
+   *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
+   *  so hosts behind a proxy must set this (or the env vars, which we read as a
+   *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
+  httpProxy?: string;
 }
 
 export interface MaintenanceConfig {
@@ -156,6 +168,10 @@ function readMaintenance(raw: unknown): MaintenanceConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readRepoPickerMode(raw: unknown): RepoPickerMode | undefined {
+  return raw === 'all' || raw === 'repos' ? raw : undefined;
+}
+
 function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const d = raw as Record<string, unknown>;
@@ -225,6 +241,8 @@ export function readGlobalConfig(): GlobalConfig {
   const raw = readRawConfig();
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
+  const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
+  if (repoPickerMode) out.repoPickerMode = repoPickerMode;
   const dashboard = readDashboard(raw.dashboard);
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);
@@ -233,8 +251,17 @@ export function readGlobalConfig(): GlobalConfig {
   if (worker) out.worker = worker;
   const maintenance = readMaintenance(raw.maintenance);
   if (maintenance) out.maintenance = maintenance;
+  if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   readCache = { path, value: out, at: Date.now() };
   return out;
+}
+
+/** Derive repo-picker scan options from the machine-wide `repoPickerMode`.
+ *  'repos' hides linked worktrees from selection cards; anything else
+ *  (default 'all') lists repos + their worktrees. Shared by every scan
+ *  entry point (daemon spawn paths + `/repo`) so they stay consistent. */
+export function repoPickerScanOptions(): ProjectScanOptions {
+  return { includeWorktrees: readGlobalConfig().repoPickerMode !== 'repos' };
 }
 
 /** Merge a patch into the on-disk config, preserving unknown keys. Creates

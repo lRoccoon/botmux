@@ -1,7 +1,7 @@
 // src/dashboard.ts
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import {
-  readFileSync, existsSync, chmodSync, mkdirSync, statSync,
+  readFileSync, existsSync, chmodSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname } from 'node:path';
@@ -11,7 +11,7 @@ import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
-  generateToken, parseCookie, buildSetCookie, verifyHmac, decideDashboardAuth,
+  generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
   loadPersistedToken, persistToken,
 } from './dashboard/auth.js';
 import { DaemonRegistry } from './dashboard/registry.js';
@@ -29,12 +29,13 @@ import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { CLI_SELECT_OPTIONS, resolveCliSelection } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeDashboardConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig } from './global-config.js';
+import { mergeDashboardConfig, mergeGlobalConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig, type RepoPickerMode } from './global-config.js';
 import { isLocale } from './i18n/types.js';
 import { isLocalDevInstall } from './utils/install-info.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
+import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -89,6 +90,7 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  repoPickerMode: RepoPickerMode;
   /** Auto-update / auto-restart schedule (off by default). */
   maintenance: MaintenanceConfig;
   /** True when running from a source checkout — the Settings UI greys out the
@@ -97,11 +99,13 @@ interface ResolvedDashboardSettings {
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
-  const dashboard = readGlobalConfig().dashboard ?? {};
+  const global = readGlobalConfig();
+  const dashboard = global.dashboard ?? {};
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
-    maintenance: readGlobalConfig().maintenance ?? {},
+    repoPickerMode: global.repoPickerMode ?? 'all',
+    maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
   };
 }
@@ -194,7 +198,23 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
+  '.wasm': 'application/wasm',
+  '.pck': 'application/octet-stream',
 };
+
+/** Stream an absolute file (used for HD2D cache binaries that live outside
+ *  WEB_DIR). Callers pass only vetted paths from `hd2dAssetPath`. */
+function serveFileAbs(res: ServerResponse, fp: string): boolean {
+  let st;
+  try { st = statSync(fp); } catch { return false; }
+  if (!st.isFile()) return false;
+  res.writeHead(200, {
+    'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
+    'content-length': String(st.size),
+  });
+  createReadStream(fp).pipe(res);
+  return true;
+}
 
 function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
@@ -367,8 +387,15 @@ async function closeSessionsMatching(
 /**
  * Shared loopback-HMAC gate for the `/__cli/*` endpoints. Returns `{ ok: true }`
  * on success, or a ready-to-send `{ status, body }` error otherwise.
+ *
+ * The HMAC is bound to `method + pathname + the port WE actually bound`
+ * (`boundDashboardPort`, not the attacker-controllable Host header). That scopes
+ * a captured credential to this exact route on this exact dashboard, so a
+ * malicious local server handed a `botmux dashboard` discovery probe can't
+ * forward those headers to a different `/__cli/*` route or to the real dashboard
+ * on another port. See {@link cliAuthBind}.
  */
-function verifyCliRequest(req: IncomingMessage):
+function verifyCliRequest(req: IncomingMessage, pathname: string):
   | { ok: true }
   | { ok: false; status: number; body: Record<string, unknown> } {
   const ts = req.headers['x-botmux-cli-ts'];
@@ -378,7 +405,8 @@ function verifyCliRequest(req: IncomingMessage):
     return { ok: false, status: 400, body: { error: 'missing_headers' } };
   }
   const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
-  const r = verifyHmac(SECRET, { ts, nonce, sig }, remote);
+  const bind = cliAuthBind(req.method ?? 'POST', pathname, boundDashboardPort);
+  const r = verifyHmac(SECRET, { ts, nonce, sig }, remote, bind);
   if (!r.ok) return { ok: false, status: 401, body: { error: 'unauthorized', reason: r.reason } };
   return { ok: true };
 }
@@ -418,7 +446,7 @@ const server = createServer(async (req, res) => {
     // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
     // token, invalidating any previously-issued link.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
-      const gate = verifyCliRequest(req);
+      const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
       activeToken = generateToken();
       try {
@@ -434,7 +462,7 @@ const server = createServer(async (req, res) => {
     // dashboard link survives restart untouched. 404 → no token has ever been
     // minted (caller falls back to suggesting `botmux dashboard`).
     if (req.method === 'POST' && url.pathname === '/__cli/current') {
-      const gate = verifyCliRequest(req);
+      const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
       if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
       return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
@@ -472,19 +500,60 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Static frontend (index.html + /assets/*) ──────────────────────────
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/assets/'))) {
-      // Map /assets/foo.js → WEB_DIR/foo.js
+    // ─── Static frontend (index.html + /assets/* + /game/*) ────────────────
+    if (
+      req.method === 'GET' &&
+      (url.pathname === '/' || url.pathname.startsWith('/assets/') || url.pathname.startsWith('/game/'))
+    ) {
+      // HD2D runtime binaries (index.wasm / index.pck) are NOT shipped — they
+      // are downloaded on demand into the cache dir and served from there.
+      // Everything else under /game/ is the small shell shipped in dist.
+      if (url.pathname === '/game/index.wasm' || url.pathname === '/game/index.pck') {
+        const fp = hd2dAssetPath(url.pathname.slice('/game/'.length));
+        if (fp && serveFileAbs(res, fp)) return;
+        res.writeHead(404); res.end(); return;
+      }
+      // Map /assets/foo.js → WEB_DIR/foo.js; /game/* is served as-is.
       const lookupPath = url.pathname.startsWith('/assets/')
         ? '/' + url.pathname.slice(8)
         : url.pathname;
       if (serveStatic(req, res, lookupPath)) return;
     }
 
+    // ─── HD2D office assets (token-gated: download triggers a ~74MB fetch) ──
+    if (req.method === 'GET' && url.pathname === '/api/game/status') {
+      // `proxy` prefills the office tab's optional proxy input (config value
+      // only; an env-var proxy still works as a silent fallback downstream).
+      return jsonRes(res, 200, { ...hd2dStatus(), proxy: readGlobalConfig().httpProxy ?? '' });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/game/download') {
+      // Optional `proxy` in the body is persisted (so it survives restart) and
+      // takes effect immediately for this download — Node's fetch ignores the
+      // proxy env vars, so hosts behind a proxy set it here.
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { body = undefined; }
+      if (body && typeof body === 'object' && 'proxy' in body) {
+        const raw = (body as { proxy?: unknown }).proxy;
+        const proxy = typeof raw === 'string' ? raw.trim() : '';
+        mergeGlobalConfig({ httpProxy: proxy || null });
+      }
+      return jsonRes(res, 200, startHd2dDownload());
+    }
+
     // ─── Public API (cookie/token already validated above) ──────────────────
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
-      return jsonRes(res, 200, { sessions: aggregator.getSessions() });
+      // Sessions spawned before a bot config carried a display name store the
+      // raw appId as botName — resolve through the live registry so consumers
+      // (dashboard, HD2D office tab) always see the human-facing name.
+      const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
+      const sessions = aggregator.getSessions().map(s => {
+        const n = names.get(s.larkAppId);
+        return n && n !== s.larkAppId && (!s.botName || s.botName === s.larkAppId)
+          ? { ...s, botName: n }
+          : s;
+      });
+      return jsonRes(res, 200, { sessions });
     }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       // Public-read carve-out: the row carries CONTENT (prompt = business
@@ -524,6 +593,12 @@ const server = createServer(async (req, res) => {
       }
       let touched = false;
       if (Object.keys(patch).length > 0) { mergeDashboardConfig(patch); touched = true; }
+      if ('repoPickerMode' in body) {
+        const v = body.repoPickerMode;
+        if (v !== 'all' && v !== 'repos') return jsonRes(res, 400, { ok: false, error: 'invalid_repoPickerMode' });
+        mergeGlobalConfig({ repoPickerMode: v });
+        touched = true;
+      }
       if ('maintenance' in body) {
         const r = parseMaintenancePatch(body.maintenance);
         if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.error });

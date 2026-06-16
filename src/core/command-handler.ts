@@ -7,6 +7,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
+import { repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -314,6 +315,7 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
     workingDirs: config.daemon.workingDirs,
   });
 }
+
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1332,7 +1334,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));
           break;
         }
-        const projects = scanMultipleProjects(validDirs);
+        const projects = scanMultipleProjects(validDirs, 3, repoPickerScanOptions());
         if (projects.length === 0) {
           await sessionReply(rootId, t('cmd.repo.no_git_repos', { dirs: validDirs.join(', ') }, loc));
           break;

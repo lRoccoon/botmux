@@ -30,6 +30,15 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex/auth.json'],
     resolvedBin: process.execPath,
 
+    // resolvedBin is node-running-the-runner; the REAL codex is spawned later for
+    // the app-server (codex-app-runner.ts). Declare it so the file sandbox can
+    // re-expose its bin dir when it lives under /run (fnm/nvm) — else --tmpfs /run
+    // masks it and the in-sandbox app-server spawn ENOENTs into a crash-loop. Same
+    // lazy resolve+cache as buildArgs; only an executable path, never the cwd.
+    sandboxExtraExecPaths() {
+      return [(cachedCodexBin ??= resolveCommand(rawCodexBin))];
+    },
+
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale }) {
       const args = [
         runnerPath(),
