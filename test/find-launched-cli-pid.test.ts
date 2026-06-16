@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import { findLaunchedCliPid, launcherRetryStillValid } from '../src/core/session-discovery.js';
+import { findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+
+// Manual scheduler so the retry loop runs deterministically without real timers.
+function makeScheduler() {
+  const queue: Array<() => void> = [];
+  return {
+    schedule: (fn: () => void) => { queue.push(fn); },
+    runAll: (max = 100) => { let n = 0; while (queue.length && n++ < max) queue.shift()!(); },
+    pending: () => queue.length,
+  };
+}
 
 // findLaunchedCliPid sees through a wrapperCli launcher (`aiden x claude`) to the
 // real CLI process it forks. The OS-probing is injected so the BFS is tested
@@ -82,5 +92,75 @@ describe('launcherRetryStillValid()', () => {
 
   it('invalid when getChildPid is unavailable', () => {
     expect(launcherRetryStillValid(backendA, backendA, null, 100)).toBe(false);
+  });
+});
+
+// scheduleWrapperRealCliPid is the resolver loop shared by BOTH worker spawn
+// paths — the synchronous one and the zellij late-pid fallback. The late-path
+// blocker Codex flagged is that the resolver must run there too; this covers the
+// resolver's retry/apply/guard behaviour deterministically.
+describe('scheduleWrapperRealCliPid()', () => {
+  const backendA = { id: 'A' };
+
+  it('applies the real pid on the first tick when the CLI is already forked', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => 200, getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (p) => applied.push(p), schedule: sch.schedule,
+    });
+    sch.runAll();
+    expect(applied).toEqual([200]);
+  });
+
+  it('retries until the launcher forks the CLI, then rewires (late/async fork — the zellij case)', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    let calls = 0;
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => (++calls >= 3 ? 200 : null), // not forked for first 2 ticks
+      getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (p) => applied.push(p), schedule: sch.schedule,
+    });
+    sch.runAll();
+    expect(calls).toBe(3);
+    expect(applied).toEqual([200]);
+  });
+
+  it('aborts (never applies) when a respawn swapped the backend mid-retry', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    let current: unknown = backendA;
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => 200, getBackend: () => current, getChildPid: () => 100,
+      applyRealPid: (p) => applied.push(p), schedule: sch.schedule,
+    });
+    current = { id: 'B' }; // worker restart replaced the backend before the tick ran
+    sch.runAll();
+    expect(applied).toEqual([]);
+  });
+
+  it('stops after maxAttempts without applying when the CLI never appears', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    let calls = 0;
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => { calls++; return null; }, getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (p) => applied.push(p), schedule: sch.schedule, maxAttempts: 3,
+    });
+    sch.runAll();
+    expect(applied).toEqual([]);
+    expect(calls).toBe(3);
+  });
+
+  it('does not apply when the only descendant found IS the launcher pid', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => 100, getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (p) => applied.push(p), schedule: sch.schedule, maxAttempts: 2,
+    });
+    sch.runAll();
+    expect(applied).toEqual([]);
   });
 });

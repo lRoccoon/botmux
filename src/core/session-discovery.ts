@@ -390,6 +390,50 @@ export function launcherRetryStillValid(
   return currentChildPid === launcherPid;
 }
 
+export interface WrapperRealPidResolveDeps {
+  /** Find the real CLI descendant pid under the launcher (null until forked). */
+  findRealPid: (launcherPid: number) => number | null;
+  /** Current backend instance (identity-compared against the spawn snapshot). */
+  getBackend: () => unknown;
+  /** Backend's current child pid (the launcher while unchanged). */
+  getChildPid: () => number | null | undefined;
+  /** Apply the resolved real pid: rewire backend.cliPid + bridgeCliPid. */
+  applyRealPid: (realPid: number) => void;
+  /** Timer scheduler (injectable for tests). */
+  schedule: (fn: () => void, ms: number) => void;
+  intervalMs?: number;
+  maxAttempts?: number;
+}
+
+/**
+ * Drive the wrapperCli real-CLI-pid resolution as a bounded retry loop. Shared
+ * by BOTH worker spawn paths — the synchronous one (tmux/pty, where
+ * getChildPid() is the launcher immediately) and the late-pid fallback (zellij,
+ * where getChildPid() is null at spawn and only resolves to the launcher
+ * asynchronously). Either way the launcher forks the real CLI a beat later, so
+ * we poll until findRealPid returns a descendant, then rewire.
+ *
+ * Every tick is gated by launcherRetryStillValid: a worker restart that swapped
+ * the backend (or changed its child pid) aborts the loop so a stale resolution
+ * can't clobber the new session's bridge/discovery.
+ */
+export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperRealPidResolveDeps): void {
+  const backendAtSpawn = deps.getBackend();
+  const intervalMs = deps.intervalMs ?? 200;
+  const maxAttempts = deps.maxAttempts ?? 30;
+  let attempts = 0;
+  const tick = () => {
+    if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
+    const realPid = deps.findRealPid(launcherPid);
+    if (realPid && realPid !== launcherPid) {
+      deps.applyRealPid(realPid);
+      return;
+    }
+    if (++attempts < maxAttempts) deps.schedule(tick, intervalMs);
+  };
+  deps.schedule(tick, intervalMs);
+}
+
 /**
  * Try to read Claude Code session metadata from ~/.claude/sessions/<PID>.json.
  * Returns { sessionId, cwd, startedAt } or undefined.
