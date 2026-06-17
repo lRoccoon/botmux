@@ -54,15 +54,52 @@ export function deriveSeedDataDir(bin: string): string {
   }
 }
 
+/** Given a resolved binary path (may be a shim symlink or the real cli.js),
+ *  determine whether it's the Seed or Relay variant.
+ *
+ *  Heuristics (in order), checked against the realpath-resolved binary:
+ *    1. If the binary's own basename is `relay` → relay
+ *    2. If the binary's own basename is `seed` → seed
+ *    3. Walk up from the binary and look for a path component exactly named
+ *       `relay` (unscoped package)
+ *    4. Walk up and look for a `@*` scope directory whose name *ends with*
+ *       `-relay` (scoped package, e.g. `@scope-relay/claude-code`)
+ *    5. Otherwise → seed (safe default)
+ *
+ *  We walk the realpath components so symlinks / shims don't hide the
+ *  underlying package. We only match whole path segments (not substrings)
+ *  to avoid false positives from parent directories that happen to contain
+ *  the string "relay" (e.g. temp dirs, project names).
+ */
+function detectBinName(bin: string): 'relay' | 'seed' {
+  const base = bin.split('/').pop() ?? '';
+  if (base === 'relay') return 'relay';
+  if (base === 'seed') return 'seed';
+  try {
+    const real = realpathSync(bin);
+    const parts = real.split('/');
+    // Check each path segment
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]!;
+      if (part === 'relay') return 'relay';
+      if (part.startsWith('@') && part.endsWith('-relay')) return 'relay';
+    }
+  } catch {
+    // realpath failed — fall through to default
+  }
+  return 'seed';
+}
+
 export function createSeedAdapter(pathOverride?: string): CliAdapter {
   // When no explicit path is given, prefer the newer `relay` binary (Seed has
   // been rebranded to Relay). Fall back to legacy `seed` if relay is not
   // installed. An explicit pathOverride always wins as-is.
-  let binName: 'relay' | 'seed' = 'seed';
   let bin: string;
+  let binName: 'relay' | 'seed';
 
   if (pathOverride) {
     bin = resolveCommand(pathOverride);
+    binName = detectBinName(bin);
   } else {
     const relayBin = resolveCommand('relay');
     if (isAbsolute(relayBin)) {
@@ -70,6 +107,7 @@ export function createSeedAdapter(pathOverride?: string): CliAdapter {
       binName = 'relay';
     } else {
       bin = resolveCommand('seed');
+      binName = 'seed';
     }
   }
 
@@ -77,6 +115,8 @@ export function createSeedAdapter(pathOverride?: string): CliAdapter {
 
   if (!pathOverride) {
     logger.info(`[seed] using ${binName} binary at ${bin}`);
+  } else {
+    logger.info(`[seed] using override binary at ${bin} (detected as ${binName})`);
   }
 
   return createClaudeFamilyAdapter({

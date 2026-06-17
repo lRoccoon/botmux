@@ -110,3 +110,62 @@ describe('createSeedAdapter', () => {
     expect(dirname(adapter.claudeStateJsonPath!)).toBe(expectedDataDir);
   });
 });
+
+describe('createSeedAdapter with relay-path pathOverride', () => {
+  // When pathOverride points to a Relay binary, the adapter should detect it
+  // and use 'relay' as resumeBin so the closed-session card shows the right
+  // resume command — not 'seed --resume' which would fail because the
+  // transcript lives in relay's runtime dir.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'seed-ovr-test-')));
+
+  // Scoped package layout (mirrors real npm install):
+  //   node_modules/@scope-relay/claude-code/dist/cli.js
+  //   node_modules/@scope-seed/claude-code/dist/cli.js
+  const relayPkg = join(root, 'node_modules', '@scope-relay', 'claude-code');
+  const seedPkg = join(root, 'node_modules', '@scope-seed', 'claude-code');
+  mkdirSync(join(relayPkg, 'dist'), { recursive: true });
+  mkdirSync(join(seedPkg, 'dist'), { recursive: true });
+  writeFileSync(join(relayPkg, 'dist', 'cli.js'), '// relay');
+  writeFileSync(join(seedPkg, 'dist', 'cli.js'), '// seed');
+
+  // Case 1: direct path to cli.js inside a relay scoped package
+  const relayCliJs = join(relayPkg, 'dist', 'cli.js');
+
+  // Case 2: shim symlink named "relay" pointing to cli.js
+  const shimDir = join(root, 'shim', 'bin');
+  mkdirSync(shimDir, { recursive: true });
+  const relayShim = join(shimDir, 'relay');
+  symlinkSync(relayCliJs, relayShim);
+
+  // Case 3: shim symlink named "seed" pointing to seed cli.js (baseline)
+  const seedShim = join(shimDir, 'seed');
+  symlinkSync(join(seedPkg, 'dist', 'cli.js'), seedShim);
+
+  it('detects relay from scoped package path (@scope-relay/claude-code)', () => {
+    const a = createSeedAdapter(relayCliJs);
+    expect(a.id).toBe('seed');
+    expect(a.claudeDataDir).toBe(join(relayPkg, '.claude-runtime'));
+    expect(a.buildResumeCommand?.({ sessionId: 'sid', cliSessionId: 'cli-sid' }))
+      .toBe('relay --resume cli-sid');
+  });
+
+  it('detects relay from a shim symlink whose basename is "relay"', () => {
+    const a = createSeedAdapter(relayShim);
+    expect(a.id).toBe('seed');
+    expect(a.claudeDataDir).toBe(join(relayPkg, '.claude-runtime'));
+    expect(a.buildResumeCommand?.({ sessionId: 'sid', cliSessionId: 'cli-sid' }))
+      .toBe('relay --resume cli-sid');
+  });
+
+  it('keeps seed resumeBin for a seed scoped package path (baseline)', () => {
+    const a = createSeedAdapter(join(seedPkg, 'dist', 'cli.js'));
+    expect(a.buildResumeCommand?.({ sessionId: 'sid', cliSessionId: 'cli-sid' }))
+      .toBe('seed --resume cli-sid');
+  });
+
+  it('keeps seed resumeBin for a shim named "seed" (baseline)', () => {
+    const a = createSeedAdapter(seedShim);
+    expect(a.buildResumeCommand?.({ sessionId: 'sid', cliSessionId: 'cli-sid' }))
+      .toBe('seed --resume cli-sid');
+  });
+});
