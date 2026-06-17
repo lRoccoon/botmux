@@ -238,7 +238,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,
     // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
     // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
-    readyPattern: /[›❯]|\d+% left/,
+    // Startup advisory / picker screens also use `❯ 1.` as a menu cursor, so
+    // exclude numbered selector rows; otherwise botmux flushes the first prompt
+    // into the advisory instead of TRAE's real composer.
+    readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
     systemHints: BOTMUX_SHELL_HINTS,
     // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
     // a turn is running is parked and merged into the active turn.
