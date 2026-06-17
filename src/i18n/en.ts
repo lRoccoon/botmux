@@ -300,6 +300,7 @@ export const messages: Record<string, string> = {
   'cmd.config.value_required': 'Please provide a value for {field}: /botconfig set {field} <value>',
   'cmd.config.invalid_bool': '{field} expects a boolean (on/off), got: {value}',
   'cmd.config.invalid_enum': '{field} must be one of {values}.',
+  'cmd.config.invalid_number': '{field} expects a positive integer, got: {value}',
   'cmd.config.invalid_cli': '⚠️ {msg}',
   'cmd.config.set_ok': '✅ Updated {field}: {old} → {new}\n{effect}',
   'cmd.config.unset_ok': '✅ Cleared {field} (was {old}), reverted to default.\n{effect}',

@@ -39,7 +39,7 @@ import {
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
-  applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, type ConfigEffect,
+  applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, coerceConfigValue, type ConfigEffect,
 } from '../services/bot-config-store.js';
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
@@ -692,12 +692,20 @@ async function handleConfigCommand(
     const rawValue = parts.slice(2).join(' ').trim();
     if (!rawValue) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
 
-    let value: string | string[] | boolean;
+    let value: string | string[] | boolean | number;
     switch (spec.kind) {
       case 'stringList': {
         const arr = parseCustomPassthroughInput(rawValue);
         if (arr.length === 0) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
         value = arr;
+        break;
+      }
+      case 'number': {
+        // 统一走 coerceConfigValue 的 number 校验（正整数），避免文字路径把 '6'
+        // 当字符串写进 maxLiveWorkers（与 card/API 路径同口径）。
+        const coerced = coerceConfigValue(spec, rawValue);
+        if (!coerced.ok) { await reply(t('cmd.config.invalid_number', { field: spec.key, value: rawValue }, loc)); return; }
+        value = coerced.value;
         break;
       }
       case 'boolean': {

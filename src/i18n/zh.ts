@@ -303,6 +303,7 @@ export const messages: Record<string, string> = {
   'cmd.config.value_required': '请提供 {field} 的值：/botconfig set {field} <值>',
   'cmd.config.invalid_bool': '{field} 需要布尔值（on/off），收到：{value}',
   'cmd.config.invalid_enum': '{field} 取值需为 {values} 之一。',
+  'cmd.config.invalid_number': '{field} 需要正整数，收到：{value}',
   'cmd.config.invalid_cli': '⚠️ {msg}',
   'cmd.config.set_ok': '✅ 已更新 {field}：{old} → {new}\n{effect}',
   'cmd.config.unset_ok': '✅ 已清除 {field}（原值 {old}），回退默认。\n{effect}',
