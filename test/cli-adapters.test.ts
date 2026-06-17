@@ -788,6 +788,7 @@ describe('readyPattern', () => {
     expect(adapter.readyPattern!.test('›')).toBe(true);
     expect(adapter.readyPattern!.test('❯ Run /review on my current changes')).toBe(true);
     expect(adapter.readyPattern!.test('GPT-5.5 · Context 100% left')).toBe(true);
+    expect(adapter.readyPattern!.test('❯ 1. Continue into TRAE CLI')).toBe(false);
   });
 
   it('codex-app matches runner prompt indicator', () => {
