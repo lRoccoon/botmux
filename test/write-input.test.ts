@@ -46,6 +46,7 @@ import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -171,13 +172,14 @@ const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
- *  delayed Enter — CoCo / Trae CLI and Codex. See coco.ts for the Trae 0.120.31
+ *  delayed Enter — CoCo / Trae CLI, Codex, and Pi. See coco.ts for the Trae 0.120.31
  *  burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
  *  (Codex 0.134+ handles bracketed paste correctly — the old "Codex exits on
  *  bracketed paste" note was true only for a much earlier build). */
 const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
   ['codex', createCodexAdapter('/bin/codex')],
+  ['pi', createPiAdapter('/bin/pi')],
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
@@ -489,6 +491,26 @@ describe('supportsTypeAhead flag', () => {
 
   it('codex: true (0.134.0+ parks submit-while-busy, writes rollout user event at dequeue time)', () => {
     expect(createCodexAdapter('/bin/codex').supportsTypeAhead).toBe(true);
+  });
+
+  it('pi: undefined (uses busy marker probes instead of type-ahead)', () => {
+    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBeUndefined();
+  });
+
+  it('pi: exposes Working... as the explicit busy marker', () => {
+    const adapter = createPiAdapter('/bin/pi');
+    expect(adapter.busyPattern?.test('⠙ Working...')).toBe(true);
+    expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
+  });
+
+  it('pi: does not squash queued botmux turns', () => {
+    expect(createPiAdapter('/bin/pi').mergeQueuedInput).toBeUndefined();
+  });
+
+  it('non-pi type-ahead adapters do not squash queued botmux turns', () => {
+    expect(createClaudeCodeAdapter('/bin/claude').mergeQueuedInput).toBeUndefined();
+    expect(createCocoAdapter('/bin/coco').mergeQueuedInput).toBeUndefined();
+    expect(createCodexAdapter('/bin/codex').mergeQueuedInput).toBeUndefined();
   });
 
   it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex'))('%s: undefined (default behavior)', (_name, adapter) => {
