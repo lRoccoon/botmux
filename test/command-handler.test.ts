@@ -77,6 +77,14 @@ vi.mock('../src/bot-registry.js', () => ({
       workingDirs: ['~/projects'],
     },
   })),
+  readBotSkillPolicy: vi.fn((raw: unknown) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const r = raw as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    if (Array.isArray(r.include)) out.include = r.include.filter((item) => typeof item === 'string' && item.startsWith('skill:'));
+    return Object.keys(out).length ? out : undefined;
+  }),
+  getLoadedConfigPath: vi.fn(() => process.env.BOTS_CONFIG),
   // Production runs ONE daemon per bot, so getAllBots() sees only this process's
   // own bot. Default to the Claude process; the split-brain test overrides this
   // to prove the /group election does NOT depend on getAllBots().
@@ -370,7 +378,9 @@ import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
 import { bindOncall } from '../src/services/oncall-store.js';
-import { existsSync, statSync, readFileSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
 import { repoPickerScanOptions } from '../src/global-config.js';
 import { createRepoWorktree } from '../src/services/git-worktree.js';
@@ -483,7 +493,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -504,9 +514,9 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 24 = 21 original + /land (sandbox-landing) + /term (operable-terminal slash)
-    //      + /subscribe-lark-doc (Feishu doc comment entry).
-    expect(DAEMON_COMMANDS.size).toBe(24);
+    // 25 = 21 original + /land (sandbox-landing) + /term (operable-terminal slash)
+    //      + /subscribe-lark-doc (Feishu doc comment entry) + /skills.
+    expect(DAEMON_COMMANDS.size).toBe(25);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -588,6 +598,7 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
   it('contains /group and its /g alias', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/group')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/g')).toBe(true);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/skills')).toBe(true);
   });
 
   it('is a subset of DAEMON_COMMANDS (they are still daemon-handled)', () => {
@@ -603,6 +614,52 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/cd')).toBe(false);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/close')).toBe(false);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/card')).toBe(false);
+  });
+});
+
+describe('/botconfig skills JSON text command', () => {
+  it('persists skills as a parsed policy object, not a raw JSON string', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-skills-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    try {
+      await handleCommand(
+        '/botconfig',
+        ROOT_ID,
+        makeLarkMessage('/botconfig set skills {"include":["skill:deploy-runbook"],"delivery":"prompt","projectSkills":"all"}', { senderId: 'ou_sender' }),
+        makeDeps(),
+        'app-1',
+      );
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.skills).toEqual({ include: ['skill:deploy-runbook'] });
+      expect(typeof stored.skills).toBe('object');
+      expect(bot.config.skills).toEqual({ include: ['skill:deploy-runbook'] });
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
   });
 });
 

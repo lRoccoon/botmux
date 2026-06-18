@@ -90,6 +90,17 @@ describe('buildSandboxArgs (overlay model)', () => {
     expect(outboxIdx).toBeGreaterThan(maskIdx); // outbox bind comes after the mask
   });
 
+  it('binds selected skill runtime roots read-only before the outbox', () => {
+    const a = buildSandboxArgs(plan({
+      readonlyRoots: ['/data/runtime-skills/s1/claude-plugin'],
+    }));
+    const rootIdx = tripleIdx(a, '--ro-bind', '/data/runtime-skills/s1/claude-plugin', '/data/runtime-skills/s1/claude-plugin');
+    const outboxIdx = tripleIdx(a, '--bind', '/data/sandboxes/s1/outbox', '/data/sandboxes/s1/outbox');
+
+    expect(rootIdx).toBeGreaterThanOrEqual(0);
+    expect(outboxIdx).toBeGreaterThan(rootIdx);
+  });
+
   it('no clone/scrub artefacts: never binds a per-session clone "work" dir', () => {
     const a = buildSandboxArgs(plan());
     // The old model bound a `git clone` "work" dir; the overlay model never does

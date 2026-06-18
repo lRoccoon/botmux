@@ -9,7 +9,7 @@
  * （grants / quota）由既有 `/grant` 负责，不在此重复。
  */
 import type { BotConfig } from '../bot-registry.js';
-import { getBot } from '../bot-registry.js';
+import { getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
@@ -27,7 +27,7 @@ import { parseCustomPassthroughInput } from '../core/passthrough-commands.js';
  */
 export type ConfigEffect = 'immediate' | 'next-session';
 
-export type ConfigFieldKind = 'string' | 'stringList' | 'boolean' | 'number' | 'enum' | 'cli' | 'dir' | 'allowedUsers';
+export type ConfigFieldKind = 'string' | 'stringList' | 'boolean' | 'number' | 'enum' | 'cli' | 'dir' | 'allowedUsers' | 'json';
 
 export interface ConfigFieldSpec {
   /** 用户面命令里用的字段名（大小写不敏感匹配，见 {@link findConfigField}）。 */
@@ -57,6 +57,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'brandLabel', configKey: 'brandLabel', kind: 'string', effect: 'immediate', clearable: true, hint: '卡片页脚品牌文案；unset 回默认 botmux 链接' },
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
+  { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
@@ -94,6 +95,9 @@ function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
   if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
     return arr.length ? arr.join(', ') : '∅';
+  }
+  if (spec.kind === 'json') {
+    return value === undefined || value === null ? '∅' : JSON.stringify(value);
   }
   if (value === undefined || value === null || value === '') return '∅';
   return String(value);
@@ -143,7 +147,7 @@ export type ApplyFieldResult =
 export async function applyConfigField(
   larkAppId: string,
   spec: ConfigFieldSpec,
-  value: string | string[] | boolean | number | null,
+  value: unknown,
 ): Promise<ApplyFieldResult> {
   if (spec.kind === 'allowedUsers') return { ok: false, reason: 'use_setBotAllowedUsers' };
   let bot;
@@ -160,6 +164,8 @@ export async function applyConfigField(
       // 与 parseBotConfigsFromText 一致：true 才写，false → 删 key（bots.json 保持干净）。
       if (effective === true) entry[spec.configKey] = true;
       else delete entry[spec.configKey];
+    } else if (spec.kind === 'json') {
+      entry[spec.configKey] = effective as any;
     } else {
       entry[spec.configKey] = effective;
     }
@@ -172,6 +178,8 @@ export async function applyConfigField(
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
     (bot.config as any)[spec.configKey] = effective || undefined;
+  } else if (spec.kind === 'json') {
+    (bot.config as any)[spec.configKey] = effective;
   } else {
     (bot.config as any)[spec.configKey] = effective;
   }
@@ -220,8 +228,8 @@ export async function setBotAllowedUsers(
 }
 
 export type CoerceResult =
-  | { ok: true; value: string | string[] | boolean | number }
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'empty' };
+  | { ok: true; value: unknown }
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'empty' };
 
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
@@ -258,6 +266,18 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
     case 'dir': {
       try { if (statSync(expandHomePath(s)).isDirectory()) return { ok: true, value: s }; } catch { /* not a dir */ }
       return { ok: false, reason: 'invalid_dir' };
+    }
+    case 'json': {
+      try {
+        const parsed = JSON.parse(s);
+        if (spec.configKey === 'skills') {
+          const policy = readBotSkillPolicy(parsed);
+          return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
+        }
+        return { ok: true, value: parsed };
+      } catch {
+        return { ok: false, reason: 'invalid_json' };
+      }
     }
     default: // 'string'
       return { ok: true, value: s };

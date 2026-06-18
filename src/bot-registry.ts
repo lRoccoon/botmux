@@ -8,6 +8,7 @@ import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
+import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
 
@@ -183,6 +184,11 @@ export interface BotConfig {
    * 未配置（undefined）→ 仅用内置白名单（保持现状）。
    */
   customPassthroughCommands?: string[];
+  /**
+   * Optional per-bot priority skill policy. Missing means botmux does not alter
+   * the underlying CLI's native skill discovery or spawn arguments.
+   */
+  skills?: BotSkillPolicy;
   /**
    * Custom footer brand label for cards this bot sends. Three states:
    *   • `undefined` (unset)  → default `[botmux](github)` link
@@ -723,6 +729,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (uniq.length > 0) customPassthroughCommands = uniq;
     }
 
+    const skills = readBotSkillPolicy(entry.skills);
+
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
     // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
     // （凭证是否可用）在 resolveVoiceConfig 做，这里只挡明显垃圾。
@@ -786,6 +794,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       customPassthroughCommands,
+      skills,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
@@ -826,4 +835,28 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   }
 
   return configs;
+}
+
+function readStringArray(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const values = raw
+    .map((v) => typeof v === 'string' ? v.trim() : '')
+    .filter(Boolean);
+  return values.length > 0 ? values : undefined;
+}
+
+function readDirectSkillSelectors(raw: unknown): SkillSelector[] | undefined {
+  const values = readStringArray(raw);
+  if (!values) return undefined;
+  const selectors = values.filter((value): value is SkillSelector => /^skill:.+$/.test(value));
+  return selectors.length > 0 ? selectors : undefined;
+}
+
+export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: BotSkillPolicy = {};
+  const include = readDirectSkillSelectors(r.include);
+  if (include) out.include = include;
+  return Object.keys(out).length > 0 ? out : undefined;
 }

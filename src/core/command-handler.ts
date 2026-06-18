@@ -54,6 +54,7 @@ import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
+import { runSkillsImCommand } from './skills/im-command.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -73,7 +74,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/skills']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -700,7 +701,7 @@ async function handleConfigCommand(
     const rawValue = parts.slice(2).join(' ').trim();
     if (!rawValue) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
 
-    let value: string | string[] | boolean | number;
+    let value: unknown;
     switch (spec.kind) {
       case 'stringList': {
         const arr = parseCustomPassthroughInput(rawValue);
@@ -743,6 +744,12 @@ async function handleConfigCommand(
         const v = validateWorkingDir(rawValue, loc);
         if (!v.ok) { await reply(v.error); return; }
         value = rawValue; // 存原始（保留 ~），与 workingDir 落盘一致；使用处再 expandHome
+        break;
+      }
+      case 'json': {
+        const coerced = coerceConfigValue(spec, rawValue);
+        if (!coerced.ok) { await reply(t('cmd.config.write_failed', { reason: coerced.reason }, loc)); return; }
+        value = coerced.value;
         break;
       }
       default: // 'string'
@@ -1433,6 +1440,26 @@ export async function handleCommand(
         }
         await handleConfigCommand(message, rootId, appId, deps);
         logger.info(`[${logTag}] Config command handled`);
+        break;
+      }
+
+      case '/skills': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc));
+          break;
+        }
+        const sub = message.content.replace(/^\/skills\s*/i, '').trim().split(/\s+/, 1)[0]?.toLowerCase();
+        if (sub === 'attach' || sub === 'detach') {
+          let bot;
+          try { bot = getBot(appId); } catch { await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc)); break; }
+          const admins = bot.resolvedAllowedUsers ?? [];
+          if (admins.length === 0) { await sessionReply(rootId, t('cmd.config.no_owner', undefined, loc)); break; }
+          if (!message.senderId || !admins.includes(message.senderId)) { await sessionReply(rootId, t('cmd.config.not_admin', undefined, loc)); break; }
+        }
+        const result = await runSkillsImCommand(appId, message.content);
+        await sessionReply(rootId, result.message);
+        logger.info(`[${logTag}] Skills command handled: ${result.ok ? 'ok' : 'error'}`);
         break;
       }
 

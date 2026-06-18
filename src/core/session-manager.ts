@@ -342,6 +342,9 @@ export function buildNewTopicPrompt(
   // and session ID via system prompt, so skip those blocks here.
   if (mentionBlock) parts.push(mentionBlock);
   if (botBlock) parts.push(botBlock);
+  // The per-session skill catalog block is appended later in the worker-pool
+  // fork path (prepareSessionSkillPrompt), which also writes the manifest and
+  // resolves delivery — keeping a single injection site avoids double-rendering.
 
   return parts.join('\n\n');
 }

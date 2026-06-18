@@ -45,6 +45,12 @@ export interface ResumableSession {
   lastActivityAt: number;
 }
 
+export interface SkillDeliveryCapability {
+  readonly nativeKind: 'claude-plugin' | 'skill-root';
+  readonly supportsScopedSession: boolean;
+  readonly supportsExclusive: boolean;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -75,6 +81,8 @@ export interface CliAdapter {
     model?: string;
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Optional session-scoped skill plugin/root prepared by botmux. */
+    skillPluginDir?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
@@ -142,6 +150,11 @@ export interface CliAdapter {
    *  user's global `~/.claude/skills`, so a standalone `claude` won't surface
    *  (and mis-fire) them. Mutually exclusive with `skillsDir`. */
   readonly pluginDir?: string;
+
+  /** Optional native skill delivery support for user/team custom skills.
+   *  This is separate from `skillsDir`/`pluginDir`, which are still used by
+   *  botmux-owned built-in bridge skills. */
+  readonly skillDelivery?: SkillDeliveryCapability;
 
   /** hook 安装描述：spawn 时写入各 CLI 的 hook 配置，使 askUserQuestion 事件转发到
    *  `botmux hook <cliId>`。undefined = 不通过 hook 接管 askUserQuestion。 */

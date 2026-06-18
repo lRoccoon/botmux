@@ -133,6 +133,8 @@ export interface SandboxPlan {
    *  the CLI's token refresh / login persists — unlike project edits which are
    *  isolated). Resolved + existence-filtered by prepareSandbox. */
   authReal?: string[];
+  /** Runtime-generated roots that the CLI must see but must not mutate. */
+  readonlyRoots?: string[];
   /** Keep network egress. File-only scope ⇒ default true (npm/pip/git work). */
   net?: boolean;
 }
@@ -161,6 +163,8 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   // Per-bot privacy masks (opt-in, no defaults).
   for (const dir of plan.hideDirs) a.push('--tmpfs', dir);
   for (const f of plan.hideFiles) a.push('--ro-bind', f.empty, f.path);
+  // Session-scoped runtime inputs, e.g. generated skill/plugin dirs.
+  for (const root of plan.readonlyRoots ?? []) a.push('--ro-bind', root, root);
   // Outbox LAST so it wins even if a mask covers a parent dir.
   a.push('--bind', plan.outbox, plan.outbox);
   // Isolate namespaces (keep net unless explicitly disabled).
@@ -288,6 +292,8 @@ export function prepareSandbox(opts: {
    *  spawned inside the sandbox beyond cliBin — re-exposed if under /run. ONLY
    *  executable paths (never cwd/path args). undefined → none. */
   extraExecPaths?: readonly string[];
+  /** Runtime-generated roots that should be visible read-only inside bwrap. */
+  readonlyRoots?: readonly string[];
 }): SandboxSpawn | null {
   if (!opts.enabled) return null;
   if (process.platform !== 'linux') return null; // overlayfs + bwrap are Linux-only
@@ -374,6 +380,12 @@ export function prepareSandbox(opts: {
     try { if (existsSync(p)) authReal.push(p); } catch { /* */ }
   }
 
+  const readonlyRoots: string[] = [];
+  for (const raw of opts.readonlyRoots ?? []) {
+    if (!raw || typeof raw !== 'string') continue;
+    try { if (existsSync(raw)) readonlyRoots.push(raw); } catch { /* */ }
+  }
+
   const plan: SandboxPlan = {
     projectMount,
     projectMerged: projMerged,
@@ -383,6 +395,7 @@ export function prepareSandbox(opts: {
     hideDirs,
     hideFiles,
     authReal,
+    readonlyRoots,
     net: true,
   };
   const args = buildSandboxArgs(plan);

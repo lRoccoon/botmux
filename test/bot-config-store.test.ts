@@ -79,6 +79,7 @@ describe('bot-config store', () => {
     expect(keys).toContain('allowedUsers');
     expect(keys).toContain('model');
     expect(keys).not.toContain('repoPickerMode');
+    expect(keys).toContain('skills');
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {
@@ -109,6 +110,57 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().model).toBeUndefined();
     expect(registry.getBot('app_default').config.model).toBeUndefined();
+  });
+
+  it('parses bot skill policy while leaving omitted policy undefined', async () => {
+    const { registry } = await freshModules();
+    const [plain, skilled, advancedOnly] = registry.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' },
+      {
+        larkAppId: 'skilled',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        skills: {
+          profiles: ['frontend'],
+          include: ['skill:deploy-runbook'],
+          exclude: ['skill:old-release'],
+          projectSkills: 'trusted',
+          mode: 'priority',
+          delivery: 'auto',
+        },
+      },
+      {
+        larkAppId: 'advanced-only',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        skills: {
+          delivery: 'prompt',
+          projectSkills: 'all',
+        },
+      },
+    ]));
+
+    expect(plain.skills).toBeUndefined();
+    expect(skilled.skills).toEqual({ include: ['skill:deploy-runbook'] });
+    expect(advancedOnly.skills).toBeUndefined();
+  });
+
+  it('sets and unsets JSON skills policy through /config store', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('skills')!;
+    const coerced = store.coerceConfigValue(spec, '{"include":["skill:deploy-runbook"],"delivery":"prompt"}');
+    expect(coerced).toEqual({ ok: true, value: { include: ['skill:deploy-runbook'] } });
+    if (!coerced.ok) throw new Error('coerce failed');
+
+    const r1 = await store.applyConfigField('app_default', spec, coerced.value);
+    expect(r1.ok).toBe(true);
+    expect(readConfig().skills).toEqual({ include: ['skill:deploy-runbook'] });
+    expect(registry.getBot('app_default').config.skills).toEqual({ include: ['skill:deploy-runbook'] });
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().skills).toBeUndefined();
+    expect(registry.getBot('app_default').config.skills).toBeUndefined();
   });
 
   it('boolean field writes true / deletes key on false (keeps bots.json tidy)', async () => {

@@ -447,6 +447,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       // (role/persona content, per-bot oncall config, CLI option metadata).
       '/api/roles/cli_app/oc_chat',
       '/api/bots',
+      '/api/skills',
       '/api/cli-options',
       // Mints a token-bearing writable terminal URL — never public, even in
       // publicReadOnly (the daemon IPC behind it is also loopback-HMAC gated).

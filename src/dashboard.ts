@@ -45,6 +45,16 @@ import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/te
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
+import {
+  readSkillRegistry,
+  removeInstalledSkill,
+  updateInstalledSkillAsync,
+} from './services/skill-registry-store.js';
+import { redactGitUrlCredentials } from './core/skills/sources.js';
+import { loadBotConfigs } from './bot-registry.js';
+import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
+import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
+import { installDashboardSkill, parseDashboardSkillInstallRequest } from './dashboard/skill-install-request.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -449,6 +459,129 @@ function dashboardUrlFor(token: string): string {
   return `http://${config.dashboard.externalHost}:${boundDashboardPort}/?t=${token}`;
 }
 
+type SkillJobStatus = 'running' | 'succeeded' | 'failed';
+interface SkillJob {
+  id: string;
+  type: 'install' | 'update';
+  status: SkillJobStatus;
+  createdAt: string;
+  updatedAt: string;
+  skill?: SkillPackage;
+  error?: string;
+}
+
+const skillJobs = new Map<string, SkillJob>();
+const MAX_SKILL_JOBS = 50;
+
+function publicSkillJob(job: SkillJob): Record<string, unknown> {
+  return {
+    id: job.id,
+    type: job.type,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    skill: job.skill ? sanitizeSkillForDashboard(job.skill) : undefined,
+    error: job.error,
+  };
+}
+
+function trimSkillJobs(): void {
+  const jobs = [...skillJobs.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  while (jobs.length > MAX_SKILL_JOBS) {
+    const old = jobs.shift();
+    if (old) skillJobs.delete(old.id);
+  }
+}
+
+function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage>): SkillJob {
+  const now = new Date().toISOString();
+  const job: SkillJob = {
+    id: randomBytes(8).toString('hex'),
+    type,
+    status: 'running',
+    createdAt: now,
+    updatedAt: now,
+  };
+  skillJobs.set(job.id, job);
+  trimSkillJobs();
+  setImmediate(() => void (async () => {
+    try {
+      job.skill = await run();
+      job.status = 'succeeded';
+    } catch (err: any) {
+      job.error = redactGitUrlCredentials(err?.message ?? String(err));
+      job.status = 'failed';
+    } finally {
+      job.updatedAt = new Date().toISOString();
+      trimSkillJobs();
+    }
+  })());
+  return job;
+}
+
+function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
+  if (skill.source.type !== 'git') return skill;
+  return {
+    ...skill,
+    source: { ...skill.source, url: redactGitUrlCredentials(skill.source.url) },
+  };
+}
+
+function dashboardSkillsPayload(): Record<string, unknown> {
+  const globalSkills = readGlobalConfig().skills ?? {};
+  return {
+    skills: Object.values(readSkillRegistry().skills)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(sanitizeSkillForDashboard),
+    trustProjectSkills: globalSkills.trustProjectSkills ?? 'off',
+    delivery: globalSkills.delivery ?? 'auto',
+  };
+}
+
+function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: SkillReferenceBot): void {
+  const current = refs.get(ref.larkAppId);
+  if (!current) {
+    refs.set(ref.larkAppId, { ...ref });
+    return;
+  }
+  current.direct ||= ref.direct;
+}
+
+async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
+  const refs = new Map<string, SkillReferenceBot>();
+  try {
+    for (const ref of analyzeSkillReferences(skillName, {
+      bots: loadBotConfigs(),
+    }).bots) mergeSkillReferenceBot(refs, ref);
+  } catch {
+    // Fall back to online daemon data below when the dashboard process cannot
+    // read persistent bot config.
+  }
+
+  const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+  const onlineRefs = await Promise.all(onlineBots.map(async d => {
+    try {
+      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`, {
+        signal: AbortSignal.timeout(1_500),
+      });
+      if (!r.ok) return null;
+      const j = await r.json() as any;
+      const [ref] = analyzeSkillReferences(skillName, {
+        bots: [{ larkAppId: d.larkAppId, botName: d.botName ?? j.botName ?? d.larkAppId, skills: j.skills as BotSkillPolicy | null | undefined }],
+      }).bots;
+      return ref ?? null;
+    } catch {
+      return null;
+    }
+  }));
+  for (const ref of onlineRefs) {
+    if (ref) mergeSkillReferenceBot(refs, ref);
+  }
+  return {
+    bots: [...refs.values()].sort((a, b) => a.botName.localeCompare(b.botName)),
+  };
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -666,6 +799,98 @@ const server = createServer(async (req, res) => {
       }
       if (!touched) return jsonRes(res, 400, { ok: false, error: 'empty_patch' });
       return jsonRes(res, 200, { ok: true, settings: resolveDashboardSettings() });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/skills') {
+      return jsonRes(res, 200, dashboardSkillsPayload());
+    }
+
+    if (req.method === 'PUT' && url.pathname === '/api/skills/global') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      if (!('trustProjectSkills' in body) && !('delivery' in body)) return jsonRes(res, 400, { ok: false, error: 'empty_patch' });
+      const patch: NonNullable<ReturnType<typeof readGlobalConfig>['skills']> = {};
+      if ('trustProjectSkills' in body) {
+        const raw = body.trustProjectSkills;
+        const trustProjectSkills = raw === 'trusted' ? 'all' : raw;
+        if (trustProjectSkills !== 'off' && trustProjectSkills !== 'all') {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_trustProjectSkills' });
+        }
+        patch.trustProjectSkills = trustProjectSkills;
+      }
+      if ('delivery' in body) {
+        const delivery = body.delivery;
+        if (delivery !== 'auto' && delivery !== 'prompt' && delivery !== 'native') {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_delivery' });
+        }
+        patch.delivery = delivery;
+      }
+      const currentSkills = readGlobalConfig().skills ?? {};
+      mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
+      return jsonRes(res, 200, { ok: true, ...dashboardSkillsPayload() });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skills/install') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      try {
+        const installRequest = parseDashboardSkillInstallRequest(body);
+        const job = startSkillJob('install', () => installDashboardSkill(installRequest));
+        return jsonRes(res, 202, { ok: true, job: publicSkillJob(job) });
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
+      }
+    }
+
+    let mSkillJob: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mSkillJob = url.pathname.match(/^\/api\/skills\/jobs\/([^/]+)$/))) {
+      const job = skillJobs.get(decodeURIComponent(mSkillJob[1]));
+      if (!job) return jsonRes(res, 404, { ok: false, error: 'job_not_found' });
+      return jsonRes(res, 200, { ok: true, job: publicSkillJob(job) });
+    }
+
+    let mSkillUpdate: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mSkillUpdate = url.pathname.match(/^\/api\/skills\/([^/]+)\/update$/))) {
+      const name = decodeURIComponent(mSkillUpdate[1]);
+      if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
+      const job = startSkillJob('update', async () => {
+        const r = await updateInstalledSkillAsync(name);
+        if (!r.ok) throw new Error(r.reason);
+        return r.skill;
+      });
+      return jsonRes(res, 202, { ok: true, job: publicSkillJob(job) });
+    }
+
+    let mSkillDelete: RegExpMatchArray | null;
+    if (req.method === 'DELETE' && (mSkillDelete = url.pathname.match(/^\/api\/skills\/([^/]+)$/))) {
+      const name = decodeURIComponent(mSkillDelete[1]);
+      const force = url.searchParams.get('force') === '1';
+      if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
+      const refs = await dashboardSkillReferences(name);
+      if (!force && refs.bots.length > 0) {
+        return jsonRes(res, 409, {
+          ok: false,
+          error: 'skill_in_use',
+          affectedBots: refs.bots,
+        });
+      }
+      const r = removeInstalledSkill(name);
+      if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+      return jsonRes(res, 200, {
+        ok: true,
+        affectedBots: refs.bots,
+        ...dashboardSkillsPayload(),
+      });
     }
 
     if (await handleConnectorApi(req, res, url)) {
@@ -1173,6 +1398,7 @@ const server = createServer(async (req, res) => {
             messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
             p2pMode: j.p2pMode === 'chat' ? 'chat' : 'thread',
             maxLiveWorkers: typeof j.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
+            skills: j.skills && typeof j.skills === 'object' ? j.skills : null,
           };
         } catch (e: any) {
           return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
@@ -1188,6 +1414,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-default-oncall`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/skills — proxy to that bot's daemon. Body accepts
+    // `{ action:'attach'|'detach', name }` or `{ action:'set', policy|null }`.
+    let mBotSkills: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSkills = url.pathname.match(/^\/api\/bots\/([^/]+)\/skills$/))) {
+      const appId = decodeURIComponent(mBotSkills[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-skills`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

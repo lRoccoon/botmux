@@ -442,6 +442,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     claudeStateJsonPath: variant.stateJsonPath,
     spawnEnv: variant.spawnEnv,
     authPaths: variant.authPaths,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
 
     /** Prove the resume JSONL exists (or at least the project dir does, so the
      *  sessionId lookup will find it). Conservative: only returns true when we
@@ -488,7 +489,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -529,6 +530,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
+      if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId }));
       return args;
     },

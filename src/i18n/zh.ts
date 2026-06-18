@@ -729,6 +729,7 @@ export const messages: Record<string, string> = {
   // Worker-side submit / notify messages
   'worker.submit_impossible': '⚠️ 刚才那条消息没有写入 {cliName}，因为当前按键配置无法从终端自动提交。\n原因：{reason}\n请调整 Claude Code Chat keybinding 后重发。\n开头：{preview}',
   'worker.submit_unconfirmed': '⚠️ 刚才那条消息发给 {cliName} 后没能确认提交（重试 Enter 后等了 {secs}s 仍未在{transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：{preview}',
+  'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
 
   // Restart / maintenance report (bot-0 DM to owner)

@@ -6,6 +6,7 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
+import { registerBot } from '../src/bot-registry.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -293,6 +294,31 @@ describe('POST /api/locale/reload', () => {
     // (same i18n module singleton the daemon's card rendering reads).
     const { getDefaultLocale } = await import('../src/i18n/index.js');
     expect(getDefaultLocale()).toBe(body.defaultLocale);
+  });
+});
+
+describe('PUT /api/bot-skills', () => {
+  it('rejects invalid non-null policy instead of clearing skills', async () => {
+    const appId = 'test-skill-policy-app';
+    setLarkAppId(appId);
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      skills: { include: ['skill:deploy'] },
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-skills`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'set', policy: { include: [123] } }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'invalid_policy' });
   });
 });
 

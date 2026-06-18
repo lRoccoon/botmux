@@ -5291,6 +5291,22 @@ switch (command) {
     await cmdAsk(sub, rest);
     break;
   }
+  case 'skill': {
+    const { runSkillSessionCommand } = await import('./core/skills/cli-session-command.js');
+    const result = runSkillSessionCommand(process.argv.slice(3));
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.exitCode = result.code;
+    break;
+  }
+  case 'skills': {
+    const { runSkillsAdminCommand } = await import('./core/skills/cli-admin-command.js');
+    const result = runSkillsAdminCommand(process.argv.slice(3));
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.exitCode = result.code;
+    break;
+  }
   case 'hook': {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';

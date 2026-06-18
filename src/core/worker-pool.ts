@@ -13,6 +13,7 @@ import { installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
+import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { fallbackTurnId } from './reply-target.js';
@@ -40,6 +41,8 @@ import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
+import { prepareSkillDelivery } from './skills/delivery.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
@@ -1505,6 +1508,33 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const familyAdapter = createCliAdapterSync(botCfg.cliId, botCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
+  let skillPluginDir: string | undefined;
+  let skillReadonlyRoots: string[] | undefined;
+  if (!resume && prompt.trim().length > 0) {
+    const preparedSkills = prepareSessionSkillPrompt({
+      sessionId: ds.session.sessionId,
+      cliId: botCfg.cliId,
+      workingDir: cwd,
+      prompt,
+      botPolicy: botCfg.skills,
+    });
+    prompt = preparedSkills.prompt;
+    const delivery = prepareSkillDelivery(familyAdapter, preparedSkills.manifest, preparedSkills.manifest?.delivery ?? 'auto');
+    skillPluginDir = delivery.pluginDir;
+    skillReadonlyRoots = delivery.readonlyRoots.length ? delivery.readonlyRoots : undefined;
+    for (const diagnostic of delivery.diagnostics) logger.warn(`[${t}] skill delivery: ${diagnostic}`);
+    if (delivery.fatal) {
+      const reason = delivery.diagnostics.join(', ') || 'unknown';
+      const message = tr('worker.skill_delivery_failed', { reason }, botLocale(botCfg));
+      logger.warn(`[${t}] Skill delivery blocked session start: ${reason}`);
+      void cb.sessionReply(sessionAnchorId(ds), message, undefined, ds.larkAppId, fallbackTurnId(ds, undefined))
+        .catch((err) => logger.warn(`[${t}] Failed to notify skill delivery error: ${err?.message ?? err}`));
+      void closeSession(ds.session.sessionId)
+        .catch((err) => logger.warn(`[${t}] Failed to close skill delivery error session: ${err?.message ?? err}`));
+      return;
+    }
+  }
+
   // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
   // The wrapper script there is written by the daemon at startup.
   const botmuxBinDir = join(homedir(), '.botmux', 'bin');
@@ -1520,6 +1550,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       CLAUDECODE: undefined,
       BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
       SESSION_DATA_DIR: config.session.dataDir,
+      BOTMUX_SESSION_ID: ds.session.sessionId,
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
@@ -1578,6 +1609,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     turnId: ds.currentReplyTarget?.turnId,
+    skillPluginDir,
+    skillReadonlyRoots,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;

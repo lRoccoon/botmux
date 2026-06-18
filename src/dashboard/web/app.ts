@@ -5,6 +5,7 @@ import { renderSessionsPage } from './sessions.js';
 import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
+import { renderSkillsPage } from './skills.js';
 import { renderRolesPage } from './roles.js';
 import { renderTeamFederationPage, renderTeamManagePage } from './team-federation.js';
 import { renderConnectorsPage } from './connectors.js';
@@ -31,7 +32,7 @@ let publicReadOnly = false;
 
 // Management pages are token-gated end-to-end (no public GET) — a read-only
 // visitor must not reach them. `data-route` values from index.html's nav.
-const MANAGE_ROUTES = ['roles', 'bot-defaults', 'team', 'connectors'];
+const MANAGE_ROUTES = ['roles', 'bot-defaults', 'skills', 'team', 'connectors'];
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 // Shown only when the dashboard token was rotated WHILE public read-only is off
@@ -247,6 +248,7 @@ function route() {
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/settings')) void renderSettingsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
+  else if (hash.startsWith('#/skills')) void renderSkillsPage(root);
   else if (hash.startsWith('#/connectors')) renderConnectorsPage(root);
   else if (hash.startsWith('#/team/manage')) renderTeamManagePage(root);
   else if (hash.startsWith('#/team')) renderTeamFederationPage(root);

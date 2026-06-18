@@ -57,9 +57,11 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot } from '../bot-registry.js';
+import { getBotBrand, getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import type { ScheduledTask, ParsedSchedule, Session } from '../types.js';
+import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
+import { readSkillRegistry } from '../services/skill-registry-store.js';
 
 export interface IpcServerHandle {
   port: number;
@@ -875,6 +877,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     p2pMode,
     maxLiveWorkers,
+    skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
 });
 
@@ -1008,6 +1011,48 @@ ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
+});
+
+// Per-bot skill policy. Dashboard uses this for attach/detach; JSON policy
+// still shares the same applyConfigField path as /botconfig.
+ipcRoute('PUT', '/api/bot-skills', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const body = raw as { action?: unknown; name?: unknown; policy?: unknown };
+  const spec = findConfigField('skills');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  const current = getBot(cachedLarkAppId).config.skills;
+  let next = current;
+  if (body.action === 'attach') {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name) return jsonRes(res, 400, { ok: false, error: 'name_required' });
+    if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
+    next = attachSkillPolicy(current, name);
+  } else if (body.action === 'detach') {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name) return jsonRes(res, 400, { ok: false, error: 'name_required' });
+    next = detachSkillPolicy(current, name);
+  } else if (body.action === 'set') {
+    if (body.policy === null) {
+      next = undefined;
+    } else {
+      const parsed = readBotSkillPolicy(body.policy);
+      if (!parsed) return jsonRes(res, 400, { ok: false, error: 'invalid_policy' });
+      next = parsed;
+    }
+  } else {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+  }
+
+  const r = await applyConfigField(cachedLarkAppId, spec, next ?? null);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, skills: getBot(cachedLarkAppId).config.skills ?? null });
 });
 
 // Per-bot file-sandbox toggle. Body `{ enabled: boolean }`. When on, this bot's
