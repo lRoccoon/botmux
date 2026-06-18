@@ -55,6 +55,7 @@ import { loadBotConfigs } from './bot-registry.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { installDashboardSkill, parseDashboardSkillInstallRequest } from './dashboard/skill-install-request.js';
+import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -301,10 +302,26 @@ async function proxyToDaemon(
  *  Surfaces invalidBotIds/invalidUserIds so the UI never implies a non-added
  *  bot/user joined. */
 /** Live daemon-registry bots — authoritative source for THIS deployment's
- *  bots (cliId added from bots-info.json downstream). Fixes an empty/stale
- *  bots-info.json hiding running bots from the team roster / federation. */
-function liveBots(): { larkAppId: string; botName: string }[] {
-  return registry.list().map(d => ({ larkAppId: d.larkAppId, botName: d.botName }));
+ *  bots. cliId comes from the daemon descriptor, with bots.json as a
+ *  compatibility fallback for descriptors written by older daemons. */
+function configuredCliIds(): Map<string, string> {
+  try {
+    return new Map(loadBotConfigs().map(b => [b.larkAppId, b.cliId]));
+  } catch {
+    return new Map();
+  }
+}
+
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string }>(bot: T, ids: Map<string, string>): T & { cliId?: string } {
+  return bot.cliId ? bot : { ...bot, cliId: ids.get(bot.larkAppId) };
+}
+
+function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
+  const ids = configuredCliIds();
+  return registry.list().map(d => {
+    const b = withConfiguredCliId(d, ids);
+    return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
+  });
 }
 
 async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[] }): Promise<{
@@ -1102,7 +1119,8 @@ const server = createServer(async (req, res) => {
       const out = new Map<string, any>();
       // Sort by botIndex so the matrix columns + the create-group bot picker
       // both match the order in bots.json (fs.readdir order is unstable).
-      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+      const cliIds = configuredCliIds();
+      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
       await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
@@ -1121,6 +1139,7 @@ const server = createServer(async (req, res) => {
             cur.memberBots.push({
               larkAppId: d.larkAppId,
               botName: d.botName,
+              cliId: d.cliId,
               inChat: true,
               oncallChat: oncallChat ?? null,
               hasRole: hasRole ?? false,
@@ -1139,7 +1158,7 @@ const server = createServer(async (req, res) => {
         const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
         for (const b of onlineBots) {
           if (!present.has(b.larkAppId)) {
-            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, inChat: false, oncallChat: null, hasRole: false });
+            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
           }
         }
       }
@@ -1162,7 +1181,7 @@ const server = createServer(async (req, res) => {
       // prompt strip + keeps /api/bots oncall removal honest).
       return jsonRes(res, 200, {
         chats: authed ? sorted : redactGroupsForPublic(sorted),
-        bots: onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName, botAvatarUrl: b.botAvatarUrl })),
+        bots: onlineBots.map(botSummaryPayload),
       });
     }
 
@@ -1366,43 +1385,18 @@ const server = createServer(async (req, res) => {
     // PUT  /api/bots/:appId/default-oncall   — proxy to that bot's daemon
 
     if (req.method === 'GET' && url.pathname === '/api/bots') {
-      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+      const cliIds = configuredCliIds();
+      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
           if (!r.ok) {
-            return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: `http_${r.status}` };
+            return botDefaultsPayload(d, undefined, `http_${r.status}`);
           }
           const j = await r.json() as any;
-          return {
-            larkAppId: d.larkAppId,
-            botName: d.botName ?? j.botName,
-            online: true,
-            defaultOncall: j.defaultOncall,
-            autoboundChatCount: j.autoboundChatCount ?? 0,
-            brandLabel: j.brandLabel ?? null,
-            sandbox: j.sandbox === true,
-            disableStreamingCard: j.disableStreamingCard === true,
-            writableTerminalLinkInCard: j.writableTerminalLinkInCard === true,
-            privateCard: j.privateCard === true,
-            autoStartOnGroupJoin: j.autoStartOnGroupJoin === true,
-            autoStartOnGroupJoinPrompt: typeof j.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
-            autoStartOnNewTopic: j.autoStartOnNewTopic === true,
-            regularGroupReplyMode: (j.regularGroupReplyMode === 'new-topic' || j.regularGroupReplyMode === 'shared')
-              ? j.regularGroupReplyMode
-              : 'chat',
-            regularGroupMentionMode: (j.regularGroupMentionMode === 'topic' || j.regularGroupMentionMode === 'never')
-              ? j.regularGroupMentionMode
-              : 'always',
-            restrictGrantCommands: j.restrictGrantCommands === true,
-            messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
-            p2pMode: j.p2pMode === 'chat' ? 'chat' : 'thread',
-            maxLiveWorkers: typeof j.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
-            startupCommands: typeof j.startupCommands === 'string' ? j.startupCommands : '',
-            skills: j.skills && typeof j.skills === 'object' ? j.skills : null,
-          };
+          return botDefaultsPayload({ ...d, botName: d.botName ?? j.botName }, j);
         } catch (e: any) {
-          return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
+          return botDefaultsPayload(d, undefined, e?.message ?? String(e));
         }
       }));
       return jsonRes(res, 200, { bots: out });

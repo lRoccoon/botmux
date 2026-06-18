@@ -1,10 +1,26 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BotOnboardingManager } from '../src/dashboard/bot-onboarding.js';
 import type { RegisterAppOptions, RegisterAppResult } from '../src/setup/register-app.js';
 import type { OpenPlatformAutomationResult } from '../src/setup/open-platform-automation.js';
+
+const { userGetMock } = vi.hoisted(() => ({
+  userGetMock: vi.fn(),
+}));
+
+vi.mock('@larksuiteoapi/node-sdk', () => ({
+  Client: class {
+    contact = {
+      v3: {
+        user: {
+          get: userGetMock,
+        },
+      },
+    };
+  },
+}));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -23,6 +39,11 @@ const autoOk = (): OpenPlatformAutomationResult => ({
 });
 
 describe('BotOnboardingManager', () => {
+  beforeEach(() => {
+    userGetMock.mockReset();
+    userGetMock.mockResolvedValue({ code: 99992361, msg: 'user is not visible to this app' });
+  });
+
   it('publishes a scannable QR status while registration is waiting', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
     const pending = deferred<RegisterAppResult>();
@@ -50,7 +71,7 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('appends the created Feishu app as a default claude-code bot without exposing the secret', async () => {
+  it('does not write the scanner open_id when the new app cannot resolve it', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
     const manager = new BotOnboardingManager({
       botsJsonPath: join(dir, 'bots.json'),
@@ -84,8 +105,54 @@ describe('BotOnboardingManager', () => {
       larkAppSecret: 'super-secret-value',
       cliId: 'claude-code',
       workingDir: '~',
-      allowedUsers: ['ou_owner'],
     }]);
+    expect(bots[0]).not.toHaveProperty('allowedUsers');
+    expect(userGetMock).toHaveBeenCalledWith({
+      path: { user_id: 'ou_owner' },
+      params: { user_id_type: 'open_id' },
+    });
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('writes the scanner union_id to allowedUsers when the new app can resolve it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: {
+        user: {
+          union_id: 'on_scanner',
+          name: 'Scanner',
+        },
+      },
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_new',
+        appSecret: 'super-secret-value',
+        brand: 'feishu',
+        userOpenId: 'ou_scanner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ cliId: 'traex', workingDir: dir });
+    await job.done;
+
+    const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
+    expect(bots[0]).toMatchObject({
+      larkAppId: 'cli_new',
+      cliId: 'traex',
+      allowedUsers: ['on_scanner'],
+    });
+    expect(userGetMock).toHaveBeenCalledWith({
+      path: { user_id: 'ou_scanner' },
+      params: { user_id_type: 'open_id' },
+    });
 
     rmSync(dir, { recursive: true, force: true });
   });

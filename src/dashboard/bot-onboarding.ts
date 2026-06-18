@@ -227,11 +227,6 @@ export class BotOnboardingManager {
     if (result.brand === 'lark') {
       bot.brand = 'lark';
     }
-    if (result.userOpenId) {
-      // 优先存 union_id（on_，跨应用稳定），避免 open_id 在其他 bot 下报 cross-app 错误。
-      // 用刚注册的应用自身凭证查询；若查询失败（无 contact 权限）则 fallback 到 open_id。
-      bot.allowedUsers = [await resolveToUnionId(result.appId, result.appSecret, result.userOpenId, result.brand)];
-    }
     const addedBotIndex = bots.length;
     writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalizeBotConfig(bot)]);
 
@@ -239,6 +234,32 @@ export class BotOnboardingManager {
     // (导入权限 / 配 redirect / 建并发版). 这一步失败不回滚 bot, 只降级到
     // 手动权限步骤提示——和 `botmux setup` 的 finishOpenPlatformSetup 行为一致.
     await this.configurePermissions(id, result.appId, result.brand, { cliId, workingDir, addedBotIndex });
+    if (result.userOpenId) {
+      // registerApp 返回的 open_id 来自扫码链路；等权限自动配置跑完后，再用新 app
+      // 自身验证。验证失败时不 fallback 写入该 ou_，避免把其他 app 视角的
+      // open_id 固化成 owner，导致 /grant 和授权卡片一直判 non-owner。
+      await this.applyScannerAllowedUser(result.appId, result.appSecret, result.userOpenId, result.brand);
+    }
+  }
+
+  private async applyScannerAllowedUser(
+    appId: string,
+    appSecret: string,
+    scannerOpenId: string,
+    brand: Brand,
+  ): Promise<void> {
+    const allowedUser = await resolveScannerAllowedUser(appId, appSecret, scannerOpenId, brand);
+    if (!allowedUser) return;
+
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const index = bots.findIndex((bot: any) => bot?.larkAppId === appId);
+    if (index < 0) return;
+    const current = bots[index] as Record<string, any>;
+    if (Array.isArray(current.allowedUsers) && current.allowedUsers.length > 0) return;
+
+    const next = [...bots];
+    next[index] = normalizeBotConfig({ ...current, allowedUsers: [allowedUser] });
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
   }
 
   /**
@@ -317,18 +338,20 @@ export class BotOnboardingManager {
 }
 
 /**
- * 用指定应用的凭证把 open_id (ou_) 解析成 union_id (on_)。
- * union_id 跨应用稳定，适合写入 allowedUsers 供多个 bot 共用。
- * 若查询失败（无 contact 权限 / API 错误）则 fallback 返回原 open_id。
+ * 用新应用自身凭证验证扫码链路拿到的 open_id。
+ * 能解析 union_id 时写 on_；没有 union_id 但 open_id 对当前 app 有效时写 ou_。
+ * 查询失败或用户不在当前 app 视角时返回 undefined，调用方不得 fallback 写入该 ou_。
  */
-async function resolveToUnionId(appId: string, appSecret: string, openId: string, brand: Brand = 'feishu'): Promise<string> {
+async function resolveScannerAllowedUser(appId: string, appSecret: string, openId: string, brand: Brand = 'feishu'): Promise<string | undefined> {
   try {
     const client = new Lark.Client({ appId, appSecret, domain: sdkDomain(brand), disableTokenCache: false });
     const res = await (client as any).contact.v3.user.get({
       path: { user_id: openId },
       params: { user_id_type: 'open_id' },
     });
-    if (res.code === 0 && res.data?.user?.union_id) return res.data.user.union_id as string;
-  } catch { /* fallback */ }
-  return openId;
+    if (res.code === 0 && res.data?.user) {
+      return res.data.user.union_id ?? openId;
+    }
+  } catch { /* do not trust scanner open_id when verification fails */ }
+  return undefined;
 }
