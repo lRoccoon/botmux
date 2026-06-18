@@ -125,15 +125,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'codex',
     authPaths: ['~/.codex/auth.json'],
-    get resolvedBin() { return cachedBin ??= resolveCommand(rawBin); },
-
-    sandboxExtraExecPaths() {
-      return [(cachedBin ??= resolveCommand(rawBin))];
-    },
-
-    versionCommand() {
-      return { bin: (cachedBin ??= resolveCommand(rawBin)), args: ['--version'] };
-    },
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
       const baseArgs = [
