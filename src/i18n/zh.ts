@@ -317,6 +317,7 @@ export const messages: Record<string, string> = {
   'config.label.autoStartOnGroupJoin': '进群即开工',
   'config.label.autoStartOnNewTopic': '新话题即开工',
   'config.label.disableCliBypass': '关绕过·更安全',
+  'config.label.claudeCodeUltracode': 'Claude Ultracode',
   'config.label.restrictGrantCommands': '被授权人仅对话',
   'card.config.note': '🟢=开 ⚪=关，点一下即切换并刷新（model/cli 下个新会话起效）。语言：`/botconfig zh`｜`/botconfig en`。\n更多字段点「✏️ 文本设置」；allowedUsers / oncall 用 `/botconfig help`。',
   'card.config.text_btn': '✏️ 文本设置',

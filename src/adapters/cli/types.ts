@@ -58,6 +58,8 @@ export interface CliAdapter {
     model?: string;
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Claude Code only: enable ultracode via process-level --settings. Other adapters ignore it. */
+    claudeCodeUltracode?: boolean;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).

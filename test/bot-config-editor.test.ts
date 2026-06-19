@@ -213,6 +213,18 @@ describe('applyBotConfigEdits', () => {
     expect(cleared.model).toBeUndefined();
   });
 
+  it('edits and clears claudeCodeUltracode', () => {
+    const enabled = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+    }, { claudeCodeUltracode: 'on' });
+    expect(enabled.claudeCodeUltracode).toBe(true);
+
+    const disabled = applyBotConfigEdits(enabled, { claudeCodeUltracode: 'off' });
+    expect(disabled.claudeCodeUltracode).toBeUndefined();
+  });
+
   // 防回归：cli.ts 的 promptEditBotConfig 在切换 CLI 时会把 input.model 设成
   // null 强制清空旧 model — 这里只测 applyBotConfigEdits 把 null 解释为
   // "删字段"的契约，覆盖"切 CLI 后旧 model 残留"边界。

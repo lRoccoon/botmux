@@ -26,7 +26,7 @@ import { logger } from '../utils/logger.js';
  */
 export type ConfigEffect = 'immediate' | 'next-session';
 
-export type ConfigFieldKind = 'string' | 'boolean' | 'enum' | 'cli' | 'dir' | 'allowedUsers';
+export type ConfigFieldKind = 'string' | 'boolean' | 'enum' | 'cli' | 'dir' | 'allowedUsers' | 'claudeBoolean';
 
 export interface ConfigFieldSpec {
   /** 用户面命令里用的字段名（大小写不敏感匹配，见 {@link findConfigField}）。 */
@@ -62,6 +62,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
+  { key: 'claudeCodeUltracode', configKey: 'claudeCodeUltracode', kind: 'claudeBoolean', effect: 'next-session', clearable: false, hint: 'Claude Code 专属：新会话通过 --settings 开启 ultracode on|off' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；chat=扁平连续会话，thread/unset 回默认（每条 DM 独立会话）' },
 ];
@@ -87,7 +88,7 @@ export function parseBooleanValue(raw: string): boolean | undefined {
 
 /** 展示某字段当前值的人类可读文本。 */
 function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
-  if (spec.kind === 'boolean') return value === true ? 'on' : 'off';
+  if (spec.kind === 'boolean' || spec.kind === 'claudeBoolean') return value === true ? 'on' : 'off';
   if (spec.kind === 'allowedUsers') {
     const arr = Array.isArray(value) ? value : [];
     return arr.length ? arr.join(', ') : '∅';
@@ -150,7 +151,7 @@ export async function applyConfigField(
   const r = await rmwBotEntry<null>(larkAppId, (entry) => {
     if (value === null) {
       delete entry[spec.configKey];
-    } else if (spec.kind === 'boolean') {
+    } else if (spec.kind === 'boolean' || spec.kind === 'claudeBoolean') {
       // 与 parseBotConfigsFromText 一致：true 才写，false → 删 key（bots.json 保持干净）。
       if (value === true) entry[spec.configKey] = true;
       else delete entry[spec.configKey];
@@ -164,7 +165,7 @@ export async function applyConfigField(
   // 同步内存 config（与 oncall/grant-prefs store 一致，路由/spawn 不重启即生效）。
   if (value === null) {
     (bot.config as any)[spec.configKey] = undefined;
-  } else if (spec.kind === 'boolean') {
+  } else if (spec.kind === 'boolean' || spec.kind === 'claudeBoolean') {
     (bot.config as any)[spec.configKey] = value || undefined;
   } else {
     (bot.config as any)[spec.configKey] = value;
@@ -223,7 +224,7 @@ export type CoerceResult =
  * allowedUsers 不走这里（异步，见 {@link setBotAllowedUsers}）。
  */
 export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceResult {
-  if (spec.kind === 'boolean') {
+  if (spec.kind === 'boolean' || spec.kind === 'claudeBoolean') {
     if (typeof raw === 'boolean') return { ok: true, value: raw };
     const b = parseBooleanValue(String(raw ?? ''));
     return b === undefined ? { ok: false, reason: 'invalid_bool' } : { ok: true, value: b };
@@ -297,7 +298,7 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     teamRole: resolveTeamRoleFile(larkAppId),
     quota: typeof q === 'number' && Number.isInteger(q) && q > 0 ? q : null,
     admins: bot.resolvedAllowedUsers.length,
-    booleans: CONFIG_FIELDS.filter(f => f.kind === 'boolean').map(f => ({
+    booleans: CONFIG_FIELDS.filter(f => f.kind === 'boolean' || (f.kind === 'claudeBoolean' && cfg.cliId === 'claude-code')).map(f => ({
       key: f.key, on: (cfg as any)[f.configKey] === true,
     })),
   };

@@ -3508,6 +3508,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     locale: cfg.locale,
     model: cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
+    claudeCodeUltracode: cfg.claudeCodeUltracode === true,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)

@@ -116,6 +116,7 @@ export interface BotConfigEditInput {
    */
   model?: string | null;
   backendType?: string;
+  claudeCodeUltracode?: string;
   workingDir?: string;
   allowedUsers?: string;
   allowedChatGroups?: string;
@@ -310,6 +311,16 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
         throw new Error(`backendType must be "pty", "tmux", "herdr", or "zellij": ${backendType}`);
       }
       out.backendType = backendType;
+    }
+  }
+
+  if (input.claudeCodeUltracode !== undefined) {
+    const raw = input.claudeCodeUltracode.trim();
+    if (raw) {
+      const v = raw.toLowerCase();
+      if (['on', 'true', '1', 'yes', 'y', 'enable', 'enabled', '开', '是'].includes(v)) out.claudeCodeUltracode = true;
+      else if (['off', 'false', '0', 'no', 'n', 'disable', 'disabled', '关', '否', '-'].includes(v)) delete out.claudeCodeUltracode;
+      else throw new Error(`claudeCodeUltracode must be on/off: ${raw}`);
     }
   }
 

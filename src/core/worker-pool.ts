@@ -1513,6 +1513,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     cliPathOverride: botCfg.cliPathOverride,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    claudeCodeUltracode: botCfg.cliId === 'claude-code' && botCfg.claudeCodeUltracode === true,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
@@ -2455,6 +2456,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    claudeCodeUltracode: adoptedCliId === 'claude-code' && botCfg.claudeCodeUltracode === true,
     prompt: '',
     resume: false,
     ownerOpenId: ds.ownerOpenId,

@@ -140,6 +140,23 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
+  it('enables Claude Code ultracode via inline --settings when requested', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, claudeCodeUltracode: true });
+    const idx = args.indexOf('--settings');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(args[idx + 1]);
+    expect(parsed.ultracode).toBe(true);
+    expect(parsed.hooks?.SessionStart?.[0]?.hooks?.[0]?.command).toContain('session-ready');
+  });
+
+  it('does not enable Claude Code ultracode by default', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false });
+    const idx = args.indexOf('--settings');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(args[idx + 1]);
+    expect(parsed.ultracode).toBeUndefined();
+  });
+
   it('omits dangerous permission flags/keys when disableCliBypass is true (but keeps the SessionStart ready hook)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--dangerously-skip-permissions');

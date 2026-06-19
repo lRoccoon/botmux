@@ -66,6 +66,12 @@ export interface BotConfig {
    */
   disableCliBypass?: boolean;
   /**
+   * Claude Code only: when true, botmux enables Claude's ultracode mode for
+   * newly spawned Claude Code sessions via the process-level --settings JSON
+   * ({ ultracode: true }). Ignored by other CLI adapters.
+   */
+  claudeCodeUltracode?: boolean;
+  /**
    * Run this bot's CLI inside a per-session file sandbox (bubblewrap, Linux):
    * the agent sees only a clone of the project + a de-identified config dir,
    * never the host home/secrets/other sessions. Intended for oncall bots shared
@@ -682,6 +688,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.model.trim()
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
+      claudeCodeUltracode: entry.claudeCodeUltracode === true || undefined,
       sandbox: entry.sandbox === true,
       sandboxHidePaths: Array.isArray(entry.sandboxHidePaths)
         ? entry.sandboxHidePaths.filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())

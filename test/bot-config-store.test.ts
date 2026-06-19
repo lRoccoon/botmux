@@ -200,6 +200,16 @@ describe('bot-config store', () => {
     expect(store.getConfigCardData('app_missing')).toBeNull();
   });
 
+  it('shows Claude ultracode toggle only for Claude Code bots', async () => {
+    const { store } = await loaded({ cliId: 'claude-code', claudeCodeUltracode: true });
+    const claudeData = store.getConfigCardData('app_default');
+    expect(claudeData!.booleans.find(b => b.key === 'claudeCodeUltracode')?.on).toBe(true);
+
+    const { store: codexStore } = await loaded({ cliId: 'codex', claudeCodeUltracode: true });
+    const codexData = codexStore.getConfigCardData('app_default');
+    expect(codexData!.booleans.some(b => b.key === 'claudeCodeUltracode')).toBe(false);
+  });
+
   it('returns bot_not_registered for an unknown bot', async () => {
     const { store } = await loaded();
     const spec = store.findConfigField('model')!;

@@ -314,6 +314,7 @@ export const messages: Record<string, string> = {
   'config.label.autoStartOnGroupJoin': 'Auto-start on join',
   'config.label.autoStartOnNewTopic': 'Auto-start on new topic',
   'config.label.disableCliBypass': 'Disable bypass · safer',
+  'config.label.claudeCodeUltracode': 'Claude Ultracode',
   'config.label.restrictGrantCommands': 'Grantees chat-only',
   'card.config.note': '🟢=on ⚪=off, tap to flip & refresh (model/cli take effect next session). Language: `/botconfig zh` | `/botconfig en`.\nMore fields via "✏️ Text fields"; allowedUsers / oncall use `/botconfig help`.',
   'card.config.text_btn': '✏️ Text fields',
