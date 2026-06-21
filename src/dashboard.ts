@@ -53,6 +53,7 @@ import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
+  installLocalSkillLinks,
   readSkillRegistry,
   removeInstalledSkill,
   updateInstalledSkillAsync,
@@ -60,8 +61,9 @@ import {
 import { redactGitUrlCredentials } from './core/skills/sources.js';
 import { loadBotConfigs } from './bot-registry.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
+import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
-import { installDashboardSkill, parseDashboardSkillInstallRequest } from './dashboard/skill-install-request.js';
+import { installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
@@ -641,12 +643,31 @@ function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
   };
 }
 
+function dashboardSkillCliIds(): CliId[] {
+  const ids = new Set<CliId>();
+  try {
+    for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
+  } catch {
+    // Fall back to daemon descriptors below when persistent config is unavailable.
+  }
+  for (const bot of registry.list()) {
+    if (bot.cliId) ids.add(bot.cliId as CliId);
+  }
+  return [...ids];
+}
+
 function dashboardSkillsPayload(): Record<string, unknown> {
   const globalSkills = readGlobalConfig().skills ?? {};
+  const nativeSkillGroups = discoverNativeCliSkillGroups(dashboardSkillCliIds())
+    .map(group => ({
+      ...group,
+      skills: group.skills.map(sanitizeSkillForDashboard),
+    }));
   return {
     skills: Object.values(readSkillRegistry().skills)
       .sort((a, b) => a.name.localeCompare(b.name))
       .map(sanitizeSkillForDashboard),
+    nativeSkillGroups,
     trustProjectSkills: globalSkills.trustProjectSkills ?? 'off',
     delivery: globalSkills.delivery ?? 'auto',
   };
@@ -1065,6 +1086,27 @@ const server = createServer(async (req, res) => {
         const installRequest = parseDashboardSkillInstallRequest(body);
         const job = startSkillJob('install', () => installDashboardSkill(installRequest));
         return jsonRes(res, 202, { ok: true, job: publicSkillJob(job) });
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skills/install-local-links') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const sources = parseInstallLocalLinksSources(parsed);
+      if (sources.length === 0) return jsonRes(res, 400, { ok: false, error: 'sources_required' });
+      if (sources.length > MAX_LOCAL_LINK_SOURCES) return jsonRes(res, 400, { ok: false, error: 'too_many_sources' });
+      try {
+        const skills = installLocalSkillLinks(sources);
+        // Frontend re-fetches /api/skills (refresh()) after success, so we keep
+        // the response lean — no need to spread a full dashboardSkillsPayload()
+        // (which would re-run the native-skill discovery scan a second time).
+        return jsonRes(res, 200, { ok: true, installed: skills.map(sanitizeSkillForDashboard) });
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
       }
