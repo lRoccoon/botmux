@@ -63,6 +63,19 @@ describe('isNewerVersion', () => {
     expect(isNewerVersion('2.85.1', '2.85.1')).toBe(false);
     expect(isNewerVersion('2.85.0', '2.85.1')).toBe(false);
   });
+
+  // The update check always compares against the stable `latest` dist-tag (the
+  // update button installs `@latest` = stable). These lock in the canary policy:
+  // a canary running AHEAD of the latest stable must NOT be prompted to update,
+  // while a canary that merely preceded the now-released stable should be.
+  it('does not prompt a canary that is ahead of the latest stable', () => {
+    expect(isNewerVersion('2.86.0', '2.87.0-canary.0')).toBe(false); // minor ahead
+    expect(isNewerVersion('2.86.0', '2.86.1-canary.0')).toBe(false); // patch ahead
+  });
+  it('prompts a canary precursor when its stable (or a newer stable) is released', () => {
+    expect(isNewerVersion('2.86.0', '2.86.0-canary.5')).toBe(true);  // stable finalizes its own canary
+    expect(isNewerVersion('2.87.0', '2.87.0-canary.3')).toBe(true);
+  });
 });
 
 describe('selectReleasesSince', () => {

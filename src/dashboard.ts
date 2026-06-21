@@ -941,6 +941,10 @@ const server = createServer(async (req, res) => {
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
       const current = resolveCurrentVersion();
+      // Compare against the npm `latest` dist-tag (always stable; the update
+      // button installs `@latest`). isNewerVersion uses semver precedence, so a
+      // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
+      // 2.86.0) is NOT flagged behind — exactly the canary case we want.
       const latest = await cachedLatestVersion();
       return jsonRes(res, 200, {
         current,
