@@ -71,7 +71,6 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient } from './platform/tunnel-client.js';
-import { listMemberships } from './services/federation-membership-store.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -2226,8 +2225,6 @@ function startPlatformTunnelIfBound(): void {
       getDashboardPort: () => boundDashboardPort,
       getDashboardToken: () => activeToken,
       getVersion: () => version,
-      getMemberships: () =>
-        listMemberships(config.session.dataDir).map((m) => ({ hubUrl: m.hubUrl, teamId: m.teamId, teamName: m.teamName })),
       log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
     });
     logger.info(`[platform-tunnel] 绑定到 ${binding.platformUrl}，启动隧道`);

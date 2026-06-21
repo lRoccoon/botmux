@@ -13,6 +13,13 @@ export interface PlatformBinding {
   machineToken: string;
   /** 机器展示名（默认机器名） */
   name?: string;
+  /** 本机所属的平台团队（成员关系下沉到部署本地，平台零存储靠各机上报重组） */
+  teams?: PlatformTeam[];
+}
+
+export interface PlatformTeam {
+  teamId: string;
+  teamName: string;
 }
 
 export const PLATFORM_BINDING_PATH = join(homedir(), '.botmux', 'platform.json');
@@ -32,4 +39,13 @@ export function readPlatformBinding(): PlatformBinding | null {
 
 export function writePlatformBinding(b: PlatformBinding): void {
   atomicWriteFileSync(PLATFORM_BINDING_PATH, JSON.stringify(b, null, 2), { mode: 0o600 });
+}
+
+/** 更新本机平台团队列表并落盘（读最新 binding 防覆盖其它字段）。返回更新后的列表。 */
+export function setPlatformTeams(teams: PlatformTeam[]): PlatformTeam[] {
+  const b = readPlatformBinding();
+  if (!b) return [];
+  b.teams = teams;
+  writePlatformBinding(b);
+  return teams;
 }

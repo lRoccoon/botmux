@@ -4,13 +4,7 @@
 import net from 'node:net';
 import { hostname } from 'node:os';
 import { WebSocket, createWebSocketStream } from 'ws';
-import type { PlatformBinding } from './binding.js';
-
-export interface TunnelMembership {
-  hubUrl: string;
-  teamId: string;
-  teamName: string;
-}
+import { setPlatformTeams, type PlatformBinding, type PlatformTeam } from './binding.js';
 
 export interface TunnelClientOptions {
   binding: PlatformBinding;
@@ -19,7 +13,6 @@ export interface TunnelClientOptions {
   /** 当前 dashboard token（会轮转，每次读最新） */
   getDashboardToken: () => string | null;
   getVersion: () => string;
-  getMemberships: () => TunnelMembership[];
   log: (msg: string, extra?: Record<string, unknown>) => void;
 }
 
@@ -38,6 +31,8 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
   let heartbeat: NodeJS.Timeout | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let backoff = BACKOFF_MIN_MS;
+  // 本机平台团队（成员关系下沉到部署本地）
+  let teams: PlatformTeam[] = opts.binding.teams ? [...opts.binding.teams] : [];
 
   const base = wsBase(opts.binding.platformUrl);
   const tokenQ = encodeURIComponent(opts.binding.machineToken);
@@ -56,13 +51,19 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     });
 
     sock.on('message', (data) => {
-      let msg: { type?: string; streamId?: string };
+      let msg: { type?: string; streamId?: string; teamId?: string; teamName?: string };
       try {
         msg = JSON.parse(data.toString());
       } catch {
         return;
       }
-      if (msg.type === 'open-stream' && msg.streamId) openDataStream(msg.streamId);
+      if (msg.type === 'open-stream' && msg.streamId) {
+        openDataStream(msg.streamId);
+      } else if (msg.type === 'join-team' && msg.teamId) {
+        joinTeam(msg.teamId, msg.teamName || msg.teamId, sock);
+      } else if (msg.type === 'leave-team' && msg.teamId) {
+        leaveTeam(msg.teamId, sock);
+      }
     });
 
     sock.on('unexpected-response', (_req, res) => {
@@ -103,7 +104,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       botmuxVersion: opts.getVersion(),
       dashboardToken: opts.getDashboardToken() || '',
       dashboardPort: opts.getDashboardPort(),
-      memberships: opts.getMemberships(),
+      memberships: teams,
     });
   }
 
@@ -112,8 +113,34 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       type: 'heartbeat',
       botmuxVersion: opts.getVersion(),
       dashboardToken: opts.getDashboardToken() || '',
-      memberships: opts.getMemberships(),
+      memberships: teams,
     });
+  }
+
+  function joinTeam(teamId: string, teamName: string, sock: WebSocket): void {
+    if (!teams.some((t) => t.teamId === teamId)) {
+      teams = [...teams, { teamId, teamName }];
+    } else {
+      teams = teams.map((t) => (t.teamId === teamId ? { teamId, teamName } : t));
+    }
+    persistTeams();
+    opts.log('加入团队', { teamId, teamName });
+    sendHeartbeat(sock); // 立即上报新成员关系
+  }
+
+  function leaveTeam(teamId: string, sock: WebSocket): void {
+    teams = teams.filter((t) => t.teamId !== teamId);
+    persistTeams();
+    opts.log('退出团队', { teamId });
+    sendHeartbeat(sock);
+  }
+
+  function persistTeams(): void {
+    try {
+      setPlatformTeams(teams);
+    } catch (e) {
+      opts.log('团队落盘失败', { err: String(e) });
+    }
   }
 
   function openDataStream(streamId: string): void {

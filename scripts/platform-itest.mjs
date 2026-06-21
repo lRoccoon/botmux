@@ -34,6 +34,8 @@ const cval = (sc, n) => { for (const c of sc) { const m = c.match(new RegExp('^'
 async function main() {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'botmux-itest-'));
   fs.mkdirSync(path.join(tmpHome, '.botmux'), { recursive: true });
+  // 让本进程(含稍后 import 的 tunnel-client)都用隔离 HOME，绝不碰真实 ~/.botmux
+  process.env.HOME = tmpHome;
 
   // mock dashboard
   const dash = http.createServer((rq, rs) => { rs.writeHead(200, { 'content-type': 'text/html' }); rs.end('<html>REAL_TUNNEL_OK ' + rq.url + '</html>'); });
@@ -91,6 +93,15 @@ async function main() {
     const pcookie = `botmux_proxy_session=${cval(opened.setCookies, 'botmux_proxy_session')}`;
     const proxied = await req({ path: '/x', host: subHost, headers: { cookie: pcookie } });
     ok(proxied.body.includes('REAL_TUNNEL_OK'), '经真实隧道反代到 dashboard');
+
+    // 团队：平台创建 → 真实 tunnel-client 收 join-team 落盘+上报 → 名册
+    const team = JSON.parse((await req({ path: '/api/teams', method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ name: '集成队' }) })).body);
+    ok(team.delivered >= 1, '创建团队下发到真实 daemon');
+    await sleep(500);
+    const roster = JSON.parse((await req({ path: `/api/teams/${team.teamId}/roster`, headers: { cookie } })).body);
+    ok(roster.members.length === 1, '真实 daemon 上报团队成员关系→名册');
+    const pj = JSON.parse(fs.readFileSync(path.join(tmpHome, '.botmux', 'platform.json'), 'utf8'));
+    ok(Array.isArray(pj.teams) && pj.teams.some((t) => t.teamId === team.teamId), 'join-team 落盘到 platform.json');
   } catch (e) {
     fails++; console.error('异常', e);
   } finally {
