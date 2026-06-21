@@ -113,14 +113,21 @@ describe('fetchLatestVersion', () => {
 });
 
 describe('fetchReleasesSince', () => {
-  it('maps + filters the releases array', async () => {
+  it('maps + filters the releases array (ok:true)', async () => {
     const releases = [{ tag_name: 'v2.85.1', body: 'n', html_url: 'u', published_at: 'x' }];
     const out = await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(200, releases) });
-    expect(out.map(r => r.version)).toEqual(['2.85.1']);
+    expect(out.ok).toBe(true);
+    expect(out.releases.map(r => r.version)).toEqual(['2.85.1']);
   });
-  it('returns [] on failure', async () => {
-    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(404, {}) })).toEqual([]);
-    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(200, { not: 'array' }) })).toEqual([]);
-    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => { throw new Error('x'); } })).toEqual([]);
+  it('ok:true with an empty list when already latest (genuinely empty)', async () => {
+    const out = await fetchReleasesSince('2.85.1', { fetchImpl: async () => jsonResponse(200, [{ tag_name: 'v2.85.1' }]) });
+    expect(out).toMatchObject({ ok: true, releases: [] });
+  });
+  it('ok:false on failure, flags rate-limit on 403', async () => {
+    const rl = await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(403, {}) });
+    expect(rl).toMatchObject({ ok: false, rateLimited: true, releases: [] });
+    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(404, {}) })).toMatchObject({ ok: false, releases: [] });
+    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => jsonResponse(200, { not: 'array' }) })).toMatchObject({ ok: false, releases: [] });
+    expect(await fetchReleasesSince('2.85.0', { fetchImpl: async () => { throw new Error('x'); } })).toMatchObject({ ok: false, releases: [] });
   });
 });

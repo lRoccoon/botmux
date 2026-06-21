@@ -15,7 +15,8 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { isLocalDevInstallAt } from './install-info.js';
+import { isLocalDevInstallAt, botmuxVersion, botmuxInstallRoot } from './install-info.js';
+import { parseVersion } from '../core/update-check.js';
 
 /** Minimum Node major (mirrors package.json `engines.node`). */
 export const MIN_NODE_MAJOR = 22;
@@ -33,6 +34,32 @@ export function checkNode(version: string = process.version, required = MIN_NODE
   const m = version.match(/v?(\d+)\./);
   const major = m ? Number(m[1]) : 0;
   return { version, major, required, ok: major >= required };
+}
+
+/**
+ * The version to show in the update card. For an npm install this is the real
+ * published version from package.json. A source checkout ships the unbuilt
+ * `0.0.0` (CI injects the real version only at publish), so we derive a real
+ * baseline from the latest git tag (`git describe --tags --abbrev=0` → the clean
+ * tag, e.g. "v2.86.0", stripped of the leading v). That makes the version
+ * display, "behind" comparison, and changelog range correct in dev mode too.
+ * Falls back to the raw package.json version if git is unavailable.
+ */
+export function resolveCurrentVersion(): string {
+  const raw = botmuxVersion();
+  if (raw !== '0.0.0') return raw;
+  try {
+    const tag = execFileSync('git', ['describe', '--tags', '--abbrev=0'], {
+      cwd: botmuxInstallRoot(),
+      encoding: 'utf-8',
+      timeout: 3_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const ver = tag.replace(/^v/i, '');
+    return parseVersion(ver) ? ver : raw;
+  } catch {
+    return raw; // no git / no tags / not a checkout
+  }
 }
 
 export type InstallKind = 'npm-global' | 'source-checkout' | 'unknown';

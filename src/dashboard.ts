@@ -41,8 +41,9 @@ import { invalidWorkingDirs } from './utils/working-dir.js';
 import { mergeDashboardConfig, mergeGlobalConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig, type RepoPickerMode } from './global-config.js';
 import { isLocale } from './i18n/types.js';
 import { isLocalDevInstall, botmuxVersion } from './utils/install-info.js';
-import { checkNode, detectBotmuxInstalls } from './utils/install-diagnostics.js';
-import { fetchLatestVersion, fetchReleasesSince, isNewerVersion } from './core/update-check.js';
+import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
+import { GITHUB_REPO } from './core/restart-report.js';
 import { spawnDetachedRestart } from './core/maintenance.js';
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { spawn } from 'node:child_process';
@@ -173,6 +174,32 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 /** Guard against two concurrent `npm install -g` runs (e.g. two admin tabs, or
  *  a manual update racing the maintenance auto-update) corrupting the global. */
 let updateInFlight = false;
+
+// Cache the upstream version/changelog lookups so the nav-badge check + the
+// Settings card don't hammer the npm registry / GitHub on every page load.
+// GitHub's unauthenticated API is only 60 req/h per IP, so caching the changelog
+// also keeps us from exhausting it. Failures cache briefly so they self-heal.
+const LATEST_TTL_MS = 30 * 60_000;
+const CHANGELOG_TTL_MS = 15 * 60_000;
+const FAILURE_TTL_MS = 60_000;
+let latestVersionCache: { value: string | null; at: number } | null = null;
+let changelogCache: { key: string; value: ChangelogResult; at: number } | null = null;
+
+async function cachedLatestVersion(now = Date.now()): Promise<string | null> {
+  const ttl = latestVersionCache?.value ? LATEST_TTL_MS : FAILURE_TTL_MS;
+  if (latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache.value;
+  const value = await fetchLatestVersion();
+  latestVersionCache = { value, at: now };
+  return value;
+}
+
+async function cachedChangelog(current: string, now = Date.now()): Promise<ChangelogResult> {
+  const ttl = changelogCache?.value.ok ? CHANGELOG_TTL_MS : FAILURE_TTL_MS;
+  if (changelogCache && changelogCache.key === current && now - changelogCache.at < ttl) return changelogCache.value;
+  const value = await fetchReleasesSince(current);
+  changelogCache = { key: current, value, at: now };
+  return value;
+}
 
 /**
  * Run `npm install -g botmux@latest` for the manual-update flow WITHOUT blocking
@@ -913,8 +940,8 @@ const server = createServer(async (req, res) => {
     // unauthenticated caller (in both normal and public-read mode). The explicit
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
-      const current = botmuxVersion();
-      const latest = await fetchLatestVersion();
+      const current = resolveCurrentVersion();
+      const latest = await cachedLatestVersion();
       return jsonRes(res, 200, {
         current,
         latest,
@@ -926,8 +953,15 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/update/changelog') {
-      const current = botmuxVersion();
-      return jsonRes(res, 200, { current, releases: await fetchReleasesSince(current) });
+      const current = resolveCurrentVersion();
+      const result = await cachedChangelog(current);
+      return jsonRes(res, 200, {
+        current,
+        ok: result.ok,
+        rateLimited: result.rateLimited === true,
+        releases: result.releases,
+        releasesUrl: `https://github.com/${GITHUB_REPO}/releases`,
+      });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/run') {

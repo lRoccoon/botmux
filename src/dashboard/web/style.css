@@ -157,6 +157,20 @@ a { color: inherit; }
   color: var(--accent-strong);
 }
 
+/* Red dot on the Settings nav when a newer botmux version is available. */
+.sidebar-nav a.nav-has-update { position: relative; }
+.sidebar-nav a.nav-has-update::after {
+  content: "";
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
 .sidebar-foot {
   margin-top: auto;
   padding: 10px 8px 4px;

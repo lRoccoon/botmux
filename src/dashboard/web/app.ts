@@ -199,6 +199,25 @@ function applyAuthVisibility(): void {
   if (addBot) addBot.style.display = isAuthed ? '' : 'none';
 }
 
+// Show a small dot on the Settings nav when a newer botmux version is published,
+// so an available update is visible without opening the page. Authed-only (the
+// status endpoint is token-gated; the result is server-cached so this is cheap).
+// Best-effort and silent on failure.
+async function checkUpdateBadge(): Promise<void> {
+  if (!isAuthed) return;
+  try {
+    const r = await fetch('/api/update/status');
+    if (!r.ok) return;
+    const j = await r.json();
+    const a = document.querySelector<HTMLAnchorElement>('.sidebar-nav a[data-route="settings"]');
+    if (!a) return;
+    const behind = j.behind === true;
+    a.classList.toggle('nav-has-update', behind);
+    if (behind) a.title = t('update.navBadgeTitle', { version: `v${j.latest}` });
+    else a.removeAttribute('title');
+  } catch { /* best-effort */ }
+}
+
 function renderAuthRequiredPage(host: HTMLElement): void {
   host.innerHTML =
     '<section class="auth-required" style="max-width:520px;margin:64px auto;text-align:center;' +
@@ -363,6 +382,7 @@ void (async () => {
   // hidden and route guards are active for read-only visitors from frame one.
   await loadAuthState();
   applyAuthVisibility();
+  void checkUpdateBadge();
   initOwnerAvatar();
   try {
     await bootstrap();

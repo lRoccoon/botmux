@@ -121,27 +121,38 @@ export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | nul
   }
 }
 
+export interface ChangelogResult {
+  /** false when the GitHub fetch failed (offline / rate-limited / malformed) —
+   *  the caller shows a "view on GitHub" fallback instead of "no releases". */
+  ok: boolean;
+  /** true on HTTP 403 — GitHub's unauthenticated API is 60 req/h per IP, easily
+   *  exhausted behind shared NAT. Lets the UI explain the failure precisely. */
+  rateLimited?: boolean;
+  releases: ReleaseNote[];
+}
+
 /**
  * Stable GitHub releases strictly newer than `current`, newest first, capped at
- * `max`. Best-effort: [] on failure. Pre-releases (canary/beta/rc) are excluded
- * — the card mirrors exactly what `@latest` would install.
+ * `max`. Pre-releases (canary/beta/rc) are excluded — the card mirrors exactly
+ * what `@latest` would install. Returns `{ ok:false }` on any failure so the UI
+ * distinguishes "couldn't load" from a genuinely empty (already-latest) list.
  */
 export async function fetchReleasesSince(
   current: string,
   opts?: FetchOpts & { max?: number },
-): Promise<ReleaseNote[]> {
+): Promise<ChangelogResult> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
     const res = await fetchImpl(`https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=100`, {
       headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'botmux' },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
-    if (!res.ok) return [];
+    if (!res.ok) return { ok: false, rateLimited: res.status === 403, releases: [] };
     const raw = await res.json();
-    if (!Array.isArray(raw)) return [];
-    return selectReleasesSince(raw, current, opts?.max ?? 30);
+    if (!Array.isArray(raw)) return { ok: false, releases: [] };
+    return { ok: true, releases: selectReleasesSince(raw, current, opts?.max ?? 30) };
   } catch {
-    return [];
+    return { ok: false, releases: [] };
   }
 }
 

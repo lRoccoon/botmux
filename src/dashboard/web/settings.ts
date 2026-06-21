@@ -149,9 +149,11 @@ interface ReleaseNote { version: string; name: string; body: string; url: string
 
 let upStatus: UpdateStatus | null = null;
 let upStatusError: string | null = null;
-let upChangelog: ReleaseNote[] | null = null;
+let upChangelog: ReleaseNote[] | null = null; // null = not loaded yet (loading)
 let upChangelogOpen = false;
-let upChangelogError: string | null = null;
+let upChangelogOk = true;                      // false = fetch failed (offline / rate-limited)
+let upChangelogRateLimited = false;
+let upReleasesUrl = '';
 let upBusy = false;
 let upMsg: { text: string; cls: string } | null = null;
 
@@ -162,8 +164,14 @@ function installKindLabel(kind: string): string {
 }
 
 function renderChangelogPanel(): string {
-  if (upChangelogError) return `<p class="hint-warn-inline">${t('update.changelogFailed')}</p>`;
   if (upChangelog === null) return `<p class="empty">${t('update.changelogLoading')}</p>`;
+  if (!upChangelogOk) {
+    const reason = upChangelogRateLimited ? t('update.changelogRateLimited') : t('update.changelogFailed');
+    const link = upReleasesUrl
+      ? ` <a href="${escapeHtml(upReleasesUrl)}" target="_blank" rel="noopener">${t('update.changelogViewOnGitHub')}</a>`
+      : '';
+    return `<p class="hint-warn-inline">${reason}${link}</p>`;
+  }
   if (upChangelog.length === 0) return `<p class="empty">${t('update.changelogEmpty')}</p>`;
   return `<div class="update-changelog">${upChangelog.map(r => {
     const title = r.name && r.name !== `v${r.version}` ? r.name : '';
@@ -243,14 +251,19 @@ function mountUpdateCard(container: HTMLElement, canWrite: boolean): void {
   }
 
   async function loadChangelog(): Promise<void> {
-    upChangelog = null; upChangelogError = null; rerender();
+    upChangelog = null; upChangelogOk = true; upChangelogRateLimited = false; rerender();
     try {
       const r = await fetch('/api/update/changelog');
       const body = await r.json().catch(() => ({}));
-      if (!r.ok) upChangelogError = body?.error ?? `HTTP ${r.status}`;
-      else upChangelog = Array.isArray(body.releases) ? body.releases : [];
-    } catch (e: any) {
-      upChangelogError = e?.message ?? String(e);
+      upReleasesUrl = typeof body?.releasesUrl === 'string' ? body.releasesUrl : '';
+      if (!r.ok) { upChangelog = []; upChangelogOk = false; }
+      else {
+        upChangelog = Array.isArray(body.releases) ? body.releases : [];
+        upChangelogOk = body.ok !== false;
+        upChangelogRateLimited = body.rateLimited === true;
+      }
+    } catch {
+      upChangelog = []; upChangelogOk = false;
     }
     rerender();
   }
