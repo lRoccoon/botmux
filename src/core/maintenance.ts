@@ -26,6 +26,7 @@ import { evaluateDue } from './maintenance-schedule.js';
 import { anyDaemonBusy } from './daemon-heartbeat.js';
 import { writeRestartIntent, type RestartIntent } from '../services/restart-intent-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from '../utils/install-info.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -144,6 +145,17 @@ export function maintenanceRestartLogPath(): string {
 }
 
 /**
+ * Cross-process lock target that serializes `npm install -g botmux@latest`
+ * between the scheduled auto-update (this daemon process) and a
+ * dashboard-triggered manual update (the separate `botmux-dashboard` process),
+ * so the two never write the global npm prefix concurrently. Both sides acquire
+ * `withFileLock(Sync)` on this path.
+ */
+export function npmGlobalUpdateLockTarget(): string {
+  return join(config.session.dataDir, 'npm-global-update');
+}
+
+/**
  * Build the command to launch `botmux restart` for applying an auto-update.
  *
  * The restart driver must NOT remain a descendant of the daemon it's about to
@@ -216,7 +228,15 @@ function productionDeps(): MaintenanceDeps {
     isLocalDev: () => isLocalDevInstall(),
     currentVersion: () => botmuxVersion(),
     runUpdate: () => {
-      execSync('npm install -g botmux@latest', { stdio: 'inherit' });
+      // Hold the shared update lock for the whole install so a concurrent
+      // dashboard manual update can't run `npm install -g` at the same time.
+      // Short wait: if the dashboard holds it (a manual update is mid-flight),
+      // don't block the daemon thread waiting out a 30s install — throw a lock
+      // timeout fast so the tick logs it and slips to the next day (the manual
+      // update is already bumping to latest anyway).
+      withFileLockSync(npmGlobalUpdateLockTarget(), () => {
+        execSync('npm install -g botmux@latest', { stdio: 'inherit' });
+      }, { maxWaitMs: 500 });
     },
     writeIntent: (intent) => writeRestartIntent(intent),
     triggerRestart: () => spawnDetachedRestart('auto-update'),
