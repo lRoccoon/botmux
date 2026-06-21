@@ -107,7 +107,10 @@ function completedMs(content: string): number | undefined {
 }
 
 function failedExit(output: string): number | undefined {
-  const m = /(?:exit(?:ed)?(?: code)?|Exit Code)[^\d-]*(-?\d+)/i.exec(output);
+  // Match the real exit phrasings ("Process exited with code N", "Exit Code: N",
+  // "exited N") but bound the gap to the number ([\s:=]{0,4}) so it can't skip
+  // whole words to an unrelated number (the old [^\d-]* did).
+  const m = /(?:process\s+)?exit(?:ed)?(?:\s+with)?(?:\s+code)?[\s:=]{0,4}(-?\d+)/i.exec(output);
   if (!m) return undefined;
   const code = Number(m[1]);
   return Number.isFinite(code) && code !== 0 ? code : undefined;

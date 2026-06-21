@@ -96,7 +96,11 @@ function outputText(output: unknown): string {
 }
 
 function failedExit(output: string): number | null {
-  const m = /(?:Process exited with code|exit(?:ed)?(?: code)?)[^\d-]*(-?\d+)/i.exec(output);
+  // Match the real exit phrasings ("Process exited with code N", "exit code: N",
+  // "exited N") but bound the gap to the number ([\s:=]{0,4}) so it can't skip
+  // whole words to an unrelated number (the old [^\d-]* matched "exited from
+  // menu. 1 file changed" → 1).
+  const m = /(?:process\s+)?exit(?:ed)?(?:\s+with)?(?:\s+code)?[\s:=]{0,4}(-?\d+)/i.exec(output);
   if (!m) return null;
   const code = Number(m[1]);
   return Number.isFinite(code) && code !== 0 ? code : null;

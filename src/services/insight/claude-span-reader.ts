@@ -204,7 +204,17 @@ export function parseClaudeInsight(path: string, opts: InsightReaderOptions = {}
         if (!span) continue;
         span.status = block.is_error === true ? 'error' : 'ok';
         span.outputSummary = summarizeToolOutput(block);
-        const output = typeof block.content === 'string' ? block.content : undefined;
+        // tool_result content may be a string OR an array of {type:'text',text}
+        // blocks — flatten the array form too, else a successful array result
+        // looks empty and mislabels as 'no_output'.
+        const output = typeof block.content === 'string'
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content
+                .map((c: any) => (typeof c === 'string' ? c : typeof c?.text === 'string' ? c.text : ''))
+                .join('\n')
+                .trim() || undefined
+            : undefined;
         span.result = resultForToolOutput(span, output, block.is_error === true);
         if (span.phase === 'run') {
           const safeOutput = safeOutputPreview(block.content);

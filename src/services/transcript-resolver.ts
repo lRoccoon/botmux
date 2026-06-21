@@ -118,10 +118,15 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const path = cachedTranscriptPathLookup(`traex:${sid}`, null, () => findTraexRolloutBySessionId(sid) ?? null, { retryMiss: q.fresh });
       return path ? { path, kind: 'traex' } : null;
     }
-    case 'antigravity':
-      return q.cliSessionId
-        ? { path: join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl'), kind: 'antigravity' }
-        : null;
+    case 'antigravity': {
+      // Validate the CLI session id before interpolating it into a path (every
+      // other branch resolves by scanning a data dir; this one builds the path
+      // directly). Conservative charset rules out traversal / separators, and
+      // existsSync keeps the null-when-absent contract the other branches honor.
+      if (!q.cliSessionId || !/^[A-Za-z0-9._-]+$/.test(q.cliSessionId)) return null;
+      const p = join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+      return existsSync(p) ? { path: p, kind: 'antigravity' } : null;
+    }
     default:
       return null;
   }
