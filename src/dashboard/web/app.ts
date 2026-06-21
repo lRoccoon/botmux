@@ -13,6 +13,7 @@ import { renderSettingsPage } from './settings.js';
 import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { renderOfficePage } from './office.js';
+import { renderInsightsPage } from './insights.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
@@ -32,7 +33,7 @@ let publicReadOnly = false;
 
 // Management pages are token-gated end-to-end (no public GET) — a read-only
 // visitor must not reach them. `data-route` values from index.html's nav.
-const MANAGE_ROUTES = ['roles', 'role-profiles', 'bot-defaults', 'skills', 'team', 'connectors'];
+const MANAGE_ROUTES = ['roles', 'role-profiles', 'bot-defaults', 'skills', 'team', 'connectors', 'insights'];
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 // Shown only when the dashboard token was rotated WHILE public read-only is off
@@ -265,6 +266,7 @@ function route() {
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
   else if (hash.startsWith('#/sessions')) renderSessionsPage(root);
   else if (hash.startsWith('#/office')) pageDispose = renderOfficePage(root) ?? null;
+  else if (hash.startsWith('#/insights')) pageDispose = renderInsightsPage(root);
   else void renderOverviewPage(root);
 
   highlightNav(hash);

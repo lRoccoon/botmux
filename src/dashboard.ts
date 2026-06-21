@@ -57,6 +57,8 @@ import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSumm
 import { installDashboardSkill, parseDashboardSkillInstallRequest } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
+import { mergeSafeInsightOverviews } from './services/insight/report.js';
+import type { SafeInsightOverview } from './services/insight/types.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -259,7 +261,7 @@ function serveFileAbs(res: ServerResponse, fp: string): boolean {
   return true;
 }
 
-function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const fp = resolve(WEB_DIR, rel);
   const webRoot = resolve(WEB_DIR);
@@ -269,7 +271,23 @@ function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: strin
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
-    res.writeHead(200, { 'content-type': MIME[extname(fp)] ?? 'application/octet-stream' });
+    // Bundle filenames are fixed (app.js/style.css), so without revalidation
+    // browsers heuristic-cache them and serve a stale build after a deploy
+    // (new JS + old CSS → broken layout). `no-cache` + an mtime/size ETag makes
+    // the browser revalidate every load: 304 when unchanged (cheap), fresh 200
+    // when the build changed. No manual hard-refresh needed after deploy.
+    const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+    const headers: Record<string, string> = {
+      'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
+      'cache-control': 'no-cache',
+      etag,
+    };
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, headers);
+      res.end();
+      return true;
+    }
+    res.writeHead(200, headers);
     res.end(readFileSync(fp));
     return true;
   } catch {
@@ -745,6 +763,17 @@ const server = createServer(async (req, res) => {
       });
       return jsonRes(res, 200, { sessions });
     }
+    if (req.method === 'GET' && url.pathname === '/api/insights/summary') {
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
+      const chunks = await Promise.all(registry.list().map(async d => {
+        const upstream = await proxyToDaemon(d.larkAppId, `/api/insights/summary?limit=${limit}`, { method: 'GET' });
+        if (!upstream.ok) return null;
+        const body = await upstream.json().catch(() => null) as { overview?: SafeInsightOverview } | null;
+        return body?.overview ?? null;
+      }));
+      const overview = mergeSafeInsightOverviews(chunks.filter((x): x is SafeInsightOverview => !!x), { limit });
+      return jsonRes(res, 200, { ok: true, overview });
+    }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       // Public-read carve-out: the row carries CONTENT (prompt = business
       // instructions) and a bound `workingDir` (repo/customer path) — strip
@@ -1082,6 +1111,30 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/history${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
+    // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
+    // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/insight${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight\/turn\/([^/]+)$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const turnIndex = decodeURIComponent(m[2]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/insight/turn/${turnIndex}${url.search ?? ''}`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
