@@ -729,6 +729,8 @@ const DAEMON_REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemon
 interface DaemonDescriptor {
   larkAppId: string;
   botName: string;
+  /** Bot open_id from /bot/v3/info; used by dashboard name maps. */
+  botOpenId?: string;
   /** CLI adapter id from bots.json, used by dashboard roster before any sessions exist. */
   cliId: string;
   /** Lark app avatar URL (from /bot/v3/info); absent until the open_id probe lands. */
@@ -3734,6 +3736,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
     botName: cfg.larkAppId,
+    botOpenId: getBot(cfg.larkAppId).botOpenId,
     cliId: cfg.cliId,
     botIndex: idx,
     ipcPort,
@@ -3897,10 +3900,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     probeBotOpenId(cfg.larkAppId).then(() => {
       writeBotInfoFile(config.session.dataDir);
       const probedName = bot.botName;
+      const probedOpenId = bot.botOpenId;
       const probedAvatar = bot.botAvatarUrl;
       let descChanged = false;
       if (probedName && probedName !== desc.botName) {
         desc.botName = probedName;
+        descChanged = true;
+      }
+      if (probedOpenId && probedOpenId !== desc.botOpenId) {
+        desc.botOpenId = probedOpenId;
         descChanged = true;
       }
       if (probedAvatar && probedAvatar !== desc.botAvatarUrl) {

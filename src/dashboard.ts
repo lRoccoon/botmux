@@ -417,11 +417,11 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string }>(bo
   return bot.cliId ? bot : { ...bot, cliId: ids.get(bot.larkAppId) };
 }
 
-function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
+function liveBots(): { larkAppId: string; botName: string; botOpenId?: string; cliId?: string }[] {
   const ids = configuredCliIds();
   return registry.list().map(d => {
     const b = withConfiguredCliId(d, ids);
-    return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
+    return { larkAppId: b.larkAppId, botName: b.botName, botOpenId: b.botOpenId, cliId: b.cliId };
   });
 }
 
@@ -1520,6 +1520,7 @@ const server = createServer(async (req, res) => {
             }
             cur.memberBots.push({
               larkAppId: d.larkAppId,
+              botOpenId: d.botOpenId,
               botName: d.botName,
               cliId: d.cliId,
               inChat: true,
@@ -1540,7 +1541,7 @@ const server = createServer(async (req, res) => {
         const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
         for (const b of onlineBots) {
           if (!present.has(b.larkAppId)) {
-            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
+            c.memberBots.push({ larkAppId: b.larkAppId, botOpenId: b.botOpenId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
           }
         }
       }
@@ -1561,9 +1562,11 @@ const server = createServer(async (req, res) => {
       // editor that consumes oncallChat is authed-only. Strip for anon so the
       // bound dirs don't leak via /api/groups (mirrors the /api/schedules
       // prompt strip + keeps /api/bots oncall removal honest).
+      const botSummaries = onlineBots.map(botSummaryPayload);
+      const publicBotSummaries = botSummaries.map(({ botOpenId: _botOpenId, ...rest }) => rest);
       return jsonRes(res, 200, {
         chats: authed ? sorted : redactGroupsForPublic(sorted),
-        bots: onlineBots.map(botSummaryPayload),
+        bots: authed ? botSummaries : publicBotSummaries,
       });
     }
 
