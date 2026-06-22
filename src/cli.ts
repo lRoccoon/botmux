@@ -15,8 +15,8 @@
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
- *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd)
- *   botmux worker-budget status|set|unset — inspect/override idle worker suspension budget
+ *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
+ *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
@@ -73,10 +73,19 @@ import {
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
-import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath, type WorkerConfig } from './global-config.js';
-import { detectWorkerResources, resolveWorkerBudget } from './core/worker-budget.js';
+import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+import {
+  createWhiteboard,
+  ensureDefaultWhiteboard,
+  getWhiteboard,
+  listWhiteboards,
+  readWhiteboard,
+  whiteboardEnabled,
+  whiteboardPath,
+} from './services/whiteboard-store.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
+import { stripLegacyPendingCardFields } from './services/session-store.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -128,6 +137,10 @@ function ensureConfigDir(): void {
  * may belong to an unrelated installation (e.g. IDE remote extensions).
  */
 function pm2Bin(): string {
+  if (process.platform === 'win32') {
+    const cmd = join(PKG_ROOT, 'node_modules', '.bin', 'pm2.cmd');
+    if (existsSync(cmd)) return cmd;
+  }
   try {
     return require.resolve('pm2/bin/pm2');
   } catch { /* fall through */ }
@@ -195,11 +208,42 @@ function killDuplicatePm2GodDaemons(home: string = PM2_HOME): boolean {
   return true;
 }
 
-function runPm2(args: string[], inherit = true, home: string = PM2_HOME): void {
-  execSync(`${pm2Bin()} ${args.join(' ')}`, {
+function runPm2(args: string[], inherit = true, home: string = PM2_HOME, timeoutMs?: number): void {
+  const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
+  const r = spawnSync(pm2.command, pm2.args, {
     stdio: inherit ? 'inherit' : 'pipe',
     env: pm2Env(home),
+    shell: pm2.shell ?? false,
+    timeout: timeoutMs,
   });
+  if (r.status !== 0) {
+    // r.error is set when the process couldn't be spawned/timed out (status null);
+    // prefer it so failures don't surface as a bare "status null".
+    const detail = r.error?.message ?? `status ${r.status}`;
+    throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
+  }
+}
+
+/**
+ * Run a pm2 command and capture stdout. Routes through buildPm2SpawnCommand so
+ * it works on Windows (where pm2Bin() resolves to a `.cmd` that must run through
+ * a shell) as well as macOS/Linux. Throws on non-zero exit / spawn failure.
+ */
+function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000): string {
+  const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
+  const r = spawnSync(pm2.command, pm2.args, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: pm2Env(home),
+    shell: pm2.shell ?? false,
+    timeout: timeoutMs,
+  });
+  if (r.status !== 0) {
+    const detail = r.error?.message
+      ?? ((r.stderr ? String(r.stderr).trim() : '') || `status ${r.status}`);
+    throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
+  }
+  return typeof r.stdout === 'string' ? r.stdout : '';
 }
 
 function loadBotsJson(): any[] {
@@ -244,6 +288,19 @@ function ecosystemConfig(): string {
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
+    // A graceful daemon shutdown exits 0 (SIGTERM/SIGINT → drain → process.exit(0)).
+    // Tell pm2 that exit 0 is intentional so it does NOT autorestart the daemon
+    // while `botmux restart` is tearing the fleet down — otherwise pm2 revives
+    // each daemon (after restart_delay) the instant our parallel SIGTERM drains
+    // it, and re-deleting those revivals one-by-one re-serializes the teardown
+    // (~13s of churn for 31 bots). Crashes (non-zero exit / killed by signal)
+    // are NOT in this list, so genuine crash-autorestart is preserved.
+    stop_exit_codes: [0],
+    // pm2's default kill_timeout (1.6s) is SHORTER than the daemon's own
+    // SHUTDOWN_GRACE_MS (3s), so any daemon pm2 has to signal directly gets
+    // SIGKILL'd mid-drain → orphaned (ppid=1) workers. Give pm2 headroom past
+    // the daemon's graceful-drain budget so it never force-kills mid-shutdown.
+    kill_timeout: 3500,
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
     node_args: [
@@ -277,6 +334,10 @@ function ecosystemConfig(): string {
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
+    // Same rationale as the bot daemons: don't let pm2 revive on graceful exit-0
+    // during a fleet teardown, and don't SIGKILL mid-shutdown. (See baseApp.)
+    stop_exit_codes: [0],
+    kill_timeout: 3500,
     error_file: join(LOG_DIR, 'dashboard-error.log'),
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
@@ -538,10 +599,16 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
 }
 
 /**
- * 用指定应用凭证把 open_id (ou_) 解析成 union_id (on_，跨应用稳定)。
- * 查询失败（无 contact 权限 / API 错误）则 fallback 返回原 open_id。
+ * 用新应用自身凭证验证扫码链路拿到的 open_id。
+ * 能解析 union_id 时写 on_；没有 union_id 但 open_id 对当前 app 有效时写 ou_。
+ * 查询失败或用户不在当前 app 视角时返回 undefined，调用方不得 fallback 写入该 ou_。
  */
-async function resolveOpenIdToUnionId(appId: string, appSecret: string, openId: string, brand: Brand = 'feishu'): Promise<string> {
+async function resolveScannerAllowedUser(
+  appId: string,
+  appSecret: string,
+  openId: string,
+  brand: Brand = 'feishu',
+): Promise<string | undefined> {
   try {
     const { Client } = await import('@larksuiteoapi/node-sdk');
     // brand → 域名。Lark 扫码人 ou_→on_ 必须打 larksuite.com，否则失败丢掉 cross-app 稳定性。
@@ -550,9 +617,11 @@ async function resolveOpenIdToUnionId(appId: string, appSecret: string, openId: 
       path: { user_id: openId },
       params: { user_id_type: 'open_id' },
     });
-    if (res.code === 0 && res.data?.user?.union_id) return res.data.user.union_id as string;
-  } catch { /* fallback */ }
-  return openId;
+    if (res.code === 0 && res.data?.user) {
+      return res.data.user.union_id ?? openId;
+    }
+  } catch { /* do not trust scanner open_id when verification fails */ }
+  return undefined;
 }
 
 /**
@@ -575,11 +644,11 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
     }
     const invalid = findInvalidAllowedUserEntries(entries);
     if (invalid.length > 0) {
-      console.log(`   ❌ 以下不是完整邮箱或 open_id（邮箱前缀不接受）: ${invalid.join(', ')}`);
+      console.log(`   ❌ 以下不是完整邮箱、union_id 或 open_id（邮箱前缀不接受）: ${invalid.join(', ')}`);
       continue;
     }
     if (!hasOwnerEntry(entries)) {
-      console.log('   ❌ 至少需要一个 open_id 或完整邮箱作为 owner。');
+      console.log('   ❌ 至少需要一个完整邮箱、union_id 或 open_id 作为 owner。');
       continue;
     }
     return entries;
@@ -641,13 +710,19 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   // setup 不再询问 model（用户常选到无权限的 model，setup 完一发消息就 spawn
   // 报错，排查成本高）。需要指定 model 走 /config 卡片或手动编辑 bots.json。
-  // 扫码场景默认填扫码人自己 (registerApp 返回里有 open_id), 天然就是 owner.
-  // 优先解析成 union_id (on_，跨应用稳定)；失败则 fallback 到 open_id (ou_)。
+  // 扫码场景默认填扫码人自己，但 registerApp 返回的 open_id 不能直接信任：
+  // 只有新 app 自身能验证时才写入 allowedUsers；验证失败则要求手动填写 owner。
   // 手动 fallback 场景没 open_id —— 必须显式指定 owner, 否则配置无 owner:
   // allowedUsers 为空时虽然"全开放", 但一旦后续加了 allowedChatGroups 就会变成
   // "群成员能对话却没人能做敏感操作 / 用 /grant". setup 阶段强制收口, 不允许没 owner.
   if (creds.userOpenId) {
-    bot.allowedUsers = [await resolveOpenIdToUnionId(creds.appId, creds.appSecret, creds.userOpenId, creds.brand)];
+    const owner = await resolveScannerAllowedUser(creds.appId, creds.appSecret, creds.userOpenId, creds.brand);
+    if (owner) {
+      bot.allowedUsers = [owner];
+    } else {
+      console.log('⚠️  无法确认扫码人的 open_id 属于当前新应用，请手动填写 owner。');
+      bot.allowedUsers = await promptRequiredOwner(rl);
+    }
   } else {
     bot.allowedUsers = await promptRequiredOwner(rl);
   }
@@ -760,7 +835,7 @@ async function promptEditBotConfig(
   input.workingDir = await ask(rl, `默认工作目录 [${formatOptionalValue(bot.workingDir)}]: `);
 
   printInputHelp('允许的用户', [
-    '可选。限制哪些飞书用户可以操作机器人，支持完整邮箱（如 alice@example.com）或 open_id（ou_xxx），多个值用逗号分隔。',
+    '可选。限制哪些飞书用户可以操作机器人，支持完整邮箱（如 alice@example.com）、union_id（on_xxx）或 open_id（ou_xxx），多个值用逗号分隔。',
     '注意：必须是完整邮箱，邮箱前缀（如 alice）无法解析、会被丢弃。',
     '留空保留当前值；输入 - 清空限制。',
   ]);
@@ -829,7 +904,7 @@ async function writeSingleBotConfig(): Promise<boolean> {
   await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot));
   console.log(`下一步:`);
   console.log(`  1. botmux start              启动 daemon`);
-  console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : '当前平台暂不支持'}，无需 sudo）`);
+  console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : process.platform === 'win32' ? 'Windows Task Scheduler' : '当前平台暂不支持'}，无需 sudo）`);
   return true;
 }
 
@@ -1058,7 +1133,7 @@ function preflightNodeSanity(): void {
             console.warn(`⚠️  pm2 god daemon (pid ${pm2Pid}) 使用的 Node 二进制已失效: ${cleanPath}`);
             console.warn(`   自动杀掉 pm2 god 以便用当前 Node 重启...`);
             try {
-              execSync(`${pm2Bin()} kill`, { env: pm2Env(), stdio: 'pipe', timeout: 10_000 });
+              runPm2(['kill'], false, PM2_HOME, 10_000);
             } catch {
               try { process.kill(pm2Pid, 'SIGKILL'); } catch { /* ignore */ }
             }
@@ -1167,44 +1242,79 @@ function cleanupStaleDaemonDescriptors(): void {
   }
 }
 
+/** Block the current thread for `ms`. Safe here: the restart CLI is a one-shot
+ *  process, so stalling its event loop during the shutdown poll is harmless. */
+function sleepSyncMs(ms: number): void {
+  if (ms <= 0) return;
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* SAB unavailable → no-op */ }
+}
+
 /** Delete all pm2 processes matching botmux / botmux-* under the given PM2_HOME. */
 function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
+  let entries: Array<{ name: string; pid: number; online: boolean }>;
   try {
-    const output = execSync(`${pm2Bin()} jlist`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: pm2Env(home),
-      timeout: 10_000,
-    });
-    const apps = JSON.parse(output) as any[];
-    for (const app of apps) {
-      if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
-        try {
-          execSync(`${pm2Bin()} delete ${app.name}`, {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            env: pm2Env(home),
-            timeout: 10_000,
-          });
-        } catch (e) {
-          // Don't swallow silently — a failed delete here used to leave the
-          // restart half-done with no trace. Surface it (the auto-restart
-          // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
-          console.error(`[restart] pm2 delete ${app.name} failed: ${e instanceof Error ? e.message : e}`);
-        }
-      }
-    }
+    const apps = JSON.parse(pm2Capture(['jlist'], home)) as any[];
+    entries = (Array.isArray(apps) ? apps : [])
+      .filter(a => a && (a.name === PM2_NAME || String(a.name).startsWith(`${PM2_NAME}-`)))
+      .map(a => ({ name: String(a.name), pid: Number(a.pid) || 0, online: a?.pm2_env?.status === 'online' }));
   } catch (e) {
     console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
+    return;
+  }
+  if (entries.length === 0) return;
+  const names = entries.map(e => e.name);
+
+  // Parallel graceful shutdown. pm2's own delete stops apps one-at-a-time
+  // (async eachLimit, concurrency 1) and each botmux daemon's drain eats pm2's
+  // full kill_timeout (~1.6s) → ~N×1.6s serial (~38s for 31 bots). Instead we
+  // SIGTERM every online daemon AT ONCE so their graceful drains overlap (the
+  // daemon's SIGTERM handler detaches workers within SHUTDOWN_GRACE_MS), wait
+  // once for them all to exit, then let pm2 delete reap the now-dead entries
+  // instantly. Orphan-safe: each daemon runs its FULL graceful drain and we wait
+  // for real exit before pm2 touches it — avoiding the mid-drain SIGKILL the old
+  // path forced (pm2 kill_timeout 1.6s < daemon SHUTDOWN_GRACE_MS 3s).
+  const pids = entries.filter(e => e.online && e.pid > 0).map(e => e.pid);
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  // Poll until every signalled daemon has exited (bounded). SHUTDOWN_GRACE_MS is
+  // 3s; give headroom. Exits early the moment the last one dies.
+  const deadline = Date.now() + 5_000;
+  let alive = pids.slice();
+  while (alive.length > 0 && Date.now() < deadline) {
+    sleepSyncMs(50);
+    alive = alive.filter(pid => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  }
+
+  // Reap pm2 entries. Processes are already dead → each delete is instant, and
+  // ONE batched `pm2 delete name1 name2 …` collapses N pm2 CLI cold-boots
+  // (~315ms each) into one. A revived (autorestart, gated by restart_delay)
+  // instance is still removed by name.
+  const batchTimeout = Math.max(15_000, names.length * 2_500);
+  try {
+    runPm2(['delete', ...names], false, home, batchTimeout);
+    return;
+  } catch (e) {
+    // pm2's batched delete (async eachLimit) aborts on the first failed name,
+    // so a mid-batch failure can leave stragglers. Fall back to the resilient
+    // per-name loop that try/catches each name independently.
+    console.error(`[restart] batched pm2 delete failed, falling back to per-name: ${e instanceof Error ? e.message : e}`);
+  }
+  for (const name of names) {
+    try {
+      runPm2(['delete', name], false, home, 10_000);
+    } catch (e) {
+      // Don't swallow silently — a failed delete here used to leave the
+      // restart half-done with no trace. Surface it (the auto-restart
+      // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
+      console.error(`[restart] pm2 delete ${name} failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
 }
 
 function killPm2GodDaemon(home: string = PM2_HOME): void {
   try {
-    execSync(`${pm2Bin()} kill`, {
-      stdio: 'inherit',
-      env: pm2Env(home),
-      timeout: 15_000,
-    });
+    runPm2(['kill'], true, home, 15_000);
     return;
   } catch {
     // Fall back to direct pid cleanup below.
@@ -1246,12 +1356,7 @@ function cmdStop(): void {
   cleanupLegacyPm2();
   let stopped = false;
   try {
-    const output = execSync(`${pm2Bin()} jlist`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: pm2Env(),
-      timeout: 10_000,
-    });
+    const output = pm2Capture(['jlist']);
     const apps = JSON.parse(output) as any[];
     for (const app of apps) {
       if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
@@ -1329,12 +1434,7 @@ function warnIfLegacyBotmuxAlive(): void {
   if (!legacyPid) return;
   try { process.kill(legacyPid, 0); } catch { return; }
   try {
-    const output = execSync(`${pm2Bin()} jlist`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: pm2Env(legacyHome),
-      timeout: 10_000,
-    });
+    const output = pm2Capture(['jlist'], legacyHome);
     const apps = JSON.parse(output) as any[];
     const hasBotmux = apps.some(a => a.name === PM2_NAME || a.name.startsWith(`${PM2_NAME}-`));
     if (hasBotmux) {
@@ -1380,6 +1480,7 @@ function cmdLogs(): void {
   const child = spawn(pm2.command, pm2.args, {
     stdio: 'inherit',
     env: pm2Env(),
+    shell: pm2.shell ?? false,
   });
   child.on('exit', code => process.exit(code ?? 0));
 }
@@ -1530,9 +1631,7 @@ interface SessionData {
   currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
-  pendingResponseCardId?: string;
-  pendingResponseCardState?: 'open' | 'patched';
-  lastPatchedResponseCardId?: string;
+  whiteboardId?: string;
   // Markers that a real CLI ever ran in this session (vs a daemon-command
   // scratch placeholder). Persisted by the daemon; only presence is checked
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
@@ -1652,13 +1751,17 @@ function saveSession(session: SessionData): void {
   if (existsSync(fp)) {
     try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
   }
-  data[session.sessionId] = mergePendingResponseState(session, data[session.sessionId]);
+  data[session.sessionId] = session;
 
-  // Clean up entries where file key doesn't match the entry's sessionId (data corruption)
+  // Clean up entries where file key doesn't match the entry's sessionId (data
+  // corruption), and strip legacy placeholder-card fields so the file converges
+  // to clean (see stripLegacyPendingCardFields in services/session-store).
   for (const [key, val] of Object.entries(data)) {
     if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
       delete data[key];
+      continue;
     }
+    if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
   }
 
   const tmpFp = fp + '.tmp';
@@ -2590,12 +2693,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
                    daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
                    单个活跃会话可省略 id
-  autostart enable     注册开机自启（macOS launchd / Linux user systemd，无需 sudo）
+  autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
-  worker-budget [status] 查看 idle worker 自动暂停预算
-       set --max-live-workers N [--idle-minutes N]
-                         覆盖全局 worker 预算，写入 ~/.botmux/config.json（agent 推荐用命令改，不手写 JSON）
        unset             清除 worker 预算覆盖，恢复按机器 CPU/内存自动推导
   lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
        --bot N         仅改 bots.json 中第 N 个 bot 的 lang
@@ -2603,10 +2703,14 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   voice                配置语音总结（高级功能，独立于 setup）— 交互式填 TTS 引擎+凭证
        voice status    查看当前语音配置（凭证打码）
        voice disable   关闭语音功能（移除配置）
+  whiteboard status|enable|disable
+                       本地项目白板（默认关闭；enable 只打开能力，不创建白板）
+       current --create / list / read / update / write --yes
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
+       --new-topic                     每次触发在同群开一个新话题、起独立会话（不续旧话题）
   schedule remove <id>                 删除任务
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
@@ -2751,6 +2855,249 @@ function positionals(args: string[], booleanFlags: string[] = []): string[] {
   return out;
 }
 
+function readStdinUtf8(): string {
+  // On a TTY, readFileSync(0) blocks waiting for terminal EOF (Ctrl+D) with no
+  // prompt — `whiteboard update` with no text and no pipe looked frozen. Treat
+  // a TTY as "no stdin input" so the caller's empty-content guard surfaces a
+  // real error instead of an indefinite hang.
+  if (process.stdin.isTTY) return '';
+  try { return readFileSync(0, 'utf-8'); } catch { return ''; }
+}
+
+function currentWhiteboardContext(args: string[]): { session?: SessionData; larkAppId?: string; chatId?: string; workingDir?: string; sessionId?: string } {
+  const sessionIdArg = argValue(args, '--session-id');
+  const sessions = loadSessions();
+  const sid = sessionIdArg || findAncestorSessionId() || undefined;
+  const session = sid ? sessions.get(sid) : undefined;
+  return {
+    session,
+    sessionId: session?.sessionId ?? sid,
+    larkAppId: argValue(args, '--lark-app-id', '--app-id') ?? session?.larkAppId ?? process.env.LARK_APP_ID,
+    chatId: argValue(args, '--chat-id') ?? session?.chatId,
+    workingDir: argValue(args, '--working-dir', '--repo') ?? session?.workingDir ?? process.cwd(),
+  };
+}
+
+function requireWhiteboardEnabled(): void {
+  if (whiteboardEnabled()) return;
+  console.error('Whiteboard is disabled. Enable it with `botmux whiteboard enable` or the dashboard Settings page.');
+  process.exit(2);
+}
+
+// Boolean flags valid on `read`/`update`/`write` that must NOT be parsed as
+// value-taking. Without this hint, `positionals()` treats e.g. a bare `--yes`
+// as a value flag and swallows the *following* positional arg as its "value" —
+// the content ends up empty and the board is silently blanked (a shared
+// current-state snapshot lost with no history). `--create` belongs to
+// `current`, `--yes` to `write`, `--json` to `read`; all harmless to declare
+// together so content parsing never mis-eats a flag's neighbor.
+const WHITEBOARD_BOOLEAN_FLAGS = ['--create', '--yes', '--json'];
+
+function whiteboardContentFromArgs(args: string[], booleanFlags: string[] = []): string {
+  const file = argValue(args, '--content-file', '--file');
+  if (file) return readFileSync(file, 'utf-8');
+  const pos = positionals(args, booleanFlags);
+  return pos.length > 0 ? pos.join(' ') : readStdinUtf8();
+}
+
+/** Translate store-level whiteboard write errors into friendly CLI exits. The
+ *  store throws stable machine codes (whiteboard_cas_mismatch /
+ *  whiteboard_empty_content / whiteboard_not_found); map each to a clear,
+ *  actionable message so an agent or human reading stderr knows what to do
+ *  next instead of seeing a bare code. Always exits. */
+function handleWhiteboardWriteError(e: unknown, id: string): never {
+  const msg = (e as Error)?.message ?? String(e);
+  if (msg === 'whiteboard_cas_mismatch') {
+    console.error(
+      `Whiteboard was modified since you last read it (CAS mismatch). Re-run ` +
+      `\`botmux whiteboard read --id ${id} --json\` to get the latest content ` +
+      `+ updatedAt, re-merge your changes against it, then update again with ` +
+      `--expected-updated-at <new updatedAt>.`,
+    );
+    process.exit(2);
+  }
+  if (msg === 'whiteboard_empty_content') {
+    console.error('Refusing to write empty whiteboard content. Pass text as args, pipe stdin, or use --content-file <path>. (The board is a shared current-state snapshot and cannot be blanked.)');
+    process.exit(2);
+  }
+  if (msg === 'whiteboard_not_found') {
+    console.error(`Whiteboard not found: ${id}`);
+    process.exit(1);
+  }
+  console.error(`Whiteboard write failed: ${msg}`);
+  process.exit(1);
+}
+
+async function cmdWhiteboard(sub: string, rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const action = sub || 'status';
+  if (action === 'help' || action === '--help' || action === '-h') {
+    console.log(`botmux whiteboard <command>
+
+Commands:
+  status                       Show whether whiteboard is enabled
+  enable | disable             Toggle optional whiteboard feature (does not create boards)
+  list                         List local whiteboards (read-only, even when disabled)
+  current [--create]           Show current default board; --create ensures it when enabled
+  create [--id ID] [--title T] Create a board for current/bound context
+  read [--id ID] [--json]      Read board.md (requires enabled). --json emits
+                               { id, updatedAt, content } so a caller can CAS on update
+  path [--id ID]               Print board/meta/log paths
+  update [--id ID] [text...]   Replace board.md current state (or stdin / --content-file).
+                               --expected-updated-at <ts> refuses the write if the board
+                               changed since that version (CAS); exit 2 with a re-read hint
+  write --yes [--id ID] ...    Force-overwrite board.md; --yes required. Also honors
+                               --expected-updated-at when supplied
+
+Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
+    return;
+  }
+
+  if (action === 'status') {
+    console.log(JSON.stringify({ enabled: whiteboardEnabled(), count: listWhiteboards().length }, null, 2));
+    return;
+  }
+  if (action === 'enable' || action === 'on') {
+    mergeGlobalConfig({ whiteboard: { enabled: true } as any });
+    console.log('Whiteboard enabled. No board was created; a board is ensured only when first needed.');
+    return;
+  }
+  if (action === 'disable' || action === 'off') {
+    mergeGlobalConfig({ whiteboard: { enabled: false } as any });
+    console.log('Whiteboard disabled. Existing boards remain on disk and dashboard can show history read-only.');
+    return;
+  }
+  if (action === 'list' || action === 'ls') {
+    const boards = listWhiteboards().map(b => ({ id: b.id, title: b.title, scope: b.scope, larkAppId: b.larkAppId, chatId: b.chatId, workingDir: b.workingDir, updatedAt: b.updatedAt, path: b.path }));
+    console.log(JSON.stringify({ enabled: whiteboardEnabled(), boards }, null, 2));
+    return;
+  }
+
+  if (action === 'current') {
+    requireWhiteboardEnabled();
+    const id = argValue(rest, '--id');
+    if (id) {
+      const meta = getWhiteboard(id);
+      if (!meta) { console.error(`Whiteboard not found: ${id}`); process.exit(1); }
+      console.log(JSON.stringify({ enabled: true, current: meta, path: whiteboardPath(id) }, null, 2));
+      return;
+    }
+    const ctx = currentWhiteboardContext(rest);
+    let meta = ctx.session?.whiteboardId ? getWhiteboard(ctx.session.whiteboardId) : undefined;
+    if (!meta && argFlag(rest, '--create')) {
+      meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+      if (ctx.session) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    }
+    if (!meta) {
+      console.log(JSON.stringify({ enabled: true, current: null, hint: 'Run `botmux whiteboard current --create` to ensure the default board.' }, null, 2));
+      return;
+    }
+    console.log(JSON.stringify({ enabled: true, current: meta, path: whiteboardPath(meta.id) }, null, 2));
+    return;
+  }
+
+  if (action === 'create') {
+    requireWhiteboardEnabled();
+    const ctx = currentWhiteboardContext(rest);
+    const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+    if (ctx.session && !ctx.session.whiteboardId) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    console.log(JSON.stringify({ board: meta, path: whiteboardPath(meta.id) }, null, 2));
+    return;
+  }
+
+  // Anything reaching here must be one of the file-operating subcommands; the
+  // earlier branches (help/status/enable/disable/list/current/create) already
+  // returned. Reject unknown actions BEFORE computing an id — otherwise a typo
+  // like `post` fell through to the misleading "No whiteboard id" error.
+  if (!['read', 'path', 'update', 'write'].includes(action)) {
+    console.error(`Unknown whiteboard command: ${action}`);
+    process.exit(1);
+  }
+  if (['read', 'update', 'write'].includes(action)) requireWhiteboardEnabled();
+
+  const explicitId = argValue(rest, '--id');
+  const ctx = currentWhiteboardContext(rest);
+  let id = explicitId ?? ctx.session?.whiteboardId;
+  if (!id && whiteboardEnabled() && action === 'update') {
+    const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
+    id = meta.id;
+    if (ctx.session) { ctx.session.whiteboardId = id; saveSession(ctx.session); }
+  }
+  if (!id) { console.error('No whiteboard id. Pass --id or run `botmux whiteboard current --create`.'); process.exit(1); }
+
+  if (action === 'read') {
+    requireWhiteboardEnabled();
+    // Default: stream raw board.md to stdout (back-compat for agents/skills
+    // that treat stdout as the board content). `--json` returns
+    // { id, updatedAt, content } so an agent can capture the version it read
+    // and pass it back as --expected-updated-at on update — the compare-and-set
+    // that turns the read→merge→update flow from blind last-writer-wins into a
+    // conflict-detecting update.
+    if (argFlag(rest, '--json')) {
+      const meta = getWhiteboard(id);
+      if (!meta) { console.error(`Whiteboard not found: ${id}`); process.exit(1); }
+      console.log(JSON.stringify({ id: meta.id, updatedAt: meta.updatedAt, content: readWhiteboard(id) }));
+    } else {
+      process.stdout.write(readWhiteboard(id));
+    }
+    return;
+  }
+  if (action === 'path') {
+    const meta = getWhiteboard(id);
+    if (!meta) { console.error(`Whiteboard not found: ${id}`); process.exit(1); }
+    console.log(JSON.stringify({ board: meta, path: whiteboardPath(id) }, null, 2));
+    return;
+  }
+  if (action === 'update') {
+    requireWhiteboardEnabled();
+    const content = whiteboardContentFromArgs(rest, WHITEBOARD_BOOLEAN_FLAGS);
+    if (!content.trim()) {
+      console.error('Refusing to write empty whiteboard content. Pass text as args, pipe stdin, or use --content-file <path>. (The board is a shared current-state snapshot and cannot be blanked.)');
+      process.exit(2);
+    }
+    // Optional CAS: the agent passes the updatedAt it observed at read time.
+    // If the board changed in between, the store refuses with
+    // whiteboard_cas_mismatch → friendly exit 2 so the agent re-reads/merges
+    // instead of silently clobbering the other writer's update.
+    const expectedUpdatedAt = argValue(rest, '--expected-updated-at');
+    const { writeWhiteboard } = await import('./services/whiteboard-store.js');
+    try {
+      const meta = writeWhiteboard(id, content, { actor: ctx.sessionId, kind: 'update', expectedUpdatedAt });
+      console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
+    } catch (e) {
+      handleWhiteboardWriteError(e, id);
+    }
+    return;
+  }
+  if (action === 'write') {
+    requireWhiteboardEnabled();
+    if (!argFlag(rest, '--yes')) {
+      console.error('Refusing to overwrite whiteboard without --yes. Prefer `botmux whiteboard update` for current-state updates.');
+      process.exit(2);
+    }
+    const content = whiteboardContentFromArgs(rest, WHITEBOARD_BOOLEAN_FLAGS);
+    if (!content.trim()) {
+      console.error('Refusing to write empty whiteboard content. Pass text as args, pipe stdin, or use --content-file <path>. (The board is a shared current-state snapshot and cannot be blanked.)');
+      process.exit(2);
+    }
+    // `write --yes` is the human force-overwrite escape hatch, but if a CAS
+    // version is supplied we still honor it — a conscious writer that knows
+    // the base version should still get a conflict signal rather than clobber.
+    const expectedUpdatedAt = argValue(rest, '--expected-updated-at');
+    const { writeWhiteboard } = await import('./services/whiteboard-store.js');
+    try {
+      const meta = writeWhiteboard(id, content, { actor: ctx.sessionId, expectedUpdatedAt });
+      console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
+    } catch (e) {
+      handleWhiteboardWriteError(e, id);
+    }
+    return;
+  }
+
+  console.error(`Unknown whiteboard command: ${action}`);
+  process.exit(1);
+}
+
 async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   // Ensure SESSION_DATA_DIR points at the daemon's data dir so schedule-store
   // writes to the right file even when invoked outside the daemon env.
@@ -2786,9 +3133,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest);
+    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--root-msg-id ROOT] [--lark-app-id APP] [--workdir DIR]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--root-msg-id ROOT] [--lark-app-id APP] [--workdir DIR] [--new-topic]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -2804,7 +3151,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const larkAppId = argValue(rest, '--lark-app-id') ?? cur?.larkAppId;
     const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
-    const deliver = (argValue(rest, '--deliver') as 'origin' | 'local' | undefined) ?? 'origin';
+    // --new-topic: every fire opens a brand-new topic in a fresh session.
+    const deliver: 'origin' | 'local' | 'new-topic' = rest.includes('--new-topic')
+      ? 'new-topic'
+      : ((argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined) ?? 'origin');
 
     if (!chatId) {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
@@ -2839,7 +3189,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   规则: ${parsed.display}`);
     console.log(`   下次执行: ${next}`);
     console.log(`   工作目录: ${workingDir}`);
-    console.log(`   话题: ${rootMessageId ?? '(将新开)'}`);
+    console.log(`   话题: ${deliver === 'new-topic' ? '(每次新开话题，独立会话)' : rootMessageId ?? '(将新开)'}`);
     return;
   }
 
@@ -3082,10 +3432,8 @@ function argValues(args: string[], ...flags: string[]): string[] {
 
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
-// keeps using `buildCardBodyElements` from there.
-import { buildMentionedPendingResponseCard } from './im/lark/card-builder.js';
-import { buildCardBodyElements, brandFooterSegment } from './im/lark/md-card.js';
-import { COMPLETED_REACTION_EMOJI_TYPE, claimPendingResponseCard, isPendingResponseCardOpen, markPendingResponseCardPatchedIfCurrent, mergePendingResponseState, shouldMarkPendingAsMentionedSend, shouldPatchPendingOnExplicitSend } from './core/pending-response.js';
+// keeps using `buildImageCardElements` from there.
+import { buildImageCardElements, brandFooterSegment } from './im/lark/md-card.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
 import { openLedger } from './verified-delivery/ledger.js';
@@ -3359,17 +3707,6 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
         appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${docTarget.commentId}`, contentLength: content.length }) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
-      // 收尾飞书侧占位卡（streaming-disabled 会话）避免停在「处理中」。
-      try {
-        const pendingCardId = claimPendingResponseCard(s);
-        const latest = pendingCardId ? loadSessionFresh(s) : undefined;
-        if (pendingCardId && latest?.pendingResponseCardId === pendingCardId) {
-          const { updateMessage } = await import('./im/lark/client.js');
-          const { buildMarkdownCard } = await import('./im/lark/md-card.js');
-          await updateMessage(appId, pendingCardId, buildMarkdownCard(t('daemon.doc_comment_replied_card', undefined, loc), undefined, resolveBrandLabel(appId), loc));
-          if (markPendingResponseCardPatchedIfCurrent(latest, pendingCardId)) saveSession(latest);
-        }
-      } catch { /* best-effort */ }
       console.error(`✓ 已回复文档评论 ${docTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
       console.log(JSON.stringify({ success: true, commentId: docTarget.commentId, sessionId: sid, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
@@ -3423,7 +3760,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, updateMessage, addReaction, MessageWithdrawnError } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -3504,51 +3841,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
 
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
-  let hasNotificationMentionsForPending = mentionArgs.length > 0;
-
-  const dispatchOrPatchPending = async (content: string, msgType: string): Promise<string> => {
-    const pendingCardId = shouldPatchPendingOnExplicitSend(s, { msgType, sendTopLevel, overrideChatId: !!overrideChatId, sendInto: !!sendInto, hasNotificationMentions: hasNotificationMentionsForPending })
-      ? claimPendingResponseCard(s)
-      : undefined;
-    if (!pendingCardId) {
-      const sentId = await dispatchPrimary(content, msgType);
-      if (shouldMarkPendingAsMentionedSend({ msgType, sendTopLevel, overrideChatId: !!overrideChatId, sendInto: !!sendInto, hasNotificationMentions: hasNotificationMentionsForPending })) {
-        const stalePendingCardId = claimPendingResponseCard(s);
-        const latest = stalePendingCardId ? loadSessionFresh(s) : undefined;
-        if (stalePendingCardId && latest?.pendingResponseCardId === stalePendingCardId) {
-          updateMessage(appId, stalePendingCardId, buildMentionedPendingResponseCard(localeForBot(appId)))
-            .then(() => {
-              if (markPendingResponseCardPatchedIfCurrent(latest, stalePendingCardId)) saveSession(latest);
-            })
-            .catch((err: any) => logger.warn(`[send:${sid.substring(0, 8)}] failed to mark pending card after mentioned send: ${err?.message ?? err}`));
-        }
-      }
-      return sentId;
-    }
-
-    const latest = loadSessionFresh(s);
-    if (latest?.pendingResponseCardId !== pendingCardId) return dispatchPrimary(content, msgType);
-
-    try {
-      await updateMessage(appId, pendingCardId, content);
-      if (markPendingResponseCardPatchedIfCurrent(latest, pendingCardId)) {
-        saveSession(latest);
-        if (latest.quoteTargetId) {
-          addReaction(appId, latest.quoteTargetId, COMPLETED_REACTION_EMOJI_TYPE)
-            .catch((err: any) => logger.warn(`[send:${sid.substring(0, 8)}] failed to add completion reaction to ${latest.quoteTargetId}: ${err?.message ?? err}`));
-        }
-      }
-      return pendingCardId;
-    } catch (err: any) {
-      if (err instanceof MessageWithdrawnError) {
-        logger.warn(`[send:${sid.substring(0, 8)}] pending card withdrawn before explicit send patch; sending a new reply`);
-        markPendingResponseCardPatchedIfCurrent(latest, pendingCardId);
-        saveSession(latest);
-        return dispatchPrimary(content, msgType);
-      }
-      throw err;
-    }
-  };
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -3694,7 +3986,6 @@ async function cmdSend(rest: string[]): Promise<void> {
     } catch { /* best-effort */ }
 
     const explicitKnownBotMention = hasKnownBotMention(text, mentions, botEntries, crossRef, appId);
-    hasNotificationMentionsForPending ||= explicitKnownBotMention;
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
     // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
     // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
@@ -3741,26 +4032,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       // body bottom — they're consolidated onto the footer `发送给：` line below
       // (human addressee first, then explicit targets). See orderedFooterRecipients.
 
-      // Inline images into the markdown via ![](img_key). If caller used an
-      // `![alt](img:N)` placeholder, substitute by 0-based index; any remaining
-      // images get appended at the end so they flow with the text.
-      let mdWithImages = md;
-      const usedImgIdx = new Set<number>();
-      if (imageKeys.length > 0) {
-        mdWithImages = mdWithImages.replace(/!\[([^\]]*)\]\(img:(\d+)\)/g, (full, alt: string, idxStr: string) => {
-          const idx = Number(idxStr);
-          if (idx < 0 || idx >= imageKeys.length) return full;
-          usedImgIdx.add(idx);
-          return `![${alt}](${imageKeys[idx]})`;
-        });
-        const trailing = imageKeys
-          .map((k, i) => (usedImgIdx.has(i) ? '' : `![](${k})`))
-          .filter(Boolean)
-          .join('\n\n');
-        if (trailing) mdWithImages = mdWithImages ? `${mdWithImages}\n\n${trailing}` : trailing;
-      }
-
-      const elements = mdWithImages ? buildCardBodyElements(mdWithImages) : [];
+      // Resolve image placeholders into card elements. A single-index
+      // `![alt](img:N)` inlines a full-width image; a grouped `![](img:0,1[,2…])`
+      // renders one row of images side by side (2/row, 3/row …); any image not
+      // referenced by a placeholder is appended full-width at the end.
+      const elements = (md || imageKeys.length > 0) ? buildImageCardElements(md, imageKeys) : [];
 
       // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
       // text size + grey font tag so it reads like a footnote below the hr.
@@ -3842,7 +4118,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         config: { update_multi: true },
         body: { direction: 'vertical', elements },
       });
-      messageId = await dispatchOrPatchPending(cardJson, 'interactive');
+      messageId = await dispatchPrimary(cardJson, 'interactive');
     }
 
     // Bridge fallback marker — append-only jsonl per session. Same-thread
@@ -5175,88 +5451,6 @@ async function cmdLang(args: string[]): Promise<void> {
   await reportLocaleApplied();
 }
 
-// ─── botmux worker-budget ───────────────────────────────────────────────────
-
-function parsePositiveInt(value: string | undefined, label: string): number {
-  const n = Number(value);
-  if (!Number.isInteger(n) || n <= 0) {
-    console.error(`${label} must be a positive integer.`);
-    process.exit(1);
-  }
-  return n;
-}
-
-function formatGib(bytes: number): string {
-  return `${(bytes / 1024 ** 3).toFixed(1)}GiB`;
-}
-
-function cmdWorkerBudget(args: string[]): void {
-  const sub = (args[0] ?? 'status').toLowerCase();
-  if (sub === '--help' || sub === '-h' || sub === 'help') {
-    console.log(`Usage:
-  botmux worker-budget [status]
-  botmux worker-budget set --max-live-workers <n> [--idle-minutes <n>|--idle-ms <n>]
-  botmux worker-budget unset`);
-    return;
-  }
-
-  if (sub === 'status') {
-    const cfg = readGlobalConfig();
-    const resources = detectWorkerResources();
-    const budget = resolveWorkerBudget(cfg.worker, resources);
-    console.log('Worker budget');
-    console.log(`  maxLiveWorkers: ${budget.maxLiveWorkers} (${budget.maxLiveWorkersSource})`);
-    console.log(`  idleSuspendMs:  ${budget.idleSuspendMs} (${budget.idleSuspendMsSource})`);
-    console.log(`  auto baseline:  ${budget.autoMaxLiveWorkers} from cpu=${resources.cpuCount}, memory=${formatGib(resources.memoryBytes)}`);
-    console.log(`  Config file:    ${globalConfigPath()}`);
-    console.log('');
-    console.log('Agent-safe edit commands:');
-    console.log('  botmux worker-budget set --max-live-workers 12 --idle-minutes 45');
-    console.log('  botmux worker-budget unset');
-    return;
-  }
-
-  if (sub === 'set') {
-    const rest = args.slice(1);
-    const maxLive = argValue(rest, '--max-live-workers', '--max-live');
-    const idleMs = argValue(rest, '--idle-ms', '--idle-suspend-ms');
-    const idleMinutes = argValue(rest, '--idle-minutes', '--idle-min');
-    if (maxLive === undefined && idleMs === undefined && idleMinutes === undefined) {
-      console.error('Usage: botmux worker-budget set --max-live-workers <n> [--idle-minutes <n>|--idle-ms <n>]');
-      process.exit(1);
-    }
-    if (idleMs !== undefined && idleMinutes !== undefined) {
-      console.error('Use only one of --idle-ms or --idle-minutes.');
-      process.exit(1);
-    }
-
-    const current = readGlobalConfig().worker ?? {};
-    const next: WorkerConfig = { ...current };
-    if (maxLive !== undefined) next.maxLiveWorkers = parsePositiveInt(maxLive, '--max-live-workers');
-    if (idleMs !== undefined) next.idleSuspendMs = parsePositiveInt(idleMs, '--idle-ms');
-    if (idleMinutes !== undefined) next.idleSuspendMs = parsePositiveInt(idleMinutes, '--idle-minutes') * 60_000;
-
-    mergeGlobalConfig({ worker: next });
-    const budget = resolveWorkerBudget(next);
-    console.log('✅ Updated worker budget.');
-    console.log(`  maxLiveWorkers: ${budget.maxLiveWorkers} (${budget.maxLiveWorkersSource})`);
-    console.log(`  idleSuspendMs:  ${budget.idleSuspendMs} (${budget.idleSuspendMsSource})`);
-    console.log(`  Config file:    ${globalConfigPath()}`);
-    console.log('Daemon reads this on the next idle-worker sweep; restart also picks it up.');
-    return;
-  }
-
-  if (sub === 'unset' || sub === 'clear') {
-    mergeGlobalConfig({ worker: null });
-    console.log('✅ Cleared worker budget override; daemon will use the auto-derived budget.');
-    console.log(`  Config file: ${globalConfigPath()}`);
-    return;
-  }
-
-  console.error('Usage: botmux worker-budget [status|set|unset]');
-  process.exit(1);
-}
-
 // ─── botmux preset ────────────────────────────────────────────────────────────
 
 /**
@@ -5598,6 +5792,22 @@ switch (command) {
     await cmdAsk(sub, rest);
     break;
   }
+  case 'skill': {
+    const { runSkillSessionCommand } = await import('./core/skills/cli-session-command.js');
+    const result = runSkillSessionCommand(process.argv.slice(3));
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.exitCode = result.code;
+    break;
+  }
+  case 'skills': {
+    const { runSkillsAdminCommand } = await import('./core/skills/cli-admin-command.js');
+    const result = runSkillsAdminCommand(process.argv.slice(3));
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.exitCode = result.code;
+    break;
+  }
   case 'hook': {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';
@@ -5626,7 +5836,8 @@ switch (command) {
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'lang':     await cmdLang(process.argv.slice(3)); break;
   case 'voice':    await cmdVoiceSetup(process.argv.slice(3)); break;
-  case 'worker-budget': cmdWorkerBudget(process.argv.slice(3)); break;
+  case 'whiteboard':
+  case 'wb':       await cmdWhiteboard(process.argv[3] ?? 'status', process.argv.slice(4)); break;
   case 'thread':   {
     // Removed in favor of `botmux history` (普通群也兼容). Friendly stderr so
     // pre-rename scripts/skills surface the rename instead of "unknown command".

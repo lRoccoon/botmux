@@ -125,16 +125,24 @@ describe('built-in botmux-handoff skill', () => {
   });
 });
 
-describe('built-in botmux-worker-budget skill', () => {
-  it('teaches agents to use the CLI command instead of hand-editing JSON', () => {
-    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget');
+describe('built-in botmux-whiteboard skill', () => {
+  it('is registered and teaches disabled/default-safe usage', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-whiteboard');
     expect(skill).toBeDefined();
-    expect(skill!.content).toContain('botmux worker-budget status');
-    expect(skill!.content).toContain('botmux worker-budget set --max-live-workers');
-    expect(skill!.content).toContain('botmux worker-budget unset');
-    expect(skill!.content).toContain('不要直接编辑 `~/.botmux/config.json`');
-    expect(skill!.content).toContain('maxLiveWorkers');
-    expect(skill!.content).toContain('idleSuspendMs');
+    expect(skill!.content).toContain('botmux whiteboard status');
+    expect(skill!.content).toContain('默认关闭');
+    expect(skill!.content).toContain('botmux whiteboard update');
+    expect(skill!.content).not.toContain('botmux whiteboard post');
+    expect(skill!.content).toContain('write --yes');
+    expect(skill!.content).toContain('不要写');
+    expect(skill!.content).toContain('botmux send');
+  });
+});
+
+describe('botmux-worker-budget skill retired (moved to per-bot dashboard field)', () => {
+  it('is no longer a standalone skill and is pruned on upgrade', () => {
+    expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget')).toBeUndefined();
+    expect(RETIRED_SKILL_NAMES).toContain('botmux-worker-budget');
   });
 });
 

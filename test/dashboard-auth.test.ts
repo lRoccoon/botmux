@@ -203,6 +203,18 @@ describe('decideDashboardAuth — public surface', () => {
     expect(d.kind).toBe('allow');
   });
 
+  it('DELETE /api/whiteboards/:id without token → deny401', () => {
+    const d = decideDashboardAuth({
+      method: 'DELETE',
+      pathname: '/api/whiteboards/wb_test',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+      publicReadOnly: true,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
   it('GET /game/index.html — HD2D office shell allow without any token', () => {
     const d = decideDashboardAuth({
       method: 'GET',
@@ -447,6 +459,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       // (role/persona content, per-bot oncall config, CLI option metadata).
       '/api/roles/cli_app/oc_chat',
       '/api/bots',
+      '/api/skills',
       '/api/cli-options',
       // Mints a token-bearing writable terminal URL — never public, even in
       // publicReadOnly (the daemon IPC behind it is also loopback-HMAC gated).

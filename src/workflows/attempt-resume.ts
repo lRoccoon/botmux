@@ -24,12 +24,13 @@ import {
   isValidPathSegment,
   isValidRunId,
 } from './ops-projection.js';
+import { prependBotmuxBin } from '../core/botmux-wrapper.js';
 
 export const ATTEMPT_RESUME_SCHEMA_VERSION = 1;
 export const ATTEMPT_RESUME_IDLE_MS = 30 * 60 * 1000;
 export const ATTEMPT_RESUME_GRACE_MS = 5000;
 export const RESUME_REQUIRES_CLI_SESSION_ID = new Set(['antigravity', 'codex-app', 'cursor', 'mira']);
-export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'seed', 'codex', 'mtr', 'hermes', 'pi']);
+export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'seed', 'relay', 'codex', 'mtr', 'hermes', 'pi', 'mir']);
 
 export type AttemptResumeStatus = 'starting' | 'live' | 'closed';
 
@@ -237,7 +238,7 @@ export class AttemptResumeManager {
       cwd: workingDir,
       env: {
         ...process.env,
-        PATH: `${join(homedir(), '.botmux', 'bin')}:${process.env.PATH ?? ''}`,
+        PATH: prependBotmuxBin(join(homedir(), '.botmux', 'bin'), process.env.PATH),
         BOTMUX_WORKFLOW: '1',
         BOTMUX_WORKFLOW_RESUME: '1',
         BOTMUX_WORKFLOW_RUN_ID: input.runId,

@@ -13,7 +13,8 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree } from '../services/git-worktree.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
+import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
@@ -38,24 +39,44 @@ import {
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
-  applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, type ConfigEffect,
+  applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, coerceConfigValue, type ConfigEffect,
 } from '../services/bot-config-store.js';
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
-import { decorateResumeForWrapper } from '../setup/cli-selection.js';
+import { buildClosedSessionCard } from './closed-session-card.js';
+import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
+import { buildSafeInsightReport } from '../services/insight/report.js';
+import type { SafeInsightReport } from '../services/insight/types.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
-import { writeRoleFile, deleteRoleFile, resolveRole, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
+import { writeRoleFile, deleteRoleFile, resolveRole, resolveRoleFile, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
 import { getBotCapability, setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
+import {
+  deleteRoleProfileEntry,
+  deleteRoleProfileIfEmpty,
+  isValidRoleProfileId,
+  listRoleProfileEntries,
+  listRoleProfiles,
+  MAX_ROLE_PROFILE_ENTRY_BYTES,
+  readRoleProfileEntry,
+  writeRoleProfileEntry,
+} from '../services/role-profile-store.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
+import { runSkillsImCommand } from './skills/im-command.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc']);
+// DAEMON_COMMANDS / PASSTHROUGH_COMMANDS / normalizePassthroughCommand now live
+// in the leaf ./passthrough-commands.js so the config store can share the
+// normalization without a circular import; imported for internal use and
+// re-exported to keep callers (daemon.ts, tests) importing from command-handler
+// unchanged.
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, normalizePassthroughCommand, parseCustomPassthroughInput } from './passthrough-commands.js';
+export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -65,31 +86,7 @@ export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help'
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig']);
-
-/**
- * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
- * Claude Code's `/compact`, `/model`, `/usage`). The daemon does NOT handle
- * these — it just relays them to the worker via a raw_input IPC message,
- * bypassing the normal prompt-wrapping and bracketed-paste path so the CLI's
- * own slash-command parser sees them.
- */
-export const PASSTHROUGH_COMMANDS = new Set([
-  '/compact', '/model', '/clear', '/plugin', '/usage',
-  // 只读 / 低副作用，飞书卡片里能直接吐文本：
-  '/context', '/cost', '/mcp', '/diff',
-  '/code-review', '/security-review', '/review',
-  // Codex：/btw 向当前会话追加一条旁注/引导消息
-  '/btw',
-]);
-
-function normalizePassthroughCommand(cmd: unknown): string | null {
-  if (typeof cmd !== 'string') return null;
-  const normalized = cmd.trim().toLowerCase();
-  if (!/^\/[a-z0-9][a-z0-9:_-]*$/.test(normalized)) return null;
-  if (DAEMON_COMMANDS.has(normalized)) return null;
-  return normalized;
-}
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/skills']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -348,6 +345,151 @@ async function handleRoleCommand(
   const loc = localeForBot(larkAppId);
   const dataDir = config.session.dataDir;
 
+  // /role profile [...] — reusable suites of per-bot chat roles. Profiles are
+  // not a runtime role layer; applying one materializes this bot's entry into
+  // the current chat role.
+  const profileMatch = trimmed.match(/^profile\b([\s\S]*)$/);
+  if (profileMatch) {
+    const profileArgs = profileMatch[1].trim();
+    const subMatch = profileArgs.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+    const sub = (subMatch?.[1] ?? '').toLowerCase();
+    const subBody = subMatch?.[2]?.trim() ?? '';
+
+    if (!sub || sub === 'help') {
+      await sessionReply(rootId, t('role.profile.help', undefined, loc));
+      return;
+    }
+
+    if (sub === 'list' || sub === 'ls') {
+      const profiles = listRoleProfiles(dataDir);
+      if (profiles.length === 0) {
+        await sessionReply(rootId, t('role.profile.list_empty', undefined, loc));
+        return;
+      }
+      const lines = profiles.map(p => {
+        const hasEntry = readRoleProfileEntry(dataDir, p.profileId, larkAppId) !== null;
+        const status = hasEntry
+          ? t('role.profile.current_configured', undefined, loc)
+          : t('role.profile.current_missing', undefined, loc);
+        return `• ${p.profileId} — ${p.entryCount} ${t('role.profile.entries', undefined, loc)}; ${status}`;
+      });
+      await sessionReply(rootId, `${t('role.profile.list_header', undefined, loc)}\n${lines.join('\n')}`);
+      return;
+    }
+
+    const [profileId = '', ...afterProfile] = subBody.split(/\s+/);
+    if (!profileId || !isValidRoleProfileId(profileId)) {
+      await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
+      return;
+    }
+
+    if (sub === 'show') {
+      const showAll = afterProfile.includes('--all');
+      if (showAll) {
+        const entries = listRoleProfileEntries(dataDir, profileId);
+        if (entries.length === 0) {
+          await sessionReply(rootId, t('role.profile.no_entries', { profile: profileId }, loc));
+          return;
+        }
+        const body = entries.map(entry =>
+          `### ${entry.larkAppId}\n${t('role.byte_count', { bytes: entry.byteLength, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc)}\n\`\`\`markdown\n${entry.content}\n\`\`\``,
+        ).join('\n\n');
+        await sessionReply(rootId, `${t('role.profile.show_all_header', { profile: profileId }, loc)}\n${body}`);
+        return;
+      }
+      const content = readRoleProfileEntry(dataDir, profileId, larkAppId);
+      if (content === null) {
+        await sessionReply(rootId, t('role.profile.entry_empty', { profile: profileId }, loc));
+        return;
+      }
+      await sessionReply(rootId, `${t('role.profile.entry_current', { profile: profileId }, loc)}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: Buffer.byteLength(content, 'utf-8'), max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc)}`);
+      return;
+    }
+
+    if (sub === 'set') {
+      const content = subBody.slice(profileId.length).trim();
+      if (!content) {
+        await sessionReply(rootId, t('role.profile.set_empty', undefined, loc));
+        return;
+      }
+      writeRoleProfileEntry(dataDir, profileId, larkAppId, content);
+      await sessionReply(rootId, t('role.profile.entry_saved', {
+        profile: profileId,
+        bytes: Math.min(Buffer.byteLength(content.trim(), 'utf-8'), MAX_ROLE_PROFILE_ENTRY_BYTES),
+        max: MAX_ROLE_PROFILE_ENTRY_BYTES,
+      }, loc));
+      return;
+    }
+
+    if (sub === 'save') {
+      const { content, source } = resolveRole(larkAppId, chatId);
+      if (!content) {
+        await sessionReply(rootId, t('role.profile.save_no_effective', { profile: profileId }, loc));
+        return;
+      }
+      writeRoleProfileEntry(dataDir, profileId, larkAppId, content);
+      await sessionReply(rootId, t('role.profile.saved_effective', {
+        profile: profileId,
+        source,
+        bytes: Buffer.byteLength(content, 'utf-8'),
+        max: MAX_ROLE_PROFILE_ENTRY_BYTES,
+      }, loc));
+      return;
+    }
+
+    if (sub === 'delete' || sub === 'del' || sub === 'rm' || sub === '删除') {
+      const existed = deleteRoleProfileEntry(dataDir, profileId, larkAppId);
+      deleteRoleProfileIfEmpty(dataDir, profileId);
+      await sessionReply(rootId, existed
+        ? t('role.profile.entry_deleted', { profile: profileId }, loc)
+        : t('role.profile.entry_nothing', { profile: profileId }, loc));
+      return;
+    }
+
+    if (sub === 'apply') {
+      const flags = new Set(afterProfile);
+      const preview = flags.has('--preview');
+      const force = flags.has('--force');
+      const quiet = flags.has('--quiet');
+      const content = readRoleProfileEntry(dataDir, profileId, larkAppId);
+      if (content === null) {
+        await sessionReply(rootId, t('role.profile.apply_missing', { profile: profileId }, loc));
+        return;
+      }
+      const existing = resolveRoleFile(larkAppId, chatId);
+      const bytes = Buffer.byteLength(content, 'utf-8');
+      if (preview) {
+        const overwriteLine = existing && !force
+          ? `\n${t('role.profile.apply_would_refuse', undefined, loc)}`
+          : '';
+        await sessionReply(rootId, `${t('role.profile.apply_preview', { profile: profileId, bytes, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc)}${overwriteLine}\n\`\`\`markdown\n${content}\n\`\`\``);
+        return;
+      }
+      if (existing && !force) {
+        // An empty entry would *clear* the chat role, not overwrite it — phrase
+        // the --force refusal accordingly so the intent is not misread.
+        const refusedKey = content ? 'role.profile.apply_refused' : 'role.profile.apply_refused_clear';
+        await sessionReply(rootId, t(refusedKey, { profile: profileId }, loc));
+        return;
+      }
+      if (!content) {
+        deleteRoleFile(larkAppId, chatId);
+        if (!quiet) {
+          await sessionReply(rootId, t('role.profile.applied', { profile: profileId, bytes, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc));
+        }
+        return;
+      }
+      writeRoleFile(larkAppId, chatId, content);
+      if (!quiet) {
+        await sessionReply(rootId, t('role.profile.applied', { profile: profileId, bytes, max: MAX_ROLE_PROFILE_ENTRY_BYTES }, loc));
+      }
+      return;
+    }
+
+    await sessionReply(rootId, t('role.profile.help', undefined, loc));
+    return;
+  }
+
   // /role team [...] — manage the team-level (per-bot, cross-chat) role
   const teamMatch = trimmed.match(/^team\b([\s\S]*)$/);
   if (teamMatch) {
@@ -527,28 +669,36 @@ async function handleScheduleCommand(
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
+    // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
+    const { deliver, prompt: schedPrompt } = scheduler.extractDeliveryMode(parsed.prompt);
+    const schedName = deliver === 'new-topic'
+      ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
+      : parsed.name;
     const task = scheduler.addTask({
-      name: parsed.name,
+      name: schedName,
       schedule: trimmed,
       parsed: parsed.parsed,
-      prompt: parsed.prompt,
+      prompt: schedPrompt,
       workingDir,
       chatId,
       rootMessageId: taskScope === 'thread' ? rootId : undefined,
       scope: taskScope,
       chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       larkAppId,
+      deliver,
     });
     const next = scheduler.getNextRun(task.id);
     const nextStr = next ? next.toLocaleString(timeLocale, { timeZone }) : 'N/A';
-    await sessionReply(rootId, t('schedule.created', {
+    const createdMsg = t('schedule.created', {
       id: task.id,
       name: task.name,
       rule: parsed.parsed.display,
       prompt: task.prompt,
       dir: expandHome(workingDir),
       next: nextStr,
-    }, loc));
+    }, loc);
+    const deliverNote = deliver === 'new-topic' ? '\n' + t('schedule.deliver_new_topic', undefined, loc) : '';
+    await sessionReply(rootId, createdMsg + deliverNote);
     return;
   }
 
@@ -657,8 +807,14 @@ async function handleConfigCommand(
   const cardLoc = cardLocaleArg(sub);
   if (!sub || cardLoc) {
     const renderLoc: Locale = cardLoc ?? loc;
-    let modelChoices: readonly string[] = [];
-    try { modelChoices = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride).modelChoices ?? []; } catch { /* 无候选 → 不渲染 model 下拉 */ }
+    // ttadk 网关 bot：模型候选用 ttadk 网关模型（glm-5.1…），不是底层适配器的
+    // opus/gpt-5（那会被 worker 注入成 `ttadk -m opus` 用错模型启动失败）；CoCo 无候选。
+    // 非 ttadk（返回 null）才回落底层适配器自己的 modelChoices。
+    const ttadkChoices = ttadkConfigModelChoices(bot.config.wrapperCli);
+    let modelChoices: readonly string[] = ttadkChoices ?? [];
+    if (ttadkChoices === null) {
+      try { modelChoices = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride).modelChoices ?? []; } catch { /* 无候选 → 不渲染 model 下拉 */ }
+    }
     const data = getConfigCardData(larkAppId, modelChoices);
     if (!data) { await reply(buildConfigHelp(renderLoc)); return; }
     const cardJson = buildConfigCard(data, renderLoc);
@@ -702,8 +858,22 @@ async function handleConfigCommand(
     const rawValue = parts.slice(2).join(' ').trim();
     if (!rawValue) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
 
-    let value: string | boolean;
+    let value: unknown;
     switch (spec.kind) {
+      case 'stringList': {
+        const arr = parseCustomPassthroughInput(rawValue);
+        if (arr.length === 0) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
+        value = arr;
+        break;
+      }
+      case 'number': {
+        // 统一走 coerceConfigValue 的 number 校验（正整数），避免文字路径把 '6'
+        // 当字符串写进 maxLiveWorkers（与 card/API 路径同口径）。
+        const coerced = coerceConfigValue(spec, rawValue);
+        if (!coerced.ok) { await reply(t('cmd.config.invalid_number', { field: spec.key, value: rawValue }, loc)); return; }
+        value = coerced.value;
+        break;
+      }
       case 'boolean': {
         const b = parseBooleanValue(rawValue);
         if (b === undefined) { await reply(t('cmd.config.invalid_bool', { field: spec.key, value: rawValue }, loc)); return; }
@@ -731,6 +901,12 @@ async function handleConfigCommand(
         const v = validateWorkingDir(rawValue, loc);
         if (!v.ok) { await reply(v.error); return; }
         value = rawValue; // 存原始（保留 ~），与 workingDir 落盘一致；使用处再 expandHome
+        break;
+      }
+      case 'json': {
+        const coerced = coerceConfigValue(spec, rawValue);
+        if (!coerced.ok) { await reply(t('cmd.config.write_failed', { reason: coerced.reason }, loc)); return; }
+        value = coerced.value;
         break;
       }
       default: // 'string'
@@ -879,6 +1055,34 @@ export async function handleTermLinkCommand(
   // channel === 'ephemeral': the visible-to-you card IS the response; no extra msg.
 }
 
+/** Format a SafeInsightReport into a compact owner-facing summary for the
+ *  `/insight` command. Spans are never rendered here — the dashboard Insight tab
+ *  owns span detail; the chat card stays a one-glance summary (aggregate + the
+ *  severity-sorted rule suggestions, top first). */
+function formatInsightCard(report: SafeInsightReport, loc: Locale): string {
+  if (report.status === 'unsupported_cli') return t('cmd.insight.unsupported', undefined, loc);
+  if (report.status === 'transcript_missing') return t('cmd.insight.no_transcript', undefined, loc);
+  if (report.status !== 'ok') return t('cmd.insight.parse_error', undefined, loc);
+  const a = report.agg;
+  if (a.totalSpans === 0) return t('cmd.insight.no_spans', undefined, loc);
+  const icon = (s: string) => (s === 'bad' ? '🔴' : s === 'warn' ? '🟡' : 'ℹ️');
+  const header = t('cmd.insight.header', undefined, loc);
+  const lines: string[] = [report.meta.asOf ? `${header} · ${report.meta.asOf}` : header];
+  lines.push(t('cmd.insight.metrics_line', {
+    total: String(a.totalSpans),
+    failed: String(a.failedSpans),
+    slow: String(a.slowSpans),
+    rw: a.readWriteRatio === null ? '—' : String(a.readWriteRatio),
+    compactions: String(a.compactions),
+  }, loc));
+  lines.push('', `${t('cmd.insight.suggestions_label', undefined, loc)}:`);
+  for (const s of report.suggestions) {
+    lines.push(`${icon(s.severity)} ${s.title} — ${s.action}`);
+    if (s.evidence.length) lines.push(`   · ${s.evidence.join('；')}`);
+  }
+  return lines.join('\n');
+}
+
 export async function handleCommand(
   cmd: string,
   rootId: string,
@@ -904,34 +1108,12 @@ export async function handleCommand(
     switch (cmd) {
       case '/close': {
         if (ds) {
-          const closedSessionId = ds.session.sessionId;
-          const closedTitle = ds.session.title;
-          const botCfg = getBot(ds.larkAppId).config;
-          const closedCliId = ds.session.cliId ?? botCfg.cliId;
-          const closedAnchor = sessionAnchorId(ds);
-          const closedWorkingDir = ds.session.workingDir;
-          const cliResumeCommand = (() => {
-            try {
-              const adapter = createCliAdapterSync(closedCliId, botCfg.cliPathOverride);
-              const raw = adapter.buildResumeCommand?.({
-                sessionId: closedSessionId,
-                cliSessionId: ds.session.cliSessionId,
-              }) ?? null;
-              return raw ? decorateResumeForWrapper(raw, botCfg.wrapperCli) : null;
-            } catch { return null; }
-          })();
+          // Capture the closed-session card BEFORE killWorker/closeSession —
+          // it reads the live session's identity off `ds`.
+          const card = buildClosedSessionCard(ds, loc);
           killWorker(ds);
-          sessionStore.closeSession(closedSessionId);
+          sessionStore.closeSession(ds.session.sessionId);
           activeSessions.delete(sessionKey(rootId, larkAppId!));
-          const card = buildSessionClosedCard(
-            closedSessionId,
-            closedAnchor,
-            closedTitle,
-            closedCliId,
-            closedWorkingDir,
-            cliResumeCommand,
-            loc,
-          );
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
@@ -946,6 +1128,29 @@ export async function handleCommand(
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
+        break;
+      }
+
+      case '/insight': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        // owner-only：与 /card /term 同一 operator 门（开放模式下 owner 通过；
+        // 仅对话授权的 grantee 不算 operator）。无权限直接不回内容。
+        if (!canOperate(larkAppId!, ds.chatId, message.senderId)) {
+          await sessionReply(rootId, t('cmd.insight.operator_only', undefined, loc));
+          break;
+        }
+        // 卡片只取 summary（聚合 + 规则建议）；span 明细留给 dashboard Insight tab。
+        // buildSafeInsightReport 同步、只读、自带 fail-closed 脱敏，raw 永不进结构。
+        const report = buildSafeInsightReport({
+          cliId: ds.session.cliId ?? 'unknown',
+          sessionId: ds.session.sessionId,
+          cliSessionId: ds.session.cliSessionId,
+          cwd: ds.session.workingDir,
+        }, { detail: 'summary' });
+        await sessionReply(rootId, formatInsightCard(report, loc));
         break;
       }
 
@@ -1078,7 +1283,8 @@ export async function handleCommand(
             // dropped: wrap them now (full prompt-building context lives here)
             // and stash for delivery right after the raw input on prompt_ready.
             if (hasBufferedInput) {
-              const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+              const { buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
+              ensureSessionWhiteboard(ds!);
               const followUpPrompt = buildNewTopicPrompt(
                 pendingPrompt,
                 ds!.session.sessionId,
@@ -1091,7 +1297,7 @@ export async function handleCommand(
                 { name: selfBot.botName, openId: selfBot.botOpenId },
                 loc,
                 ds!.pendingSender,
-                { larkAppId, chatId: ds!.chatId },
+                { larkAppId, chatId: ds!.chatId, whiteboardId: ds!.session.whiteboardId },
               );
               ds!.pendingFollowUpInput = {
                 userPrompt: pendingPrompt || (ds!.pendingFollowUps?.join('\n\n') ?? ''),
@@ -1101,7 +1307,8 @@ export async function handleCommand(
             rememberLastCliInput(ds!, pendingRawInput, pendingRawInput);
             forkWorker(ds!, '', false);
           } else if (hasBufferedInput) {
-            const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+            const { buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
+            ensureSessionWhiteboard(ds!);
             const prompt = buildNewTopicPrompt(
               pendingPrompt,
               ds!.session.sessionId,
@@ -1114,7 +1321,7 @@ export async function handleCommand(
               { name: selfBot.botName, openId: selfBot.botOpenId },
               loc,
               ds!.pendingSender,
-              { larkAppId, chatId: ds!.chatId },
+              { larkAppId, chatId: ds!.chatId, whiteboardId: ds!.session.whiteboardId },
             );
             // Last-line defence: prompt prep awaited above — if anything
             // replaced OR closed the session in that window (`/close` deletes
@@ -1145,19 +1352,45 @@ export async function handleCommand(
         // close + recreate the session (mid-session switch). Used by both the
         // numeric `/repo <N>` form and the `/repo <path|name>` form.
         const commitRepoSelection = async (selectedPath: string, displayName: string, how: string) => {
-          ds!.workingDir = selectedPath;
-          ds!.session.workingDir = selectedPath;
-          sessionStore.updateSession(ds!.session);
-
           if (ds!.pendingRepo) {
+            // First spawn: pin the new cwd onto the CURRENT session, then fork.
+            ds!.workingDir = selectedPath;
+            ds!.session.workingDir = selectedPath;
+            sessionStore.updateSession(ds!.session);
             await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
+            // Safety net: a mid-session `/repo` switch closes the running
+            // session and spawns a fresh one on the SAME anchor. Without a
+            // trace, the old context silently vanishes (relay/adopt/resume all
+            // hit `anchor_occupied` once the new session holds the anchor).
+            // So, before displacing it, post the same "session closed" card
+            // `/close` emits — it keeps the old session visible and carries the
+            // terminal `claude --resume` command. (Its in-card resume button
+            // still hits anchor_occupied while the new session occupies this
+            // anchor — expected; `/close` the new one first, or use the
+            // command.) Mirrors the `/close` case above.
+            //
+            // The new cwd is NOT written onto the old session here — it would
+            // pollute the displaced session's stored workingDir (and the closed
+            // card), so `claude --resume` later would reopen the old context in
+            // the new repo's cwd. The new repo is pinned onto the fresh session
+            // below instead.
+            const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
+            await deliverEphemeralOrReply(
+              ds!,
+              message.senderId,
+              closedCard,
+              'interactive',
+              () => sessionReply(rootId, closedCard, 'interactive'),
+            );
+
             const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
             ds!.session = session;
             ds!.lastUserPrompt = undefined;
             ds!.lastCliInput = undefined;
+            ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
             ds!.session.larkAppId = ds!.larkAppId;
             sessionStore.updateSession(ds!.session);
@@ -1174,7 +1407,8 @@ export async function handleCommand(
 
         // `/repo wt <N|name|path> [branch]` → create a worktree off the repo's
         // remote default branch and open THAT as the session repo. Without a
-        // branch arg the branch/dir are auto-named (wt/N, <repo>-wt-N).
+        // branch arg the branch/dir are auto-named from the topic title / first
+        // pending prompt when possible (fallback: wt/N, <repo>-wt-N).
         if (ds && /^wt(\s|$)/i.test(repoArg)) {
           const rest = repoArg.replace(/^wt\s*/i, '').trim().split(/\s+/).filter(Boolean);
           if (rest.length < 1 || rest.length > 2) {
@@ -1226,7 +1460,11 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.repo.worktree_creating', { repo: repoPath }, loc));
             let creation;
             try {
-              creation = await createRepoWorktree(repoPath, { branch: branchArg });
+              const slug = branchArg ? undefined : await worktreeSlugFromContextAI(ds!.session.title, ds!.pendingPrompt);
+              creation = await createRepoWorktree(repoPath, {
+                branch: branchArg,
+                slug,
+              });
             } catch (e) {
               await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, loc));
               break;
@@ -1347,7 +1585,7 @@ export async function handleCommand(
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);
-        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId, loc);
+        const cardJson = buildRepoSelectCard(projects, currentCwd, rootId, loc, ds ? getBot(ds.larkAppId).config.worktreeMultiPicker : undefined);
         const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
         if (ds) {
           ds.repoCardMessageId = repoCardMsgId;
@@ -1412,6 +1650,26 @@ export async function handleCommand(
         }
         await handleConfigCommand(message, rootId, appId, deps);
         logger.info(`[${logTag}] Config command handled`);
+        break;
+      }
+
+      case '/skills': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc));
+          break;
+        }
+        const sub = message.content.replace(/^\/skills\s*/i, '').trim().split(/\s+/, 1)[0]?.toLowerCase();
+        if (sub === 'attach' || sub === 'detach') {
+          let bot;
+          try { bot = getBot(appId); } catch { await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc)); break; }
+          const admins = bot.resolvedAllowedUsers ?? [];
+          if (admins.length === 0) { await sessionReply(rootId, t('cmd.config.no_owner', undefined, loc)); break; }
+          if (!message.senderId || !admins.includes(message.senderId)) { await sessionReply(rootId, t('cmd.config.not_admin', undefined, loc)); break; }
+        }
+        const result = await runSkillsImCommand(appId, message.content);
+        await sessionReply(rootId, result.message);
+        logger.info(`[${logTag}] Skills command handled: ${result.ok ? 'ok' : 'error'}`);
         break;
       }
 
@@ -1800,6 +2058,16 @@ export async function handleCommand(
         for (const m of mentions) {
           if (m.name) rawArgs = rawArgs.split(`@${m.name}`).join(' ');
         }
+        let roleProfileId: string | undefined;
+        const roleProfileArg = rawArgs.match(/(?:^|\s)--role-profile(?:=|\s+)(\S+)/);
+        if (roleProfileArg) {
+          if (!isValidRoleProfileId(roleProfileArg[1])) {
+            await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
+            break;
+          }
+          roleProfileId = roleProfileArg[1];
+          rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
+        }
         const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
         const MAX_NAME = 50; // Lark group names cap around 60; leave headroom for '…'
         let groupName: string;
@@ -1824,6 +2092,7 @@ export async function handleCommand(
             userOpenIds: [senderOpenId],
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
+            roleProfileId,
           });
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
@@ -1854,6 +2123,13 @@ export async function handleCommand(
           }
           if (result.invalidBotIds.length > 0) {
             hints.push(t('cmd.group.warn_bots_rejected', { bots: result.invalidBotIds.map(nameOf).join('、') }, loc));
+          }
+          if (roleProfileId) {
+            if (result.roleProfileBootstrapError) {
+              hints.push(t('cmd.group.role_profile_bootstrap_failed', { profile: roleProfileId, reason: result.roleProfileBootstrapError ?? 'unknown' }, loc));
+            } else {
+              hints.push(t('cmd.group.role_profile_bootstrap_sent', { profile: roleProfileId }, loc));
+            }
           }
           const hintsText = hints.length > 0 ? '\n' + hints.join('\n') : '';
           await sessionReply(rootId, t('cmd.group.created', { name: groupName, link, hints: hintsText }, loc));
@@ -2361,7 +2637,14 @@ export async function handleCommand(
         const workingDir = getSessionWorkingDir(ds);
         const builtin = [...PASSTHROUGH_COMMANDS];
         const adapterDefaults = resolveAdapterDefaultPassthroughCommands(larkAppId);
-        const custom = botCfg?.customPassthroughCommands ?? [];
+        // 只展示「实际生效」的 custom 命令：用与 resolvePassthroughCommands 同一套
+        // normalize 过滤掉手写 bots.json 里遮蔽 daemon 命令 / 非法的项（parser 出于
+        // 兼容会保留它们，但路由会丢弃），避免 `/status` 之类被展示成可用却走 daemon。
+        const custom = [...new Set(
+          (botCfg?.customPassthroughCommands ?? [])
+            .map(normalizePassthroughCommand)
+            .filter((c): c is string => !!c),
+        )];
         let cliAdapter;
         try {
           cliAdapter = createCliAdapterSync(cliId, botCfg?.cliPathOverride);

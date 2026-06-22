@@ -41,6 +41,14 @@ export interface AdoptableSession {
 
 const CLI_COMM_MAP: Record<string, CliId> = {
   claude: 'claude-code',
+  // Seed / Relay are ByteDance Claude Code forks (Relay is Seed's new release
+  // name). Both rebrand process.title to their product name, so a running
+  // session's `/proc/<pid>/comm` is literally `seed` / `relay` (verified on a
+  // live host) — map them so `/adopt` can discover live panes by comm, the same
+  // way `claude` resolves to claude-code. filterCliId keeps a seed/relay bot
+  // from adopting the other's (or claude's) sessions.
+  seed: 'seed',
+  relay: 'relay',
   codex: 'codex',
   aiden: 'aiden',
   coco: 'coco',

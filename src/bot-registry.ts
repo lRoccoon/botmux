@@ -8,6 +8,9 @@ import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
+import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
+import { normalizeStartupCommandList } from './core/startup-commands.js';
+import { sanitizePerBotEnv } from './core/per-bot-env.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
 
@@ -100,6 +103,18 @@ export interface BotConfig {
    */
   sandboxHidePaths?: string[];
   backendType?: BackendType;
+  /**
+   * Max simultaneously-LIVE sessions for this bot. When the bot's live session
+   * count exceeds this, the idle-worker sweeper suspends its longest-idle,
+   * not-currently-busy sessions (resumable backends only) down to the cap — the
+   * worker AND the CLI are killed to reclaim memory, and the session
+   * cold-resumes from its on-disk transcript on the next message. Unset → the
+   * built-in default {@link DEFAULT_MAX_LIVE_WORKERS} (30); an explicit positive
+   * integer overrides it. Pure count-based: there is NO idle-time threshold.
+   * Configured per bot from the dashboard (Groups & Bots → bot card). Adopted
+   * sessions are never suspended. See core/idle-worker-sweeper.ts.
+   */
+  maxLiveWorkers?: number;
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
@@ -172,6 +187,32 @@ export interface BotConfig {
    */
   customPassthroughCommands?: string[];
   /**
+   * Optional per-bot startup commands: slash-command lines the worker types into
+   * a freshly spawned CLI right after it's ready, BEFORE the user's first prompt
+   * (e.g. `/effort ultracode`, `/model opus`). Sent in order, one submit each,
+   * via the same literal-input path as a passthrough slash command (no prompt
+   * wrapping). Re-applied on every fresh spawn (incl. resume) — so session-only
+   * settings like `/effort ultracode` survive a resume. Skipped in adopt mode
+   * (we observe the user's existing session, not drive a fresh one). Each entry
+   * is trimmed and gets a leading `/` if missing; arguments (spaces) preserved.
+   */
+  startupCommands?: string[];
+  /**
+   * Optional per-bot environment variables, injected into THIS bot's CLI
+   * process (e.g. `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` to run the bot
+   * on GLM / a third-party Anthropic-compatible provider, an `HTTPS_PROXY`, or
+   * a CLI feature flag). Sanitized at load via {@link sanitizePerBotEnv}
+   * (valid env-var names + string/number/boolean values; botmux-reserved keys
+   * dropped). Delivered per-session as SpawnOpts.injectEnv so it never pollutes
+   * the shared tmux/zellij server env. Missing/empty → undefined.
+   */
+  env?: Record<string, string>;
+  /**
+   * Optional per-bot priority skill policy. Missing means botmux does not alter
+   * the underlying CLI's native skill discovery or spawn arguments.
+   */
+  skills?: BotSkillPolicy;
+  /**
    * Custom footer brand label for cards this bot sends. Three states:
    *   • `undefined` (unset)  → default `[botmux](github)` link
    *   • `''` (empty)         → brand suppressed (footer shows only 发送给 if any)
@@ -240,6 +281,13 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
+  /**
+   * Worktree picker mode on the repo-select card. When true, the worktree
+   * control renders the multi-repo selector (pick N repos + branch) instead of
+   * the single-select dropdown. Toggled from the card's 「切换多仓库选择器」button;
+   * persists so all of this bot's future sessions default to it. Default false.
+   */
+  worktreeMultiPicker?: boolean;
   /**
    * Per-bot DEFAULT session mode for regular Lark groups (overridable per-chat
    * via `/reply-mode` → `chatReplyModes`). Resolved by
@@ -711,6 +759,19 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (uniq.length > 0) customPassthroughCommands = uniq;
     }
 
+    // startupCommands：开会话后、首条 prompt 前自动敲进 CLI 的 slash 命令行（可带
+    // 参数，如 `/effort ultracode`）。归一化：去多余空白、补前导 `/`、去重；空 →
+    // undefined（与 customPassthroughCommands 同款"不写空数组保持干净"）。
+    const startupCommandsList = normalizeStartupCommandList(entry.startupCommands);
+    const startupCommands = startupCommandsList.length > 0 ? startupCommandsList : undefined;
+
+    // env：per-bot 环境变量（如代理 / 第三方服务商端点 ANTHROPIC_BASE_URL+AUTH_TOKEN）。
+    // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
+    const sanitizedEnv = sanitizePerBotEnv(entry.env);
+    const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
+
+    const skills = readBotSkillPolicy(entry.skills);
+
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
     // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
     // （凭证是否可用）在 resolveVoiceConfig 做，这里只挡明显垃圾。
@@ -752,6 +813,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.sandboxHidePaths.filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
         : [],
       backendType: entry.backendType,
+      // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
+      maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
+        && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
+        ? entry.maxLiveWorkers
+        : undefined,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
@@ -769,6 +835,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       customPassthroughCommands,
+      startupCommands,
+      env,
+      skills,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
@@ -789,6 +858,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are
       // meaningful; 'chat' (the flat default) and anything else normalize to
       // undefined so bots.json stays clean.
@@ -809,4 +879,28 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   }
 
   return configs;
+}
+
+function readStringArray(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const values = raw
+    .map((v) => typeof v === 'string' ? v.trim() : '')
+    .filter(Boolean);
+  return values.length > 0 ? values : undefined;
+}
+
+function readDirectSkillSelectors(raw: unknown): SkillSelector[] | undefined {
+  const values = readStringArray(raw);
+  if (!values) return undefined;
+  const selectors = values.filter((value): value is SkillSelector => /^skill:.+$/.test(value));
+  return selectors.length > 0 ? selectors : undefined;
+}
+
+export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: BotSkillPolicy = {};
+  const include = readDirectSkillSelectors(r.include);
+  if (include) out.include = include;
+  return Object.keys(out).length > 0 ? out : undefined;
 }

@@ -46,11 +46,12 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ### 创建
 
 \`\`\`
-botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--deliver origin|local]
+botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--deliver origin|local] [--new-topic]
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
 可选 \`--deliver local\` 表示只记录不推送（适合"每小时检查一次，没事就别打扰我"）。
+可选 \`--new-topic\`（等价 \`--deliver new-topic\`）：每次触发都在同群开一个**全新话题**、起一个独立 CLI 会话，多次执行互不串扰（适合日报这类"每天一篇、各自独立"的任务）。斜杠命令里也可在 prompt 前加"新话题"关键字，如 \`/schedule 每日9:00 新话题 生成日报\`。
 
 ### 查看
 
@@ -321,6 +322,8 @@ botmux send --content-file $msg
 ### 图文混排（图片穿插在正文中）
 
 \`--images <path>\` 上传本地图片（可重复）。在 markdown 正文中用占位符 \`![alt](img:N)\` 标记位置（\`N\` 是 0-based 索引，按 \`--images\` 给出的顺序对应）；不写占位符的图片自动追加到消息末尾。
+
+**多图一行（图片组合）**：一个占位符里写多个逗号分隔的索引，就把这几张图排成一行并列显示（自动等宽缩放、保留完整画面不裁剪）——\`![](img:0,1)\` 两张一行，\`![](img:0,1,2)\` 三张一行。每个占位符是一行，想多行就写多个占位符。适合菜单、多图对比这类「一屏看完」的场景，避免单图全宽纵向堆很长。
 
 \`\`\`bash
 # 单图：默认追加到末尾
@@ -1001,31 +1004,6 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
 `;
 
-const WORKER_BUDGET_SKILL = `---
-name: botmux-worker-budget
-description: 查看或调整 botmux idle worker 自动暂停预算。触发场景：用户提到 OOM、内存占用、live worker 太多、闲置会话暂停、maxLiveWorkers、idleSuspendMs，或要求 agent 修改 worker 预算配置。必须使用 botmux worker-budget 命令，不要手写 ~/.botmux/config.json。
----
-
-# botmux-worker-budget — worker 预算配置
-
-当用户要求查看或调整 botmux worker 资源预算时，使用 \`botmux worker-budget\`。不要直接编辑 \`~/.botmux/config.json\`；命令会校验正整数、保留未知配置，并写入 daemon 读取的全局配置。
-
-## 用法
-
-\`\`\`bash
-# 查看自动推导值、当前覆盖值、配置文件路径
-botmux worker-budget status
-
-# 覆盖 live worker 上限；idle 阈值可选
-botmux worker-budget set --max-live-workers 12 --idle-minutes 45
-
-# 清除覆盖，恢复按 CPU/内存自动推导
-botmux worker-budget unset
-\`\`\`
-
-\`maxLiveWorkers\` 控制多少个 live worker 以内保持常驻；超过预算时 daemon 会优先暂停最久未活跃的 worker。\`idleSuspendMs\` 控制 worker 需要闲置多久才允许被暂停。
-`;
-
 const ORCHESTRATE_SKILL = `---
 name: botmux-orchestrate
 description: 作为「主 bot/编排者」把一个大项目拆成多个子项目，在普通群里自动开多话题、把不同 bot（常 coder+reviewer 一组）派进各话题并行干活，用飞书任务清单当共享进度板，收齐结果再汇总。触发：用户提到「多话题协作模式」，或要「把大项目拆给多个机器人并行做」「协调多个 bot」「多话题并行推进」「你当总控/编排」「一个写一个 review 多组并行」，或显式提到 botmux orchestrate / botmux dispatch 派活。
@@ -1099,6 +1077,124 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 - 失败别硬重试同一招 ≥3 次；上报用户。
 `;
 
+const WHITEBOARD_SKILL = `---
+name: botmux-whiteboard
+description: 使用 botmux 本地项目白板读写跨 agent 的项目摘要、关键决策、已验证命令、阻塞和交接信息。触发场景：用户说白板、上下文、项目记忆、让其他 agent 看本地总结、长任务断点、多 agent 协作、handoff、需要沉淀不适合发飞书的大段上下文时。
+---
+
+# botmux-whiteboard — 本地项目白板
+
+白板是可选能力，默认关闭。它用于保存项目级、可持久化的核心摘要知识和本地 handoff 信息；它不是飞书消息的替代，也不是存秘密的地方。
+
+## 先判断是否启用
+
+\`\`\`bash
+botmux whiteboard status
+\`\`\`
+
+如果未启用，不要尝试隐式开启；告诉用户/dashboard 管理员需要先打开白板能力。关闭时 CLI/agent 读写会拒绝。
+
+## 当前白板
+
+\`\`\`bash
+botmux whiteboard current
+botmux whiteboard current --create   # 仅在用户要求或你确实需要沉淀长期上下文时使用
+botmux whiteboard list
+\`\`\`
+
+默认绑定 key 是当前群的 default 白板；不按 bot 或 workingDir 分裂。显式创建的多白板用 id/title 区分。
+
+## 读取
+
+当用户/其他 agent 让你“看白板”、或你需要恢复项目状态时：
+
+\`\`\`bash
+botmux whiteboard read --id <whiteboardId>          # 输出 board.md 纯内容
+botmux whiteboard read --id <whiteboardId> --json   # 输出 { id, updatedAt, content }
+\`\`\`
+
+不要假设白板正文已经在上下文里；prompt 只会给 id 和 CLI 命令说明。
+
+\`--json\` 同时返回内容与该版本的 \`updatedAt\`——更新时用它做并发冲突检测（见下）。
+
+## 写入原则
+
+白板是**当前项目的全局上下文快照**：记录项目目标、组织方式、核心方案、关键进展和下一步。它不是过程日志，也不是零散备忘录——不要把每轮对话/命令流水记上去。
+
+适合写：
+- 项目目标、组织方式（群/白板/协作角色分工、默认白板与多白板关系）
+- 当前采用的核心方案与关键边界（含「不做什么 / 已废弃什么」）
+- 关键进展（已完成、已验证、当前风险/阻塞）
+- 下一步计划
+- 需要其他 agent 接力时的当前状态说明
+
+不要写：密钥、token、个人隐私、未授权外部信息、大段无用日志、单轮过程流水。
+
+每次 update 都先 read 旧白板，融合新信息后整体重写为一份完整的当前状态，而不是只追加本轮局部信息——白板永远是「当前快照」，不是累加日志。默认用中文撰写，除非用户明确要求其他语言；代码标识、命令、错误信息可保留原文。
+
+### 并发冲突检测（CAS）
+
+白板是整个群共享的单一快照，多个 agent 可能同时读写。为避免后写静默覆盖先写、丢掉其它 agent 的更新，更新时回传 read 到的版本号做 compare-and-set：
+
+\`\`\`bash
+# 1) 读取当前内容 + 版本号
+botmux whiteboard read --id <whiteboardId> --json
+# → { "id": "wb_...", "updatedAt": "2026-06-22T01:23:45.000Z", "content": "# 当前状态\\n..." }
+
+# 2) 融合后整体重写，用 --expected-updated-at 回传刚才读到的 updatedAt
+botmux whiteboard update --id <whiteboardId> --expected-updated-at 2026-06-22T01:23:45.000Z <<'EOF'
+# 当前状态
+...
+EOF
+\`\`\`
+
+- 若期间没有其它 agent 改过白板，写入成功，返回新的 board（含新 updatedAt）。
+- 若报 \`whiteboard_cas_mismatch\`（exit 2），说明有人改过——重新 \`read --json\` 拿最新内容与 updatedAt，再次融合重写，不要直接覆盖。
+- 不传 \`--expected-updated-at\` 时退化为直接覆盖（向后兼容），但推荐每次 update 都带上以获得冲突保护。
+
+更新当前状态用 update（覆盖 board.md，保持它是最新全局状态）。建议沿用以下固定结构：
+
+\`\`\`bash
+botmux whiteboard update --id <whiteboardId> <<'EOF'
+# 当前状态
+
+## 项目目标
+
+- ...
+
+## 组织方式
+
+- 群/白板/协作角色如何分工
+- 当前默认白板/多白板关系
+
+## 核心方案
+
+- 当前采用的设计与关键边界
+- 不做什么 / 已废弃什么
+
+## 关键进展
+
+- 已完成
+- 已验证
+- 当前风险/阻塞
+
+## 下一步
+
+- ...
+EOF
+\`\`\`
+
+\`write --yes\` 是人工强制覆盖的兼容命令；agent 默认使用 \`update\`。
+
+## 飞书提示
+
+白板减少飞书噪音，但不能让人完全不可见：
+- 首次创建白板，或首次更新关键状态时，用 \`botmux send\` 发一句短提示：\`已建立/更新 whiteboard:<id>，后续关键状态会维护在那里。\`
+- 小更新不要每次通知。
+- 需要其他 agent 接力时，在飞书 @ 对方并让它读 \`whiteboard:<id>\`；不要复制大段白板内容。
+- 用户可见结论、需要确认的决策、最终结果仍必须 \`botmux send\`。
+`;
+
 export const ASK_SKILL_NAME = 'botmux-ask';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
@@ -1109,8 +1205,8 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
-  { name: 'botmux-worker-budget', content: WORKER_BUDGET_SKILL },
   { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
+  { name: 'botmux-whiteboard', content: WHITEBOARD_SKILL },
 ];
 
 /** Skills that earlier botmux versions installed but no longer ship. The
@@ -1121,4 +1217,8 @@ export const RETIRED_SKILL_NAMES: string[] = [
   // Folded into botmux-send as the `--attention` flag. Installer prunes the old
   // standalone skill dir.
   'botmux-needs-help',
+  // Retired in favour of a per-bot "max live sessions" dashboard field
+  // (Groups & Bots → bot card). The CLI subcommand was removed too, so the
+  // skill has nothing to drive — prune it from every CLI's skills dir on upgrade.
+  'botmux-worker-budget',
 ];

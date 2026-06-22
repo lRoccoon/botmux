@@ -4,12 +4,12 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync } from 'node:child_process';
-import { basename as pathBasename } from 'node:path';
+import { basename as pathBasename, dirname, join } from 'node:path';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard } from './card-builder.js';
 import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
@@ -24,12 +24,13 @@ import {
 } from './workflow-card-handler.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
-import { decorateResumeForWrapper } from '../../setup/cli-selection.js';
+import { buildClosedSessionCard } from '../../core/closed-session-card.js';
+import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { publishAttentionPatch } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
@@ -38,7 +39,8 @@ import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
+import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -55,8 +57,9 @@ interface CardActionData {
   operator?: { open_id?: string };
   action?: {
     value?: Record<string, string>;
-    option?: string;
-    form_value?: Record<string, string>;  // V2 form input values
+    option?: unknown;
+    options?: unknown;
+    form_value?: Record<string, unknown>;  // V2 form input values
   };
   context?: { open_message_id?: string };
   open_message_id?: string;
@@ -144,6 +147,41 @@ function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string
   return false;
 }
 
+function stringListFromLarkMultiSelect(raw: unknown): string[] {
+  const tokens = Array.isArray(raw)
+    ? raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const token of tokens) {
+    if (seen.has(token)) continue;
+    seen.add(token);
+    result.push(token);
+  }
+  return result;
+}
+
+function multiWorktreeParentPath(repoPaths: string[], name: string): string {
+  const first = repoPaths[0];
+  const parentRoot = first ? dirname(first) : process.cwd();
+  return join(parentRoot, dirSuffixForBranch(name));
+}
+
+function worktreeChildNameForRepo(repoPath: string, projects: ProjectInfo[] | undefined): string {
+  return projects?.find(p => p.path === repoPath)?.name ?? pathBasename(repoPath);
+}
+
+function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: ProjectInfo[] | undefined): string[] {
+  const seen = new Set<string>();
+  const dupes = new Set<string>();
+  for (const repoPath of repoPaths) {
+    const childName = worktreeChildNameForRepo(repoPath, projects);
+    if (seen.has(childName)) dupes.add(childName);
+    else seen.add(childName);
+  }
+  return [...dupes];
+}
+
 /**
  * Commit a resolved working directory onto a repo-select session: pin it, then
  * either fork the pending CLI (first selection) or close + recreate the session
@@ -158,6 +196,7 @@ async function commitRepoSelection(
     rootId: string;
     cardMessageId?: string;
     larkAppId?: string;
+    operatorOpenId?: string;
     activeSessions: Map<string, DaemonSession>;
     sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
   },
@@ -168,7 +207,7 @@ async function commitRepoSelection(
   // confirmation so the user sees a single message, not two.
   opts?: { suppressConfirmReply?: boolean },
 ): Promise<void> {
-  const { ds, rootId, cardMessageId, larkAppId, activeSessions, sessionReply } = ctx;
+  const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
   const locTarget = localeForBot(ds.larkAppId);
   // `/close` deletes the active-map entry without touching sessionId or
   // pendingRepo — identity against the map is the only tell that the session
@@ -176,11 +215,12 @@ async function commitRepoSelection(
   const repoSessionKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
   const sessionStillActive = () => activeSessions.get(repoSessionKey) === ds;
   const commitGenSessionId = ds.session.sessionId;
-  ds.workingDir = dirPath;
-  ds.session.workingDir = dirPath;
-  sessionStore.updateSession(ds.session);
 
   if (ds.pendingRepo) {
+    // First spawn: pin the new cwd onto the CURRENT session before forking.
+    ds.workingDir = dirPath;
+    ds.session.workingDir = dirPath;
+    sessionStore.updateSession(ds.session);
     const selfBot = getBot(ds.larkAppId);
     const botCfg = selfBot.config;
     const effectiveCliId = sessionCliId(ds);
@@ -195,6 +235,7 @@ async function commitRepoSelection(
       pendingPrompt.trim().length > 0 ||
       (ds.pendingAttachments?.length ?? 0) > 0 ||
       (ds.pendingFollowUps?.length ?? 0) > 0;
+    if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
     const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
       ? buildNewTopicPrompt(
           pendingPrompt,
@@ -208,7 +249,7 @@ async function commitRepoSelection(
           { name: selfBot.botName, openId: selfBot.botOpenId },
           locTarget,
           ds.pendingSender,
-          { larkAppId: ds.larkAppId, chatId: ds.chatId },
+          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
         )
       : '';
     const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -241,6 +282,19 @@ async function commitRepoSelection(
     logger.info(`[${tag(ds)}] Repo selected: ${dirPath}, spawning CLI`);
   } else {
     // Mid-session repo switch — close old session, start fresh.
+    // Safety net (mirrors the `/repo` text-command path): build the same
+    // "session closed" card `/close` emits BEFORE displacing the old session
+    // (it reads the live session's identity off `ds`). The new session reuses
+    // this anchor, so the old context would otherwise vanish without a trace
+    // (relay/adopt/resume all hit `anchor_occupied`). The card keeps it
+    // visible and carries the terminal `claude --resume` command.
+    //
+    // The new cwd is NOT written onto the old session here — it would pollute
+    // the displaced session's stored workingDir (and the closed card), so
+    // `claude --resume` later would reopen the old context in the new repo's
+    // cwd. The new repo is pinned onto the fresh session below instead.
+    const closedCard = buildClosedSessionCard(ds, locTarget);
+
     killWorker(ds);
     // Park the current card in `frozenCards` so the next POST under the new
     // session sweeps it via recall. closeSession() wipes the on-disk
@@ -250,6 +304,15 @@ async function commitRepoSelection(
     // stays in the thread instead of vanishing prematurely.
     parkStreamCard(ds);
     sessionStore.closeSession(ds.session.sessionId);
+
+    await deliverEphemeralOrReply(
+      ds,
+      operatorOpenId,
+      closedCard,
+      'interactive',
+      () => sessionReply(rootId, closedCard, 'interactive'),
+    );
+
     const session = sessionStore.createSession(ds.chatId, rootId, dirLabel, ds.chatType);
     ds.session = session;
     ds.lastUserPrompt = undefined;
@@ -259,6 +322,7 @@ async function commitRepoSelection(
     // workingDir and the worker spawns in the bot's default cwd, so
     // `claude --resume` looks in the wrong .claude/projects/<hash>/ dir and
     // exits code 0 immediately, crash-looping until the rate-limiter trips.
+    ds.workingDir = dirPath;
     ds.session.workingDir = dirPath;
     ds.session.larkAppId = ds.larkAppId;
     sessionStore.updateSession(ds.session);
@@ -563,7 +627,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (admins.length === 0 || !operatorOpenId || !admins.includes(operatorOpenId)) {
       return { toast: { type: 'error', content: t('cmd.config.not_admin', undefined, loc) } };
     }
+    // ttadk 网关 bot 用 ttadk 网关模型候选（glm-5.1…），非底层适配器的 opus/gpt-5
+    // （否则被 worker 注入成 `ttadk -m opus` 用错模型启动失败）；CoCo 无候选。
     const modelChoices = (() => {
+      const ttadkChoices = ttadkConfigModelChoices(cbot.config.wrapperCli);
+      if (ttadkChoices !== null) return ttadkChoices;
       try { return createCliAdapterSync(cbot.config.cliId, cbot.config.cliPathOverride).modelChoices ?? []; } catch { return []; }
     })();
     const reRender = () => {
@@ -594,7 +662,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const spec = fk ? findConfigField(fk) : undefined;
       if (!spec) return { toast: { type: 'error', content: t('cmd.config.unknown_field', { field: fk ?? '?', fields: '' }, loc) } };
-      const r = await applyConfigField(larkAppId, spec, raw ? raw : null);
+      // 多值字段（stringList，如 customPassthroughCommands）：留空 = 清除，否则按 kind
+      // 归一化成数组再落盘；普通文本字段沿用原始字符串。
+      let valueToApply: string | string[] | null;
+      if (!raw) {
+        valueToApply = null;
+      } else if (spec.kind === 'stringList') {
+        const coerced = coerceConfigValue(spec, raw);
+        if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) } };
+        // stringList 的 coerce 只会产出 string[]（永不 boolean）；narrow 给 applyConfigField。
+        valueToApply = coerced.value as string[];
+      } else {
+        valueToApply = raw;
+      }
+      const r = await applyConfigField(larkAppId, spec, valueToApply);
       if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
       logger.info(`[config:${larkAppId}] text field ${spec.key} saved via card`);
       return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` } };
@@ -783,7 +864,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -806,8 +887,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const chatId = ds?.chatId ?? closedForCtx?.chatId;
     // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo / 手动填目录
     // 起会话——与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
+    // 注意：worktree_toggle_mode 故意不在此列——它持久写 bot 级 worktreeMultiPicker
+    // （影响该 bot 所有后续会话），属管理动作，必须走 canOperate，不能让 talk-only/
+    // chat-granted 用户借「开自己的 pending 卡」绕过去改 bot 配置。
     const pendingRepoOwnerException =
-      (value.action === 'skip_repo' || value.action === 'repo_manual_submit') && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -832,7 +916,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isWorkflowApprovalAction(value?.action)) {
     const locWf = localeForBot(larkAppId);
-    const result = await handleWorkflowApprovalAction(data, deps.workflowApprovalDeps, locWf);
+    const workflowData = data as Parameters<typeof handleWorkflowApprovalAction>[0];
+    const result = await handleWorkflowApprovalAction(workflowData, deps.workflowApprovalDeps, locWf);
     const runId = value?.run_id;
     if (result?.ok && !result.duplicate && runId) {
       await deps.workflowApprovalResolved?.(runId);
@@ -925,34 +1010,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'close' && ds) {
-      const closedSessionId = ds.session.sessionId;
-      const closedTitle = ds.session.title;
       const botCfg = getBot(ds.larkAppId).config;
-      const closedCliId = ds.session.cliId ?? botCfg.cliId;
-      const closedAnchor = sessionAnchorId(ds);
-      const closedWorkingDir = ds.session.workingDir;
-      const cliResumeCommand = (() => {
-        try {
-          const adapter = createCliAdapterSync(closedCliId, botCfg.cliPathOverride);
-          const raw = adapter.buildResumeCommand?.({
-            sessionId: closedSessionId,
-            cliSessionId: ds.session.cliSessionId,
-          }) ?? null;
-          return raw ? decorateResumeForWrapper(raw, botCfg.wrapperCli) : null;
-        } catch { return null; }
-      })();
+      // Build the closed card BEFORE killWorker/closeSession — it reads the
+      // live session's identity off `ds`.
+      const card = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
       killWorker(ds);
-      sessionStore.closeSession(closedSessionId);
+      sessionStore.closeSession(ds.session.sessionId);
       activeSessions.delete(sKey);
-      const card = buildSessionClosedCard(
-        closedSessionId,
-        closedAnchor,
-        closedTitle,
-        closedCliId,
-        closedWorkingDir,
-        cliResumeCommand,
-        localeForBot(ds.larkAppId),
-      );
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
       // closed card ephemeral to the same owner audience instead. No group
@@ -1152,7 +1216,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_text_input' && ds) {
-      const inputText = action?.form_value?.tui_custom_input ?? '';
+      const inputTextRaw = action?.form_value?.tui_custom_input;
+      const inputText = typeof inputTextRaw === 'string' ? inputTextRaw : '';
       let inputKeys: string[] = [];
       try { inputKeys = JSON.parse(value?.input_keys ?? '[]'); } catch { /* bad json */ }
       const locDs = localeForBot(ds.larkAppId);
@@ -1461,6 +1526,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           pendingPrompt.trim().length > 0 ||
           (ds.pendingAttachments?.length ?? 0) > 0 ||
           (ds.pendingFollowUps?.length ?? 0) > 0;
+        if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
         const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
           ? buildNewTopicPrompt(
               pendingPrompt,
@@ -1474,7 +1540,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               { name: selfBot.botName, openId: selfBot.botOpenId },
               locDs,
               ds.pendingSender,
-              { larkAppId: ds.larkAppId, chatId: ds.chatId },
+              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
             )
           : '';
         const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -1524,10 +1590,59 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const selectedPath = validation.resolvedPath;
       const displayName = pathBasename(selectedPath) || selectedPath;
       await commitRepoSelection(
-        { ds, rootId, cardMessageId, larkAppId, activeSessions, sessionReply },
+        { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply },
         selectedPath,
         displayName,
       );
+    }
+
+    if (actionType === 'worktree_toggle_mode' && ds) {
+      // Flip the persisted per-bot worktree picker mode (single ⇄ multi), then
+      // re-send a fresh repo card in the new mode — a form can't ride an
+      // in-place patch, so the old card is withdrawn and a new one posted.
+      const locDs = localeForBot(ds.larkAppId);
+      const spec = findConfigField('worktreeMultiPicker');
+      if (!spec) return;
+      const next = getBot(ds.larkAppId).config.worktreeMultiPicker !== true;
+      const r = await applyConfigField(ds.larkAppId, spec, next);
+      if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, locDs) } };
+      const projects = lastRepoScan.get(ds.chatId) ?? [];
+      // await so a rejected delete is caught here (not an unhandled rejection);
+      // a missing/already-gone card is fine — we post the fresh one regardless.
+      if (ds.repoCardMessageId && ds.larkAppId) { try { await deleteMessage(ds.larkAppId, ds.repoCardMessageId); } catch { /* card already gone */ } }
+      const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next);
+      ds.repoCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      return { toast: { type: 'info', content: t(next ? 'card.repo.toast_worktree_mode_switched' : 'card.repo.toast_worktree_mode_switched_back', undefined, locDs) } };
+    }
+
+    if (actionType === 'repo_worktree_submit' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const selectedPaths = stringListFromLarkMultiSelect(action?.form_value?.repo_worktree_paths);
+      if (selectedPaths.length === 0) {
+        return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, locDs) } };
+      }
+      if (ds.worktreeCreating) {
+        return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
+      }
+      const branch = String(action?.form_value?.repo_worktree_branch ?? '').trim() || undefined;
+      const multiParent = selectedPaths.length > 1
+        ? multiWorktreeParentPath(selectedPaths, branch ?? await worktreeSlugFromContextAI(ds.session.title, ds.pendingPrompt) ?? 'worktree')
+        : undefined;
+      if (multiParent) {
+        const duplicateNames = duplicateMultiWorktreeChildNames(selectedPaths, lastRepoScan.get(ds.chatId));
+        if (duplicateNames.length > 0) {
+          return { toast: { type: 'error', content: t('card.repo.worktree_child_conflict', { names: duplicateNames.join(', ') }, locDs) } };
+        }
+      }
+      const rootIdForAction = rootId;
+      void handleCardAction({
+        ...data,
+        action: {
+          value: { key: 'repo_worktree', root_id: rootIdForAction, repo_worktree_paths_json: JSON.stringify(selectedPaths), ...(branch ? { branch } : {}), ...(multiParent ? { parent_path: multiParent } : {}) },
+          option: selectedPaths[0],
+        },
+      }, deps, larkAppId);
+      return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, locDs) } };
     }
     return;
   }
@@ -1536,6 +1651,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   const option = action?.option;
   if (!option) {
     logger.warn('Card action received but no option or action value');
+    return;
+  }
+  if (Array.isArray(option)) {
+    logger.warn('Card action received multi options for a single-select handler');
+    return;
+  }
+  if (typeof option !== 'string') {
+    logger.warn('Card action received non-string option for a single-select handler');
     return;
   }
 
@@ -1714,6 +1837,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   const cached = lastRepoScan.get(targetDs.chatId);
   const project = cached?.find(p => p.path === selectedPath);
   const displayName = project ? `${project.name} (${project.branch})` : selectedPath;
+  let selectedWorktreePaths = [selectedPath];
+  if (isWorktreeOpen && typeof action?.value?.repo_worktree_paths_json === 'string') {
+    try {
+      selectedWorktreePaths = stringListFromLarkMultiSelect(JSON.parse(action.value.repo_worktree_paths_json));
+    } catch {
+      selectedWorktreePaths = [];
+    }
+    if (selectedWorktreePaths.length === 0) {
+      return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, localeForBot(targetDs.larkAppId)) } };
+    }
+  }
 
   const locTarget = localeForBot(targetDs.larkAppId);
 
@@ -1726,7 +1860,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Shared commit context for a resolved directory — funnels the dropdown,
   // worktree and manual-entry flows through the same module-level
   // commitRepoSelection (pin dir, then fork pending CLI or close+recreate).
-  const commitCtx = { ds: targetDs, rootId, cardMessageId, larkAppId, activeSessions, sessionReply };
+  const commitCtx = { ds: targetDs, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply };
 
   if (isWorktreeOpen) {
     // Worktree creation involves a `git fetch` that can take many seconds —
@@ -1738,6 +1872,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // here, or two creations would race and the loser's commitSelection
       // would yank the session the winner just spawned.
       return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locTarget) } };
+    }
+    const parentPath = action?.value?.parent_path;
+    if (selectedWorktreePaths.length > 1 && parentPath) {
+      const duplicateNames = duplicateMultiWorktreeChildNames(selectedWorktreePaths, cached);
+      if (duplicateNames.length > 0) {
+        return { toast: { type: 'error', content: t('card.repo.worktree_child_conflict', { names: duplicateNames.join(', ') }, locTarget) } };
+      }
     }
     targetDs.worktreeCreating = true;
     // Session generation snapshot: if another selection lands while git runs
@@ -1756,11 +1897,43 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     void (async () => {
       try {
         let creation;
+        // Track each successful (sourceRepo → created worktree) so a later repo's
+        // failure in a multi-repo batch can roll the earlier ones back instead of
+        // leaking orphaned worktree dirs/branches.
+        const created: Array<{ repo: string; result: { path: string; branch: string; baseRef: string } }> = [];
         try {
-          creation = await createRepoWorktree(selectedPath);
+          const branch = action?.value?.branch?.trim() || undefined;
+          const slug = branch ? undefined : await worktreeSlugFromContextAI(targetDs.session.title, targetDs.pendingPrompt);
+          for (const repoPath of selectedWorktreePaths) {
+            const result = await createRepoWorktree(repoPath, {
+              branch,
+              slug,
+              worktreePath: selectedWorktreePaths.length > 1 && parentPath
+                ? join(parentPath, worktreeChildNameForRepo(repoPath, cached))
+                : undefined,
+            });
+            created.push({ repo: repoPath, result });
+          }
+          creation = selectedWorktreePaths.length > 1 && parentPath
+            ? {
+                path: parentPath,
+                branch: branch ?? created.map(c => c.result.branch).join(', '),
+                baseRef: Array.from(new Set(created.map(c => c.result.baseRef))).join(', '),
+              }
+            : created[0]!.result;
         } catch (e) {
-          logger.warn(`[${tag(targetDs)}] Worktree creation failed for ${selectedPath}: ${e instanceof Error ? e.message : e}`);
-          await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, locTarget));
+          // The repo that threw is the one right after the last success.
+          const failedRepo = selectedWorktreePaths[created.length] ?? selectedPath;
+          const errMsg = e instanceof Error ? e.message : String(e);
+          logger.warn(`[${tag(targetDs)}] Worktree creation failed for ${failedRepo}: ${errMsg}`);
+          let rolledBack = 0;
+          for (const c of created) {
+            try { await removeRepoWorktree(c.repo, c.result.path); rolledBack++; }
+            catch (re) { logger.warn(`[${tag(targetDs)}] rollback of ${c.result.path} failed: ${re instanceof Error ? re.message : re}`); }
+          }
+          await sessionReply(rootId, rolledBack > 0
+            ? t('card.repo.worktree_rolled_back', { repo: pathBasename(failedRepo), error: errMsg, count: rolledBack }, locTarget)
+            : t('cmd.repo.worktree_failed', { error: errMsg }, locTarget));
           return;
         }
         if (sessionChanged()) return notSwitched(creation, 'mid-flight');

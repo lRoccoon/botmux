@@ -14,7 +14,7 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
-import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, killPersistentSession } from './persistent-backend.js';
+import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -30,6 +30,7 @@ import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRole } from './role-resolver.js';
+import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -245,6 +246,43 @@ function renderRoleContextBlock(larkAppId: string | undefined, chatId: string | 
   return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
 }
 
+export function ensureSessionWhiteboard(ds: DaemonSession): void {
+  if (!whiteboardEnabled()) return;
+  // Whiteboard is an optional, best-effort context enhancement. A failure here
+  // (file-lock timeout, disk error, corrupted index) must NOT propagate and
+  // break session creation / forking at the ~11 call sites in daemon.ts — the
+  // session is still fully usable without a board. Log and degrade gracefully.
+  try {
+    if (ds.session.whiteboardId && getWhiteboard(ds.session.whiteboardId)) return;
+    const meta = ensureDefaultWhiteboard({
+      larkAppId: ds.larkAppId,
+      chatId: ds.session.chatId,
+      workingDir: ds.session.workingDir ?? ds.workingDir,
+      sessionId: ds.session.sessionId,
+    });
+    ds.session.whiteboardId = meta.id;
+    sessionStore.updateSession(ds.session);
+  } catch (e) {
+    logger.warn(`[whiteboard] ensureSessionWhiteboard failed for session ${ds.session.sessionId}: ${(e as Error)?.message ?? e}`);
+  }
+}
+
+function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
+  if (!whiteboardEnabled() || !opts?.whiteboardId) return '';
+  const meta = getWhiteboard(opts.whiteboardId);
+  if (!meta || meta.archived) return '';
+  const id = xmlEscape(meta.id);
+  return [
+    `<whiteboard id="${id}">`,
+    '本地项目上下文；读取：`botmux whiteboard read --id ' + id + ' --json`（拿到 content 与 updatedAt）。',
+    '更新状态：`botmux whiteboard update --id ' + id + ' --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
+    '更新前先用 `read --json` 拿到当前内容与 updatedAt，融合新信息后整体重写为一份完整的当前状态（默认中文；代码标识/命令/错误信息可保留原文），并用 `--expected-updated-at` 回传 read 到的版本号做并发冲突检测。',
+    '若更新报 `whiteboard_cas_mismatch`，说明期间有其它 agent 改过白板——重新 `read --json` 拿最新内容与 updatedAt，再次融合重写。',
+    '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
+    '</whiteboard>',
+  ].join('\n');
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -257,7 +295,7 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -283,6 +321,7 @@ export function buildNewTopicPrompt(
   }
 
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
 
   let mentionBlock = '';
   if (mentions && mentions.length > 0) {
@@ -319,13 +358,17 @@ export function buildNewTopicPrompt(
 
   // Put stable, instruction-like context before the user's first turn. This
   // improves salience without moving per-turn attribution (sender/mentions)
-  // into the prompt-cache prefix.
+  // into the prompt-cache prefix. The whiteboard block is per-turn available
+  // context (a tool/usage hint for this round), so it goes before the user's
+  // message — same position as in follow-ups — not after it, where it could be
+  // misread as part of the user's text.
   if (!adapter.injectsSessionContext) {
     if (routingBlock) parts.push(routingBlock);
     if (identityBlock) parts.push(identityBlock);
     parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   }
   if (roleBlock) parts.push(roleBlock);
+  if (whiteboardBlock) parts.push(whiteboardBlock);
 
   parts.push(userBlock);
 
@@ -342,6 +385,9 @@ export function buildNewTopicPrompt(
   // and session ID via system prompt, so skip those blocks here.
   if (mentionBlock) parts.push(mentionBlock);
   if (botBlock) parts.push(botBlock);
+  // The per-session skill catalog block is appended later in the worker-pool
+  // fork path (prepareSessionSkillPrompt), which also writes the manifest and
+  // resolves delivery — keeping a single injection site avoids double-rendering.
 
   return parts.join('\n\n');
 }
@@ -354,22 +400,26 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string },
 ): string {
   const parts: string[] = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false);
 
   // Put stable context before the user's turn. Follow the new-topic order for
-  // shared blocks: session id first, then role. Keep per-turn attribution and
-  // attachments after <user_message>.
+  // shared blocks: session id first, then role. The whiteboard block is
+  // per-turn available context, so place it right after <botmux_reminder> and
+  // before <user_message> — consistent with new-topic/refork — not after the
+  // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
   if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   if (roleBlock) parts.push(roleBlock);
   if (opts?.cliId !== 'mira') {
     parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
   }
+  if (whiteboardBlock) parts.push(whiteboardBlock);
 
   parts.push(`<user_message>\n${content}\n</user_message>`);
 
@@ -528,6 +578,7 @@ export function buildReforkPrompt(
     sender: opts?.sender,
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
+    whiteboardId: ds.session.whiteboardId,
   });
 }
 
@@ -550,10 +601,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
     JSON.stringify(s.replyThreadAliases ?? {}) === JSON.stringify(ds.replyThreadAliases ?? {}) &&
-    JSON.stringify(s.currentReplyTarget ?? null) === JSON.stringify(ds.currentReplyTarget ?? null) &&
-    s.pendingResponseCardId === ds.pendingResponseCardId &&
-    s.pendingResponseCardState === ds.pendingResponseCardState &&
-    s.lastPatchedResponseCardId === ds.lastPatchedResponseCardId
+    JSON.stringify(s.currentReplyTarget ?? null) === JSON.stringify(ds.currentReplyTarget ?? null)
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
@@ -565,9 +613,6 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.lastCliInput = ds.lastCliInput;
   s.replyThreadAliases = ds.replyThreadAliases;
   s.currentReplyTarget = ds.currentReplyTarget;
-  s.pendingResponseCardId = ds.pendingResponseCardId;
-  s.pendingResponseCardState = ds.pendingResponseCardState;
-  s.lastPatchedResponseCardId = ds.lastPatchedResponseCardId;
   // Clear legacy field so it doesn't drift
   s.streamExpanded = undefined;
   sessionStore.updateSession(s);
@@ -698,9 +743,6 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         lastCliInput: session.lastCliInput,
         replyThreadAliases: session.replyThreadAliases,
         currentReplyTarget: session.currentReplyTarget,
-        pendingResponseCardId: session.pendingResponseCardId,
-        pendingResponseCardState: session.pendingResponseCardState,
-        lastPatchedResponseCardId: session.lastPatchedResponseCardId,
         // Restart stays silent for adopt sessions too: forkAdoptWorker shares
         // setupWorkerHandlers, so the recovery ready/screen_update would post a
         // card without this. Cleared on the first real CLI input.
@@ -756,9 +798,6 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       lastCliInput: session.lastCliInput,
       replyThreadAliases: session.replyThreadAliases,
       currentReplyTarget: session.currentReplyTarget,
-      pendingResponseCardId: session.pendingResponseCardId,
-      pendingResponseCardState: session.pendingResponseCardState,
-      lastPatchedResponseCardId: session.lastPatchedResponseCardId,
       // Restart stays silent in the group: the recovery re-fork won't post or
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
@@ -777,6 +816,16 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   // actual re-fork is deferred into `toReattach` and staggered below so a box
   // with dozens of surviving sessions doesn't spike on restart.
   const toReattach: DaemonSession[] = [];
+  // Server-liveness is sampled ONCE per backend type (cached): a single
+  // `tmux list-sessions` answers for all of that backend's sessions, and a
+  // consistent snapshot avoids a mid-loop race where an early lazy fork could
+  // flip the answer partway through (the loop itself starts no workers).
+  const serverStateCache = new Map<PersistentBackendType, 'running' | 'down' | 'unknown'>();
+  const backendServerState = (bt: PersistentBackendType) => {
+    let s = serverStateCache.get(bt);
+    if (s === undefined) { s = probePersistentBackendServer(bt); serverStateCache.set(bt, s); }
+    return s;
+  };
   for (const [, ds] of activeSessions) {
     const backendType = getSessionPersistentBackendType(ds);
     if (!backendType) continue;
@@ -785,10 +834,30 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
     const probe = probePersistentSession(backendType, backendName);
     if (probe === 'missing') {
-      // Probe succeeded and authoritatively says the backing pane/agent is gone
-      // — this is a true zombie. Close it (evicts the active record + marks the
-      // store row closed) so the next message starts a clean session.
       const tag = ds.session.sessionId.substring(0, 8);
+      // Intentionally cold-resume-suspended (idle-worker sweeper killed the
+      // backing session + CLI to reclaim memory over the per-bot live cap). The
+      // 'missing' backing is EXPECTED here, not a zombie — keep the worker-less
+      // active record so the next message cold-resumes from the transcript
+      // (forkWorker(resume=true) clears the marker once the worker is back).
+      if (ds.session.suspendedColdResume) {
+        logger.info(`[${tag}] ${backendType} session was cap-suspended — keeping active for lazy cold-resume`);
+        continue;
+      }
+      // 'missing' is ambiguous: it means EITHER this one pane is gone while the
+      // server runs (a true solo zombie) OR the whole multiplexer server is down
+      // (e.g. machine reboot) and every pane vanished at once. Only the former is
+      // a zombie to close. On a reboot the CLI transcript on disk is still
+      // resumable, so keep the worker-less active record and let it lazily resume
+      // on the next message (exactly like a pty session) instead of mass-closing
+      // every session — the bug that wiped a full dashboard after a host reboot.
+      if (backendServerState(backendType) === 'down') {
+        logger.warn(`[${tag}] ${backendType} server is down (host reboot?) — keeping "${backendName}" active for lazy resume instead of closing`);
+        continue;
+      }
+      // Server is up (or its state is inconclusive) and this specific pane is
+      // gone — a true zombie. Close it (evicts the active record + marks the
+      // store row closed) so the next message starts a clean session.
       logger.warn(`[${tag}] ${backendType} backing session "${backendName}" is gone — closing zombie active session`);
       await closeSession(ds.session.sessionId);
       continue;
@@ -1014,9 +1083,6 @@ export async function resumeSession(
     lastCliInput: session.lastCliInput,
     replyThreadAliases: session.replyThreadAliases,
     currentReplyTarget: session.currentReplyTarget,
-    pendingResponseCardId: session.pendingResponseCardId,
-    pendingResponseCardState: session.pendingResponseCardState,
-    lastPatchedResponseCardId: session.lastPatchedResponseCardId,
   };
 
   messageQueue.ensureQueue(anchor);
@@ -1076,7 +1142,15 @@ export async function executeScheduledTask(
   let anchor: string;
   let isContinuation = false;
 
-  if (scope === 'chat') {
+  if (task.deliver === 'new-topic') {
+    // Every fire opens a brand-new topic and runs in a fresh session. A
+    // top-level sendMessage in a topic group creates a new topic; in a plain
+    // group it's just a new top-level message. Either way we never reply
+    // in-thread and never reuse a prior session, so successive runs stay fully
+    // isolated. The returned message_id becomes this run's thread anchor.
+    anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
+    isContinuation = false;
+  } else if (scope === 'chat') {
     // A group may have been converted from 普通群 to 话题群 after the schedule
     // was created. In topic mode, a top-level sendMessage creates a new topic;
     // keep scheduled continuations in the original thread when we have one.
@@ -1158,8 +1232,18 @@ export async function executeScheduledTask(
   if (isContinuation && existing?.worker && !existing.worker.killed) {
     markSessionActivity(existing);
     try {
-      rememberLastCliInput(existing, task.prompt, task.prompt);
-      existing.worker.send({ type: 'message', content: task.prompt });
+      ensureSessionWhiteboard(existing);
+      const content = buildFollowUpContent(task.prompt, existing.session.sessionId, {
+        isAdoptMode: false,
+        cliId: bot.config.cliId,
+        cliPathOverride: bot.config.cliPathOverride,
+        locale: localeForBot(larkAppId),
+        larkAppId,
+        chatId: task.chatId,
+        whiteboardId: existing.session.whiteboardId,
+      });
+      rememberLastCliInput(existing, task.prompt, content);
+      existing.worker.send({ type: 'message', content });
       logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}`);
       return;
     } catch (err: any) {
@@ -1172,7 +1256,10 @@ export async function executeScheduledTask(
   // chatId-as-seed for audit (sessionAnchorId() returns chatId via scope). If a
   // formerly chat-scope task was redirected into a converted topic chat, promote
   // the runtime session to thread-scope so follow-up replies stay in-thread.
-  const runtimeScope: 'thread' | 'chat' = scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
+  const runtimeScope: 'thread' | 'chat' =
+    task.deliver === 'new-topic' ? 'thread'
+      : scope === 'chat' && anchor !== task.chatId ? 'thread'
+        : scope;
   const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`);
   const now = Date.now();
   session.larkAppId = larkAppId;
@@ -1180,8 +1267,6 @@ export async function executeScheduledTask(
   session.lastMessageAt = new Date(now).toISOString();
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
-
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId });
 
   const ds: DaemonSession = {
     session,
@@ -1198,6 +1283,8 @@ export async function executeScheduledTask(
     hasHistory: isContinuation,
     workingDir: task.workingDir,
   };
+  ensureSessionWhiteboard(ds);
+  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
   rememberLastCliInput(ds, task.prompt, prompt);
   forkWorker(ds, prompt);

@@ -5,6 +5,10 @@ import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, ASK_SKILL, ASK_SKILL_NAME } from './definitions.js';
 
+// This module only manages botmux-owned bridge/ask skills. User-defined skills
+// live in src/core/skills/* and services/skill-registry-store.ts so their
+// lifecycle stays independent of any specific CLI's global skill directory.
+
 function expandHome(p: string): string {
   return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
 }

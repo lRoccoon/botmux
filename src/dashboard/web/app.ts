@@ -5,13 +5,16 @@ import { renderSessionsPage } from './sessions.js';
 import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
-import { renderRolesPage } from './roles.js';
+import { renderSkillsPage } from './skills.js';
+import { renderRoleProfilesPage, renderRolesPage } from './roles.js';
 import { renderTeamFederationPage, renderTeamManagePage } from './team-federation.js';
 import { renderConnectorsPage } from './connectors.js';
 import { renderSettingsPage } from './settings.js';
 import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { renderOfficePage } from './office.js';
+import { renderWhiteboardsPage } from './whiteboards.js';
+import { renderInsightsPage } from './insights.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
@@ -31,7 +34,7 @@ let publicReadOnly = false;
 
 // Management pages are token-gated end-to-end (no public GET) — a read-only
 // visitor must not reach them. `data-route` values from index.html's nav.
-const MANAGE_ROUTES = ['roles', 'bot-defaults', 'team', 'connectors'];
+const MANAGE_ROUTES = ['roles', 'role-profiles', 'bot-defaults', 'skills', 'team', 'connectors', 'insights', 'whiteboards'];
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 // Shown only when the dashboard token was rotated WHILE public read-only is off
@@ -197,6 +200,25 @@ function applyAuthVisibility(): void {
   if (addBot) addBot.style.display = isAuthed ? '' : 'none';
 }
 
+// Show a small dot on the Settings nav when a newer botmux version is published,
+// so an available update is visible without opening the page. Authed-only (the
+// status endpoint is token-gated; the result is server-cached so this is cheap).
+// Best-effort and silent on failure.
+async function checkUpdateBadge(): Promise<void> {
+  if (!isAuthed) return;
+  try {
+    const r = await fetch('/api/update/status');
+    if (!r.ok) return;
+    const j = await r.json();
+    const a = document.querySelector<HTMLAnchorElement>('.sidebar-nav a[data-route="settings"]');
+    if (!a) return;
+    const behind = j.behind === true;
+    a.classList.toggle('nav-has-update', behind);
+    if (behind) a.title = t('update.navBadgeTitle', { version: `v${j.latest}` });
+    else a.removeAttribute('title');
+  } catch { /* best-effort */ }
+}
+
 function renderAuthRequiredPage(host: HTMLElement): void {
   host.innerHTML =
     '<section class="auth-required" style="max-width:520px;margin:64px auto;text-align:center;' +
@@ -204,7 +226,7 @@ function renderAuthRequiredPage(host: HTMLElement): void {
     'padding:40px 36px;box-shadow:0 8px 28px rgba(0,0,0,.12)">' +
     '<h2 style="margin:0 0 12px;font-size:20px;color:var(--fg)">此页需要授权链接</h2>' +
     '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted);font-size:14px">' +
-    '你当前是只读访问，管理页（角色 / Bot 配置 / 团队 / Webhook）需要授权链接。' +
+    '你当前是只读访问，管理页（群角色 / Profiles / Bot 配置 / 团队 / Webhook）需要授权链接。' +
     '运行 <code>botmux dashboard</code> 获取最新链接后即可管理。</p>' +
     '<a href="#/" style="display:inline-block;padding:8px 22px;background:var(--accent);' +
     'color:var(--on-accent);border-radius:8px;text-decoration:none;font-size:14px">返回总览</a>' +
@@ -218,7 +240,11 @@ let pageDispose: (() => void) | null = null;
 function highlightNav(hash: string): void {
   for (const a of document.querySelectorAll<HTMLAnchorElement>('.sidebar-nav a')) {
     const href = a.getAttribute('href') ?? '#/';
-    a.classList.toggle('active', href === (hash || '#/'));
+    const current = hash || '#/';
+    const isActive = href === current || (
+      href !== '#/' && (current.startsWith(`${href}?`) || current.startsWith(`${href}/`))
+    );
+    a.classList.toggle('active', isActive);
   }
 }
 
@@ -247,13 +273,21 @@ function route() {
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/settings')) void renderSettingsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
+  else if (hash.startsWith('#/skills')) void renderSkillsPage(root);
   else if (hash.startsWith('#/connectors')) renderConnectorsPage(root);
   else if (hash.startsWith('#/team/manage')) renderTeamManagePage(root);
   else if (hash.startsWith('#/team')) renderTeamFederationPage(root);
+  else if (hash.startsWith('#/role-profiles')) {
+    window.location.replace(`#/roles/profile${hash.slice('#/role-profiles'.length)}`);
+    return;
+  }
+  else if (hash.startsWith('#/roles/profile')) renderRoleProfilesPage(root);
   else if (hash.startsWith('#/roles')) renderRolesPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
+  else if (hash.startsWith('#/whiteboards')) void renderWhiteboardsPage(root);
   else if (hash.startsWith('#/sessions')) renderSessionsPage(root);
   else if (hash.startsWith('#/office')) pageDispose = renderOfficePage(root) ?? null;
+  else if (hash.startsWith('#/insights')) pageDispose = renderInsightsPage(root);
   else void renderOverviewPage(root);
 
   highlightNav(hash);
@@ -350,6 +384,7 @@ void (async () => {
   // hidden and route guards are active for read-only visitors from frame one.
   await loadAuthState();
   applyAuthVisibility();
+  void checkUpdateBadge();
   initOwnerAvatar();
   try {
     await bootstrap();

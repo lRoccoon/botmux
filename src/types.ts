@@ -85,11 +85,6 @@ export interface Session {
   /** Whether the quote-target sender is a bot (vs a human) — drives the
    *  @ hard-gate's context-aware error text. */
   quoteTargetSenderIsBot?: boolean;
-  /** Pending placeholder card used when streaming cards are disabled. The first
-   *  botmux send for the turn PATCHes this card instead of posting a new one. */
-  pendingResponseCardId?: string;
-  pendingResponseCardState?: 'open' | 'patched';
-  lastPatchedResponseCardId?: string;
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
@@ -104,8 +99,20 @@ export interface Session {
   usageLimit?: CliUsageLimitState;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Default local project whiteboard bound to this session when the optional whiteboard feature is enabled. */
+  whiteboardId?: string;
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
   cliSessionId?: string;
+  /**
+   * Set true when the idle-worker sweeper suspends this session over the per-bot
+   * live cap: the worker AND the backing tmux/herdr/zellij session (+ CLI) were
+   * intentionally killed to reclaim memory, but the session stays `active` and
+   * cold-resumes from its on-disk transcript on the next message. Distinguishes
+   * this deliberate state from a real zombie (pane gone while the server runs):
+   * `restoreActiveSessions` must NOT close a suspended session whose backing
+   * session probes 'missing'. Cleared once a live worker is re-established.
+   */
+  suspendedColdResume?: boolean;
   /** CLI used to spawn this session — stamped on every save so closed sessions retain it. */
   cliId?: import('./adapters/cli/types.js').CliId;
   /**
@@ -232,8 +239,12 @@ export interface ScheduledTask {
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
   repeat?: { times: number | null; completed: number };
-  /** Delivery target: 'origin' (original thread, default), 'local' (log only, no delivery) */
-  deliver?: 'origin' | 'local';
+  /** Delivery target:
+   *  - 'origin' (default): reply into the original thread, or post to the chat
+   *  - 'new-topic': every fire opens a brand-new topic in the chat and runs in
+   *    a fresh session (never reuses a prior session / never replies in-thread)
+   *  - 'local': log only, no delivery */
+  deliver?: 'origin' | 'local' | 'new-topic';
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
@@ -251,7 +262,7 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; model?: string; disableCliBypass?: boolean; sandbox?: boolean; sandboxHidePaths?: string[]; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string; turnId?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate

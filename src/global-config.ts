@@ -19,12 +19,12 @@ import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
 
-export interface WorkerConfig {
-  maxLiveWorkers?: number;
-  idleSuspendMs?: number;
-}
-
 export type RepoPickerMode = 'all' | 'repos';
+
+export interface WhiteboardConfig {
+  /** Optional local project whiteboard. Off by default; enabling it must not create boards by itself. */
+  enabled?: boolean;
+}
 
 export interface GlobalConfig {
   lang?: Locale;
@@ -40,17 +40,24 @@ export interface GlobalConfig {
    *  services/voice/types.ts. Presence (with usable creds) gates the
    *  "🔊 语音总结" button. */
   voice?: VoiceConfig;
-  /** Machine-wide worker resource policy. Daemon falls back to an
-   *  auto-derived live-worker budget when this block is absent. */
-  worker?: WorkerConfig;
   /** Machine-wide auto-update / auto-restart schedule. Off unless explicitly
    *  enabled. Only the primary daemon (bot-0) acts on it — see core/maintenance.ts. */
   maintenance?: MaintenanceConfig;
+  /** Optional local project whiteboard. Disabled unless explicitly enabled. */
+  whiteboard?: WhiteboardConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
    *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
    *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
   httpProxy?: string;
+  /** Machine-wide user skill registry policy. Skill package storage itself lives under
+   *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
+  skills?: GlobalSkillConfig;
+}
+
+export interface GlobalSkillConfig {
+  trustProjectSkills?: 'off' | 'trusted' | 'all';
+  delivery?: 'auto' | 'prompt' | 'native';
 }
 
 export interface MaintenanceConfig {
@@ -181,20 +188,25 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function readPositiveInteger(raw: unknown): number | undefined {
-  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) return undefined;
-  return raw;
+function readGlobalSkills(raw: unknown): GlobalSkillConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: GlobalSkillConfig = {};
+  if (r.trustProjectSkills === 'off' || r.trustProjectSkills === 'trusted' || r.trustProjectSkills === 'all') {
+    out.trustProjectSkills = r.trustProjectSkills;
+  }
+  if (r.delivery === 'auto' || r.delivery === 'prompt' || r.delivery === 'native') {
+    out.delivery = r.delivery;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function readWorker(raw: unknown): WorkerConfig | undefined {
+function readWhiteboard(raw: unknown): WhiteboardConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
-  const worker: WorkerConfig = {};
-  const maxLiveWorkers = readPositiveInteger(v.maxLiveWorkers);
-  const idleSuspendMs = readPositiveInteger(v.idleSuspendMs);
-  if (maxLiveWorkers !== undefined) worker.maxLiveWorkers = maxLiveWorkers;
-  if (idleSuspendMs !== undefined) worker.idleSuspendMs = idleSuspendMs;
-  return Object.keys(worker).length > 0 ? worker : undefined;
+  const out: WhiteboardConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 export function globalConfigPath(): string {
@@ -247,11 +259,13 @@ export function readGlobalConfig(): GlobalConfig {
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);
   if (voice) out.voice = voice;
-  const worker = readWorker(raw.worker);
-  if (worker) out.worker = worker;
   const maintenance = readMaintenance(raw.maintenance);
   if (maintenance) out.maintenance = maintenance;
+  const whiteboard = readWhiteboard(raw.whiteboard);
+  if (whiteboard) out.whiteboard = whiteboard;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
+  const skills = readGlobalSkills(raw.skills);
+  if (skills) out.skills = skills;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }

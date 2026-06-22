@@ -20,7 +20,10 @@ import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlCon
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldWriteNow } from './utils/input-gate.js';
+import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input-queue.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
+import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
+import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -37,7 +40,8 @@ import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/t
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
-import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -57,7 +61,7 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
-import { buildWrappedLaunch } from './setup/cli-selection.js';
+import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid } from './core/session-discovery.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
@@ -109,6 +113,10 @@ let consecutiveInWorkerRestarts = 0;
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
  *  of the same warning. */
 let resumeFallbackNotified = false;
+const IDLE_PROBE_INTERVAL_MS = 3_500;
+const IDLE_PROBE_MAX_ATTEMPTS = 24;
+let busyPatternIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
+let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 /** The effectiveResume flag used by the most recent spawnCli call. Written
  *  immediately after the two-tier fallback check so late-attach timers
  *  (hermes, cursor, etc.) can read THE SAME semantics the spawn used,
@@ -117,6 +125,7 @@ let resumeFallbackNotified = false;
  *  setup so even the tick that fires between spawnCli-start and the
  *  adapter's hermesBridgeAttach reads the correct mode. */
 let lastSpawnEffectiveResume = false;
+let lastSpawnEffectiveCliSessionId: string | undefined;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
@@ -152,11 +161,17 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
+/** Per-spawn one-shot: have this spawn's bot.startupCommands been typed in yet?
+ *  Reset in spawnCli so a restart/resume (which re-spawns the CLI) re-applies
+ *  them — needed because session-only settings like `/effort ultracode` are lost
+ *  when the CLI restarts. Consumed inside flushPending right before the first
+ *  user prompt is drained, so the commands always precede it (see runStartupCommands). */
+let hasRunStartupCommands = false;
 /** Ready-gate (Claude-family): holds the first prompt until the SessionStart
  *  hook fires a true-ready signal, so a cjadk-style startup selector's ❯ (which
  *  falsely matches readyPattern) can't eat the first message. Recreated + armed
@@ -218,7 +233,70 @@ function releaseReadyGate(reason: string): void {
     settleThenFlush(Date.now());
   }
 }
-const pendingMessages: Array<{ content: string; turnId?: string }> = [];
+
+/** Per-startup-command quiescence: how long the PTY must be quiet before sending
+ *  the next command, capped so a slow/redrawing command can't stall the queue. */
+const STARTUP_CMD_QUIET_MS = 500;
+const STARTUP_CMD_CAP_MS = 4_000;
+
+/** Type one literal input LINE into the CLI exactly like a passthrough slash
+ *  command: raw text → a 200ms beat (so the TUI's slash-command picker registers
+ *  the match before submit) → a separate Enter. Non-TUI backends fall back to a
+ *  single write + CR. Shared by the `raw_input` IPC handler and runStartupCommands
+ *  so both stay in lockstep. */
+async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
+  if ('sendText' in be && 'sendSpecialKeys' in be) {
+    (be as any).sendText(content);
+    await new Promise(r => setTimeout(r, 200));
+    (be as any).sendSpecialKeys('Enter');
+  } else {
+    be.write(content + '\r');
+  }
+}
+
+/** Resolve once the PTY has been quiet for `quietMs`, or after `capMs` total.
+ *  Spaces out startup commands so each is processed before the next is typed. */
+function awaitPtyQuiescence(quietMs: number, capMs: number): Promise<void> {
+  return new Promise(resolve => {
+    const startedAt = Date.now();
+    const check = () => {
+      const now = Date.now();
+      if (now - lastPtyOutputAtMs >= quietMs || now - startedAt >= capMs) { resolve(); return; }
+      const wait = Math.min(quietMs - (now - lastPtyOutputAtMs), capMs - (now - startedAt));
+      const t = setTimeout(check, Math.max(50, wait));
+      t.unref?.();
+    };
+    check();
+  });
+}
+
+/** Type this spawn's bot.startupCommands into the CLI in order — one submit each,
+ *  before the first user prompt. Best-effort: a failing command is logged and
+ *  skipped, never blocking the first prompt. Skipped in adopt mode (we observe
+ *  the user's existing session). Invoked once per spawn from flushPending under
+ *  the isFlushing mutex, so no user message can interleave. */
+async function runStartupCommands(): Promise<void> {
+  const cmds = lastInitConfig?.startupCommands;
+  if (!cmds || cmds.length === 0) return;
+  if (lastInitConfig?.adoptMode) return;
+  if (!backend) return;
+  log(`Running ${cmds.length} startup command(s) before first prompt`);
+  for (const cmd of cmds) {
+    if (!backend) break;
+    try {
+      await sendRawCommandLine(backend, cmd);
+      await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
+      log(`Startup command sent: ${cmd}`);
+    } catch (e: any) {
+      log(`Startup command failed (${cmd}): ${e?.message ?? e}`);
+    }
+  }
+  // Commands consumed turns and reset idle; treat the first user prompt fresh.
+  isPromptReady = false;
+  idleDetector?.reset();
+}
+
+const pendingMessages: PendingCliInput[] = [];
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
 const inflightInputs = new InflightInputTracker();
@@ -2612,7 +2690,7 @@ let trustHandled = false;
 // not pollute the visible terminal. Strip them before xterm rendering and
 // translate them back into worker IPC.
 const CODEX_APP_OSC_PREFIX = '\x1b]777;botmux:';
-const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira']);
+const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira', 'mir']);
 let codexAppOscPending = '';
 
 function decodeCodexAppPayload(payload: string): any | undefined {
@@ -2761,6 +2839,7 @@ function onPtyData(data: string): void {
 
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
+  stopBusyPatternIdleProbe();
   // Ready-gate: a startup selector's ❯ (cjadk et al.) falsely matches
   // readyPattern → the IdleDetector fires idle while the CLI is NOT actually at
   // its input box. Hold off declaring ready until the SessionStart hook signal
@@ -2814,6 +2893,48 @@ function persistCliSessionId(cliSessionId: string): void {
   } catch (err: any) {
     log(`Failed to persist CLI session id: ${err.message}`);
   }
+}
+
+function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  if (!shouldObserveCursorChatId({
+    cliId: lastInitConfig?.cliId,
+    effectiveResume: lastSpawnEffectiveResume,
+    effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
+  })) return;
+
+  const backendAtSpawn = backend;
+  let attempts = 0;
+  const maxAttempts = 60; // Cursor may open store.db only after its startup render settles.
+  const tick = () => {
+    if (!backend || !shouldObserveCursorChatId({
+      cliId: lastInitConfig?.cliId,
+      effectiveResume: lastSpawnEffectiveResume,
+      effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
+    })) return;
+    if (backend !== backendAtSpawn) return;
+    const currentPid = backend.getChildPid?.();
+    if (currentPid && currentPid !== pid) return;
+
+    const realPid = findLaunchedCliPid(pid, 'cursor') ?? pid;
+    const chatId = findCursorChatIdByPid(realPid);
+    if (chatId) {
+      if (!shouldPersistObservedCursorChatId({
+        effectiveResume: lastSpawnEffectiveResume,
+        effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
+        observedChatId: chatId,
+      })) {
+        log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
+        return;
+      }
+      persistCliSessionId(chatId);
+      log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${chatId}`);
+      return;
+    }
+    attempts++;
+    if (attempts < maxAttempts) setTimeout(tick, 500);
+  };
+  setTimeout(tick, 250);
 }
 
 /** How long to wait before re-checking whether a submit-not-confirmed message
@@ -2985,6 +3106,16 @@ async function flushPending(): Promise<void> {
   }
 
   try {
+    // One-shot per spawn: type the bot's startup commands (e.g. `/effort
+    // ultracode`) into the CLI before the first user prompt drains. Both ready
+    // paths funnel through flushPending — the ready-gate settle for Claude-family
+    // CLIs, markPromptReady for the rest — so this is the single universal
+    // "ready, about to send the first prompt" point, for every CLI. Held by the
+    // isFlushing mutex so no Lark message can interleave between the commands.
+    if (!hasRunStartupCommands) {
+      hasRunStartupCommands = true;
+      await runStartupCommands();
+    }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const item = pendingMessages.shift()!;
       // Track as in-flight until the CLI returns to idle (markPromptReady).
@@ -3022,6 +3153,7 @@ async function flushPending(): Promise<void> {
       let result: Awaited<ReturnType<typeof cliAdapter.writeInput>> | undefined;
       try {
         result = await cliAdapter.writeInput(backend, msg);
+        scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
         log(`writeInput threw: ${err?.message ?? err}`);
         // If the CLI exited mid-write the backend already fired onExit (which
@@ -3064,7 +3196,19 @@ async function flushPending(): Promise<void> {
 
 function sendToPty(content: string, turnId?: string): void {
   if (!backend || !cliAdapter) return;
-  pendingMessages.push({ content, turnId });
+  const next = { content, turnId };
+  const shouldMergeQueued = !isFlushing && !shouldWriteNow({
+    isPromptReady,
+    isFlushing,
+    supportsTypeAhead: cliAdapter.supportsTypeAhead === true,
+    awaitingFirstPrompt,
+  }) && cliAdapter.mergeQueuedInput === true;
+  const mergedQueued = shouldMergeQueued && mergeQueuedCliInput(pendingMessages, next);
+  if (mergedQueued) {
+    log(`Merged queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
+  } else {
+    pendingMessages.push(next);
+  }
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
   // wrong (false positive on a question that has no rendered options) and a
@@ -3089,10 +3233,11 @@ function sendToPty(content: string, turnId?: string): void {
   // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
   // brief reaching Codex before its first idle and never landing.
   if (shouldWriteNow({ isPromptReady, isFlushing, supportsTypeAhead: cliAdapter.supportsTypeAhead === true, awaitingFirstPrompt })) {
-    log(`Writing to PTY: "${content.substring(0, 80)}"`);
+    if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
-    log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
+    if (!mergedQueued) log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
+    scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);
   }
 }
 
@@ -3328,7 +3473,84 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
   }
 }
 
+function captureBackendScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): string {
+  return be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? '';
+}
+
+function busyProbeRegion(content: string): string {
+  const lines = content.split(/\r?\n/);
+  const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));
+  return lines.slice(-tailLineCount).join('\n');
+}
+
+function probeBusyPatternIdle(
+  source: string,
+  be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>,
+): boolean {
+  try {
+    const content = captureBackendScreen(be);
+    if (!content) return false;
+    if (cliAdapter?.busyPattern) {
+      if (cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
+      log(`${source} idle probe: busy marker absent, marking prompt ready`);
+      markPromptReady();
+      return true;
+    }
+  } catch (err: any) {
+    log(`${source} idle probe captureCurrentScreen failed: ${err.message}`);
+  }
+  return false;
+}
+
+function scheduleReattachIdleProbe(source: string, be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): void {
+  stopReattachIdleProbe();
+  if (!cliAdapter?.busyPattern || (!be.captureCurrentScreen && !be.captureViewport)) return;
+  reattachIdleProbeTimer = setTimeout(() => {
+    reattachIdleProbeTimer = null;
+    if (backend !== be || !awaitingFirstPrompt || isPromptReady) return;
+    probeBusyPatternIdle(source, be);
+  }, IDLE_PROBE_INTERVAL_MS);
+  reattachIdleProbeTimer.unref?.();
+}
+
+function stopReattachIdleProbe(): void {
+  if (reattachIdleProbeTimer) {
+    clearTimeout(reattachIdleProbeTimer);
+    reattachIdleProbeTimer = null;
+  }
+}
+
+function stopBusyPatternIdleProbe(): void {
+  if (busyPatternIdleProbeTimer) {
+    clearTimeout(busyPatternIdleProbeTimer);
+    busyPatternIdleProbeTimer = null;
+  }
+}
+
+function scheduleBusyPatternIdleProbe(source: string): void {
+  stopBusyPatternIdleProbe();
+  if (!cliAdapter?.busyPattern || (!backend?.captureCurrentScreen && !backend?.captureViewport)) return;
+
+  let attempts = 0;
+  const tick = () => {
+    busyPatternIdleProbeTimer = null;
+    if (!backend || isPromptReady) return;
+    attempts += 1;
+    if (probeBusyPatternIdle(source, backend)) return;
+    if (attempts < IDLE_PROBE_MAX_ATTEMPTS && !isPromptReady) {
+      busyPatternIdleProbeTimer = setTimeout(tick, IDLE_PROBE_INTERVAL_MS);
+      busyPatternIdleProbeTimer.unref?.();
+    }
+  };
+
+  busyPatternIdleProbeTimer = setTimeout(tick, IDLE_PROBE_INTERVAL_MS);
+  busyPatternIdleProbeTimer.unref?.();
+}
+
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
+  // prediction — only a genuinely fresh CLI process replays them; see
+  // willReattachPersistent.)
   // Re-deliver inputs that were in-flight when the previous CLI died (see
   // backend.onExit). killCli() already wiped pendingMessages, so these go to
   // the front; the normal flush paths (prompt detect / first-prompt timeout)
@@ -3440,13 +3662,18 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
   // backendType=tmux trust-but-verify: an explicit per-bot config (or
   // BACKEND_TYPE=tmux env override) bypasses config.ts's auto-detect, so
-  // the worker re-probes here. If tmux can't start a server we silently
-  // fall back to PTY rather than letting attach-session / new-session spam
-  // the daemon error log every poll cycle.
+  // the worker re-probes here. Existing botmux tmux sessions are more
+  // authoritative than the disposable "can we create a new server?" probe:
+  // abandoning one after a transient probe failure would spawn a duplicate CLI
+  // under raw PTY and make later submits invisible to the real Codex history.
   let effectiveBackend = cfg.backendType;
-  if (effectiveBackend === 'tmux' && !TmuxBackend.isAvailable()) {
-    log('tmux backend requested but functional probe failed — falling back to PTY backend');
-    effectiveBackend = 'pty';
+  if (effectiveBackend === 'tmux') {
+    const existingSessionName = TmuxBackend.sessionName(cfg.sessionId);
+    const hasExistingSession = TmuxBackend.hasSession(existingSessionName);
+    if (!hasExistingSession && !TmuxBackend.isAvailable()) {
+      log('tmux backend requested but functional probe failed and no existing session is available — falling back to PTY backend');
+      effectiveBackend = 'pty';
+    }
   }
   if (effectiveBackend === 'herdr' && !HerdrBackend.isAvailable()) {
     log('herdr backend requested but probe failed — falling back to PTY backend');
@@ -3491,6 +3718,40 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log(`[sandbox] redirecting Claude bridge dataDir → overlay upper: ${redirected}`);
     claudeDataDir = redirected;
   }
+  // Predict reattach vs fresh BEFORE the resume pre-flight. On a persistent
+  // backend (tmux/herdr/zellij) a daemon restart finds the CLI process still
+  // alive in its pane, so the backend will `attach` to the live process and
+  // IGNORE the bin/args — there is no spawn, and the live process still holds
+  // the full in-memory conversation. In that case the resume-vs-fresh question
+  // is moot: we must NOT run the pre-flight fallback (which would drop --resume
+  // and post a misleading "started a fresh clean session — context lost" card
+  // on EVERY restart, e.g. for a sandboxed session whose transcript lives in
+  // an ephemeral overlay upper that the probe can't see). Computed here (not at
+  // the spawn site below) so the pre-flight can short-circuit on it.
+  const persistentSessionName = effectiveBackendType === 'tmux'
+    ? TmuxBackend.sessionName(cfg.sessionId)
+    : effectiveBackendType === 'herdr'
+      ? HerdrBackend.sessionName(cfg.sessionId)
+      : effectiveBackendType === 'zellij'
+        ? ZellijBackend.sessionName(cfg.sessionId)
+      : undefined;
+  const willReattachPersistent = persistentSessionName
+    ? effectiveBackendType === 'tmux'
+      ? TmuxBackend.hasSession(persistentSessionName)
+      : effectiveBackendType === 'zellij'
+        ? ZellijBackend.hasSession(persistentSessionName)
+        : HerdrBackend.hasSession(persistentSessionName)
+    : false;
+
+  // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
+  // A reattach to a LIVE persistent pane (daemon-restart recovery) is the SAME
+  // CLI with /effort etc. already applied — replaying would re-type them (and
+  // /clear,/compact would corrupt the recovered context). hasRun=true ⇒ skip.
+  // Fresh spawns (incl. resume that starts a new CLI, where hasSession is false)
+  // arm it. spawnCli is synchronous up to backend spawn, so this lands before
+  // any flushPending consumes the flag.
+  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent });
+
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
   // → skip --resume, spawn FRESH.
@@ -3503,13 +3764,14 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   //
   // User impact: losing context is better than a 4× daemon-side crash loop
   // that leaves the bot stuck in "crashed N times" state until the human
-  // re-closes the session.
+  // re-closes the session. Skipped entirely when reattaching to a live
+  // persistent pane (no spawn happens, no context is lost).
   let effectiveResume = cfg.resume ?? false;
   let effectiveCliSessionId = cfg.cliSessionId;
   let effectiveAdapterSessionId = adapterSessionId;
   const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
   let tier1ProbeFalse = false;
-  if (effectiveResume && !tier2ForceFresh) {
+  if (effectiveResume && !tier2ForceFresh && !willReattachPersistent) {
     const probe = cliAdapter.checkResumeTargetExists?.({
       sessionId: effectiveAdapterSessionId,
       cliSessionId: effectiveCliSessionId,
@@ -3518,7 +3780,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     });
     if (probe === false) tier1ProbeFalse = true;
   }
-  const fallBackToFresh = effectiveResume && (tier1ProbeFalse || tier2ForceFresh);
+  const fallBackToFresh =
+    effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh);
   if (fallBackToFresh) {
     const reason = tier2ForceFresh
       ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
@@ -3565,18 +3828,33 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // `lastInitConfig.resume` (= true) and baseline an empty store, swallowing
   // the fresh session's first turn.
   lastSpawnEffectiveResume = effectiveResume;
+  lastSpawnEffectiveCliSessionId = effectiveCliSessionId;
 
+  // ttadk 网关：模型走 ttadk 自己的 `-m`（启动期注入到 ttadk 前缀，见下方 wrapperCli
+  // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。
+  const ttadkGateway = isTtadkWrapper(cfg.wrapperCli);
+  // When a bot has startupCommands AND this CLI bakes the first prompt into
+  // launch args (passesInitialPromptViaArgs, e.g. Gemini -i), don't bake it —
+  // route it through the input queue instead so startupCommands run first
+  // (flushPending's hook can't precede an args-baked prompt). The init handler
+  // mirrors this when deciding whether to enqueue the prompt.
+  const deferInitialPrompt = shouldDeferInitialPromptForStartup({
+    hasStartupCommands: !!cfg.startupCommands?.length,
+    adoptMode: cfg.adoptMode === true,
+    passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
+  });
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
     workingDir: cfg.workingDir,
     resumeSessionId: effectiveCliSessionId,
-    initialPrompt: cfg.prompt || undefined,
+    initialPrompt: deferInitialPrompt ? undefined : (cfg.prompt || undefined),
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
-    model: cfg.model,
+    model: ttadkGateway ? undefined : cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
+    skillPluginDir: cfg.skillPluginDir,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -3607,25 +3885,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       ? process.env.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD ?? '2147483647'
       : undefined;
 
-  // Predict reattach vs fresh so the log line tells the truth. When a bmx-*
-  // tmux session is still alive, TmuxBackend.spawn ignores the bin/args and
-  // just `tmux attach-session`s — logging `Spawning: <new bin>` in that case
-  // is misleading and has cost real debugging time. (CliId-mismatch reattach
-  // is now blocked upstream in restoreActiveSessions / killStalePids.)
-  const persistentSessionName = effectiveBackendType === 'tmux'
-    ? TmuxBackend.sessionName(cfg.sessionId)
-    : effectiveBackendType === 'herdr'
-      ? HerdrBackend.sessionName(cfg.sessionId)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.sessionName(cfg.sessionId)
-      : undefined;
-  const willReattachPersistent = persistentSessionName
-    ? effectiveBackendType === 'tmux'
-      ? TmuxBackend.hasSession(persistentSessionName)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.hasSession(persistentSessionName)
-        : HerdrBackend.hasSession(persistentSessionName)
-    : false;
+  // Reattach vs fresh was predicted above (see willReattachPersistent) so the
+  // resume pre-flight could short-circuit on it; reuse it here so the log line
+  // tells the truth. When a bmx-* tmux session is still alive, TmuxBackend.spawn
+  // ignores the bin/args and just `tmux attach-session`s — logging
+  // `Spawning: <new bin>` in that case is misleading and has cost real
+  // debugging time. (CliId-mismatch reattach is now blocked upstream in
+  // restoreActiveSessions / killStalePids.)
   if (willReattachPersistent) {
     log(`Re-attaching to existing ${effectiveBackendType} session: ${persistentSessionName} (requested CLI: ${cliAdapter.resolvedBin})`);
   } else {
@@ -3679,6 +3945,16 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // passthrough whitelist (BOTMUX_INJECTED_ENV_KEYS) so the tmux backend forwards
   // them past the server's global env.
   if (cliAdapter.spawnEnv) Object.assign(childEnv, cliAdapter.spawnEnv);
+
+  // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
+  // ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN to run a bot on GLM/a 3rd-party
+  // provider, an HTTPS_PROXY, or a CLI feature flag. Passed as injectEnv (NOT
+  // merged into childEnv) so the tmux/zellij backends inject it via the per-pane
+  // `/usr/bin/env` prefix and never into the shared backing-server global env,
+  // keeping it from leaking across bots. Re-sanitized here (crossed IPC).
+  const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  const perBotInjectKeys = Object.keys(perBotInjectEnv);
+  if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
 
   // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
   // per-session project copy + de-identified config. The agent's `botmux send`
@@ -3743,6 +4019,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           hidePaths: cfg.sandboxHidePaths ?? [],
           authPaths: cliAdapter.authPaths,
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
+          readonlyRoots: cfg.skillReadonlyRoots ?? [],
         });
         if (sbx) {
           spawnBin = sbx.bin;
@@ -3775,15 +4052,46 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // bin 走 PATH 解析），无需 wrapper 脚本、跨系统。aiden x claude 形态会剥掉 aiden 拒收的
   // --settings（见 buildWrappedLaunch）。与文件沙盒互斥：沙盒已把命令重写成 bwrap，叠加
   // 前缀会破坏隔离，故 sandboxOn 时跳过并告警（网关 + oncall 沙盒本就不是合理组合）。
+  // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
+  // below. Strip any value inherited from the daemon's own env first so a
+  // daemon launched under `cjadk feishu` (which exports it) can't leak it via
+  // the tmux env allowlist into EVERY bot's pane — only the cjadk branch should
+  // ever (re)set it. Harmless for non-cjadk CLIs (they don't read it), but this
+  // keeps the behaviour intentional rather than ambient. (Codex review note.)
+  delete (childEnv as Record<string, string>).CJADK_INTERACTIVE;
+
   if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
     if (sandboxOn) {
       log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with bwrap)`);
     } else {
-      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b);
+      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b, {
+        ttadkModel: cfg.model,
+      });
       if (launch.bin) {
         spawnBin = launch.bin;
         spawnArgs = launch.args;
         log(`Launch prefix: spawning ${spawnBin} ${spawnArgs.slice(0, 2).join(' ')} … (cliId=${cfg.cliId})`);
+        // ttadk runs its launched agent through a gateway that pops an interactive
+        // model-picker unless `-m <model>` is given. buildWrappedLaunch injects
+        // `-m <bot.model || glm-5.1> --skip-check` into the ttadk prefix above
+        // (CoCo excluded — it takes no -m). The model is sourced from the bot's
+        // `model` config (editable in the dashboard), NOT baked into wrapperCli.
+        if (ttadkGateway) {
+          log(`ttadk launcher: model=${(cfg.model ?? '').trim() || 'glm-5.1 (default)'} injected as -m, suppressed on underlying ${cfg.cliId}`);
+        }
+        // cjadk runs its launched agent in an INTERACTIVE wrapper by default —
+        // a model/session selector at startup plus terminal quirks that fight
+        // botmux's automated input (the selector eats the first prompt; the
+        // pre-render lag fragments multi-line messages; follow-ups can stick in
+        // the input box). cjadk's own botmux integration (`cjadk feishu`, see its
+        // botmux-wrapper-writer) sets CJADK_INTERACTIVE=0 to disable all of that.
+        // We mirror it here so a `cjadk <agent>` wrapperCli is driven the way
+        // cjadk intends — no selector, clean soft-newline input. Keyed on the
+        // wrapper's leading token so only cjadk launches are affected.
+        if (parseWrapperCli(cfg.wrapperCli)[0] === 'cjadk') {
+          (childEnv as Record<string, string>).CJADK_INTERACTIVE = '0';
+          log('cjadk launcher: set CJADK_INTERACTIVE=0 (non-interactive, mirrors cjadk feishu wrapper)');
+        }
       }
     }
   }
@@ -3793,6 +4101,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     cols: PTY_COLS,
     rows: PTY_ROWS,
     env: childEnv as Record<string, string>,
+    injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
   });
 
   // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)
@@ -3845,6 +4154,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     });
   };
   if (cliPid) startWrapperRealPidResolve(cliPid);
+  if (cliPid) observeCursorCliSessionId(cliPid);
 
   // Wire pid + cwd so the claude-code adapter's writeInput can read
   // ~/.claude/sessions/<pid>.json — the spawn-time pid-state record. Its
@@ -3891,6 +4201,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI
         // pid too (mirrors the synchronous path above). No-op for non-wrapperCli.
         startWrapperRealPidResolve(pid);
+        observeCursorCliSessionId(pid, 'async');
         return;
       }
       if (++attempts < 25) setTimeout(resolveCliPidLate, 120); // ~3s budget
@@ -4014,7 +4325,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
   // Set up idle detection
   idleDetector = new IdleDetector(cliAdapter);
-  idleDetector.onIdle(() => {
+  idleDetector.onIdle(async () => {
     log('Prompt detected (idle)');
     // Bridge drain MUST run before markPromptReady() — the latter calls
     // flushPending() which can immediately fire the next queued message
@@ -4048,6 +4359,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (isPipeMode && backend && 'isReattach' in backend && backend.isReattach) {
     log(`Re-attached to existing ${effectiveBackendType} session via pipe backend: ${persistentSessionName}`);
     seedBackendScreen(`${effectiveBackendType} reattach`, backend);
+    scheduleReattachIdleProbe(`${effectiveBackendType} reattach`, backend);
   }
 
   // Fallback: if the CLI takes too long to show its prompt (e.g. slow
@@ -4061,6 +4373,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       awaitingFirstPrompt = false;
       renderer?.markNewTurn();
       log('First prompt timeout — enabling screen updates and flushing queued messages');
+      if (backend && cliAdapter?.busyPattern && probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)) {
+        return;
+      }
       // For type-ahead adapters (Codex/CoCo/TRAE/Claude) the TUI is booted
       // enough to park input even if the idle detector hasn't fired yet.
       // Directly invoking markPromptReady() would claim the CLI is idle
@@ -4074,6 +4389,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 function killCli(): void {
   idleDetector?.dispose();
   idleDetector = null;
+  stopReattachIdleProbe();
+  stopBusyPatternIdleProbe();
   // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
@@ -4665,10 +4982,17 @@ process.on('message', async (raw: unknown) => {
 
         // Queue the initial prompt — flushed when CLI shows idle.
         // Adapters with passesInitialPromptViaArgs (e.g. Gemini -i) bake the
-        // prompt into CLI args, so we skip queuing to avoid double-send.
-        // Bridge mark is deferred to flushPending — see flushPending
-        // comment for why marking at enqueue is wrong.
-        if (msg.prompt && !cliAdapter?.passesInitialPromptViaArgs) {
+        // prompt into CLI args, so we normally skip queuing to avoid double-send.
+        // EXCEPTION: when this bot has startupCommands, spawnCli deliberately did
+        // NOT bake the prompt (deferInitialPrompt) so the commands can precede it
+        // — so we MUST queue it here. shouldDeferInitialPromptForStartup mirrors
+        // spawnCli's decision exactly. Bridge mark is deferred to flushPending.
+        const deferInitialPrompt = shouldDeferInitialPromptForStartup({
+          hasStartupCommands: !!msg.startupCommands?.length,
+          adoptMode: msg.adoptMode === true,
+          passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
+        });
+        if (msg.prompt && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
           pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
         }
 
@@ -4782,20 +5106,14 @@ process.on('message', async (raw: unknown) => {
       usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       if (backend) {
-        if ('sendText' in backend && 'sendSpecialKeys' in backend) {
-          (backend as any).sendText(msg.content);
-          // Beat between text and Enter so the CLI's slash-command picker has
-          // time to register the match before submit. Without this, Codex
-          // (and likely other Ink-based TUIs) fires Enter while the picker
-          // is still building, dismisses the match, and submits the literal
-          // `/clear` as a regular user prompt — visible to the user as
-          // "/clear + 换行" stuck in conversation history. 200ms mirrors the
-          // codex adapter's own writeInput paste-detection delay.
-          await new Promise(r => setTimeout(r, 200));
-          (backend as any).sendSpecialKeys('Enter');
-        } else {
-          backend.write(msg.content + '\r');
-        }
+        // sendRawCommandLine: literal text → 200ms beat (so the CLI's slash-
+        // command picker registers the match before submit; without it Codex /
+        // other Ink TUIs fire Enter while the picker is still building, dismiss
+        // the match, and submit the literal `/clear` as a regular user prompt —
+        // visible to the user as "/clear + 换行" stuck in history; the 200ms
+        // mirrors the codex adapter's own writeInput paste-detection delay) →
+        // Enter. Shared with runStartupCommands so both stay in lockstep.
+        await sendRawCommandLine(backend, msg.content);
         isPromptReady = false;
         idleDetector?.reset();
         log(`Passthrough slash command: ${msg.content}`);
@@ -4924,7 +5242,15 @@ process.on('message', async (raw: unknown) => {
       log('Suspend requested');
       stopScreenshotLoop();
       stopBridgeWatcher();
-      try { backend?.kill(); } catch { /* detach best-effort */ }
+      // Free the CLI's memory, not just the worker's: destroySession kills the
+      // backing tmux/herdr/zellij session AND the CLI process inside it (kill()
+      // would only detach the pty viewer and leave the CLI running in the
+      // background — defeating the whole point of a session cap, since the CLI
+      // is the memory hog). On the next message the session cold-resumes via
+      // forkWorker(resume=true) → a fresh `new-session --resume <cliSessionId>`
+      // that rebuilds context from the on-disk transcript (same path the daemon
+      // uses to recover sessions after a reboot kills the tmux server).
+      try { (backend?.destroySession ?? backend?.kill)?.call(backend); } catch { /* best-effort */ }
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: preserve the sandbox overlay mount + the

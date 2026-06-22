@@ -6,6 +6,7 @@ type OnboardingStatus =
   | 'verifying'
   | 'configuring_permissions'
   | 'waiting_for_platform_scan'
+  | 'needs_owner'
   | 'completed'
   | 'failed';
 
@@ -38,10 +39,19 @@ type OnboardingJob = {
   message?: string;
 };
 
-type CliOption = { id: string; label: string };
+type CliOption = {
+  id: string;
+  label: string;
+  // ttadk 网关项 (后端 /api/cli-options 标注): 选中时模型框默认成 ttadk 默认模型 + 挂候选.
+  gateway?: 'ttadk';
+  acceptsModel?: boolean; // ttadk 子命令是否接受 -m (CoCo 为 false)
+};
 
 let dialog: HTMLDialogElement | null = null;
 let pollTimer: number | null = null;
+// ttadk 模型默认值 + 候选 (随 /api/cli-options 一起拉取, 单一事实源在 cli-selection).
+let ttadkModelDefault = 'glm-5.1';
+let ttadkModelSuggestions: string[] = [];
 
 function stopPolling(): void {
   if (pollTimer !== null) {
@@ -68,14 +78,15 @@ function statusText(job: OnboardingJob): string {
       : t('botOnboarding.configuringPermissions');
   }
   if (job.status === 'waiting_for_platform_scan') return t('botOnboarding.platformScanHint');
+  if (job.status === 'needs_owner') return t('botOnboarding.needsOwner');
   if (job.status === 'completed') return t('botOnboarding.completed');
   if (job.status === 'failed') return `${t('botOnboarding.failed')}: ${escapeHtml(job.message ?? job.error ?? 'unknown')}`;
   return t('botOnboarding.starting');
 }
 
-/** 完成页的权限摘要 / 手动兜底步骤. */
+/** 完成页 / 待填 owner 页的权限摘要 / 手动兜底步骤. */
 function permissionBlock(job: OnboardingJob): string {
-  if (job.status !== 'completed' || !job.permission) return '';
+  if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return '';
   const p = job.permission;
   if (p.ok) {
     const parts = [t('botOnboarding.permissionOk', { count: p.scopeCount ?? 0 })];
@@ -95,7 +106,24 @@ function permissionBlock(job: OnboardingJob): string {
     + (steps ? `<ol class="onboarding-steps">${steps}</ol>` : '');
 }
 
-function renderJob(job: OnboardingJob): void {
+/** needs_owner：扫码人身份验证不了, 让用户手动填 owner (带内联报错). */
+function ownerBlock(job: OnboardingJob, ownerError?: string): string {
+  if (job.status !== 'needs_owner') return '';
+  const errorHtml = ownerError ? `<p class="form-error">${escapeHtml(ownerError)}</p>` : '';
+  return `<form id="ob-owner-form" class="onboarding-form">
+      <label class="onboarding-field">
+        <span>${t('botOnboarding.ownerLabel')}</span>
+        <input id="ob-owner" type="text" placeholder="${t('botOnboarding.ownerPlaceholder')}" autocomplete="off" spellcheck="false">
+      </label>
+      <p class="hint-warn">${t('botOnboarding.ownerHint')}</p>
+      ${errorHtml}
+      <menu class="onboarding-actions">
+        <button type="submit" class="primary">${t('botOnboarding.ownerSubmit')}</button>
+      </menu>
+    </form>`;
+}
+
+function renderJob(job: OnboardingJob, ownerError?: string): void {
   const d = ensureDialog();
   // 第 1 个二维码: 扫码建应用
   const appQr = job.status === 'waiting_for_scan' && job.qrDataUrl
@@ -129,18 +157,99 @@ function renderJob(job: OnboardingJob): void {
     ${platformQr}
     ${metaLine}
     ${permissionBlock(job)}
+    ${ownerBlock(job, ownerError)}
     ${restartHint}
     <form method="dialog"><button>${t('botOnboarding.close')}</button></form>
   </article>`;
+
+  // needs_owner：把提交挂上去 (走 /owner 端点, 通过校验后转 completed)。
+  if (job.status === 'needs_owner') {
+    const ownerForm = d.querySelector<HTMLFormElement>('#ob-owner-form');
+    ownerForm?.addEventListener('submit', ev => {
+      ev.preventDefault();
+      const owner = d.querySelector<HTMLInputElement>('#ob-owner')?.value ?? '';
+      void submitOwner(job, owner);
+    });
+  }
+}
+
+async function submitOwner(job: OnboardingJob, ownerRaw: string): Promise<void> {
+  if (!ownerRaw.trim()) {
+    renderJob(job, t('botOnboarding.ownerEmpty'));
+    return;
+  }
+  try {
+    const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(job.id)}/owner`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ owner: ownerRaw.trim() }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      // 校验失败 (格式 / 不可用): 留在 needs_owner 内联报错, 不丢已填值的语义。
+      renderJob(job, body?.message ?? body?.error ?? t('botOnboarding.ownerInvalid'));
+      return;
+    }
+    if (body?.job) renderJob(body.job);
+  } catch (err) {
+    renderJob(job, err instanceof Error ? err.message : String(err));
+  }
 }
 
 async function fetchCliOptions(): Promise<CliOption[]> {
   try {
     const res = await fetch('/api/cli-options');
     const body = await res.json();
-    if (res.ok && Array.isArray(body?.options)) return body.options as CliOption[];
+    if (res.ok && Array.isArray(body?.options)) {
+      if (typeof body.ttadkModelDefault === 'string' && body.ttadkModelDefault.trim()) {
+        ttadkModelDefault = body.ttadkModelDefault.trim();
+      }
+      if (Array.isArray(body.ttadkModelSuggestions)) {
+        ttadkModelSuggestions = body.ttadkModelSuggestions.filter((s: unknown): s is string => typeof s === 'string');
+      }
+      return body.options as CliOption[];
+    }
   } catch { /* fall through to default */ }
   return [{ id: 'claude-code', label: 'Claude' }];
+}
+
+/**
+ * 根据当前选中的 CLI 调整模型输入框：
+ *   - ttadk 网关 (接受 -m): 候选下拉 + 默认值 (空框时回填 ttadk 默认模型)
+ *   - ttadk CoCo (不接受 -m): 禁用并提示无需模型
+ *   - 其它 CLI: 普通占位, 留空走 CLI 默认模型
+ * 仅在切换到「之前不是同类」时回填默认值, 不覆盖用户已手填的内容。
+ */
+function syncModelFieldForCli(opts: CliOption[]): void {
+  const d = dialog;
+  if (!d) return;
+  const cli = d.querySelector<HTMLSelectElement>('#ob-cli');
+  const model = d.querySelector<HTMLInputElement>('#ob-model');
+  const list = d.querySelector<HTMLDataListElement>('#ob-model-suggestions');
+  if (!cli || !model) return;
+  const opt = opts.find(o => o.id === cli.value);
+  const isTtadk = opt?.gateway === 'ttadk';
+  const acceptsModel = isTtadk && opt?.acceptsModel !== false;
+
+  if (isTtadk && !acceptsModel) {
+    // CoCo: ttadk 不接受 -m
+    model.value = '';
+    model.disabled = true;
+    model.placeholder = t('botOnboarding.modelTtadkCocoPlaceholder');
+    return;
+  }
+  model.disabled = false;
+  if (acceptsModel) {
+    if (list) list.innerHTML = ttadkModelSuggestions.map(m => `<option value="${escapeHtml(m)}"></option>`).join('');
+    model.placeholder = t('botOnboarding.modelTtadkPlaceholder').replace('{model}', ttadkModelDefault);
+    // 切到 ttadk 且用户没手填 → 回填默认模型, 让「不写 wrapper、开箱即用」成立.
+    if (!model.value.trim()) model.value = ttadkModelDefault;
+  } else {
+    if (list) list.innerHTML = '';
+    model.placeholder = t('botOnboarding.modelPlaceholder');
+    // 从 ttadk 切回普通 CLI: 清掉之前回填的 ttadk 默认模型, 避免误带.
+    if (model.value.trim() === ttadkModelDefault) model.value = '';
+  }
 }
 
 function renderForm(options: CliOption[], errorMsg?: string): void {
@@ -165,7 +274,8 @@ function renderForm(options: CliOption[], errorMsg?: string): void {
       </label>
       <label class="onboarding-field">
         <span>${t('botOnboarding.modelLabel')}</span>
-        <input id="ob-model" type="text" placeholder="${t('botOnboarding.modelPlaceholder')}" autocomplete="off" spellcheck="false">
+        <input id="ob-model" type="text" list="ob-model-suggestions" placeholder="${t('botOnboarding.modelPlaceholder')}" autocomplete="off" spellcheck="false">
+        <datalist id="ob-model-suggestions"></datalist>
       </label>
       ${errorHtml}
       <menu class="onboarding-actions">
@@ -178,6 +288,10 @@ function renderForm(options: CliOption[], errorMsg?: string): void {
   const form = d.querySelector<HTMLFormElement>('#onboarding-form');
   const cancel = d.querySelector<HTMLButtonElement>('#ob-cancel');
   cancel?.addEventListener('click', () => d.close());
+  // ttadk 网关项: 选中时把模型框默认成 ttadk 默认模型 + 挂候选 (CoCo 禁用).
+  const cliSelect = d.querySelector<HTMLSelectElement>('#ob-cli');
+  cliSelect?.addEventListener('change', () => syncModelFieldForCli(options));
+  syncModelFieldForCli(options);
   form?.addEventListener('submit', ev => {
     ev.preventDefault();
     const cliId = d.querySelector<HTMLSelectElement>('#ob-cli')?.value ?? '';
@@ -227,7 +341,11 @@ async function pollJob(id: string): Promise<void> {
   const body = await res.json();
   if (!res.ok || !body?.job) throw new Error(body?.error ?? `http_${res.status}`);
   renderJob(body.job);
-  if (body.job.status === 'completed' || body.job.status === 'failed') stopPolling();
+  // needs_owner 也停轮询：它是等用户操作的状态, 继续轮询会周期性重渲染、清掉用户
+  // 正在输入的 owner。后续由 owner 提交流程驱动渲染。
+  if (body.job.status === 'completed' || body.job.status === 'failed' || body.job.status === 'needs_owner') {
+    stopPolling();
+  }
 }
 
 async function openBotOnboarding(): Promise<void> {

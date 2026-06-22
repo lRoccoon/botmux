@@ -45,6 +45,12 @@ export interface ResumableSession {
   lastActivityAt: number;
 }
 
+export interface SkillDeliveryCapability {
+  readonly nativeKind: 'claude-plugin' | 'skill-root';
+  readonly supportsScopedSession: boolean;
+  readonly supportsExclusive: boolean;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -75,6 +81,8 @@ export interface CliAdapter {
     model?: string;
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Optional session-scoped skill plugin/root prepared by botmux. */
+    skillPluginDir?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
@@ -143,6 +151,11 @@ export interface CliAdapter {
    *  (and mis-fire) them. Mutually exclusive with `skillsDir`. */
   readonly pluginDir?: string;
 
+  /** Optional native skill delivery support for user/team custom skills.
+   *  This is separate from `skillsDir`/`pluginDir`, which are still used by
+   *  botmux-owned built-in bridge skills. */
+  readonly skillDelivery?: SkillDeliveryCapability;
+
   /** hook 安装描述：spawn 时写入各 CLI 的 hook 配置，使 askUserQuestion 事件转发到
    *  `botmux hook <cliId>`。undefined = 不通过 hook 接管 askUserQuestion。 */
   readonly hookInstall?: {
@@ -171,6 +184,12 @@ export interface CliAdapter {
 
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
+
+  /** Busy marker regex — matches when the CLI is explicitly rendering a
+   *  still-running state. Used for re-attached persistent sessions where there
+   *  may be no new PTY output: if the current screen does NOT match this marker,
+   *  the worker may safely let quiescence mark the session idle. */
+  readonly busyPattern?: RegExp;
 
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
@@ -209,6 +228,11 @@ export interface CliAdapter {
    *  assistant_final). CodexBridgeQueue's HOL-block-drop keeps attribution
    *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
+
+  /** When true, worker may squash additional queued Lark messages into the
+   *  pending tail instead of preserving one botmux turn per queued message.
+   *  Keep this opt-in: most adapters rely on distinct turnId / card routing. */
+  readonly mergeQueuedInput?: boolean;
 
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
@@ -319,4 +343,4 @@ export interface CliAdapter {
   readonly defaultPassthroughCommands?: readonly string[];
 }
 
-export type CliId = 'claude-code' | 'seed' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi';

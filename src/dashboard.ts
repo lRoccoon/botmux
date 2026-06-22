@@ -5,8 +5,9 @@ import {
   readFileSync, existsSync, chmodSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, dirname, extname } from 'node:path';
+import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { randomBytes, createHmac } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
@@ -28,18 +29,52 @@ import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
-import { CLI_SELECT_OPTIONS, resolveCliSelection } from './setup/cli-selection.js';
+import {
+  CLI_SELECT_OPTIONS,
+  resolveCliSelection,
+  isTtadkWrapper,
+  ttadkAcceptsModel,
+  TTADK_DEFAULT_MODEL,
+  TTADK_MODEL_SUGGESTIONS,
+} from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeDashboardConfig, mergeGlobalConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig, type RepoPickerMode } from './global-config.js';
+import { mergeDashboardConfig, mergeGlobalConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocale } from './i18n/types.js';
-import { isLocalDevInstall } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion } from './utils/install-info.js';
+import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
+import { GITHUB_REPO } from './core/restart-report.js';
+import { spawnDetachedRestart, npmGlobalUpdateLockTarget } from './core/maintenance.js';
+import { writeRestartIntent } from './services/restart-intent-store.js';
+import { withFileLock } from './utils/file-lock.js';
+import { spawn } from 'node:child_process';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
+import {
+  installLocalSkillLinks,
+  readSkillRegistry,
+  removeInstalledSkill,
+  updateInstalledSkillAsync,
+} from './services/skill-registry-store.js';
+import { redactGitUrlCredentials } from './core/skills/sources.js';
+import { loadBotConfigs } from './bot-registry.js';
+import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
+import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
+import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
+import { installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
+import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
+import { isValidRoleProfileId } from './services/role-profile-store.js';
+import { mergeSafeInsightOverviews } from './services/insight/report.js';
+import type { SafeInsightOverview } from './services/insight/types.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+/** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
+ *  aggregate latency when one daemon's insight parse is slow or hung. */
+const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
@@ -119,6 +154,8 @@ interface ResolvedDashboardSettings {
   /** True when running from a source checkout — the Settings UI greys out the
    *  auto-update toggle (npm-global only). */
   localDevInstall: boolean;
+  /** Optional local project whiteboard. Disabled by default. */
+  whiteboard: WhiteboardConfig;
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
@@ -130,6 +167,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
+    whiteboard: { enabled: global.whiteboard?.enabled === true },
   };
 }
 
@@ -138,6 +176,68 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   for await (const c of req) chunks.push(c as Buffer);
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   return raw ? JSON.parse(raw) : {};
+}
+
+/** Fast in-process guard against double-clicks within this dashboard process.
+ *  Cross-process serialization against the maintenance auto-update (a different
+ *  process) is handled separately by the shared file lock in the run route. */
+let updateInFlight = false;
+
+// Cache the upstream version/changelog lookups so the nav-badge check + the
+// Settings card don't hammer the npm registry / GitHub on every page load.
+// GitHub's unauthenticated API is only 60 req/h per IP, so caching the changelog
+// also keeps us from exhausting it. Failures cache briefly so they self-heal.
+const LATEST_TTL_MS = 30 * 60_000;
+const CHANGELOG_TTL_MS = 15 * 60_000;
+const FAILURE_TTL_MS = 60_000;
+let latestVersionCache: { value: string | null; at: number } | null = null;
+let changelogCache: { key: string; value: ChangelogResult; at: number } | null = null;
+
+async function cachedLatestVersion(now = Date.now()): Promise<string | null> {
+  const ttl = latestVersionCache?.value ? LATEST_TTL_MS : FAILURE_TTL_MS;
+  if (latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache.value;
+  const value = await fetchLatestVersion();
+  latestVersionCache = { value, at: now };
+  return value;
+}
+
+async function cachedChangelog(current: string, now = Date.now()): Promise<ChangelogResult> {
+  const ttl = changelogCache?.value.ok ? CHANGELOG_TTL_MS : FAILURE_TTL_MS;
+  if (changelogCache && changelogCache.key === current && now - changelogCache.at < ttl) return changelogCache.value;
+  const value = await fetchReleasesSince(current);
+  changelogCache = { key: current, value, at: now };
+  return value;
+}
+
+/**
+ * Run `npm install -g botmux@latest` for the manual-update flow WITHOUT blocking
+ * the event loop (async spawn, not execSync — the dashboard must keep serving
+ * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
+ * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
+ * a fixed literal — no shell interpolation of untrusted input.
+ */
+function runNpmInstallLatest(): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn('npm', ['install', '-g', 'botmux@latest'], {
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32', // resolve npm.cmd on Windows
+    });
+    let tail = '';
+    const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
+    child.stdout?.on('data', capture);
+    child.stderr?.on('data', capture);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('npm install timed out after 180s'));
+    }, 180_000);
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`npm exited ${code}: ${tail.trim().slice(-500)}`));
+    });
+  });
 }
 
 /**
@@ -208,7 +308,7 @@ await Promise.all(registry.list().map(attachDaemon));
 // ─── Static frontend ─────────────────────────────────────────────────────────
 
 // Path to the bundled frontend (sibling of dist/dashboard.js)
-const __dirname = dirname(new URL(import.meta.url).pathname);
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(__dirname, 'dashboard-web');
 
 const MIME: Record<string, string> = {
@@ -239,15 +339,33 @@ function serveFileAbs(res: ServerResponse, fp: string): boolean {
   return true;
 }
 
-function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-  const fp = join(WEB_DIR, rel);
-  // Path-traversal guard: resolved path must stay inside WEB_DIR
-  if (!fp.startsWith(WEB_DIR + '/') && fp !== join(WEB_DIR, 'index.html')) return false;
+  const fp = resolve(WEB_DIR, rel);
+  const webRoot = resolve(WEB_DIR);
+  const relToRoot = relative(webRoot, fp);
+  // Path-traversal guard: resolved path must stay inside WEB_DIR.
+  if (relToRoot === '..' || relToRoot.startsWith('..\\') || relToRoot.startsWith('../') || isAbsolute(relToRoot)) return false;
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
-    res.writeHead(200, { 'content-type': MIME[extname(fp)] ?? 'application/octet-stream' });
+    // Bundle filenames are fixed (app.js/style.css), so without revalidation
+    // browsers heuristic-cache them and serve a stale build after a deploy
+    // (new JS + old CSS → broken layout). `no-cache` + an mtime/size ETag makes
+    // the browser revalidate every load: 304 when unchanged (cheap), fresh 200
+    // when the build changed. No manual hard-refresh needed after deploy.
+    const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+    const headers: Record<string, string> = {
+      'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
+      'cache-control': 'no-cache',
+      etag,
+    };
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, headers);
+      res.end();
+      return true;
+    }
+    res.writeHead(200, headers);
     res.end(readFileSync(fp));
     return true;
   } catch {
@@ -281,13 +399,29 @@ async function proxyToDaemon(
  *  Surfaces invalidBotIds/invalidUserIds so the UI never implies a non-added
  *  bot/user joined. */
 /** Live daemon-registry bots — authoritative source for THIS deployment's
- *  bots (cliId added from bots-info.json downstream). Fixes an empty/stale
- *  bots-info.json hiding running bots from the team roster / federation. */
-function liveBots(): { larkAppId: string; botName: string }[] {
-  return registry.list().map(d => ({ larkAppId: d.larkAppId, botName: d.botName }));
+ *  bots. cliId comes from the daemon descriptor, with bots.json as a
+ *  compatibility fallback for descriptors written by older daemons. */
+function configuredCliIds(): Map<string, string> {
+  try {
+    return new Map(loadBotConfigs().map(b => [b.larkAppId, b.cliId]));
+  } catch {
+    return new Map();
+  }
 }
 
-async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[] }): Promise<{
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string }>(bot: T, ids: Map<string, string>): T & { cliId?: string } {
+  return bot.cliId ? bot : { ...bot, cliId: ids.get(bot.larkAppId) };
+}
+
+function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
+  const ids = configuredCliIds();
+  return registry.list().map(d => {
+    const b = withConfiguredCliId(d, ids);
+    return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
+  });
+}
+
+async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[]; roleProfileId?: string }): Promise<{
   ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidUserIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string; autoInviteUnavailable?: boolean;
 }> {
   const selectedIds = Array.from(new Set(args.larkAppIds.filter(Boolean)));
@@ -313,7 +447,13 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     const upstream = await proxyToDaemon(plan.creatorLarkAppId, '/api/groups/create', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: args.name, larkAppIds: selectedIds, userOpenIds, ownerUnionIds: args.ownerUnionIds ?? [] }),
+      body: JSON.stringify({
+        name: args.name,
+        larkAppIds: selectedIds,
+        userOpenIds,
+        ownerUnionIds: args.ownerUnionIds ?? [],
+        ...(args.roleProfileId ? { roleProfileId: args.roleProfileId } : {}),
+      }),
     });
     const text = await upstream.text();
     let parsed: any = null;
@@ -437,6 +577,148 @@ function verifyCliRequest(req: IncomingMessage, pathname: string):
 /** Build the dashboard URL for a token, using the actually-bound port. */
 function dashboardUrlFor(token: string): string {
   return `http://${config.dashboard.externalHost}:${boundDashboardPort}/?t=${token}`;
+}
+
+type SkillJobStatus = 'running' | 'succeeded' | 'failed';
+interface SkillJob {
+  id: string;
+  type: 'install' | 'update';
+  status: SkillJobStatus;
+  createdAt: string;
+  updatedAt: string;
+  skill?: SkillPackage;
+  error?: string;
+}
+
+const skillJobs = new Map<string, SkillJob>();
+const MAX_SKILL_JOBS = 50;
+
+function publicSkillJob(job: SkillJob): Record<string, unknown> {
+  return {
+    id: job.id,
+    type: job.type,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    skill: job.skill ? sanitizeSkillForDashboard(job.skill) : undefined,
+    error: job.error,
+  };
+}
+
+function trimSkillJobs(): void {
+  const jobs = [...skillJobs.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  while (jobs.length > MAX_SKILL_JOBS) {
+    const old = jobs.shift();
+    if (old) skillJobs.delete(old.id);
+  }
+}
+
+function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage>): SkillJob {
+  const now = new Date().toISOString();
+  const job: SkillJob = {
+    id: randomBytes(8).toString('hex'),
+    type,
+    status: 'running',
+    createdAt: now,
+    updatedAt: now,
+  };
+  skillJobs.set(job.id, job);
+  trimSkillJobs();
+  setImmediate(() => void (async () => {
+    try {
+      job.skill = await run();
+      job.status = 'succeeded';
+    } catch (err: any) {
+      job.error = redactGitUrlCredentials(err?.message ?? String(err));
+      job.status = 'failed';
+    } finally {
+      job.updatedAt = new Date().toISOString();
+      trimSkillJobs();
+    }
+  })());
+  return job;
+}
+
+function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
+  if (skill.source.type !== 'git') return skill;
+  return {
+    ...skill,
+    source: { ...skill.source, url: redactGitUrlCredentials(skill.source.url) },
+  };
+}
+
+function dashboardSkillCliIds(): CliId[] {
+  const ids = new Set<CliId>();
+  try {
+    for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
+  } catch {
+    // Fall back to daemon descriptors below when persistent config is unavailable.
+  }
+  for (const bot of registry.list()) {
+    if (bot.cliId) ids.add(bot.cliId as CliId);
+  }
+  return [...ids];
+}
+
+function dashboardSkillsPayload(): Record<string, unknown> {
+  const globalSkills = readGlobalConfig().skills ?? {};
+  const nativeSkillGroups = discoverNativeCliSkillGroups(dashboardSkillCliIds())
+    .map(group => ({
+      ...group,
+      skills: group.skills.map(sanitizeSkillForDashboard),
+    }));
+  return {
+    skills: Object.values(readSkillRegistry().skills)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(sanitizeSkillForDashboard),
+    nativeSkillGroups,
+    trustProjectSkills: globalSkills.trustProjectSkills ?? 'off',
+    delivery: globalSkills.delivery ?? 'auto',
+  };
+}
+
+function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: SkillReferenceBot): void {
+  const current = refs.get(ref.larkAppId);
+  if (!current) {
+    refs.set(ref.larkAppId, { ...ref });
+    return;
+  }
+  current.direct ||= ref.direct;
+}
+
+async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
+  const refs = new Map<string, SkillReferenceBot>();
+  try {
+    for (const ref of analyzeSkillReferences(skillName, {
+      bots: loadBotConfigs(),
+    }).bots) mergeSkillReferenceBot(refs, ref);
+  } catch {
+    // Fall back to online daemon data below when the dashboard process cannot
+    // read persistent bot config.
+  }
+
+  const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+  const onlineRefs = await Promise.all(onlineBots.map(async d => {
+    try {
+      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`, {
+        signal: AbortSignal.timeout(1_500),
+      });
+      if (!r.ok) return null;
+      const j = await r.json() as any;
+      const [ref] = analyzeSkillReferences(skillName, {
+        bots: [{ larkAppId: d.larkAppId, botName: d.botName ?? j.botName ?? d.larkAppId, skills: j.skills as BotSkillPolicy | null | undefined }],
+      }).bots;
+      return ref ?? null;
+    } catch {
+      return null;
+    }
+  }));
+  for (const ref of onlineRefs) {
+    if (ref) mergeSkillReferenceBot(refs, ref);
+  }
+  return {
+    bots: [...refs.values()].sort((a, b) => a.botName.localeCompare(b.botName)),
+  };
 }
 
 const server = createServer(async (req, res) => {
@@ -578,6 +860,27 @@ const server = createServer(async (req, res) => {
       });
       return jsonRes(res, 200, { sessions });
     }
+    if (req.method === 'GET' && url.pathname === '/api/insights/summary') {
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
+      // Per-daemon timeout + isolate failures: an upstream insight parse can be
+      // heavy, so a slow/hung daemon must not stall the aggregated summary. A
+      // timed-out / errored chunk drops to null and is filtered out below.
+      const chunks = await Promise.all(registry.list().map(async d => {
+        try {
+          const upstream = await proxyToDaemon(d.larkAppId, `/api/insights/summary?limit=${limit}`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(INSIGHT_FANOUT_TIMEOUT_MS),
+          });
+          if (!upstream.ok) return null;
+          const body = await upstream.json().catch(() => null) as { overview?: SafeInsightOverview } | null;
+          return body?.overview ?? null;
+        } catch {
+          return null;
+        }
+      }));
+      const overview = mergeSafeInsightOverviews(chunks.filter((x): x is SafeInsightOverview => !!x), { limit });
+      return jsonRes(res, 200, { ok: true, overview });
+    }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       // Public-read carve-out: the row carries CONTENT (prompt = business
       // instructions) and a bound `workingDir` (repo/customer path) — strip
@@ -622,6 +925,14 @@ const server = createServer(async (req, res) => {
         mergeGlobalConfig({ repoPickerMode: v });
         touched = true;
       }
+      if ('whiteboard' in body) {
+        const raw = body.whiteboard;
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return jsonRes(res, 400, { ok: false, error: 'invalid_whiteboard' });
+        const wb = raw as Record<string, unknown>;
+        if (typeof wb.enabled !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_whiteboard_enabled' });
+        mergeGlobalConfig({ whiteboard: { enabled: wb.enabled } });
+        touched = true;
+      }
       if ('maintenance' in body) {
         const r = parseMaintenancePatch(body.maintenance);
         if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.error });
@@ -658,6 +969,223 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true, settings: resolveDashboardSettings() });
     }
 
+    // ─── Version & manual update ─────────────────────────────────────────────
+    // `npm install -g` and a host restart are privileged: none of these paths
+    // are on PUBLIC_READ_PATHS, so decideDashboardAuth already 401s an
+    // unauthenticated caller (in both normal and public-read mode). The explicit
+    // `authed` guards on the two mutations are defense-in-depth for host actions.
+    if (req.method === 'GET' && url.pathname === '/api/update/status') {
+      const current = resolveCurrentVersion();
+      // Compare against the npm `latest` dist-tag (always stable; the update
+      // button installs `@latest`). isNewerVersion uses semver precedence, so a
+      // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
+      // 2.86.0) is NOT flagged behind — exactly the canary case we want.
+      const latest = await cachedLatestVersion();
+      return jsonRes(res, 200, {
+        current,
+        latest,
+        behind: !!latest && isNewerVersion(latest, current),
+        localDevInstall: isLocalDevInstall(),
+        node: checkNode(),
+        installs: detectBotmuxInstalls(),
+      });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/update/changelog') {
+      const current = resolveCurrentVersion();
+      const result = await cachedChangelog(current);
+      return jsonRes(res, 200, {
+        current,
+        ok: result.ok,
+        rateLimited: result.rateLimited === true,
+        releases: result.releases,
+        releasesUrl: `https://github.com/${GITHUB_REPO}/releases`,
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/update/run') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+      const node = checkNode();
+      if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
+      if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      updateInFlight = true;
+      const oldVersion = botmuxVersion();
+      // Acquire the shared cross-process lock so a scheduled maintenance
+      // auto-update (running in the bot-0 daemon) can't `npm install -g` at the
+      // same time. `acquired` distinguishes "lock held by maintenance" (409)
+      // from "npm itself failed" (500). Short wait: don't block the request on a
+      // full in-progress install — report busy fast.
+      let acquired = false;
+      try {
+        await withFileLock(npmGlobalUpdateLockTarget(), async () => {
+          acquired = true;
+          await runNpmInstallLatest();
+        }, { maxWaitMs: 2_000 });
+      } catch (e) {
+        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        return jsonRes(res, 500, { ok: false, error: 'npm_failed', detail: e instanceof Error ? e.message : String(e) });
+      } finally {
+        updateInFlight = false;
+      }
+      const newVersion = botmuxVersion();
+      return jsonRes(res, 200, { ok: true, oldVersion, newVersion, changed: newVersion !== oldVersion });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/update/restart') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      let body: Record<string, unknown> = {};
+      try {
+        const parsed = await readJsonBody(req);
+        if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
+      } catch { /* empty / bad body → plain restart */ }
+      const upd = body.update && typeof body.update === 'object' ? body.update as Record<string, unknown> : null;
+      // After a manual update, leave an `update` breadcrumb so the fresh daemon
+      // DMs the owner the changelog (reuses the restart-report pipeline). A plain
+      // restart leaves none here; cmdRestart writes a `manual` breadcrumb itself.
+      if (upd && typeof upd.oldVersion === 'string' && typeof upd.newVersion === 'string' && upd.oldVersion !== upd.newVersion) {
+        try {
+          writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
+        } catch { /* breadcrumb is best-effort */ }
+      }
+      spawnDetachedRestart('dashboard');
+      return jsonRes(res, 200, { ok: true });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/skills') {
+      return jsonRes(res, 200, dashboardSkillsPayload());
+    }
+
+    if (req.method === 'PUT' && url.pathname === '/api/skills/global') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      if (!('trustProjectSkills' in body) && !('delivery' in body)) return jsonRes(res, 400, { ok: false, error: 'empty_patch' });
+      const patch: NonNullable<ReturnType<typeof readGlobalConfig>['skills']> = {};
+      if ('trustProjectSkills' in body) {
+        const raw = body.trustProjectSkills;
+        const trustProjectSkills = raw === 'trusted' ? 'all' : raw;
+        if (trustProjectSkills !== 'off' && trustProjectSkills !== 'all') {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_trustProjectSkills' });
+        }
+        patch.trustProjectSkills = trustProjectSkills;
+      }
+      if ('delivery' in body) {
+        const delivery = body.delivery;
+        if (delivery !== 'auto' && delivery !== 'prompt' && delivery !== 'native') {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_delivery' });
+        }
+        patch.delivery = delivery;
+      }
+      const currentSkills = readGlobalConfig().skills ?? {};
+      mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
+      return jsonRes(res, 200, { ok: true, ...dashboardSkillsPayload() });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skills/install') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      try {
+        const installRequest = parseDashboardSkillInstallRequest(body);
+        const job = startSkillJob('install', () => installDashboardSkill(installRequest));
+        return jsonRes(res, 202, { ok: true, job: publicSkillJob(job) });
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skills/install-local-links') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const sources = parseInstallLocalLinksSources(parsed);
+      if (sources.length === 0) return jsonRes(res, 400, { ok: false, error: 'sources_required' });
+      if (sources.length > MAX_LOCAL_LINK_SOURCES) return jsonRes(res, 400, { ok: false, error: 'too_many_sources' });
+      try {
+        const skills = installLocalSkillLinks(sources);
+        // Frontend re-fetches /api/skills (refresh()) after success, so we keep
+        // the response lean — no need to spread a full dashboardSkillsPayload()
+        // (which would re-run the native-skill discovery scan a second time).
+        return jsonRes(res, 200, { ok: true, installed: skills.map(sanitizeSkillForDashboard) });
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
+      }
+    }
+
+    let mSkillJob: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mSkillJob = url.pathname.match(/^\/api\/skills\/jobs\/([^/]+)$/))) {
+      const job = skillJobs.get(decodeURIComponent(mSkillJob[1]));
+      if (!job) return jsonRes(res, 404, { ok: false, error: 'job_not_found' });
+      return jsonRes(res, 200, { ok: true, job: publicSkillJob(job) });
+    }
+
+    let mSkillUpdate: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mSkillUpdate = url.pathname.match(/^\/api\/skills\/([^/]+)\/update$/))) {
+      const name = decodeURIComponent(mSkillUpdate[1]);
+      if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
+      const job = startSkillJob('update', async () => {
+        const r = await updateInstalledSkillAsync(name);
+        if (!r.ok) throw new Error(r.reason);
+        return r.skill;
+      });
+      return jsonRes(res, 202, { ok: true, job: publicSkillJob(job) });
+    }
+
+    let mSkillDelete: RegExpMatchArray | null;
+    if (req.method === 'DELETE' && (mSkillDelete = url.pathname.match(/^\/api\/skills\/([^/]+)$/))) {
+      const name = decodeURIComponent(mSkillDelete[1]);
+      const force = url.searchParams.get('force') === '1';
+      if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
+      const refs = await dashboardSkillReferences(name);
+      if (!force && refs.bots.length > 0) {
+        return jsonRes(res, 409, {
+          ok: false,
+          error: 'skill_in_use',
+          affectedBots: refs.bots,
+        });
+      }
+      const r = removeInstalledSkill(name);
+      if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+      return jsonRes(res, 200, {
+        ok: true,
+        affectedBots: refs.bots,
+        ...dashboardSkillsPayload(),
+      });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/whiteboards') {
+      return jsonRes(res, 200, { enabled: whiteboardEnabled(), whiteboards: listWhiteboards() });
+    }
+    const mWhiteboard = url.pathname.match(/^\/api\/whiteboards\/([^/]+)$/);
+    if (req.method === 'GET' && mWhiteboard) {
+      try {
+        const id = decodeURIComponent(mWhiteboard[1]);
+        return jsonRes(res, 200, { enabled: whiteboardEnabled(), id, content: readWhiteboard(id, { allowDisabled: true }) });
+      } catch (err: any) {
+        return jsonRes(res, 404, { ok: false, error: err?.message ?? 'whiteboard_not_found' });
+      }
+    }
+    if (req.method === 'DELETE' && mWhiteboard) {
+      try {
+        const id = decodeURIComponent(mWhiteboard[1]);
+        return jsonRes(res, 200, deleteWhiteboard(id));
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: err?.message ?? 'whiteboard_delete_failed' });
+      }
+    }
+
     if (await handleConnectorApi(req, res, url)) {
       return;
     }
@@ -675,7 +1203,19 @@ const server = createServer(async (req, res) => {
     // 含 aiden×claude / aiden×codex 网关项——前端打开"添加机器人"表单时拉取填充下拉.
     // id 既可能是普通 cliId, 也可能是 'aiden-x-claude' 这类选择键, 由 resolveCliSelection 解析.
     if (req.method === 'GET' && url.pathname === '/api/cli-options') {
-      return jsonRes(res, 200, { options: CLI_SELECT_OPTIONS.map((o) => ({ id: o.key, label: o.label })) });
+      return jsonRes(res, 200, {
+        options: CLI_SELECT_OPTIONS.map((o) => ({
+          id: o.key,
+          label: o.label,
+          // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
+          ...(isTtadkWrapper(o.wrapperCli)
+            ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
+            : {}),
+        })),
+        // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
+        ttadkModelDefault: TTADK_DEFAULT_MODEL,
+        ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
+      });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
@@ -712,6 +1252,33 @@ const server = createServer(async (req, res) => {
       const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : undefined;
       const job = botOnboarding.start({ cliId, wrapperCli, workingDir, model });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
+    }
+    let mOwner: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mOwner = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/owner$/))) {
+      // needs_owner 状态下用户手动提交 owner：扫码人身份验证不了时的兜底入口。
+      // submitOwner 内部做格式 + 可用性校验, 通过才落盘并转 completed。
+      const onboardingId = decodeURIComponent(mOwner[1]);
+      let parsedOwner: { owner?: unknown; allowedUsers?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsedOwner = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      // 接受 owner 字符串 (逗号/空白分隔) 或 allowedUsers 数组。
+      const entries = Array.isArray(parsedOwner.allowedUsers)
+        ? parsedOwner.allowedUsers.filter((v): v is string => typeof v === 'string')
+        : typeof parsedOwner.owner === 'string'
+          ? parsedOwner.owner.split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
+          : [];
+      const r = await botOnboarding.submitOwner(onboardingId, entries);
+      if (!r.ok) {
+        const status = r.error === 'unknown_onboarding_job' ? 404 : 400;
+        return jsonRes(res, status, r);
+      }
+      return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
     }
     let mOnboard: RegExpMatchArray | null;
     if (req.method === 'GET' && (mOnboard = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)$/))) {
@@ -789,6 +1356,30 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
+    // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
+    // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/insight${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight\/turn\/([^/]+)$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const turnIndex = decodeURIComponent(m[2]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/insight/turn/${turnIndex}${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Writable web-terminal link (token-bearing). Not in any public allow-list,
     // so decideDashboardAuth has already 401'd unauthenticated callers before we
     // get here — the token only reaches authenticated dashboard sessions.
@@ -822,7 +1413,7 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/(run|pause|resume)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/(run|pause|resume|delivery)$/))) {
       const id = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.scheduleOwnerOf(id);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
@@ -855,7 +1446,8 @@ const server = createServer(async (req, res) => {
       const out = new Map<string, any>();
       // Sort by botIndex so the matrix columns + the create-group bot picker
       // both match the order in bots.json (fs.readdir order is unstable).
-      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+      const cliIds = configuredCliIds();
+      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
       await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
@@ -874,6 +1466,7 @@ const server = createServer(async (req, res) => {
             cur.memberBots.push({
               larkAppId: d.larkAppId,
               botName: d.botName,
+              cliId: d.cliId,
               inChat: true,
               oncallChat: oncallChat ?? null,
               hasRole: hasRole ?? false,
@@ -892,7 +1485,7 @@ const server = createServer(async (req, res) => {
         const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
         for (const b of onlineBots) {
           if (!present.has(b.larkAppId)) {
-            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, inChat: false, oncallChat: null, hasRole: false });
+            c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
           }
         }
       }
@@ -915,7 +1508,7 @@ const server = createServer(async (req, res) => {
       // prompt strip + keeps /api/bots oncall removal honest).
       return jsonRes(res, 200, {
         chats: authed ? sorted : redactGroupsForPublic(sorted),
-        bots: onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName, botAvatarUrl: b.botAvatarUrl })),
+        bots: onlineBots.map(botSummaryPayload),
       });
     }
 
@@ -953,6 +1546,137 @@ const server = createServer(async (req, res) => {
         res.end(await upstream.text());
         return;
       }
+    }
+
+    // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────
+    if (req.method === 'GET' && url.pathname === '/api/role-profiles') {
+      type RoleProfileAggregate = {
+        profileId: string;
+        entryCount: number;
+        updatedAt: number | null;
+        botEntries: Array<{ larkAppId: string; hasEntry: boolean }>;
+      };
+      const merged = new Map<string, RoleProfileAggregate>();
+      await Promise.all(registry.list().map(async d => {
+        try {
+          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/role-profiles`);
+          if (!r.ok) return;
+          const j = await r.json() as { profiles?: any[]; larkAppId?: string };
+          for (const p of j.profiles ?? []) {
+            if (typeof p.profileId !== 'string') continue;
+            const cur: RoleProfileAggregate = merged.get(p.profileId) ?? { profileId: p.profileId, entryCount: 0, updatedAt: null, botEntries: [] };
+            cur.entryCount = Math.max(cur.entryCount, typeof p.entryCount === 'number' ? p.entryCount : 0);
+            if (typeof p.updatedAt === 'number') cur.updatedAt = cur.updatedAt === null ? p.updatedAt : Math.max(cur.updatedAt, p.updatedAt);
+            const larkAppId = j.larkAppId ?? d.larkAppId;
+            if (!cur.botEntries.some(entry => entry.larkAppId === larkAppId)) {
+              cur.botEntries.push({ larkAppId, hasEntry: p.hasCurrentBotEntry === true });
+            }
+            merged.set(p.profileId, cur);
+          }
+        } catch { /* skip offline/bad daemon */ }
+      }));
+      return jsonRes(res, 200, {
+        profiles: [...merged.values()]
+          .map(p => ({
+            ...p,
+            entryCount: Math.max(p.entryCount, p.botEntries.filter(entry => entry.hasEntry).length),
+          }))
+          .sort((a, b) => a.profileId.localeCompare(b.profileId)),
+      });
+    }
+
+    let mRoleProfileApply: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mRoleProfileApply = url.pathname.match(/^\/api\/role-profiles\/([^/]+)\/apply$/))) {
+      const profileId = decodeURIComponent(mRoleProfileApply[1]);
+      if (!isValidRoleProfileId(profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+      let raw = '{}';
+      let parsed: { larkAppId?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        parsed = JSON.parse(raw);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const larkAppId = typeof parsed.larkAppId === 'string' ? parsed.larkAppId : '';
+      if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
+      const upstream = await proxyToDaemon(larkAppId, `/api/role-profiles/${encodeURIComponent(profileId)}/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    let mRoleProfileEntry: RegExpMatchArray | null;
+    if ((mRoleProfileEntry = url.pathname.match(/^\/api\/role-profiles\/([^/]+)\/([^/]+)$/))) {
+      const profileId = decodeURIComponent(mRoleProfileEntry[1]);
+      const larkAppId = decodeURIComponent(mRoleProfileEntry[2]);
+      if (!isValidRoleProfileId(profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(larkAppId, `/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, `/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'DELETE') {
+        const upstream = await proxyToDaemon(larkAppId, `/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, { method: 'DELETE' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
+    let mRoleProfile: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mRoleProfile = url.pathname.match(/^\/api\/role-profiles\/([^/]+)$/))) {
+      const profileId = decodeURIComponent(mRoleProfile[1]);
+      if (!isValidRoleProfileId(profileId)) return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+      type RoleProfileEntryAggregate = {
+        profileId: string;
+        larkAppId: string;
+        content: string;
+        byteLength: number;
+        updatedAt: number | null;
+      };
+      const byBot = new Map<string, RoleProfileEntryAggregate>();
+      await Promise.all(registry.list().map(async d => {
+        try {
+          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/role-profiles/${encodeURIComponent(profileId)}`);
+          if (!r.ok) return;
+          const j = await r.json() as { entries?: any[] };
+          for (const entry of j.entries ?? []) {
+            if (typeof entry.larkAppId !== 'string' || typeof entry.content !== 'string') continue;
+            const updatedAt = typeof entry.updatedAt === 'number' ? entry.updatedAt : null;
+            const current = byBot.get(entry.larkAppId);
+            if (current && (current.updatedAt ?? 0) > (updatedAt ?? 0)) continue;
+            byBot.set(entry.larkAppId, {
+              profileId,
+              larkAppId: entry.larkAppId,
+              content: entry.content,
+              byteLength: typeof entry.byteLength === 'number' ? entry.byteLength : Buffer.byteLength(entry.content, 'utf-8'),
+              updatedAt,
+            });
+          }
+        } catch { /* skip */ }
+      }));
+      const entries = [...byBot.values()].sort((a, b) => a.larkAppId.localeCompare(b.larkAppId));
+      return jsonRes(res, 200, { profileId, entries });
     }
 
     let m2: RegExpMatchArray | null;
@@ -1119,40 +1843,18 @@ const server = createServer(async (req, res) => {
     // PUT  /api/bots/:appId/default-oncall   — proxy to that bot's daemon
 
     if (req.method === 'GET' && url.pathname === '/api/bots') {
-      const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
+      const cliIds = configuredCliIds();
+      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
           if (!r.ok) {
-            return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: `http_${r.status}` };
+            return botDefaultsPayload(d, undefined, `http_${r.status}`);
           }
           const j = await r.json() as any;
-          return {
-            larkAppId: d.larkAppId,
-            botName: d.botName ?? j.botName,
-            online: true,
-            defaultOncall: j.defaultOncall,
-            autoboundChatCount: j.autoboundChatCount ?? 0,
-            brandLabel: j.brandLabel ?? null,
-            sandbox: j.sandbox === true,
-            disableStreamingCard: j.disableStreamingCard === true,
-            writableTerminalLinkInCard: j.writableTerminalLinkInCard === true,
-            privateCard: j.privateCard === true,
-            autoStartOnGroupJoin: j.autoStartOnGroupJoin === true,
-            autoStartOnGroupJoinPrompt: typeof j.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
-            autoStartOnNewTopic: j.autoStartOnNewTopic === true,
-            regularGroupReplyMode: (j.regularGroupReplyMode === 'new-topic' || j.regularGroupReplyMode === 'shared')
-              ? j.regularGroupReplyMode
-              : 'chat',
-            regularGroupMentionMode: (j.regularGroupMentionMode === 'topic' || j.regularGroupMentionMode === 'never')
-              ? j.regularGroupMentionMode
-              : 'always',
-            restrictGrantCommands: j.restrictGrantCommands === true,
-            messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
-            p2pMode: j.p2pMode === 'chat' ? 'chat' : 'thread',
-          };
+          return botDefaultsPayload({ ...d, botName: d.botName ?? j.botName }, j);
         } catch (e: any) {
-          return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
+          return botDefaultsPayload(d, undefined, e?.message ?? String(e));
         }
       }));
       return jsonRes(res, 200, { bots: out });
@@ -1174,6 +1876,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/skills — proxy to that bot's daemon. Body accepts
+    // `{ action:'attach'|'detach', name }` or `{ action:'set', policy|null }`.
+    let mBotSkills: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSkills = url.pathname.match(/^\/api\/bots\/([^/]+)\/skills$/))) {
+      const appId = decodeURIComponent(mBotSkills[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-skills`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/brand-label — proxy to that bot's daemon. Body
     // `{ brandLabel: string | null }` (string '' = off, null = default).
     let mBotBrand: RegExpMatchArray | null;
@@ -1183,6 +1903,42 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-brand-label`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/startup-commands — proxy to that bot's daemon. Body
+    // `{ startupCommands: string }` (raw text, comma/newline separated; '' = clear).
+    let mBotStartup: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotStartup = url.pathname.match(/^\/api\/bots\/([^/]+)\/startup-commands$/))) {
+      const appId = decodeURIComponent(mBotStartup[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-startup-commands`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/env — proxy to that bot's daemon. Body
+    // `{ env: string }` (raw JSON text; '' = clear).
+    let mBotEnv: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotEnv = url.pathname.match(/^\/api\/bots\/([^/]+)\/env$/))) {
+      const appId = decodeURIComponent(mBotEnv[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-env`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -1264,6 +2020,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/max-live-workers — proxy to that bot's daemon. Body
+    // `{ maxLiveWorkers: number | null }` (null = clear → fall back to the
+    // built-in default of 30; a positive integer overrides it).
+    let mBotMaxLive: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotMaxLive = url.pathname.match(/^\/api\/bots\/([^/]+)\/max-live-workers$/))) {
+      const appId = decodeURIComponent(mBotMaxLive[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-max-live-workers`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Create a new chat — pick a creator from the user-selected larkAppIds
     // (Feishu makes the calling bot the implicit first member, so picking
     // anything else would silently add an unwanted bot). Auto-invite the
@@ -1271,7 +2046,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; bindWorkingDir?: unknown };
+      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -1285,6 +2060,12 @@ const server = createServer(async (req, res) => {
         : [];
       if (selectedIds.length === 0) {
         return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
+      }
+      const roleProfileId = typeof parsed.roleProfileId === 'string' && parsed.roleProfileId.trim()
+        ? parsed.roleProfileId.trim()
+        : null;
+      if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
       }
 
       const explicit = Array.isArray(parsed.userOpenIds)
@@ -1319,6 +2100,7 @@ const server = createServer(async (req, res) => {
         bindWorkingDir: typeof parsed.bindWorkingDir === 'string' && parsed.bindWorkingDir.trim()
           ? parsed.bindWorkingDir.trim()
           : undefined,
+        roleProfileId: roleProfileId ?? undefined,
       };
       const upstream = await fetch(
         `http://127.0.0.1:${creator.ipcPort}/api/groups/create`,
@@ -1328,6 +2110,7 @@ const server = createServer(async (req, res) => {
       let upstreamJson: any = null;
       try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
       if (upstreamJson && typeof upstreamJson === 'object') {
+        if (roleProfileId) upstreamJson.roleProfileId = roleProfileId;
         // If Lark rejected the invite (open_id wrong scope, banned user, etc.)
         // null out autoInvitedOpenId so the frontend doesn't falsely claim
         // success — the user actually isn't a member of the new chat.

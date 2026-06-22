@@ -1,4 +1,5 @@
 import type { CliId } from '../adapters/cli/types.js';
+import { sanitizePerBotEnv } from '../core/per-bot-env.js';
 
 export const CLI_ID_CHOICES: Record<string, CliId> = {
   '1': 'claude-code',
@@ -18,6 +19,8 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '15': 'pi',
   '16': 'copilot',
   '17': 'oh-my-pi',
+  '18': 'relay',
+  '19': 'mir',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -45,11 +48,13 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'pi': 'Pi',
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
+  'relay': 'Relay',
+  'mir': 'Mir CLI',
 };
 
 /**
- * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号
- * 1..16) 一致. dashboard "添加机器人" 的 CLI 下拉直接读这里, 避免再抄一份
+ * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号)
+ * 一致. dashboard "添加机器人" 的 CLI 下拉直接读这里, 避免再抄一份
  * 列表. 单一事实源: CLI_ID_CHOICES 的值序.
  */
 export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
@@ -58,7 +63,7 @@ export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
  *   - 空 → undefined (调用方决定 "preserve current" 还是套默认 'claude-code')
- *   - "1".."16" → CLI_ID_CHOICES 映射
+ *   - 序号 (CLI_ID_CHOICES 的键) → 映射成 cliId
  *   - 已是合法 cliId 字面值 → 原样返回
  *   - 其它 → throw (typo 不该静默落盘成 cliId)
  */
@@ -68,8 +73,10 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   const mapped = CLI_ID_CHOICES[raw];
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
+  // 序号上界从 CLI_ID_CHOICES 派生, 新增 CLI 时自动跟随, 不再手写硬编码区间.
+  const maxChoice = Object.keys(CLI_ID_CHOICES).length;
   throw new Error(
-    `Unknown CLI 适配器 "${raw}"。请输入序号 1-17 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
+    `Unknown CLI 适配器 "${raw}"。请输入序号 1-${maxChoice} 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
 }
 
@@ -176,6 +183,15 @@ export function botProcessName(
 ): string {
   const name = typeof bot.name === 'string' ? normalizeBotProcessName(bot.name) : undefined;
   return `${prefix}-${name ?? index}`;
+}
+
+/**
+ * Sanitize a bot entry's `env` object into a clean `KEY -> string` map (valid
+ * env-var names + string/number/boolean values; botmux-reserved keys dropped).
+ * Thin wrapper over {@link sanitizePerBotEnv} for callers that hold a bot entry.
+ */
+export function botProcessEnv(bot: { env?: unknown }): Record<string, string> {
+  return sanitizePerBotEnv(bot?.env);
 }
 
 export function normalizeBotConfig<T extends Record<string, any>>(bot: T): T {
