@@ -71,6 +71,7 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient } from './platform/tunnel-client.js';
+import { buildGoalBoard } from './verified-delivery/goal-board.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -1169,6 +1170,9 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/whiteboards') {
       return jsonRes(res, 200, { enabled: whiteboardEnabled(), whiteboards: listWhiteboards() });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/goals') {
+      return jsonRes(res, 200, buildGoalBoard());
     }
     const mWhiteboard = url.pathname.match(/^\/api\/whiteboards\/([^/]+)$/);
     if (req.method === 'GET' && mWhiteboard) {

@@ -54,6 +54,7 @@ import { triggerSessionTurn } from './trigger-session.js';
 import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest } from '../services/trigger-types.js';
+import { buildGoalBoard } from '../verified-delivery/goal-board.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -755,6 +756,10 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
   // falls through to "all tasks" when no owner filter is configured (tests).
   const all = scheduleStore.listTasks().filter(t => scheduler.belongsToOwner(t));
   jsonRes(res, 200, { schedules: all.map(composeScheduleRow) });
+});
+
+ipcRoute('GET', '/api/goals', (_req, res) => {
+  jsonRes(res, 200, buildGoalBoard());
 });
 
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
