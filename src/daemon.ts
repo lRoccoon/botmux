@@ -129,6 +129,7 @@ import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
 import type { RawParamInput } from './workflows/params.js';
 import { startGoalSupervisor } from './core/goal-supervisor.js';
+import { startGoalWatchdog } from './core/goal-watchdog.js';
 import type { AbortCancelReason } from './workflows/runtime.js';
 import {
   createDefaultHostExecutorRegistry,
@@ -3855,6 +3856,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 120_000);
   sandboxReconcileTimer.unref?.();
 
+  const goalWatchdogTimer = startGoalWatchdog({
+    larkAppId: cfg.larkAppId,
+    activeSessions,
+  });
+
   await attachColdWorkflowRuns(cfg.larkAppId);
 
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
@@ -3921,6 +3927,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     workflowRuns.clear();
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    if (goalWatchdogTimer) clearInterval(goalWatchdogTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
@@ -3991,6 +3998,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   process.on('exit', () => {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    if (goalWatchdogTimer) clearInterval(goalWatchdogTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the
