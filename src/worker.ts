@@ -20,6 +20,7 @@ import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlCon
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldWriteNow } from './utils/input-gate.js';
+import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input-queue.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
@@ -5332,14 +5333,23 @@ function teardownSandboxBestEffort(): void {
   try { sandboxCleanup?.(); } catch { /* */ }
   sandboxCleanup = null;
 }
+// Under pm2 the worker's stdout/stderr are pipes; a broken pipe (e.g. log
+// streaming detaches) would otherwise reach the uncaughtException handler below
+// and process.exit(1), killing a live session over a dropped log write. Install
+// the guard before any further stdout writes (log() writes to process.stdout).
+installStdioEpipeGuard();
 process.on('exit', () => { teardownSandboxBestEffort(); });
-process.on('uncaughtException', (err) => {
+process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
+  // A broken pipe on stdout/stderr (or any socket) must not tear down a live
+  // session — the stdio guard handles those it can; this is the backstop.
+  if (isIgnorableStreamError(err)) return;
   try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
   teardownSandboxBestEffort();
   try { cleanup(); } catch { /* */ }
   process.exit(1);
 });
 process.on('unhandledRejection', (reason: any) => {
+  if (isIgnorableStreamError(reason)) return;
   try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
   teardownSandboxBestEffort();
   try { cleanup(); } catch { /* */ }
