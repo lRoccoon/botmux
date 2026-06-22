@@ -70,6 +70,7 @@ import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
 import { consumeQuota, removeChatGrant, removeGlobalGrant } from './services/grant-store.js';
 import { abortCharge, commitCharge, beginCharge } from './services/quota-dedup.js';
+import { listOnlineDaemons } from './utils/daemon-discovery.js';
 import {
   getSessionWorkingDir,
   getProjectScanDir,
@@ -129,7 +130,7 @@ import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
 import type { RawParamInput } from './workflows/params.js';
 import { startGoalSupervisor } from './core/goal-supervisor.js';
-import { startGoalWatchdog } from './core/goal-watchdog.js';
+import { runGoalWatchdogForGoal, startGoalWatchdog } from './core/goal-watchdog.js';
 import type { AbortCancelReason } from './workflows/runtime.js';
 import {
   createDefaultHostExecutorRegistry,
@@ -252,6 +253,7 @@ const lastRepoScan: Map<string, import('./services/project-scanner.js').ProjectI
   new BoundedMap(500);
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
+let currentDaemonLarkAppId = '';
 
 function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
@@ -314,6 +316,37 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
   const timer = setInterval(() => logMemoryDiagnostics('interval'), intervalMs);
   if (typeof timer.unref === 'function') timer.unref();
   return timer;
+}
+
+async function triggerGoalWatchdogAcrossDaemons(input: {
+  goalChatId: string;
+  reason: string;
+  sourceSessionId?: string;
+}): Promise<{ contacted: number; injected: number }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  let injected = 0;
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/watchdog`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!res.ok) return;
+      const body = await res.json().catch(() => null) as { results?: Array<{ status?: string }> } | null;
+      injected += body?.results?.filter((r) => r.status === 'injected').length ?? 0;
+    } catch {
+      // Daemon descriptors are best-effort. A dead peer will age out shortly.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, injected };
 }
 
 /**
@@ -1897,6 +1930,32 @@ ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
     return jsonRes(res, status, result);
   }
   return jsonRes(res, 200, result);
+});
+
+// Internal: ask whichever daemon owns the goal's L2 supervisor to inspect
+// pending verified-delivery tasks. Worker idle/exit events may happen in a
+// different bot daemon, so callers broadcast this route to all online daemons;
+// only the daemon with an active chat-scope L2 will inject a turn.
+ipcRoute('POST', '/api/goal/watchdog', async (req, res) => {
+  let raw: { goalChatId?: unknown; reason?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const goalChatId = typeof raw.goalChatId === 'string' ? raw.goalChatId.trim() : '';
+  if (!goalChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_goalChatId', error: 'goalChatId is required' });
+  try {
+    const results = await runGoalWatchdogForGoal({
+      larkAppId: currentDaemonLarkAppId,
+      activeSessions,
+      goalChatId,
+    });
+    return jsonRes(res, 200, { ok: true, results });
+  } catch (err: any) {
+    logger.warn(`[goal-watchdog] IPC trigger failed: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
 });
 
 // ─── session-ready IPC route (internal: Claude-family 真就绪信号) ─────────────
@@ -3568,6 +3627,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   const cfg = botConfigs[idx];
   registerBot(cfg);
+  currentDaemonLarkAppId = cfg.larkAppId;
   // 启动即为本 bot 的 CLI 预装环境（skills + askUserQuestion hook + 兜底 skill）。
   // 关键：adopt 路径会跳过 ensureCliSkills，若重启后第一次就是 adopt 一个外部
   // claude 会话，必须保证此时全局 ~/.claude/settings.json 已带 hook——否则"全局
@@ -3618,6 +3678,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // matching the dashboard-driven close.
       void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent */ });
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
+    },
+    onSessionIdleOrExit(ds: DaemonSession, reason: 'idle' | 'limited' | 'exit') {
+      // Worker/report is only a fast path in verified delivery. When any session
+      // in a goal group reaches a turn boundary, ask the L2 supervisor to inspect
+      // pending tasks immediately instead of waiting for the 5m periodic sweep.
+      if (ds.scope !== 'chat' || !ds.chatId) return;
+      void triggerGoalWatchdogAcrossDaemons({
+        goalChatId: ds.chatId,
+        reason,
+        sourceSessionId: ds.session.sessionId,
+      }).then((results) => {
+        if (results.injected > 0) {
+          logger.info(`[goal-watchdog] event-triggered by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} injected=${results.injected}`);
+        }
+      }).catch((err: any) => {
+        logger.warn(`[goal-watchdog] event trigger failed: ${err?.message ?? err}`);
+      });
     },
   });
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
