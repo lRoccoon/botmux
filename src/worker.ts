@@ -3789,12 +3789,21 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         available = probe.ok;
         if (!probe.ok) reason = probe.reason;
       }
+    } else if (effectiveBackend === 'zellij') {
+      // Like tmux, zellij's probe is a disposable background session, so a
+      // live named session is more authoritative than a transient probe
+      // failure (PR#249 semantics) — check it first so we reattach, not gate.
+      hasExistingSession = ZellijBackend.hasSession(ZellijBackend.sessionName(cfg.sessionId));
+      if (!hasExistingSession) {
+        available = ZellijBackend.isAvailable();
+        reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
+      }
     } else if (effectiveBackend === 'herdr') {
+      // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
+      // (not a disposable session probe), so it has no PR#249 false-negative
+      // risk and needs no existing-session exemption.
       available = HerdrBackend.isAvailable();
       reason = 'herdr 功能性探针失败';
-    } else if (effectiveBackend === 'zellij') {
-      available = ZellijBackend.isAvailable();
-      reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
     }
     const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession });
     if (decision.action === 'gate') {

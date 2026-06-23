@@ -20,10 +20,13 @@ export type BackendGateDecision =
  * per-bot `backendType: 'pty'` — which arrives here as `requested === 'pty'`
  * and is always allowed straight through.
  *
- * An already-running persistent session reattaches regardless of a transient
- * probe failure (a disposable "can we start a new server?" probe is far less
- * authoritative than a live session — see PR#249): abandoning it would spawn a
- * duplicate CLI and orphan the real conversation.
+ * `hasExistingSession` lets an already-running persistent session reattach
+ * regardless of a transient probe failure (a disposable "can we start a new
+ * server?" probe is far less authoritative than a live session — see PR#249):
+ * abandoning it would spawn a duplicate CLI and orphan the real conversation.
+ * The caller computes it only for backends whose probe is a disposable
+ * session (tmux, zellij); herdr's probe is a cheap non-destructive
+ * `herdr --version`, so it passes `hasExistingSession: false`.
  */
 export function decideBackendGate(opts: {
   requested: BackendType;
