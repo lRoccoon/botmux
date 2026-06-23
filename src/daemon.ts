@@ -349,6 +349,7 @@ function scheduleGoalWatchdogRetry(goalChatId: string, reason: string): void {
 }
 
 async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: string): Promise<GoalWatchdogResult[]> {
+  if (isGoalPanelApp(currentDaemonLarkAppId)) return [];
   const results = await runGoalWatchdogForGoal({
     larkAppId: currentDaemonLarkAppId,
     activeSessions,
@@ -4481,10 +4482,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 120_000);
   sandboxReconcileTimer.unref?.();
 
-  const goalWatchdogTimer = startGoalWatchdog({
-    larkAppId: cfg.larkAppId,
-    activeSessions,
-  });
+  const goalWatchdogTimer = isGoalPanelApp(cfg.larkAppId)
+    ? undefined
+    : startGoalWatchdog({
+      larkAppId: cfg.larkAppId,
+      activeSessions,
+    });
 
   await attachColdWorkflowRuns(cfg.larkAppId);
 
