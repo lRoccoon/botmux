@@ -418,9 +418,31 @@ function cardActionKey(larkAppId: string, data: any): string {
     action: value?.action ?? action?.option ?? action?.tag,
     rootId: value?.root_id,
     sessionId: value?.session_id,
+    // Detail actions can share action labels across rows; include row ids so
+    // rapid clicks on different rows do not collide in the in-flight dedupe key.
+    scheduleId: value?.schedule_id,
+    runId: value?.run_id,
     nonce: value?.card_nonce ?? value?.nonce,
     option: action?.option,
     key: value?.key,
+    // Settings toggles share one action; distinguish the target field/value.
+    field: value?.field,
+    next_value: value?.next_value,
+    // Pagination actions share one action; distinguish the target page.
+    page: value?.page,
+    // Navigation context and page size affect the card that will be rebuilt.
+    origin: value?.origin,
+    pageSize: value?.page_size,
+    // `dashboard_scope` distinguishes the global tool-panel card from a
+    // per-bot view that might happen to be open on the same module. Without
+    // it a rapid global→per-bot click sequence within the dedupe window
+    // would hash-collide and the second click would be silently dropped.
+    dashboardScope: value?.dashboard_scope,
+    // Groups detail/actions can share the same `dash_groups_*` action within
+    // one card but target different chat/bot cells. Include both ids so
+    // managing bot A in group X doesn't dedupe bot B in group Y.
+    chatId: value?.chat_id,
+    appId: value?.app_id,
   })}`;
 }
 

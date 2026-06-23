@@ -241,7 +241,8 @@ function directMultiUrl(url: string): Record<string, string> {
   };
 }
 
-function terminalMultiUrl(url: string): Record<string, string> {
+/** Shared terminal multi-url behavior for streaming and dashboard cards. */
+export function terminalMultiUrl(url: string): Record<string, string> {
   return readGlobalConfig().dashboard?.openTerminalInFeishu === true
     ? sidebarMultiUrl(url)
     : directMultiUrl(url);

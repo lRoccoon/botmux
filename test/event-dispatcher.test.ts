@@ -2944,6 +2944,349 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(second).toEqual({ card: { type: 'raw', data: { type: 'toggled' } } });
     expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
   });
+
+  // codex slice-1 blocker #2: dash_sessions_page only differs by `page`. If
+  // `cardActionKey` doesn't include `page`, a rapid prev→next sequence in
+  // the in-flight window would hash to the same key and the second click
+  // would be silently dropped.
+  it('concurrent `dash_sessions_page` clicks at DIFFERENT pages must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'card1' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'card2' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (page: string) => ({
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_page_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('5'));   // user lands on page 5
+    const secondP = capturedHandlers['card.action.trigger'](ev('4'));  // immediately clicks prev → page 4
+
+    // Both handler invocations are in flight; neither was suppressed.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Settings counterpart guard — dash_settings_toggle on different fields.
+  // Sanity check that the existing settings dedupe key still works.
+  it('concurrent `dash_settings_toggle` clicks on DIFFERENT fields must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    handlers.handleCardAction
+      .mockReturnValueOnce(new Promise(resolve => { release1 = () => resolve({ type: 'a' }); }) as any)
+      .mockReturnValueOnce(new Promise(resolve => { release2 = () => resolve({ type: 'b' }); }) as any);
+
+    const ev = (field: string, next: string) => ({
+      action: { value: {
+        action: 'dash_settings_toggle', invoker_open_id: USER_OPEN_ID,
+        field, next_value: next,
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_settings_card' },
+    });
+
+    const a = capturedHandlers['card.action.trigger'](ev('publicReadOnly', 'true'));
+    const b = capturedHandlers['card.action.trigger'](ev('openTerminalInFeishu', 'true'));
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([a, b]);
+  });
+
+  // PR3 sessions slice 2a — per-row 📂 详情 buttons share `action: dash_sessions_detail`,
+  // only `value.session_id` distinguishes them. The cardActionKey already includes
+  // `sessionId`, but pin it down so a future key refactor can't silently drop it.
+  it('concurrent `dash_sessions_detail` clicks on DIFFERENT session_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'detail_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'detail_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (sessionId: string) => ({
+      action: { value: { action: 'dash_sessions_detail', invoker_open_id: USER_OPEN_ID, session_id: sessionId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_detail_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('sess_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('sess_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing session_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion test: same session_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent slice-2a
+  // actions (e.g. close) can't double-fire mid-flight.
+  it('concurrent `dash_sessions_detail` clicks on the SAME session_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'detail_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_sessions_detail', invoker_open_id: USER_OPEN_ID, session_id: 'sess_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_detail_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    // Second click hits the in-flight guard and returns a toast.
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  // PR3 schedules slice 2a — per-detail-card pause/resume buttons share
+  // `action: dash_schedules_pause` / `dash_schedules_resume`. Only
+  // `value.schedule_id` distinguishes which schedule the click targets. The
+  // cardActionKey now includes `scheduleId`; pin it down so a future key
+  // refactor can't silently drop it and turn two distinct schedule clicks
+  // into one (e.g. user opens detail A then detail B and pauses B while A
+  // is still in flight).
+  it('concurrent `dash_schedules_pause` clicks on DIFFERENT schedule_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'pause_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'pause_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (scheduleId: string) => ({
+      action: { value: { action: 'dash_schedules_pause', invoker_open_id: USER_OPEN_ID, schedule_id: scheduleId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_schedules_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('sch_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('sch_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing schedule_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion: same schedule_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent pause/resume
+  // can't double-fire on a rapid double-click.
+  it('concurrent `dash_schedules_pause` clicks on the SAME schedule_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'pause_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_schedules_pause', invoker_open_id: USER_OPEN_ID, schedule_id: 'sch_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_schedules_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  // PR3 workflows slice 2a (codex 2026-06-10) — per-detail-card cancel buttons
+  // share `action: dash_workflows_cancel`. Only `value.run_id` distinguishes
+  // which run the click targets. The cardActionKey now includes `runId`; pin
+  // it down so a future key refactor can't silently drop it and turn two
+  // distinct run cancel clicks into one (e.g. user opens detail A then detail
+  // B and cancels B while A is still in flight).
+  it('concurrent `dash_workflows_cancel` clicks on DIFFERENT run_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'cancel_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'cancel_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (runId: string) => ({
+      action: { value: { action: 'dash_workflows_cancel', invoker_open_id: USER_OPEN_ID, run_id: runId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_workflows_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('run_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('run_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing run_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion: same run_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent cancel can't
+  // double-fire on a rapid double-click against the same run.
+  it('concurrent `dash_workflows_cancel` clicks on the SAME run_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'cancel_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_workflows_cancel', invoker_open_id: USER_OPEN_ID, run_id: 'run_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_workflows_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  // Dashboard groups detail actions share the same action id across many
+  // cells. `chat_id` + `app_id` must both be in the in-flight dedupe key so
+  // managing bot A in chat X doesn't swallow bot B in chat Y.
+  it('concurrent `dash_groups_oncall_bind` clicks on DIFFERENT chat/app cells must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'bind_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'bind_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (chatId: string, appId: string) => ({
+      action: {
+        value: {
+          action: 'dash_groups_oncall_bind',
+          invoker_open_id: USER_OPEN_ID,
+          chat_id: chatId,
+          app_id: appId,
+        },
+      },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_groups_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('oc_A', 'cli_A'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('oc_B', 'cli_B'));
+
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  it('concurrent `dash_groups_oncall_bind` clicks on the SAME chat/app cell WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'bind_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: {
+        value: {
+          action: 'dash_groups_oncall_bind',
+          invoker_open_id: USER_OPEN_ID,
+          chat_id: 'oc_SAME',
+          app_id: 'cli_SAME',
+        },
+      },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_groups_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  // PR3 overview drilldown (2026-06-10): origin/page_size are now part of the
+  // dedupe key so a standalone-shaped click (origin=undefined, page_size=undef)
+  // and an overview-drilldown-shaped click (origin=overview, page_size=5) on
+  // the same page index don't hash-collide. The standalone+drilldown forms can
+  // theoretically reach the same handler from two different open cards within
+  // the dedupe window.
+  it('concurrent `dash_sessions_page` clicks differing ONLY by origin must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const evStandalone = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_a' },
+    };
+    const evDrilldown = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_b' },
+    };
+
+    const first = capturedHandlers['card.action.trigger'](evStandalone);
+    const second = capturedHandlers['card.action.trigger'](evDrilldown);
+    // Both should reach the handler — no dedupe.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([first, second]);
+  });
+
+  it('concurrent `dash_sessions_page` clicks at DIFFERENT pages but SAME origin must NOT dedupe (page already in key)', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const evPage1 = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '1', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_card' },
+    };
+    const evPage2 = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const first = capturedHandlers['card.action.trigger'](evPage1);
+    const second = capturedHandlers['card.action.trigger'](evPage2);
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([first, second]);
+  });
 });
 
 describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {
