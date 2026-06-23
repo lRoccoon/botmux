@@ -131,6 +131,7 @@ import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
 import type { RawParamInput } from './workflows/params.js';
 import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
+import { emitGoalNarration } from './verified-delivery/narration.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   injectGoalSupervisorTurn,
@@ -2326,6 +2327,14 @@ function buildGoalDashboardDecisionPrompt(input: { goalChatId: string; taskId?: 
   ].filter(Boolean).join('\n');
 }
 
+async function emitGoalNarrationBestEffort(input: Parameters<typeof emitGoalNarration>[0]): Promise<void> {
+  try {
+    await emitGoalNarration(input);
+  } catch (err) {
+    logger.warn(`[goal-narration] failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string, chatId?: string): Promise<boolean> {
   if (parsed.senderType === 'app' || parsed.senderType === 'bot') return false;
   const record = findGoalNotificationRecordForReply(parsed);
@@ -2344,6 +2353,16 @@ async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string,
   }
   try {
     if (routed) {
+      await emitGoalNarrationBestEffort({
+        larkAppId: record.larkAppId,
+        goalChatId: record.goalChatId,
+        event: {
+          type: 'human-decision',
+          key: `narr:decision:${record.goalChatId}:${parsed.messageId}`,
+          decisionText: parsed.content.trim(),
+          source: '主群回复中控',
+        },
+      });
       await sendMessage(
         record.larkAppId,
         record.parentChatId,
@@ -2403,6 +2422,16 @@ ipcRoute('POST', '/api/goals/:goalChatId/decision', async (req, res, params) => 
   const supervisor = findGoalSupervisorForNotify({ goalChatId });
   if (!supervisor) return jsonRes(res, 404, { ok: false, error: 'no_supervisor' });
   await injectGoalSupervisorTurn(supervisor, buildGoalDashboardDecisionPrompt({ goalChatId, taskId, text }));
+  await emitGoalNarrationBestEffort({
+    larkAppId: supervisor.larkAppId,
+    goalChatId,
+    event: {
+      type: 'human-decision',
+      key: `narr:decision:${goalChatId}:${taskId ?? 'goal'}:${Date.now()}`,
+      decisionText: text,
+      source: 'dashboard',
+    },
+  });
   return jsonRes(res, 200, {
     ok: true,
     goalChatId,
