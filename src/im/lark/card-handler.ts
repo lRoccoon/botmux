@@ -221,7 +221,7 @@ function goalNotificationRecordFromAction(
   };
 }
 
-function goalResolvedCard(record: GoalParentNotificationRecord, decisionText: string): string {
+function goalResolvedCard(record: GoalParentNotificationRecord, decisionText: string, decisionMode?: 'option' | 'free-text'): string {
   return buildGoalHumanAttentionResolvedCard({
     goalTitle: record.goalTitle,
     goalChatId: record.goalChatId,
@@ -237,6 +237,7 @@ function goalResolvedCard(record: GoalParentNotificationRecord, decisionText: st
     parentSessionId: record.parentSessionId,
     supervisorSessionId: record.supervisorSessionId,
     decisionText,
+    decisionMode,
   });
 }
 
@@ -565,10 +566,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
 
-  if (value?.action === 'goal_parent_decision') {
-    const decisionText = goalDecisionText(data);
+  if (value?.action === 'goal_parent_decision' || value?.action === 'goal_parent_decision_option') {
+    const isOptionDecision = value.action === 'goal_parent_decision_option';
+    const decisionText = isOptionDecision ? (value.decision_text ?? '').trim() : goalDecisionText(data);
     if (!decisionText) {
-      return { toast: { type: 'error', content: '请先输入要下发给监管者的决策。' } };
+      return { toast: { type: 'error', content: isOptionDecision ? '选项内容为空，无法下发。' : '请先输入要下发给监管者的决策。' } };
     }
     const record = goalNotificationRecordFromAction(value, cardMessageId, larkAppId);
     if (!record) {
@@ -584,7 +586,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'error', content: '没有在线监管者，稍后可重试或直接在主群补充说明。' } };
     }
     logger.info(`[goal-parent-decision] routed card decision goal=${record.goalChatId} task=${record.taskId ?? '-'} routed=${result.routed} deduped=${result.deduped}`);
-    return JSON.parse(goalResolvedCard(record, decisionText));
+    return JSON.parse(goalResolvedCard(record, decisionText, isOptionDecision ? 'option' : 'free-text'));
   }
 
   // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────

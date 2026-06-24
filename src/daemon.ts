@@ -27,6 +27,7 @@ import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { getGoalParentNotification, rememberGoalParentNotification, type GoalParentNotificationRecord } from './services/goal-parent-notification-store.js';
+import { normalizeGoalDecisionOptions, type GoalDecisionOption } from './services/goal-decision-options.js';
 import { getGoalChat } from './services/goal-chat-store.js';
 import {
   listDueGoalNotificationRetries,
@@ -2452,6 +2453,7 @@ function retryRecordFromHumanAttention(input: {
   summary: string;
   attentionKind: string;
   attentionReason: string;
+  decisionOptions?: GoalDecisionOption[];
   done?: boolean;
 }): GoalNotificationRetryRecord | null {
   const meta = input.supervisor?.session.goalSupervisor;
@@ -2476,6 +2478,7 @@ function retryRecordFromHumanAttention(input: {
     summary: input.summary,
     attentionKind: input.attentionKind,
     attentionReason: input.attentionReason,
+    decisionOptions: input.decisionOptions,
     done: input.done,
     ownerOpenId: goalNotifyOwnerOpenId(input.parent),
     attempts: 0,
@@ -2531,6 +2534,7 @@ async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord)
       taskId: record.taskId,
       attentionKind: record.attentionKind,
       attentionReason: record.attentionReason,
+      decisionOptions: record.decisionOptions,
       summary: record.summary,
       notificationLarkAppId: larkAppId,
       parentChatId: record.parentChatId,
@@ -2554,6 +2558,7 @@ async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord)
           summary: record.summary,
           attentionKind: record.attentionKind,
           attentionReason: record.attentionReason,
+          decisionOptions: record.decisionOptions,
           done: record.done,
           createdAt: Date.now(),
         });
@@ -2574,6 +2579,7 @@ async function sendGoalHumanAttention(input: {
   summary: string;
   attentionKind: string;
   attentionReason: string;
+  decisionOptions?: GoalDecisionOption[];
   done?: boolean;
 }): Promise<{ sent: boolean; error?: string }> {
   const record = retryRecordFromHumanAttention(input);
@@ -2997,6 +3003,7 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
     summary?: unknown;
     attentionKind?: unknown;
     attentionReason?: unknown;
+    decisionOptions?: unknown;
     done?: unknown;
   };
   try {
@@ -3010,6 +3017,7 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
   const attentionReason = typeof raw.attentionReason === 'string' && raw.attentionReason.trim()
     ? raw.attentionReason.replace(/\s+/g, ' ').trim().slice(0, 500)
     : summary.replace(/\s+/g, ' ').trim().slice(0, 500);
+  const decisionOptions = normalizeGoalDecisionOptions(raw.decisionOptions);
   if (!summary) return jsonRes(res, 400, { ok: false, errorCode: 'missing_summary', error: 'summary is required' });
   const notifyReq = {
     supervisorSessionId: typeof raw.supervisorSessionId === 'string' && raw.supervisorSessionId.trim() ? raw.supervisorSessionId.trim() : undefined,
@@ -3018,6 +3026,7 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
     summary,
     attentionKind: attentionKind || undefined,
     attentionReason: attentionReason || undefined,
+    decisionOptions,
     done: raw.done === true,
   };
   const supervisorForHumanNotify = findGoalSupervisorForNotify(notifyReq);
@@ -3055,6 +3064,7 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
           summary,
           attentionKind,
           attentionReason,
+          decisionOptions,
           done: notifyReq.done,
         });
         humanNotified = direct.sent;
@@ -3094,6 +3104,7 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
         summary,
         attentionKind,
         attentionReason,
+        decisionOptions,
         done: notifyReq.done,
       });
       humanNotified = direct.sent;
