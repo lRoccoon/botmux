@@ -745,11 +745,19 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
     }
     for (const rec of recs) {
       if (rec.binding) {
-        for (const gate of rec.repost) {
-          try {
-            await deps.postCard(rec.binding, gate, rec.runId);
-          } catch (err) {
-            deps.onError?.(rec.runId, err);
+        // When `resume` is true a self-healed gate lets the run be re-driven, and
+        // that drive (driveV3Run, suspend mode) re-posts every STILL-pending gate
+        // itself. Posting rec.repost here too would double-send the pending gate's
+        // card in the "one gate healed + another still pending" case, so skip it
+        // and let the drive own the re-post (codex nit #10). The blocked/loop/
+        // revisit grant reposts always carry resume:false, so they're unaffected.
+        if (!rec.resume) {
+          for (const gate of rec.repost) {
+            try {
+              await deps.postCard(rec.binding, gate, rec.runId);
+            } catch (err) {
+              deps.onError?.(rec.runId, err);
+            }
           }
         }
         if (rec.repostBlocked && deps.postBlockedCard) {

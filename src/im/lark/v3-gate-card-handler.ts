@@ -104,6 +104,13 @@ export async function handleV3GateAction(
     };
   }
   if (outcome.kind === 'already-settled') {
+    // Idempotent recovery (codex nit #14): if a prior click already APPROVED the
+    // gate but its driveRun didn't land (transient), a re-click should re-drive
+    // instead of dead-ending at an info toast — mirrors the blocked/loop grant
+    // handlers' already-granted branch. driveRun is terminal-safe (short-circuits
+    // a finished run), so this is harmless if the run already moved on. A rejected
+    // gate is terminal-ish, so don't re-drive it.
+    if (outcome.status === 'approved') deps.driveRun(value.runId);
     return {
       toast: {
         type: 'info',

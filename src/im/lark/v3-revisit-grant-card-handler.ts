@@ -91,6 +91,13 @@ export async function handleV3RevisitGrantAction(
     };
   }
   if (outcome.kind === 'stale-run') {
+    // Idempotent recovery (codex nit #13): `not-budget-blocked` means a prior
+    // grant already extended the budget and the node is no longer blocked. If
+    // that grant's driveRun didn't land (transient), a re-click should re-drive
+    // rather than dead-end at a warning. driveRun is terminal-safe, so re-driving
+    // a run that genuinely moved on (or finished) is harmless. This mirrors the
+    // blocked/loop grant handlers' already-granted branch.
+    if (outcome.reason === 'not-budget-blocked') deps.driveRun(value.runId);
     return {
       toast: {
         type: 'warning',

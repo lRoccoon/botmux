@@ -255,25 +255,33 @@ export function appendEvent(journalPath: string, event: V3Event): StoredEvent {
 // ─── Read / replay ────────────────────────────────────────────────────────
 
 /**
- * Read every event in append order.  Tolerates a torn final line (crash
- * mid-append) by skipping any line that fails to parse — the journal stays
- * usable for replay after an unclean shutdown.  Returns `[]` if the file does
- * not exist yet (a run that never started).
+ * Read every event in append order.  Tolerates a torn FINAL line (crash
+ * mid-append) but throws on any earlier unparseable line — a mid-file parse
+ * failure is real corruption, and silently dropping a middle event would
+ * desync the replayed state (e.g. a lost `nodeSucceeded` leaves the node
+ * looking pending forever), so fail loud instead (codex hardening #11).
+ * Returns `[]` if the file does not exist yet (a run that never started).
  */
 export function readJournal(journalPath: string): StoredEvent[] {
   if (!existsSync(journalPath)) return [];
   const raw = readFileSync(journalPath, 'utf-8');
+  const lines = raw.split('\n');
+  // Only the last non-empty line can legitimately be a half-written append.
+  let lastNonEmpty = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i]!.trim()) { lastNonEmpty = i; break; }
+  }
   const out: StoredEvent[] = [];
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i]!.trim();
     if (!trimmed) continue;
     try {
       out.push(JSON.parse(trimmed) as StoredEvent);
-    } catch {
-      // Torn / partial final line from an interrupted append — skip it.
-      // (Only the last line can legitimately be partial; a mid-file parse
-      //  failure would indicate real corruption, but skipping is still the
-      //  safe choice — replay proceeds with the events it can read.)
+    } catch (err) {
+      if (i === lastNonEmpty) break; // torn final line from an interrupted append — tolerate
+      throw new Error(
+        `v3 journal corrupted at line ${i + 1} of ${journalPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
   return out;

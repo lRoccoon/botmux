@@ -46,11 +46,18 @@ describe('handleV3GateAction', () => {
     expect(res.header.template).toBe('red');
   });
 
-  it('already-settled → toast，不 driveRun', async () => {
+  it('already-settled approved → toast + 幂等重驱（防上次 driveRun 没落地）', async () => {
     const { deps: d, driveRun } = deps({ resolveClick: () => ({ kind: 'already-settled', status: 'approved' }) });
     const res = await handleV3GateAction(VALUE, 'ou_user', d) as any;
-    expect(driveRun).not.toHaveBeenCalled();
+    expect(driveRun).toHaveBeenCalledWith('r1');
     expect(res.toast.content).toContain('通过');
+  });
+
+  it('already-settled rejected → toast，不 driveRun（拒绝是终态）', async () => {
+    const { deps: d, driveRun } = deps({ resolveClick: () => ({ kind: 'already-settled', status: 'rejected' }) });
+    const res = await handleV3GateAction(VALUE, 'ou_user', d) as any;
+    expect(driveRun).not.toHaveBeenCalled();
+    expect(res.toast.content).toContain('拒绝');
   });
 
   it('stale-run terminal → toast 已结束，不 driveRun', async () => {
