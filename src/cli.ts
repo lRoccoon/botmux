@@ -65,6 +65,7 @@ import { firstPositional } from './cli/arg-utils.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { loadDashboardSecret } from './dashboard/auth.js';
 import { rejectLikelyWindowsStdinMojibake } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
@@ -2667,11 +2668,17 @@ async function cmdTermLink(rest: string[]): Promise<void> {
   }
 
   const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
-  if (!existsSync(SECRET_PATH)) {
-    console.error('❌ 缺少 .dashboard-secret（daemon 未初始化）。先 `botmux restart`。');
+  let secret: string | null;
+  try {
+    secret = loadDashboardSecret(SECRET_PATH);
+  } catch (e) {
+    console.error(`❌ 无法读取 .dashboard-secret：${(e as Error).message}`);
     process.exit(1);
   }
-  const secret = readFileSync(SECRET_PATH, 'utf8').trim();
+  if (!secret) {
+    console.error('❌ 缺少或为空 .dashboard-secret（daemon 未初始化）。先 `botmux restart`。');
+    process.exit(1);
+  }
   const ts = Math.floor(Date.now() / 1000).toString();
   const nonce = randomBytes(8).toString('hex');
   const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
@@ -3484,6 +3491,7 @@ function argValues(args: string[], ...flags: string[]): string[] {
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
 import { buildImageCardElements, brandFooterSegment } from './im/lark/md-card.js';
+import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
 import { openLedger } from './verified-delivery/ledger.js';
@@ -4050,13 +4058,6 @@ async function cmdSend(rest: string[]): Promise<void> {
           knownBotOpenIds,
         });
 
-    const mentionMap = new Map<string, string>();
-    for (const m of mentions) if (m.name) mentionMap.set(m.name.toLowerCase(), m.open_id);
-    const namedMentions = mentions.filter(m => m.name);
-    const mentionPattern = namedMentions.length > 0
-      ? new RegExp(`@(${namedMentions.map(m => m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'gi')
-      : null;
-
     // Capture sentAtMs BEFORE dispatch — the worker's bridge fallback gates
     // on `sentAtMs ∈ [turn.markTimeMs, nextTurn.markTimeMs)`. If we recorded
     // it after dispatch (which can take seconds), a slow Lark RTT could push
@@ -4067,19 +4068,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     let messageId: string;
     {
       // 回复一律卡片（纯文本 post 路径已删）。
-      // Inline @mention → <at id=open_id></at>; explicit --mention args that
-      // weren't inlined are appended to the body. The session owner is
-      // rendered in the footer note instead of the body.
-      const usedIds = new Set<string>();
-      let md = text;
-      if (mentionPattern) {
-        md = text.replace(mentionPattern, (full: string, name: string) => {
-          const openId = mentionMap.get(name.toLowerCase());
-          if (!openId) return full;
-          usedIds.add(openId);
-          return `<at id=${openId}></at>`;
-        });
-      }
+      // Inline `@Name` → `<at id=…>` at the exact spot it's written (CJK-name
+      // aware, see applyInlineMentions); any --mention not inlined here is
+      // rendered on the footer `发送给：` line below, not the body.
+      const { text: md, usedIds } = applyInlineMentions(text, mentions);
       // Non-inlined mentions are no longer dangled as a trailing @ block at the
       // body bottom — they're consolidated onto the footer `发送给：` line below
       // (human addressee first, then explicit targets). See orderedFooterRecipients.

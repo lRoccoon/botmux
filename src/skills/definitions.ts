@@ -1192,7 +1192,7 @@ botmux goal notify-parent --done --summary "Goal 已完成：各 subtask 产出 
 - 失败别硬重试同一招 ≥3 次；上报用户。
 `;
 
-const WHITEBOARD_SKILL = `---
+export const WHITEBOARD_SKILL = `---
 name: botmux-whiteboard
 description: 使用 botmux 本地项目白板读写跨 agent 的项目摘要、关键决策、已验证命令、阻塞和交接信息。触发场景：用户说白板、上下文、项目记忆、让其他 agent 看本地总结、长任务断点、多 agent 协作、handoff、需要沉淀不适合发飞书的大段上下文时。
 ---
@@ -1312,6 +1312,14 @@ EOF
 
 export const ASK_SKILL_NAME = 'botmux-ask';
 
+/** Conditionally-installed skill (like {@link ASK_SKILL_NAME}): kept OUT of
+ *  {@link BUILTIN_SKILLS} so it isn't written unconditionally. The whiteboard
+ *  feature is off by default, so its skill is only materialised when the
+ *  whiteboard is enabled — see `ensureWhiteboardSkill` + the per-spawn call in
+ *  worker-pool's `ensureCliSkills`. Disabled → the skill dir is removed so the
+ *  agent never sees a skill for a turned-off capability. */
+export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
+
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
@@ -1321,7 +1329,6 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
-  { name: 'botmux-whiteboard', content: WHITEBOARD_SKILL },
 ];
 
 /** Skills that earlier botmux versions installed but no longer ship. The

@@ -433,6 +433,12 @@ function streamingCardDisabledFor(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
+function silentTurnReactionsFor(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.silentTurnReactions === true;
+  } catch { return false; }
+}
+
 function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import('./types.js').Session | undefined {
   const paths = [
     join(config.session.dataDir, `sessions-${larkAppId}.json`),
@@ -458,13 +464,14 @@ export async function noteTurnReceived(ds: DaemonSession, triggerMessageId: stri
   // This call site is the per-message acceptance point, so it also drives the
   // two-phase turn reaction. It's auto-enabled exactly for card-off sessions
   // (streaming card disabled): those have no live status card, so the ✋→✅ on
-  // the user's message is the only lightweight progress signal. When the
-  // streaming card is on it already shows status, so we stay silent.
+  // the user's message is the only lightweight progress signal. Bots can opt
+  // out via silentTurnReactions for low-noise observer scenarios.
   // React 冲! on the triggering message the instant it's accepted. Binding to the
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
   if (!streamingCardDisabledFor(ds)) return;
+  if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
   if (!triggerMessageId.startsWith('om_')) return;
   if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
@@ -4095,7 +4102,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // bridge session whose worker died would gain a whiteboard binding (and a
     // <whiteboard> block in its refork prompt) that its live turns never had.
     if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
-    const wrappedPrompt = buildReforkPrompt(ds, promptContent, {
+    // 待办池(queued)会话：CLI 从没起过，暂存的任务内容(queuedPrompt，已按角色包装好)
+    // 必须当首轮发出去——否则群里来的这第一条消息会顶替掉它、把用户分配的任务丢掉。
+    // 把暂存任务前置、用户这条消息拼在后面，一并作为首轮。forkWorker 随后清 queued。
+    const reforkContent = ds.session.queued && ds.session.queuedPrompt
+      ? `${ds.session.queuedPrompt}\n\n${promptContent}`
+      : promptContent;
+    const wrappedPrompt = buildReforkPrompt(ds, reforkContent, {
       attachments,
       mentions: parsed.mentions,
       cliId: dsBotCfgForFork.cliId,

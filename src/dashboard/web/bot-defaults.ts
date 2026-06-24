@@ -317,11 +317,14 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </section>`;
   }
 
-  // Two per-bot card-behaviour toggles. Both auto-save on change (no explicit
-  // save button — each checkbox PUTs immediately). The writable-link toggle is
-  // moot while the streaming card is disabled, so we disable it in that state.
+  // Per-bot card-behaviour toggles. Each auto-saves on change (no explicit save
+  // button — each checkbox PUTs immediately). Two are gated on the streaming-card
+  // state: the writable-link toggle is moot WHILE the card is disabled; the
+  // status-reactions toggle only matters WHILE the card is disabled (the ✋→✅
+  // reactions only appear in card-off sessions), so it's editable only then.
   function renderCardBehaviorSection(b: any): string {
     const disableStreaming = b.disableStreamingCard === true;
+    const silentReactions = b.silentTurnReactions === true;
     const writableLink = b.writableTerminalLinkInCard === true;
     const privateCard = b.privateCard === true;
     return `<section class="bd-section">
@@ -331,6 +334,12 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <span class="switch" aria-hidden="true"></span>
         <span class="toggle-tx"><strong>${t('botDefaults.disableStreaming')}</strong>
         <small>${t('botDefaults.disableStreamingHelp')}</small></span>
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-silent-reactions" ${silentReactions ? 'checked' : ''} ${disableStreaming ? '' : 'disabled'}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.silentTurnReactions')}</strong>
+        <small>${t('botDefaults.silentTurnReactionsHelp')}</small></span>
       </label>
       <label class="toggle-row">
         <input type="checkbox" data-action="toggle-writable-link" ${writableLink ? 'checked' : ''} ${disableStreaming ? 'disabled' : ''}>
@@ -521,13 +530,20 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       : t('botDefaults.quotaStateOn', { count: quota });
   }
 
-  // 授权（/grant）相关：命令限制开关（auto-save 复选框）+ 默认消息额度（数字输入 + 保存/关闭按钮，
-  // 空＝关闭无限）。两者都通过 PUT /api/bots/:appId/grant-prefs 落到 bots.json，daemon 内存同步即时生效。
+  // 授权（/grant）相关：自动申请卡、命令限制开关 + 默认消息额度。都通过
+  // PUT /api/bots/:appId/grant-prefs 落到 bots.json，daemon 内存同步即时生效。
   function renderGrantSection(b: any): string {
     const restrict = b.restrictGrantCommands === true;
+    const autoCard = b.autoGrantRequestCards !== false;
     const quota: number | null = typeof b.messageQuotaDefaultLimit === 'number' ? b.messageQuotaDefaultLimit : null;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionGrant')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-auto-grant-card" ${autoCard ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.autoGrantCard')}</strong>
+        <small>${t('botDefaults.autoGrantCardHelp')}</small></span>
+      </label>
       <label class="toggle-row">
         <input type="checkbox" data-action="toggle-restrict-grant" ${restrict ? 'checked' : ''}>
         <span class="switch" aria-hidden="true"></span>
@@ -785,6 +801,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
       // ── Card behaviour toggles (auto-save on change) ──────────────────────
       const disableStreamingCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-disable-streaming]');
+      const silentReactionsCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-silent-reactions]');
       const writableLinkCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-writable-link]');
       const privateCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-private-card]');
       const cardPrefStatusEl = card.querySelector<HTMLSpanElement>('[data-card-pref-status]');
@@ -816,6 +833,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
               cached.disableStreamingCard = body.disableStreamingCard;
+              cached.silentTurnReactions = body.silentTurnReactions;
               cached.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
               cached.privateCard = body.privateCard;
               cached.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
@@ -835,6 +853,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         } finally {
           // The writable-link checkbox stays disabled while streaming is off.
           if (selfEl === writableLinkCb) selfEl.disabled = !!disableStreamingCb?.checked;
+          // The status-reactions checkbox is only editable while streaming is off.
+          else if (selfEl === silentReactionsCb) selfEl.disabled = !disableStreamingCb?.checked;
           else selfEl.disabled = false;
         }
       }
@@ -844,8 +864,16 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           const off = disableStreamingCb.checked;
           // Streaming off → the writable-link toggle has nothing to attach to.
           if (writableLinkCb) writableLinkCb.disabled = off;
+          // Status reactions only exist in card-off sessions, so this toggle is
+          // editable only while streaming is off.
+          if (silentReactionsCb) silentReactionsCb.disabled = !off;
           if (cardPrefMootEl) cardPrefMootEl.hidden = !off;
           putCardPref({ disableStreamingCard: off }, disableStreamingCb);
+        });
+      }
+      if (silentReactionsCb) {
+        silentReactionsCb.addEventListener('change', () => {
+          putCardPref({ silentTurnReactions: silentReactionsCb.checked }, silentReactionsCb);
         });
       }
       if (writableLinkCb) {
@@ -1089,7 +1117,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         });
       }
 
-      // ── 授权偏好：命令限制开关 + 默认消息额度 ──────────────────────────
+      // ── 授权偏好：自动申请卡 + 命令限制开关 + 默认消息额度 ──────────────
+      const autoGrantCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-grant-card]');
       const restrictCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-restrict-grant]');
       const quotaInput = card.querySelector<HTMLInputElement>('input[data-input=quotaLimit]');
       const quotaSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-quota]');
@@ -1097,10 +1126,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       const grantStatusEl = card.querySelector<HTMLSpanElement>('[data-grant-status]');
       const quotaStateEl = card.querySelector<HTMLElement>('[data-quota-state]');
 
-      // PUT a partial grant-prefs patch ({ restrictGrantCommands? } and/or
-      // { messageQuotaDefaultLimit: number|null }). Mirrors putCardPref.
+      // PUT a partial grant-prefs patch ({ autoGrantRequestCards? },
+      // { restrictGrantCommands? } and/or { messageQuotaDefaultLimit: number|null }).
+      // Mirrors putCardPref.
       async function putGrantPref(
-        patch: { restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
+        patch: { autoGrantRequestCards?: boolean; restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
         selfEl: HTMLInputElement | HTMLButtonElement,
       ) {
         if (!grantStatusEl) return;
@@ -1120,6 +1150,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             const next: number | null = typeof body.messageQuotaDefaultLimit === 'number' ? body.messageQuotaDefaultLimit : null;
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
+              cached.autoGrantRequestCards = body.autoGrantRequestCards !== false;
               cached.restrictGrantCommands = body.restrictGrantCommands === true;
               cached.messageQuotaDefaultLimit = next;
             }
@@ -1139,6 +1170,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         }
       }
 
+      if (autoGrantCardCb) {
+        autoGrantCardCb.addEventListener('change', () => {
+          putGrantPref({ autoGrantRequestCards: autoGrantCardCb.checked }, autoGrantCardCb);
+        });
+      }
       if (restrictCb) {
         restrictCb.addEventListener('change', () => {
           putGrantPref({ restrictGrantCommands: restrictCb.checked }, restrictCb);

@@ -186,6 +186,12 @@ export interface BotConfig {
    */
   restrictGrantCommands?: boolean;
   /**
+   * 自动授权申请卡开关。默认开启（undefined = on）：群里有人或外部 bot 明确 @ 本 bot
+   * 但被 talk 权限闸挡住时，给 owner 弹 /grant 申请卡。显式 false 时静默丢弃，
+   * 保留原来的强权限闸但不刷卡。
+   */
+  autoGrantRequestCards?: boolean;
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -236,6 +242,12 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /**
+   * When true, suppress the lightweight GoGoGo → DONE message reactions used as
+   * progress markers in card-off sessions. Missing/false preserves the current
+   * card-off reaction behavior.
+   */
+  silentTurnReactions?: boolean;
   /**
    * Conversation mode for 1:1 private chats (DMs) with the bot:
    *   - 'thread' (default, stored as undefined): every top-level DM message
@@ -481,6 +493,11 @@ export function getBotClient(larkAppId: string): Lark.Client {
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
 export function getOwnerOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+/** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
+export function getDashboardAdminOpenIds(larkAppId: string): string[] {
+  return [...(bots.get(larkAppId)?.resolvedAllowedUsers ?? [])];
 }
 
 /** Bot 自身的 open_id（用于在 mention 解析时排除自己）。 */
@@ -895,6 +912,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       messageQuota,
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
+      // Default is ON, so only explicit false is meaningful/persisted.
+      autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       customPassthroughCommands,
       startupCommands,
       env,
@@ -904,6 +923,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      silentTurnReactions: entry.silentTurnReactions === true || undefined,
       // Only 'chat' is meaningful; 'thread' (and anything else) normalizes to
       // undefined — the legacy thread-per-message default. Keeps bots.json clean.
       p2pMode: entry.p2pMode === 'chat' ? 'chat' : undefined,

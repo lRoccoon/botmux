@@ -8,9 +8,11 @@ import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } 
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
+import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { sessionKey } from '../src/core/types.js';
 import { writeTeamRoleFile } from '../src/core/role-resolver.js';
 import { openLedger } from '../src/verified-delivery/ledger.js';
 
@@ -23,6 +25,54 @@ function tokenAuthHeaders(secret = TEST_IPC_SECRET): Record<string, string> {
   const nonce = randomBytes(8).toString('hex');
   const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
   return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
+}
+
+function parseSseFrame(raw: string): { type: string; body: any } | null {
+  let type: string | undefined;
+  let data: string | undefined;
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('event:')) type = line.slice(6).trim();
+    else if (line.startsWith('data:')) data = line.slice(5).trim();
+  }
+  if (!type) return null;
+  let body: any;
+  try { body = data ? JSON.parse(data) : undefined; } catch { body = undefined; }
+  return { type, body };
+}
+
+/** Connect to an SSE endpoint and resolve with the first event matching the
+ *  predicate, or null on timeout. Aborts the stream when done. */
+async function readSseEvent(
+  url: string,
+  predicate: (e: { type: string; body: any }) => boolean,
+  timeoutMs = 3000,
+): Promise<{ type: string; body: any } | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.body) return null;
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return null;
+      buf += dec.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const frame = parseSseFrame(buf.slice(0, idx));
+        buf = buf.slice(idx + 2);
+        if (frame && predicate(frame)) return frame;
+      }
+    }
+  } catch (e) {
+    if (ctrl.signal.aborted) return null;
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    ctrl.abort();
+  }
 }
 
 let handle: IpcServerHandle | null = null;
@@ -164,6 +214,124 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     expect(res.status).toBe(502);
     expect(await res.json()).toMatchObject({ ok: false });
     findSpy.mockRestore();
+  });
+});
+
+describe('POST /api/sessions/:sessionId/resume', () => {
+  it('wakes a resumed session immediately when wake=1 is set', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
+      session.larkAppId = '';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      session.workingDir = process.cwd();
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume?wake=1`, { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: true, sessionId: session.sessionId, wake: true });
+      expect(registry.get(sessionKey('om_resume', ''))?.session.sessionId).toBe(session.sessionId);
+      expect(forkSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ session: expect.objectContaining({ sessionId: session.sessionId }) }),
+        '',
+        true,
+      );
+    } finally {
+      forkSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('default resume (no wake) reactivates without forking a worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
+      session.larkAppId = '';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      session.workingDir = process.cwd();
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume`, { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // Reactivated, but NO eager fork — the session cold-resumes lazily on the
+      // next inbound message. This guards the `wake &&` short-circuit against a
+      // refactor that reverts to forking on every resume.
+      expect(body).toMatchObject({ ok: true, sessionId: session.sessionId, wake: false });
+      expect(registry.get(sessionKey('om_resume', ''))?.session.sessionId).toBe(session.sessionId);
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      forkSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('GET /api/events', () => {
+  it('replays current active sessions as session.spawned on connect (snapshot-on-connect)', async () => {
+    // Guards the descriptor→restore race: a dashboard that subscribes AFTER an
+    // empty hydrate (or after a restore-time announce it missed) must still learn
+    // every active row. The SSE handler subscribes then replays the live registry.
+    const registry = new Map<string, any>();
+    workerPool.setActiveSessionsRegistry(registry);
+    try {
+      registry.set(sessionKey('om_snap', 'cli_app'), {
+        session: {
+          sessionId: 'snap-1', chatId: 'oc_snap', rootMessageId: 'om_snap',
+          title: 't', status: 'active', createdAt: new Date(1000).toISOString(),
+          scope: 'thread', cliId: 'codex',
+        },
+        worker: null, workerPort: null, workerToken: null,
+        larkAppId: 'cli_app', chatId: 'oc_snap', chatType: 'group', scope: 'thread',
+        spawnedAt: 1000, cliVersion: 'test', lastMessageAt: 1000, hasHistory: true,
+      });
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const ev = await readSseEvent(
+        `http://127.0.0.1:${handle.port}/api/events`,
+        e => e.type === 'session.spawned' && e.body?.session?.sessionId === 'snap-1',
+      );
+      expect(ev).not.toBeNull();
+      expect(ev!.body.session.status).toBe('starting'); // worker:null → no screen yet
+      expect(ev!.body.session.hasHistory).toBe(true);
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+    }
   });
 });
 

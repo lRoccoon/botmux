@@ -8,7 +8,8 @@ import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
-import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
+import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, removeGlobalBotmuxSkills } from '../skills/installer.js';
+import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes } from 'node:crypto';
@@ -160,6 +161,12 @@ function streamingCardDisabled(ds: DaemonSession): boolean {
     const cfg = getBot(ds.larkAppId).config;
     return cfg.disableStreamingCard === true
       || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId));
+  } catch { return false; }
+}
+
+function silentTurnReactions(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.silentTurnReactions === true;
   } catch { return false; }
 }
 
@@ -790,8 +797,15 @@ const skillsInstalledCliIds = new Set<string>();
  * Synchronous and idempotent — runs once per CLI per daemon lifecycle.
  */
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
-  if (skillsInstalledCliIds.has(cliId)) return;
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
+  // botmux-whiteboard skill 跟随白板能力开关，且**每次 spawn 都重新评估**（不进
+  // 下面 skillsInstalledCliIds 的一次性缓存）——这样运行时在 dashboard/CLI 切换白板
+  // 开关，下一个会话即生效，无需重启 daemon。skill 落点与其它内置 skill 同目录
+  // （plugin 模式下是 {pluginDir}/skills），spawn 时一并经 --plugin-dir 注入。
+  const wbSkillsDir = adapter.pluginDir ? join(adapter.pluginDir, 'skills') : adapter.skillsDir;
+  ensureWhiteboardSkill(cliId, wbSkillsDir, whiteboardEnabled());
+
+  if (skillsInstalledCliIds.has(cliId)) return;
   if (adapter.pluginDir) {
     // 动态注入：skill 写进插件目录，spawn 时用 --plugin-dir 注入，仅本次会话可见。
     // 不再写全局 skillsDir。（全局 ~/.claude/skills 的历史残留清理改由
@@ -1471,6 +1485,14 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
+  // 不变式：一旦真正起 CLI，会话就不再是「待办池(queued)」parked 态。无论由哪条
+  // 路径触发（激活按钮 / 拖到进行中 / 群里来消息抢先起会话），都在此清掉 queued
+  // 标记并落盘——否则重启后会被当 parked 恢复成 hasHistory:false 而丢掉真历史。
+  if (ds.session.queued) {
+    ds.session.queued = false;
+    ds.session.queuedPrompt = undefined;
+    sessionStore.updateSession(ds.session);
+  }
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
@@ -2395,9 +2417,11 @@ const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
  * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
  * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
  * acceptance point (`noteTurnReceived`); when the worker next returns to idle we
- * flip every pending ✋ on this session to ✅ DONE and clear the list. Binding the
- * start to the message (not a status edge) means type-ahead / busy-batched
- * messages each get their own reaction and all settle together here.
+ * flip every pending ✋ on this session to ✅ DONE and clear the list. When
+ * silentTurnReactions is enabled after a ✋ has already landed, we only remove
+ * that received reaction and do not add DONE. Binding the start to the message
+ * (not a status edge) means type-ahead / busy-batched messages each get their
+ * own reaction and all settle together here.
  *
  * Every Feishu call is best-effort — a failure only means a missing emoji, so it
  * must never throw into the status pipeline (callers invoke as `void`).
@@ -2407,6 +2431,7 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   if (!list || list.length === 0) return;
   // Detach the batch first so a second idle edge can't double-flip it.
   ds.pendingAckReactions = [];
+  const silent = silentTurnReactions(ds);
   for (const ack of list) {
     if (ack.reactionId) {
       try {
@@ -2415,6 +2440,7 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
         logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
       }
     }
+    if (silent) continue;
     try {
       await addReaction(ds.larkAppId, ack.messageId, DONE_REACTION_EMOJI_TYPE);
     } catch (err: any) {

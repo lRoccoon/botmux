@@ -48,6 +48,27 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `backendType` | Session backend, one of `pty` / `tmux` / `herdr` / `zellij`. Leave empty to **auto-detect**: chooses `tmux` if tmux is available, otherwise `pty` (`herdr` and `zellij` are never auto-selected and must be specified explicitly). `tmux` / `herdr` / `zellij` are all persistent sessions and fall back to `pty` automatically if the corresponding binary probe fails (`zellij` requires ≥ 0.44); `pty` attaches directly to the process and does not persist across restarts. See [tmux backend](/en/tmux) |
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
+| `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
+
+### Run a bot on GLM / a third-party provider (per-bot env)
+
+Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while another keeps using official Claude — give the former an `env`:
+
+```json
+{
+  "cliId": "claude-code",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "your GLM Coding Plan key"
+  }
+}
+```
+
+- For GLM in China, use `https://open.bigmodel.cn/api/anthropic` for `ANTHROPIC_BASE_URL`.
+- For an OpenAI-protocol CLI like Codex, set `OPENAI_BASE_URL` / `OPENAI_API_KEY` (the provider's OpenAI-compatible endpoint) instead of `ANTHROPIC_*`.
+- **Isolation**: env is injected per-session into the CLI process, consistently across backends (tmux / zellij inject it per-pane, never into the shared server env), so one bot's provider config can't leak into another's.
+- **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat surfaces like `/config get` mask the values (the owner-authenticated dashboard editor shows real values).
+- Takes effect from the next **session**.
 
 ## Working directory
 
@@ -69,6 +90,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `chatGrants` | Per-group, per-user authorization `{ "oc_xxx": ["ou_yyy"] }`, only grants `canTalk`. Usually written by the `/grant` card, but can also be configured by hand |
 | `messageQuota` | Message-quota switch `{ "defaultLimit": N }`: once a positive integer is configured, a `/grant` without a number applies an N-message quota; if not configured, authorization is unlimited. Only constrains talk authorization, does not affect `canOperate` |
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
+| `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
 
 ## Cards and terminal
 
@@ -76,6 +98,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 |------|------|
 | `brandLabel` | Branding text at the bottom of the card. `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
 | `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
+| `silentTurnReactions` | When `true`, card-off sessions no longer add GoGoGo / DONE reactions to the triggering message. Only affects the lightweight status reactions used when `disableStreamingCard` or `noCardChats` suppresses live cards; defaults to `false` |
 | `writableTerminalLinkInCard` | When `true`, the card body directly embeds a **writable** terminal link (with token, anyone who can see the card can operate it); by default it's hidden behind a "Get write permission" button and sent privately to whoever clicks. Meaningless when `disableStreamingCard` is enabled |
 | `privateCard` | When `true`, `/card` uses an ephemeral private card visible only to `allowedUsers` (talk grantees and the bare triggerer don't receive it), only effective in plain `group` chats, and cannot live-update. Only affects the `/card` command itself |
 

@@ -31,6 +31,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     brandLabel: j?.brandLabel ?? null,
     sandbox: j?.sandbox === true,
     disableStreamingCard: j?.disableStreamingCard === true,
+    silentTurnReactions: j?.silentTurnReactions === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
@@ -43,6 +44,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       ? j.regularGroupMentionMode
       : 'always',
     restrictGrantCommands: j?.restrictGrantCommands === true,
+    autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'chat' ? 'chat' : 'thread',
     maxLiveWorkers: typeof j?.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
