@@ -56,7 +56,7 @@ import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-pr
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { buildGoalHumanAttentionCard, buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
@@ -2521,21 +2521,25 @@ function retryRecordFromCompletion(input: {
 async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord): Promise<{ sent: boolean; error?: string }> {
   let lastError: string | undefined;
   for (const larkAppId of record.candidates) {
-    const mention = record.ownerOpenId ? `<at user_id="${record.ownerOpenId}"></at> ` : '';
     const goalLink = chatAppLink(record.goalChatId, getBotBrand(larkAppId));
-    const text = [
-      `${mention}${record.done ? '[goal] Goal 已完成，等待确认' : '[goal] 任务需要你拍板'}`,
-      record.goalTitle ? `Goal: ${record.goalTitle}` : undefined,
-      `goalChatId: ${record.goalChatId}`,
-      record.taskId ? `taskId: ${record.taskId}` : undefined,
-      `打开 goal 群: ${goalLink}`,
-      `类型: ${record.attentionKind ?? 'blocked'}`,
-      `原因: ${record.attentionReason ?? record.summary}`,
-      '',
-      record.summary,
-    ].filter(Boolean).join('\n');
+    const ownerOpenId = getOwnerOpenId(larkAppId) ?? record.ownerOpenId;
+    const card = buildGoalHumanAttentionCard({
+      ownerOpenId,
+      goalTitle: record.goalTitle,
+      goalChatId: record.goalChatId,
+      goalLink,
+      taskId: record.taskId,
+      attentionKind: record.attentionKind,
+      attentionReason: record.attentionReason,
+      summary: record.summary,
+      notificationLarkAppId: larkAppId,
+      parentChatId: record.parentChatId,
+      parentRoot: record.parentRoot,
+      parentSessionId: record.parentSessionId,
+      supervisorSessionId: record.supervisorSessionId,
+    });
     try {
-      const messageId = await sendMessage(larkAppId, record.parentChatId, text, 'text');
+      const messageId = await sendMessage(larkAppId, record.parentChatId, card, 'interactive');
       if (messageId) {
         rememberGoalParentNotification({
           messageId,
@@ -2663,8 +2667,9 @@ async function sendGoalCompletionConfirmationRecord(record: GoalNotificationRetr
   let lastError: string | undefined;
   for (const larkAppId of record.candidates) {
     const goalLink = chatAppLink(record.goalChatId, getBotBrand(larkAppId));
+    const ownerOpenId = getOwnerOpenId(larkAppId) ?? record.ownerOpenId;
     const card = buildGoalCompletionConfirmCard({
-      ownerOpenId: record.ownerOpenId,
+      ownerOpenId,
       goalTitle: record.goalTitle,
       goalChatId: record.goalChatId,
       goalLink,
