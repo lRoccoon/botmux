@@ -16,7 +16,7 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -2020,7 +2020,8 @@ function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
 
 /**
  * Resolve the pinned working dir for a brand-new topic via the layered lookup:
- *   1) an existing oncall binding (this bot or a sibling)
+ *   1) this bot's OWN oncall binding (per-bot: another bot's binding never pins
+ *      this bot — cross-bot dir alignment is handled by layer 3 inherit-peer)
  *   2) this bot's defaultOncall — auto-binds a brand-new chat when the flag is on
  *      (this WRITES state, so it must run identically on every spawn path)
  *   3) a sibling session's workingDir (cross-bot / chat-scope inheritance)
@@ -2036,7 +2037,7 @@ async function resolvePinnedWorkingDir(ctx: {
   chatType: 'group' | 'p2p';
   larkAppId: string;
 }) {
-  let oncallEntry = findOncallChatForAnyBot(ctx.chatId);
+  let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
