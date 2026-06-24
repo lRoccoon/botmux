@@ -364,11 +364,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
   // 放在同一板块，各自一个下拉、一改即保存。
   //   • p2pMode             → PUT /api/bots/:appId/p2p-mode（走 applyConfigField，与 /botconfig 同路径）
   //   • 普通群默认模式 mode  → PUT /api/bots/:appId/card-prefs 的 regularGroupReplyMode
-  //                           （chat | new-topic | shared，默认 chat）
+  //                           （chat | chat-topic | new-topic | shared，默认 chat）
   // per-chat 的 /reply-mode 可覆盖此 per-bot 默认。
   function renderSessionModeSection(b: any): string {
     const p2p: string = b.p2pMode === 'chat' ? 'chat' : 'thread';
-    const regular: string = (b.regularGroupReplyMode === 'new-topic' || b.regularGroupReplyMode === 'shared')
+    const regular: string = (b.regularGroupReplyMode === 'new-topic' || b.regularGroupReplyMode === 'shared' || b.regularGroupReplyMode === 'chat-topic')
       ? b.regularGroupReplyMode : 'chat';
     const mention: string = (b.regularGroupMentionMode === 'topic' || b.regularGroupMentionMode === 'never')
       ? b.regularGroupMentionMode : 'always';
@@ -399,6 +399,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           <span>${t('botDefaults.regularGroupMode')}</span>
           <select data-input="regularGroupMode">
             ${opt('chat', t('botDefaults.regularGroupModeChat'))}
+            ${opt('chat-topic', t('botDefaults.regularGroupModeChatTopic'))}
             ${opt('new-topic', t('botDefaults.regularGroupModeNewTopic'))}
             ${opt('shared', t('botDefaults.regularGroupModeShared'))}
           </select>

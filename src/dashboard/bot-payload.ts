@@ -35,7 +35,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
-    regularGroupReplyMode: (j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared')
+    regularGroupReplyMode: (j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared' || j?.regularGroupReplyMode === 'chat-topic')
       ? j.regularGroupReplyMode
       : 'chat',
     regularGroupMentionMode: (j?.regularGroupMentionMode === 'topic' || j?.regularGroupMentionMode === 'never')

@@ -15,8 +15,8 @@
  *                                  (visible to the talk-grant audience) instead
  *                                  of the group-visible live card
  *   • regularGroupReplyMode     — per-bot DEFAULT session mode for regular
- *                                  groups: chat | new-topic | shared (see
- *                                  chat-reply-mode-store). Default 'chat'.
+ *                                  groups: chat | chat-topic | new-topic | shared
+ *                                  (see chat-reply-mode-store). Default 'chat'.
  */
 import { rmwBotEntry } from './config-store.js';
 import { getBot, type ChatReplyMode } from '../bot-registry.js';
@@ -33,7 +33,7 @@ export interface BotCardPrefs {
   autoStartOnGroupJoinPrompt: string;
   /** 主动开工 — 场景②: auto-start on every new topic in a topic group. */
   autoStartOnNewTopic: boolean;
-  /** Per-bot DEFAULT regular-group session mode (chat | new-topic | shared). */
+  /** Per-bot DEFAULT regular-group session mode (chat | chat-topic | new-topic | shared). */
   regularGroupReplyMode: ChatReplyMode;
   /** Per-bot 3-tier @-requirement policy for regular groups (default 'always'). */
   regularGroupMentionMode: 'always' | 'topic' | 'never';
@@ -102,7 +102,7 @@ export async function updateBotCardPrefs(
   // default) drops the key so bots.json stays tidy (absent === 'chat').
   const applyMode = (entry: any, key: keyof BotCardPrefs, val: ChatReplyMode | undefined) => {
     if (val === undefined) return;
-    if (val === 'new-topic' || val === 'shared') entry[key] = val;
+    if (val === 'new-topic' || val === 'shared' || val === 'chat-topic') entry[key] = val;
     else delete entry[key];
   };
   // 3-tier @ policy: store only the non-default tiers; 'always' (default) drops
@@ -140,7 +140,7 @@ export async function updateBotCardPrefs(
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
-        regularGroupReplyMode: (entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared')
+        regularGroupReplyMode: (entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared' || entry.regularGroupReplyMode === 'chat-topic')
           ? entry.regularGroupReplyMode
           : 'chat',
         regularGroupMentionMode: (entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never')
@@ -175,7 +175,7 @@ export async function updateBotCardPrefs(
     bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
   }
   if (patch.regularGroupReplyMode !== undefined) {
-    bot.config.regularGroupReplyMode = (patch.regularGroupReplyMode === 'new-topic' || patch.regularGroupReplyMode === 'shared')
+    bot.config.regularGroupReplyMode = (patch.regularGroupReplyMode === 'new-topic' || patch.regularGroupReplyMode === 'shared' || patch.regularGroupReplyMode === 'chat-topic')
       ? patch.regularGroupReplyMode
       : undefined;
   }

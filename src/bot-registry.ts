@@ -12,12 +12,13 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 
-export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
+export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 
 function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   if (typeof raw !== 'string') return undefined;
   const v = raw.trim().toLowerCase();
   if (v === 'chat') return 'chat';
+  if (v === 'chat-topic' || v === 'chattopic' || v === 'chat_topic') return 'chat-topic';
   if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
   if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
   return undefined;
@@ -702,9 +703,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .filter((x: any): x is string => typeof x === 'string');
     }
 
-    // chatReplyModes：只保留每群显式设置，非法值丢弃。三态 chat｜new-topic｜
-    // shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目以保持
-    // bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
+    // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
+    // new-topic｜shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
+    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
     let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
     if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
       const out: { [chatId: string]: ChatReplyMode } = {};
@@ -879,12 +880,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
-      // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are
-      // meaningful; 'chat' (the flat default) and anything else normalize to
-      // undefined so bots.json stays clean.
+      // Per-bot regular-group default mode. Only the non-default modes
+      // ('chat-topic' | 'new-topic' | 'shared') are meaningful; 'chat' (the flat
+      // default) and anything else normalize to undefined so bots.json stays clean.
       regularGroupReplyMode: (() => {
         const mode = normalizeChatReplyModeConfig(entry.regularGroupReplyMode);
-        return mode === 'new-topic' || mode === 'shared' ? mode : undefined;
+        return mode === 'new-topic' || mode === 'shared' || mode === 'chat-topic' ? mode : undefined;
       })(),
       // 3-tier @ policy. Only 'topic' | 'never' are meaningful; 'always' (the
       // default) and anything else normalize to undefined so bots.json stays clean.
