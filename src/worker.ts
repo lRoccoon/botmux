@@ -5000,12 +5000,31 @@ window.addEventListener('resize',onViewportResize);
   ws.onerror=function(){ws.close()};
 })();
 
-// ── Read-only scroll handling ──
-if(!hasToken&&!${isTmuxMode && !isPipeMode}){
-  // Non-tmux read-only: CLI mouse mode blocks local scroll, override with scrollLines
+// ── Wheel scroll handling ──
+// Alt-screen + mouse-mode CLIs (e.g. Claude Code) keep NO scrollback in xterm OR
+// tmux — their whole transcript is redrawn by the app inside the fixed alt-screen
+// grid, so term.scrollLines() reveals nothing. When the browser xterm is in the
+// alternate buffer we instead forward the wheel as SGR mouse-wheel events so the
+// CLI scrolls its own transcript and repaints (verified: Claude scrolls on this).
+// Normal-buffer CLIs keep xterm's native scrollback scroll. Capture-phase +
+// stopPropagation pre-empts xterm's own mouse handler so the wheel isn't also
+// re-emitted to the CLI. Skipped for pure tmux/zellij ATTACH (gate), where the
+// attach client owns the wheel via tmux/zellij copy-mode.
+if(!${isTmuxMode && !isPipeMode}){
   document.getElementById('terminal').addEventListener('wheel',function(e){
-    e.preventDefault();term.scrollLines(e.deltaY>0?3:-3);
-  },{passive:false});
+    if(term.buffer.active.type!=='alternate'){
+      // Normal buffer: xterm scrolls its own scrollback natively. In read-only a
+      // mouse-mode CLI could swallow the wheel, so drive scrollback directly.
+      if(!hasToken){e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);}
+      return;
+    }
+    // Alternate buffer: no local scrollback — forward the wheel so the CLI scrolls.
+    e.preventDefault();e.stopPropagation();
+    if(!hasToken||!ws_||ws_.readyState!==1)return; // read-only can't reach the app
+    var btn=e.deltaY<0?64:65; // SGR: 64=wheel-up (history), 65=wheel-down
+    var seq='\\x1b[<'+btn+';1;1M';
+    ws_.send(JSON.stringify({type:'input',data:seq+seq+seq})); // ~3 lines per notch
+  },{capture:true,passive:false});
 }
 
 // ── Touch shortcut toolbar ──
