@@ -503,10 +503,11 @@ export function findOncallChat(larkAppId: string, chatId: string): OncallChat | 
 
 // Cross-bot oncall chat discovery — cached by config-file mtime.
 //
-// /oncall bind is per-bot for talk authorization: receiving-bot gates must use
-// findOncallChat(larkAppId, chatId). This cross-bot lookup remains for paths
-// that need deployment-wide discovery/inheritance, such as pinned working-dir
-// resolution and default-oncall checks.
+// /oncall bind is per-bot, and so is consumption: both talk-authorization
+// gates AND working-dir pinning use findOncallChat(larkAppId, chatId). This
+// cross-bot lookup is now used ONLY for `botmux send` footer addressing
+// (cli.ts) — replying to the last caller in the shared oncall workspace —
+// NOT for dir pinning or permission gating.
 //
 // Multi-daemon deployments run one bot per process, so the in-memory `bots`
 // map only sees this daemon's own bot — sibling bots' bindings live only on

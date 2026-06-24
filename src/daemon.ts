@@ -1977,7 +1977,7 @@ function parseTriggerChatBinding(
  * Default-oncall is a uniform forward-only policy: whenever the toggle is
  * on, ANY chat the bot is currently in — old or newly added, doesn't matter —
  * gets auto-bound to the configured workingDir on its next observed topic,
- * unless it's already bound (`findOncallChatForAnyBot` upstream) or the user
+ * unless it's already bound (`findOncallChat`, per-bot, upstream) or the user
  * has opted out via tombstone.
  *
  * Thin wrapper around the shared `ensureDefaultOncallBound` in oncall-store,
