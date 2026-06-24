@@ -89,7 +89,7 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
 } from './core/session-manager.js';
-import { beginReplyTargetTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, fallbackTurnId, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { handleCardAction } from './im/lark/card-handler.js';
@@ -435,7 +435,18 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
     if (ds?.scope === 'chat') {
       const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
       if (fresh) syncReplyTargetState(ds, fresh);
-      const target = resolveSessionReplyTarget(ds, turnId);
+      // Resolve through fallbackTurnId so daemon-side sends that carry no turn of
+      // their own (the repo-select card, skip/switch confirmations, crash notices)
+      // still anchor into the current shared fold-back topic instead of leaking to
+      // the chat top level. Callers that DO pass an explicit turnId are unchanged —
+      // fallbackTurnId returns it verbatim, so the stale-turn hijack guard stays
+      // authoritative. Baking the fallback in HERE (the single chat-scope send
+      // chokepoint) means no individual send site can re-introduce the leak by
+      // forgetting to thread — the recurring failure mode behind this and the
+      // earlier e619250d fix. Guarded by test/session-reply-thread-anchor.test.ts
+      // (drives the real sessionReply) and test/reply-target-fallback.test.ts
+      // (the resolveSessionReplyTarget × fallbackTurnId composition it relies on).
+      const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
       if (target.mode === 'thread') return replyMessage(appId, target.rootMessageId, content, msgType, true, undefined, hookContext);
       if (ds.session.rootMessageId) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
@@ -451,6 +462,13 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
   // Thread-scope (or unknown / legacy): reply in thread.
   return replyMessage(appId, anchor, content, msgType, true, undefined, hookContext);
 }
+
+// Test seams: drive the real sessionReply (the chat-scope thread/top-level
+// chokepoint) against a seeded session, so the shared fold-back leak is guarded
+// at the function that actually routes — not just the resolveSessionReplyTarget
+// composition it relies on. See test/reply-target-fallback.test.ts.
+export const __testOnly_sessionReply = sessionReply;
+export const __testOnly_activeSessions = activeSessions;
 
 async function revokeQuotaGrant(
   larkAppId: string,
