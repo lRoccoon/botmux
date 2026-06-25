@@ -1535,9 +1535,12 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // session.workingDir empty and is invisible to cross-bot same-dir inheritance.
   // Only FILL IN a missing workingDir (default/fallback-spawned sessions) — never
   // overwrite an already-pinned value (oncall/repo-card sessions keep their stored
-  // form). And only persist a genuinely-resolved dir, never the homedir()
-  // crash-fallback (cwd !== rawCwd), so a transiently-missing dir can't pin to ~.
-  if (!ds.session.workingDir && cwd === rawCwd) {
+  // form). Persist only a genuinely-resolved dir, never the homedir() crash-fallback
+  // (cwd !== rawCwd → a transiently-missing dir can't pin to ~). Also exclude a
+  // LEGITIMATELY-resolved homedir: a bot whose workingDir is unset/`~` resolves to
+  // $HOME, and pinning that would let a sibling bot inherit $HOME (launch in the home
+  // dir with no repo context) instead of getting its own repo card.
+  if (!ds.session.workingDir && cwd === rawCwd && cwd !== homedir()) {
     ds.session.workingDir = cwd;
     sessionStore.updateSession(ds.session);
   }
