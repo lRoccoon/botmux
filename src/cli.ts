@@ -861,13 +861,6 @@ async function promptEditBotConfig(
   ]);
   input.showInTeam = await ask(rl, `平台团队页展示 showInTeam [${formatBooleanValue(bot.showInTeam, true)}]: `);
 
-  printInputHelp('平台团队可操作 teamOperate', [
-    '可选。绑定平台后，本机所属团队的成员是否可以操作（写入）这个机器人，而非仅查看。',
-    '默认 false（仅查看）；填 true 放开该机器人的团队写权限。',
-    '留空保留当前值；输入 - 恢复默认（仅查看）。',
-  ]);
-  input.teamOperate = await ask(rl, `平台团队可操作 teamOperate [${formatBooleanValue(bot.teamOperate, false)}]: `);
-
   const edited = applyBotConfigEdits(bot, input);
   // 配了 allowedChatGroups 就必须有 owner，否则敏感操作对所有人关闭。抛错由调用方捕获并中止写盘。
   assertOwnerWhenChatGroups(edited);

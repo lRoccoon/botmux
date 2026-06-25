@@ -289,13 +289,6 @@ export interface BotConfig {
    */
   showInTeam?: boolean;
   /**
-   * 平台团队成员是否可操作这个 bot（而非仅查看）. When true, members of the
-   * platform team this machine belongs to may drive this bot (write access),
-   * not just observe it. Default OFF (undefined = view-only); opt in per bot.
-   * Reported to the platform via the dashboard's bot-info upload.
-   */
-  teamOperate?: boolean;
-  /**
    * 主动开工 — 场景①. When true, the bot auto-starts a session when it is added
    * to a new chat that contains at least one of its allowedUsers (see
    * docs/specs/20260529-proactive-auto-start/). Default (undefined) = passive
@@ -900,8 +893,6 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。
       showInTeam: entry.showInTeam === false ? false : undefined,
-      // 平台团队可操作默认 OFF：只有显式 true 有意义/落盘（undefined = 仅查看）。
-      teamOperate: entry.teamOperate === true || undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
       // so an empty string doesn't linger in bots.json.

@@ -142,13 +142,6 @@ export interface BotConfigEditInput {
    *   - '' / '-' → 清空（回到默认 ON）
    */
   showInTeam?: string;
-  /**
-   * 平台团队成员是否可操作这个 bot（默认 OFF）。三态字符串：
-   *   - undefined → 不动
-   *   - 'true' / 'false' → 设置（'true' 落盘 true；'false' 落盘为删字段=默认 OFF）
-   *   - '' / '-' → 清空（回到默认 OFF）
-   */
-  teamOperate?: string;
 }
 
 /**
@@ -418,9 +411,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     }
   }
 
-  // 平台团队展示默认 ON → 只把显式 false 落盘；可操作默认 OFF → 只把显式 true 落盘。
+  // 平台团队展示默认 ON → 只把显式 false 落盘。
   applyOptionalBoolean(out, 'showInTeam', input.showInTeam, true);
-  applyOptionalBoolean(out, 'teamOperate', input.teamOperate, false);
 
   return normalizeBotConfig(out) as T;
 }

@@ -27,7 +27,6 @@ import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
-import { loadBotConfigs } from './bot-registry.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -159,38 +158,20 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
 
-// Whether platform-team *teammates* (X-Botmux-Role: teammate) may DRIVE this
-// session's terminal, per the owning bot's `teamOperate` config. Computed once
-// lazily on first terminal access (larkAppIdForUpload is set at init, before the
-// web server starts). undefined = not yet computed.
-let cachedBotTeamOperate: boolean | undefined;
-function botTeamOperateAllows(): boolean {
-  if (cachedBotTeamOperate === undefined) {
-    try {
-      cachedBotTeamOperate =
-        loadBotConfigs().find((c) => c.larkAppId === larkAppIdForUpload)?.teamOperate === true;
-    } catch {
-      cachedBotTeamOperate = false;
-    }
-  }
-  return cachedBotTeamOperate;
-}
-
 /**
  * Resolve terminal write permission for one request, honoring a platform-injected
  * `X-Botmux-Role` header. The central platform fronts `/s/*` and sets the role
  * (owner | teammate | guest) after authenticating the viewer, stripping any
  * client-supplied header; it reaches the worker via dashboard /s bridge →
  * terminal-proxy → here. When the header is present we trust it (platform-fronted
- * access): owner always writes; teammate writes only if the bot opted into
- * `teamOperate`; guest/anything-else is read-only. When the header is absent
- * (local direct access, no platform in front), fall back to the legacy
- * write-token query param.
+ * access): only `owner` may drive the terminal; everything else (teammate / guest
+ * / anything else) is read-only. When the header is absent (local direct access,
+ * no platform in front), fall back to the legacy write-token query param.
  */
 function resolveTerminalWrite(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
   const role = req.headers['x-botmux-role'];
   if (typeof role === 'string' && role) {
-    const hasWrite = role === 'owner' || (role === 'teammate' && botTeamOperateAllows());
+    const hasWrite = role === 'owner';
     return { hasWrite, platformReadonly: !hasWrite };
   }
   return { hasWrite: tokenMatches, platformReadonly: false };

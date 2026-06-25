@@ -226,6 +226,9 @@ interface ResolvedDashboardSettings {
   localDevInstall: boolean;
   /** Optional local project whiteboard. Disabled by default. */
   whiteboard: WhiteboardConfig;
+  /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
+   *  of local host:port. Off by default; only meaningful when bound. */
+  remoteAccess: boolean;
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
@@ -238,6 +241,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
+    remoteAccess: global.remoteAccess === true,
   };
 }
 
@@ -1222,7 +1226,14 @@ const server = createServer(async (req, res) => {
       // `lang` is the global UI locale (single source of truth shared with
       // `botmux lang` and the Feishu cards) — the web UI reads it as its
       // authoritative initial language when set.
-      return jsonRes(res, 200, { settings: dashboardSettings, lang: readGlobalConfig().lang ?? null, authed });
+      // `bound` reflects central-platform binding; the Settings UI only shows the
+      // 远程访问 toggle when bound (the central URLs are meaningless otherwise).
+      return jsonRes(res, 200, {
+        settings: dashboardSettings,
+        lang: readGlobalConfig().lang ?? null,
+        authed,
+        bound: readPlatformBinding() !== null,
+      });
     }
     if (req.method === 'PUT' && url.pathname === '/api/settings') {
       let parsed: unknown;
@@ -2543,15 +2554,14 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
       cliId?: string;
     }>;
     if (!Array.isArray(entries)) return [];
-    // Merge per-bot team-visibility config (showInTeam / teamOperate) from
-    // bots.json by larkAppId so the platform team page can hide bots / gate
-    // member write access. Defaults: showInTeam = true (shown), teamOperate =
-    // false (view-only). bots.json may be unreadable from the dashboard process
-    // → fall back to defaults.
-    const cfgByAppId = new Map<string, { showInTeam?: boolean; teamOperate?: boolean }>();
+    // Merge per-bot team-visibility config (showInTeam) from bots.json by
+    // larkAppId so the platform team page can hide bots. Default: showInTeam =
+    // true (shown). bots.json may be unreadable from the dashboard process →
+    // fall back to the default.
+    const cfgByAppId = new Map<string, { showInTeam?: boolean }>();
     try {
       for (const cfg of loadBotConfigs()) {
-        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam, teamOperate: cfg.teamOperate });
+        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam });
       }
     } catch {
       /* defaults below */
@@ -2566,7 +2576,6 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
           avatar: e.botAvatarUrl || undefined,
           cli: e.cliId,
           showInTeam: cfg?.showInTeam !== false, // default true
-          teamOperate: cfg?.teamOperate === true, // default false
         };
       })
       .filter((b) => b.appId);

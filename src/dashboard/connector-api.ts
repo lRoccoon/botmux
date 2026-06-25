@@ -15,6 +15,7 @@ import {
   setWebhookSecret,
 } from '../services/webhook-key.js';
 import { platformMachineBaseUrl } from '../platform/binding.js';
+import { isRemoteAccessEnabled } from '../global-config.js';
 import { listTriggerLogs, pruneTriggerLogs, summarizeTriggerLogs, type TriggerLogStats } from '../services/trigger-log-store.js';
 import type { TriggerErrorCode } from '../services/trigger-types.js';
 import { jsonRes } from './workflow-api.js';
@@ -184,9 +185,9 @@ function normalizeConnectorInput(
 }
 
 function publicWebhookUrl(req: IncomingMessage, connectorId: string, token?: string): string {
-  // 绑定平台后用「机器子域」中心域名（外部/内网可达，经隧道回本机）；否则回退本机 host。
+  // 远程访问开启且绑定平台后用「机器子域」中心域名（外部/内网可达，经隧道回本机）；否则回退本机 host。
   // 经隧道访问时 req.headers.host 会被平台改写成 127.0.0.1，故必须优先用 binding 推导的中心域名。
-  const platformBase = platformMachineBaseUrl();
+  const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
   let origin: string;
   if (platformBase) {
     origin = platformBase;
