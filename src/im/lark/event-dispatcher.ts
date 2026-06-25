@@ -18,7 +18,7 @@ import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel } from './doc-comment.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
 import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildScopeDeepLink } from '../../setup/verify-permissions.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
@@ -1323,6 +1323,12 @@ async function processCommentEvent(
     return;
   }
 
+  // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件
+  // 在该窗口内到达，下面 mention-only 闸 / 自触发过滤会拿到 undefined 的 botOpenId
+  // → 合法的 @bot 评论被误丢（事件已被 ACK，飞书不会重投，@ 永久丢失）。await
+  // 去重后的探针把 open_id 补齐；探针失败则降级（心跳会重试）。
+  await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+
   // 2) 拉评论 thread 取权威正文 / 作者 / @ 列表（事件 payload 不保证带全），
   //    同时用最新一条回复作为"触发回复"。
   const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
@@ -1340,14 +1346,13 @@ async function processCommentEvent(
   const selfBotOpenId = getBot(larkAppId).botOpenId;
   if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
 
-  // 4) 触发范围：mention-only 要求评论 @ 到本 bot。优先用事件自带的 is_mentioned
-  //    （飞书已判好），拿不到再回退按评论正文里的 @person 列表比对 bot open_id。
-  if (sub.commentTriggerMode === 'mention-only') {
-    const mentioned = parsed.isMentioned === true || (!!selfBotOpenId && trigger.mentions.includes(selfBotOpenId));
-    if (!mentioned) {
-      logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)})`);
-      return;
-    }
+  // 4) 触发范围闸（mention-only 仅当评论真的 @ 了本 bot 才触发）。
+  //    ⚠️ 必须以拉到的评论正文 @person(open_id) 列表为准，不能信事件自带的
+  //    `is_mentioned`——它表示「评论里存在任意 @」，@ 别人时也是 true，曾导致
+  //    「@ 同事的评论也被误触发」。详见 commentTriggerAllowed 注释。
+  if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
+    logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
+    return;
   }
 
   const text = trigger.text.trim();
