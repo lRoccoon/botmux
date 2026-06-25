@@ -1055,12 +1055,16 @@ export async function runWorkflow(
     const p = deps
       .resolveGate({ nodeId: node.id, prompt: gate.prompt, waitId, runDir })
       .then(({ resolution, by, selected }) => {
-        appendEvent(journalPath, { type: 'gateResolved', nodeId: node.id, waitId, resolution, by, selected });
+        // Carry instanceId (mirror gateDispatched + the daemon suspend path): a
+        // gateResolved WITHOUT it falls into state.ts's legacy per-node branch,
+        // so a late D#001 gate resolve after a revisit re-dispatched D#002 would
+        // overwrite node D's view → pollute the live D#002 instance.
+        appendEvent(journalPath, { type: 'gateResolved', nodeId: node.id, ...(instanceId ? { instanceId } : {}), waitId, resolution, by, selected });
       })
       .catch(() => {
         // A gate that errors out is treated as rejected (fail-fast); the
         // run-failure root cause is the rejection, recorded on the journal.
-        appendEvent(journalPath, { type: 'gateResolved', nodeId: node.id, waitId, resolution: 'rejected', by: 'system' });
+        appendEvent(journalPath, { type: 'gateResolved', nodeId: node.id, ...(instanceId ? { instanceId } : {}), waitId, resolution: 'rejected', by: 'system' });
       })
       .finally(() => {
         if (inFlight.get(key) === p) inFlight.delete(key);

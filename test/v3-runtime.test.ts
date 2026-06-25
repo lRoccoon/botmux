@@ -18,6 +18,7 @@ import { validateDag } from '../src/workflows/v3/dag.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { runWorkflow, revisitBudgetStatus, type V3RuntimeDeps } from '../src/workflows/v3/runtime.js';
 import { requestRevisitGrant } from '../src/workflows/v3/daemon-run.js';
+import { materialize } from '../src/workflows/v3/state.js';
 import { readAndValidateManifest, ManifestValidationError } from '../src/workflows/v3/manifest.js';
 import {
   createFileGate,
@@ -571,6 +572,55 @@ describe('runWorkflow — humanGate suspend mode', () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+
+  it('blocking 模式 gateResolved 事件带 instanceId（对齐 gateDispatched）', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-gate-inst-'));
+    try {
+      const dag = validateDag({
+        runId: 'gate-inst',
+        nodes: [{ id: 'deploy', type: 'goal', goal: 'deploy', depends: [], inputs: [], humanGate: { prompt: '批准？' } }],
+      });
+      const runNode: RunNode = async (req) => {
+        const file = product(req.outputDir, 'out.md', '# ok');
+        return { status: 'ok', manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'ok', files: [file] }) };
+      };
+      const resolveGate = createFileGate({ awaitDecision: async () => ({ resolution: 'approved', by: 'ou_cli' }) });
+      const outcome = await runWorkflow(dag, { runNode, validateManifest, resolveBotSnapshot, resolveGate }, { baseDir: base });
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+
+      // The gateResolved journal event MUST carry instanceId. Without it, state.ts
+      // takes the legacy per-node branch (set by nodeId) instead of the
+      // effective-instance-guarded branch, so a late gate resolve after a revisit
+      // re-dispatched a new instance would overwrite the node view and pollute it.
+      const events = readJournal(join(outcome.runDir, 'journal.ndjson'));
+      const dispatched = events.find((e) => e.type === 'gateDispatched') as any;
+      const resolved = events.find((e) => e.type === 'gateResolved') as any;
+      expect(dispatched?.instanceId).toBe('deploy#001');
+      expect(resolved?.instanceId).toBe('deploy#001');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('materialize：旧 instance 的 gateResolved 迟到不污染新 instance 的 node view', () => {
+    // D#001 gate waiting → revisit supersedes it & re-dispatches D#002 (now the
+    // effective instance, also gateWaiting) → the OLD D#001 gate resolves LATE.
+    // Because the event carries instanceId, state.ts only mirrors to the node view
+    // when it's the effective instance — so node D stays on D#002/gateWaiting and is
+    // NOT flipped to pending by D#001's stale approval.
+    const snap = materialize([
+      { ts: 1, type: 'nodeDispatched', nodeId: 'D', instanceId: 'D#001', attemptId: 'D#001/attempts/001' },
+      { ts: 2, type: 'gateDispatched', nodeId: 'D', instanceId: 'D#001', waitId: 'D#001-gate' },
+      { ts: 3, type: 'nodeInstanceSuperseded', nodeId: 'D', instanceId: 'D#001', byNodeId: 'X', reason: 'revisit' },
+      { ts: 4, type: 'nodeDispatched', nodeId: 'D', instanceId: 'D#002', attemptId: 'D#002/attempts/001' },
+      { ts: 5, type: 'gateDispatched', nodeId: 'D', instanceId: 'D#002', waitId: 'D#002-gate' },
+      { ts: 6, type: 'gateResolved', nodeId: 'D', instanceId: 'D#001', waitId: 'D#001-gate', resolution: 'approved', by: 'ou_x' },
+    ]);
+    expect(snap.nodes.get('D')?.effectiveInstanceId).toBe('D#002');
+    expect(snap.nodes.get('D')?.status).toBe('gateWaiting'); // NOT polluted to 'pending'
+    expect(snap.instances.get('D#002')?.status).toBe('gateWaiting');
+    expect(snap.instances.get('D#001')?.status).toBe('pending'); // the stale instance itself did resolve
   });
 });
 
