@@ -4786,7 +4786,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
               backend?.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
-              if (!authedClients.has(ws)) return; // read-only
+              if (!authedClients.has(ws)) {
+                // Read-only: allow ONLY wheel scroll sequences (SGR buttons 64-67).
+                // Scrolling the CLI's own view is non-destructive and lets read-only
+                // viewers page back through an alt-screen TUI's history (Claude etc.,
+                // which has no local scrollback). Everything else is dropped.
+                if (!/^(\x1b\[<6[4-7];\d+;\d+M)+$/.test(msg.data)) return;
+              }
               backend?.write(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
@@ -5019,8 +5025,10 @@ if(!${isTmuxMode && !isPipeMode}){
       return;
     }
     // Alternate buffer: no local scrollback — forward the wheel so the CLI scrolls.
+    // Allowed in read-only too: the server lets wheel scroll sequences through for
+    // non-authed clients (scrolling the CLI's own view is non-destructive).
     e.preventDefault();e.stopPropagation();
-    if(!hasToken||!ws_||ws_.readyState!==1)return; // read-only can't reach the app
+    if(!ws_||ws_.readyState!==1)return;
     var btn=e.deltaY<0?64:65; // SGR: 64=wheel-up (history), 65=wheel-down
     var seq='\\x1b[<'+btn+';1;1M';
     ws_.send(JSON.stringify({type:'input',data:seq+seq+seq})); // ~3 lines per notch
@@ -5072,7 +5080,7 @@ if(!${isTmuxMode && !isPipeMode}){
     if(term.buffer.active.type!=='alternate'||_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
     var y=e.touches[0].clientY;_tAccum+=y-_tLastY;_tLastY=y;
-    if(!hasToken||!ws_||ws_.readyState!==1)return; // read-only: consume, can't forward
+    if(!ws_||ws_.readyState!==1)return; // read-only allowed (server gates to wheel only)
     var data='';
     while(Math.abs(_tAccum)>=_tStep){
       var up=_tAccum>0; // finger drags down → reveal history → wheel-up (64)
