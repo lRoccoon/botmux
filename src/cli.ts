@@ -58,7 +58,7 @@ import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments }
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { loadDashboardSecret } from './dashboard/auth.js';
-import { rejectLikelyWindowsStdinMojibake } from './cli/stdin-encoding.js';
+import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
@@ -3426,26 +3426,8 @@ function readStdin(): Promise<string> {
   });
 }
 
-/**
- * Decode raw stdin bytes with platform-aware encoding detection.
- *
- * On Windows, PowerShell 5.1 converts UTF-16LE to the active code page
- * (e.g. CP936/GBK on Chinese systems) when piping to native executables.
- * Node.js reading those bytes as UTF-8 produces mojibake and truncation
- * after newlines. We detect this by trying GBK first and checking for CJK
- * characters — if present, the pipe used a non-UTF-8 code page.
- */
-function decodeStdinBytes(raw: Buffer): string {
-  if (process.platform !== 'win32') return raw.toString('utf-8');
-  const utf8 = raw.toString('utf-8');
-  try {
-    const gbk = new TextDecoder('gbk', { fatal: false }).decode(raw);
-    const hasCJK = /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/.test(gbk);
-    return hasCJK ? gbk : utf8;
-  } catch {
-    return utf8;
-  }
-}
+// decodeStdinBytes lives in ./cli/stdin-encoding.ts (imported above) so it
+// can be unit-tested with an explicit platform argument.
 
 /** Collect all values for a repeatable flag: --flag v1 --flag v2 */
 function argValues(args: string[], ...flags: string[]): string[] {
