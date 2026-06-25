@@ -737,6 +737,13 @@ function formatOptionalValue(v: unknown): string {
   return '未设置';
 }
 
+/** Render a tri-state optional boolean for the edit prompt, showing the effective
+ *  value: explicit true/false when set, else the field's documented default. */
+function formatBooleanValue(v: unknown, defaultValue: boolean): string {
+  if (typeof v === 'boolean') return String(v);
+  return `${defaultValue}（默认）`;
+}
+
 /**
  * 把 bots.json 渲染成对齐的小表格. 不带行号——进程名 (botmux-N) 已经
  * 是唯一可寻址的标识, 行号 + 进程名后缀 1-based / 0-based 并列容易引
@@ -846,6 +853,20 @@ async function promptEditBotConfig(
     '仅授对话权，不授予 /restart、/close、终端写入等敏感操作（那些仍由 allowedUsers 控制）。',
   ]);
   input.allowedChatGroups = await ask(rl, `允许的群聊组 [${formatOptionalValue(bot.allowedChatGroups)}]: `);
+
+  printInputHelp('平台团队页展示 showInTeam', [
+    '可选。绑定中心化平台后，是否在团队页（人→机器→bot）展示这个机器人。',
+    '默认 true（展示）；填 false 把内部/工具机器人从团队页隐藏。',
+    '留空保留当前值；输入 - 恢复默认（展示）。',
+  ]);
+  input.showInTeam = await ask(rl, `平台团队页展示 showInTeam [${formatBooleanValue(bot.showInTeam, true)}]: `);
+
+  printInputHelp('平台团队可操作 teamOperate', [
+    '可选。绑定平台后，本机所属团队的成员是否可以操作（写入）这个机器人，而非仅查看。',
+    '默认 false（仅查看）；填 true 放开该机器人的团队写权限。',
+    '留空保留当前值；输入 - 恢复默认（仅查看）。',
+  ]);
+  input.teamOperate = await ask(rl, `平台团队可操作 teamOperate [${formatBooleanValue(bot.teamOperate, false)}]: `);
 
   const edited = applyBotConfigEdits(bot, input);
   // 配了 allowedChatGroups 就必须有 owner，否则敏感操作对所有人关闭。抛错由调用方捕获并中止写盘。

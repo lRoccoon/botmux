@@ -1,6 +1,7 @@
 // src/dashboard.ts
-import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createServer as createTcpServer } from 'node:net';
+import { createServer, get as httpGet, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer, connect as netConnect } from 'node:net';
+import type { Duplex } from 'node:stream';
 import {
   readFileSync, existsSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
@@ -921,6 +922,15 @@ async function dashboardSkillReferences(skillName: string): Promise<SkillReferen
   };
 }
 
+/** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
+ *  the first path segment after `/s/` (stops at the next `/`; query/hash are
+ *  already stripped by URL.pathname). undefined when there's no segment. */
+function parseTerminalSessionId(pathname: string): string | undefined {
+  if (!pathname.startsWith('/s/')) return undefined;
+  const seg = pathname.slice(3).split('/')[0];
+  return seg || undefined;
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -936,6 +946,38 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/__selfcheck') {
       res.writeHead(200, { 'content-type': 'text/plain' });
       return res.end(DASHBOARD_SELF_NONCE);
+    }
+
+    // Web terminal reverse-proxy: `/s/<sessionId>/*` → the owning bot daemon's
+    // terminal proxy. The central platform only tunnels the dashboard port, so
+    // terminal links served under the machine subdomain
+    // (`https://m-<id>.<host>/s/<sessionId>`) land here. The dashboard is the
+    // aggregator process (it fronts many bot daemons, each with its own terminal
+    // proxy on proxyBasePort+idx), so we resolve the session's owning daemon's
+    // proxy port from the aggregator rows and forward there, streaming the
+    // response straight back. Mounted before the dashboard auth gate because the
+    // terminal proxy / worker enforces its own write gate (read-only without
+    // token / platform role).
+    if (url.pathname === '/s' || url.pathname.startsWith('/s/')) {
+      const sessionId = parseTerminalSessionId(url.pathname);
+      const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
+      if (!tport) {
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        return res.end('session terminal not available');
+      }
+      const upstream = httpRequest(
+        { host: '127.0.0.1', port: tport, method: req.method, path: req.url, headers: req.headers },
+        (up) => {
+          res.writeHead(up.statusCode ?? 502, up.headers);
+          up.pipe(res);
+        },
+      );
+      upstream.on('error', () => {
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('terminal proxy error');
+      });
+      req.pipe(upstream);
+      return;
     }
 
     if (await handleWebhookRoute(req, res, url, {
@@ -2377,6 +2419,48 @@ const server = createServer(async (req, res) => {
   }
 });
 
+// Web terminal WebSocket reverse-proxy: bridge `/s/*` upgrade requests through to
+// the local terminal proxy (which in turn bridges to the session worker). Raw
+// socket-to-socket bridge: dial 127.0.0.1:<terminalProxyPort>, replay the upgrade
+// request line + headers verbatim, then pipe both directions. Mirrors how
+// terminal-proxy.ts bridges to the worker. Non-`/s/*` upgrades are dropped (the
+// dashboard SPA uses SSE, not WebSocket).
+server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
+  try {
+    const rawUrl = req.url ?? '/';
+    if (!(rawUrl === '/s' || rawUrl.startsWith('/s/') || rawUrl.startsWith('/s?'))) {
+      return clientSocket.destroy();
+    }
+    // Strip query/hash before extracting the sessionId path segment.
+    const pathname = rawUrl.split(/[?#]/)[0];
+    const sessionId = parseTerminalSessionId(pathname);
+    const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
+    if (!tport) return clientSocket.destroy();
+
+    const upstream = netConnect(tport, '127.0.0.1', () => {
+      // rawHeaders is a flat [k, v, k, v, ...] list — preserves casing/duplicates.
+      const lines = [`${req.method} ${req.url} HTTP/1.1`];
+      const rh = req.rawHeaders;
+      for (let i = 0; i + 1 < rh.length; i += 2) lines.push(`${rh[i]}: ${rh[i + 1]}`);
+      lines.push('', '');
+      upstream.write(lines.join('\r\n'));
+      if (head?.length) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    const cleanup = () => {
+      try { upstream.destroy(); } catch { /* ignore */ }
+      try { clientSocket.destroy(); } catch { /* ignore */ }
+    };
+    upstream.on('error', cleanup);
+    clientSocket.on('error', cleanup);
+    upstream.on('close', () => clientSocket.destroy());
+    clientSocket.on('close', () => upstream.destroy());
+  } catch {
+    try { clientSocket.destroy(); } catch { /* ignore */ }
+  }
+});
+
 // Probe upward on EADDRINUSE rather than crashing with an unhandled 'error':
 // a second botmux instance on this host (or a stray process) holding the
 // configured port would otherwise tear the dashboard process down on bind.
@@ -2459,14 +2543,32 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
       cliId?: string;
     }>;
     if (!Array.isArray(entries)) return [];
+    // Merge per-bot team-visibility config (showInTeam / teamOperate) from
+    // bots.json by larkAppId so the platform team page can hide bots / gate
+    // member write access. Defaults: showInTeam = true (shown), teamOperate =
+    // false (view-only). bots.json may be unreadable from the dashboard process
+    // → fall back to defaults.
+    const cfgByAppId = new Map<string, { showInTeam?: boolean; teamOperate?: boolean }>();
+    try {
+      for (const cfg of loadBotConfigs()) {
+        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam, teamOperate: cfg.teamOperate });
+      }
+    } catch {
+      /* defaults below */
+    }
     return entries
-      .map((e) => ({
-        appId: e.larkAppId || '',
-        openId: e.botOpenId ?? null,
-        name: e.botName || e.larkAppId || 'bot',
-        avatar: e.botAvatarUrl || undefined,
-        cli: e.cliId,
-      }))
+      .map((e) => {
+        const cfg = cfgByAppId.get(e.larkAppId || '');
+        return {
+          appId: e.larkAppId || '',
+          openId: e.botOpenId ?? null,
+          name: e.botName || e.larkAppId || 'bot',
+          avatar: e.botAvatarUrl || undefined,
+          cli: e.cliId,
+          showInTeam: cfg?.showInTeam !== false, // default true
+          teamOperate: cfg?.teamOperate === true, // default false
+        };
+      })
       .filter((b) => b.appId);
   } catch {
     return [];

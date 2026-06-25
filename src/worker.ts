@@ -27,6 +27,7 @@ import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
+import { loadBotConfigs } from './bot-registry.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -157,6 +158,43 @@ const authedClients = new WeakSet<WebSocket>();
 /** Per-WS-client tmux/zellij attach PTYs. */
 const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
+
+// Whether platform-team *teammates* (X-Botmux-Role: teammate) may DRIVE this
+// session's terminal, per the owning bot's `teamOperate` config. Computed once
+// lazily on first terminal access (larkAppIdForUpload is set at init, before the
+// web server starts). undefined = not yet computed.
+let cachedBotTeamOperate: boolean | undefined;
+function botTeamOperateAllows(): boolean {
+  if (cachedBotTeamOperate === undefined) {
+    try {
+      cachedBotTeamOperate =
+        loadBotConfigs().find((c) => c.larkAppId === larkAppIdForUpload)?.teamOperate === true;
+    } catch {
+      cachedBotTeamOperate = false;
+    }
+  }
+  return cachedBotTeamOperate;
+}
+
+/**
+ * Resolve terminal write permission for one request, honoring a platform-injected
+ * `X-Botmux-Role` header. The central platform fronts `/s/*` and sets the role
+ * (owner | teammate | guest) after authenticating the viewer, stripping any
+ * client-supplied header; it reaches the worker via dashboard /s bridge →
+ * terminal-proxy → here. When the header is present we trust it (platform-fronted
+ * access): owner always writes; teammate writes only if the bot opted into
+ * `teamOperate`; guest/anything-else is read-only. When the header is absent
+ * (local direct access, no platform in front), fall back to the legacy
+ * write-token query param.
+ */
+function resolveTerminalWrite(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
+  const role = req.headers['x-botmux-role'];
+  if (typeof role === 'string' && role) {
+    const hasWrite = role === 'owner' || (role === 'teammate' && botTeamOperateAllows());
+    return { hasWrite, platformReadonly: !hasWrite };
+  }
+  return { hasWrite: tokenMatches, platformReadonly: false };
+}
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach
  *  clients: cleared keybinds + locked mode so every keystroke passes straight
@@ -4583,9 +4621,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         res.end('Bad Request');
         return;
       }
-      const hasWrite = url.searchParams.get('token') === writeToken;
+      const tokenMatches = url.searchParams.get('token') === writeToken;
+      const { hasWrite, platformReadonly } = resolveTerminalWrite(req, tokenMatches);
+      const loginHdr = req.headers['x-botmux-login-url'];
+      const loginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr) ? loginHdr : '';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite));
+      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl));
     });
 
     wss = new WebSocketServer({ server: httpServer });
@@ -4601,7 +4642,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.close(1008, 'Bad Request');
         return;
       }
-      const hasWrite = url.searchParams.get('token') === writeToken;
+      const tokenMatches = url.searchParams.get('token') === writeToken;
+      const { hasWrite } = resolveTerminalWrite(req, tokenMatches);
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 
@@ -4823,7 +4865,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
   });
 }
 
-function getTerminalHtml(hasWrite: boolean): string {
+function getTerminalHtml(hasWrite: boolean, platformReadonly = false, loginUrl = ''): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
 <html>
@@ -4870,11 +4912,17 @@ body.touch #terminal .xterm-screen *{
   background:rgba(247,118,142,0.12);border:1px solid rgba(247,118,142,0.35);border-radius:4px;
   backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
 #readonly-banner.show{display:inline-block}
+#login-banner{display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:50;
+  padding:4px 10px;font:12px monospace;color:#e0af68;white-space:nowrap;text-decoration:none;cursor:pointer;
+  background:rgba(224,175,104,0.12);border:1px solid rgba(224,175,104,0.35);border-radius:4px;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+#login-banner.show{display:inline-block}
 </style>
 </head>
 <body>
 <div id="terminal"></div>
 <div id="readonly-banner">只读模式 · 无写入权限</div>
+${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopener">登录后可操作 →</a>` : '<div id="login-banner">登录后可操作</div>'}
 <div id="toolbar">
   <button data-k="esc">Esc</button>
   <button data-k="ctrlc">^C</button>
@@ -4896,7 +4944,11 @@ body.touch #terminal .xterm-screen *{
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.getElementById('vp').content='width=1100,viewport-fit=cover';document.body.classList.add('touch');}
 var hasToken=${hasWrite};
-if(!hasToken){var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
+var platformReadonly=${platformReadonly};
+if(!hasToken){
+  if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
+  else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
+}
 
 var term=new Terminal({
   theme:{background:'#1a1b26',foreground:'#a9b1d6',cursor:'#c0caf5',
