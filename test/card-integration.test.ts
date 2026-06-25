@@ -832,9 +832,12 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
+      const res = await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
       await flush();
 
+      // 有权限点击：同步立即回执 success toast（投递是异步 fire-and-forget，不等它完成）。
+      expect(res?.toast?.type).toBe('success');
+      expect(res?.toast?.content).toContain('已私密发送');
       // 普通群 → 仅点击者可见的 ephemeral 私密卡，不发 DM。
       expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
         APP_ID, ds.chatId, 'ou_user', expect.stringContaining('"type":"session"'),
@@ -856,9 +859,11 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
+      const res = await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
       await flush();
 
+      // 有权限：同样同步回执 success toast（不区分投递通道）。
+      expect(res?.toast?.type).toBe('success');
       // 单聊 → 跳过注定失败的 ephemeral，直接私聊 DM（DM 落在同一个 1:1 会话里）。
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(fakeLark.dms).toHaveLength(1);

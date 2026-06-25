@@ -594,6 +594,8 @@ export const messages: Record<string, string> = {
   'card.voice.toast_need_auth': '🔒 You are not authorized to use this bot, so you cannot generate a voice summary. Ask an admin for access.',
   'card.action.takeover_retired': '⚠️ The old "Take Over" button is retired. In bridge mode, botmux bridges the original CLI so replies still come back to Lark — no takeover needed. Full takeover (`/adopt --takeover`) is on the roadmap.',
   'card.action.terminal_not_ready': '⚠️ Terminal is not ready yet, please try again shortly.',
+  'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
+  'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',
   'card.action.no_output': '(no output yet)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',

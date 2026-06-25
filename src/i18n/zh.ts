@@ -597,6 +597,8 @@ export const messages: Record<string, string> = {
   'card.voice.toast_need_auth': '🔒 你没有该机器人的使用权限，无法生成语音总结，请联系管理员授权',
   'card.action.takeover_retired': '⚠️ 旧版"接管"按钮已停用。bridge 模式下原 CLI 由 botmux 桥接，无需接管即可在飞书中收到回答。如需 /resume 完整接管能力，请等待 /adopt --takeover 命令上线。',
   'card.action.terminal_not_ready': '⚠️ 终端尚未就绪，请稍后再试。',
+  'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
+  'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
