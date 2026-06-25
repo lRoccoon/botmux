@@ -44,14 +44,20 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
-  it('projects dashboard summary trigger prefs for /api/bots', () => {
+  it('projects dashboard summary range for /api/bots', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({
-      summaryTrigger: {
-        enabled: false,
-        keyword: '总结',
+      summaryRange: {
         limit: 50,
         sinceHours: 24,
+      },
+    });
+    expect(botDefaultsPayload(daemon, {
+      summaryRange: { limit: 12, sinceHours: 6 },
+    })).toMatchObject({
+      summaryRange: {
+        limit: 12,
+        sinceHours: 6,
       },
     });
     expect(botDefaultsPayload(daemon, {
@@ -67,9 +73,7 @@ describe('dashboard bot payload helpers', () => {
         action: { type: 'start-or-wake-session', prompt: 'summary' },
       }],
     })).toMatchObject({
-      summaryTrigger: {
-        enabled: true,
-        keyword: '本次问题已解决',
+      summaryRange: {
         limit: 0,
         sinceHours: 0,
       },

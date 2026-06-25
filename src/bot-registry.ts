@@ -17,6 +17,13 @@ export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
 
+export interface SummaryRangeConfig {
+  /** 0 means no count limit; omitted defaults to 50. */
+  limit?: number;
+  /** 0 means no time limit; omitted defaults to 24 hours. */
+  sinceHours?: number;
+}
+
 export interface ContentTriggerConfig {
   name: string;
   enabled: boolean;
@@ -71,6 +78,17 @@ function normalizeNonNegativeInt(raw: unknown): number | undefined {
   if (typeof raw !== 'number') return undefined;
   if (!Number.isInteger(raw) || raw < 0) return undefined;
   return raw;
+}
+
+function normalizeSummaryRange(raw: unknown): SummaryRangeConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const out: SummaryRangeConfig = {};
+  const limit = normalizeNonNegativeInt(entry.limit);
+  const sinceHours = normalizeNonNegativeInt(entry.sinceHours);
+  if (limit !== undefined) out.limit = limit;
+  if (sinceHours !== undefined) out.sinceHours = sinceHours;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function normalizeContentTriggers(raw: unknown, botIndex: number): ContentTriggerConfig[] | undefined {
@@ -496,13 +514,11 @@ export interface BotConfig {
    * 单条订阅的触发范围之后可在 dashboard 逐文档改（doc-subscriptions 表）。
    */
   docSubscribeDefaultMode?: 'mention-only' | 'all';
+  /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */
+  summaryRange?: SummaryRangeConfig;
   /**
-   * Content/keyword triggers: opt-in per bot. When a group/topic message matches
-   * one of these rules, the dispatcher may route it to this bot even without an
-   * explicit @mention, then feeds `action.prompt` plus the configured chat
-   * history to the CLI instead of the raw trigger text. Human senders still go
-   * through canTalk. Bot-authored messages require per-trigger
-   * `allowBotMessages: true`.
+   * Legacy content/keyword trigger config. Kept parseable for config
+   * compatibility, but message routing no longer fires non-@ content triggers.
    */
   contentTriggers?: ContentTriggerConfig[];
   /**
@@ -962,6 +978,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
     const skills = readBotSkillPolicy(entry.skills);
+    const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
@@ -1068,6 +1085,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。
       docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,
+      summaryRange,
       contentTriggers,
       voice,
     });

@@ -1,4 +1,4 @@
-import { summaryTriggerFromContentTriggers } from '../services/content-trigger-preset-store.js';
+import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -36,7 +36,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
-    summaryTrigger: summaryTriggerFromContentTriggers(j?.contentTriggers),
+    summaryRange: j?.summaryRange
+      ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
+      ?? defaultSummaryRangePrefs(),
     regularGroupReplyMode: (j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared')
       ? j.regularGroupReplyMode
       : 'chat',

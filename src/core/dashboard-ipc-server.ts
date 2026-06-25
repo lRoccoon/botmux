@@ -18,7 +18,7 @@ import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
-import { updateDashboardSummaryTrigger } from '../services/content-trigger-preset-store.js';
+import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
 import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
@@ -1234,7 +1234,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     maxLiveWorkers,
     startupCommands,
     env,
-    contentTriggers: getBot(cachedLarkAppId).config.contentTriggers ?? [],
+    summaryRange: summaryRangeFromBotConfig(getBot(cachedLarkAppId).config),
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
 });
@@ -1280,17 +1280,29 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   jsonRes(res, 200, { ok: true, ...r.prefs });
 });
 
-// Per-bot default summary trigger. Body `{ enabled, keyword, limit, sinceHours }`.
-// It updates only the dashboard-managed content trigger and preserves any other
-// hand-written contentTriggers in bots.json.
+// Per-bot explicit `/summary` history range. Body `{ limit, sinceHours }`.
+ipcRoute('PUT', '/api/bot-summary-range', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const r = await updateDashboardSummaryRange(cachedLarkAppId, raw);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, summaryRange: r.summaryRange });
+});
+
+// Backward-compatible dashboard endpoint from the short-lived keyword-trigger UI.
 ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let raw: unknown;
   try { raw = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const r = await updateDashboardSummaryTrigger(cachedLarkAppId, raw);
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? { limit: (raw as Record<string, unknown>).limit, sinceHours: (raw as Record<string, unknown>).sinceHours }
+    : raw;
+  const r = await updateDashboardSummaryRange(cachedLarkAppId, body);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-  jsonRes(res, 200, { ok: true, summaryTrigger: r.summaryTrigger, contentTriggers: r.contentTriggers });
+  jsonRes(res, 200, { ok: true, summaryRange: r.summaryRange });
 });
 
 // Per-bot 授权偏好。Body 任意子集：

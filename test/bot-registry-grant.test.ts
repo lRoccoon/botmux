@@ -143,7 +143,7 @@ describe('bot-registry grant additions', () => {
     expect(cfg.repoPickerMode).toBeUndefined();
   });
 
-  it('parses p2pMode only as literal chat (else undefined = thread default)', () => {
+	  it('parses p2pMode only as literal chat (else undefined = thread default)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'p1', larkAppSecret: 's', p2pMode: 'chat' },
       { larkAppId: 'p2', larkAppSecret: 's', p2pMode: 'thread' },
@@ -156,7 +156,19 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[3].p2pMode).toBeUndefined();
   });
 
-  it('parses contentTriggers and preserves explicit unlimited history settings', () => {
+  it('parses summaryRange and preserves explicit unlimited settings', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'sr1', larkAppSecret: 's', summaryRange: { limit: 0, sinceHours: 0 } },
+      { larkAppId: 'sr2', larkAppSecret: 's', summaryRange: { limit: 20, sinceHours: 8 } },
+      { larkAppId: 'sr3', larkAppSecret: 's', summaryRange: { limit: -1, sinceHours: 1.5 } },
+    ]));
+
+    expect(cfgs[0].summaryRange).toEqual({ limit: 0, sinceHours: 0 });
+    expect(cfgs[1].summaryRange).toEqual({ limit: 20, sinceHours: 8 });
+    expect(cfgs[2].summaryRange).toBeUndefined();
+  });
+
+  it('parses legacy contentTriggers and preserves explicit unlimited history settings', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'ct1',
       larkAppSecret: 's',
@@ -188,7 +200,7 @@ describe('bot-registry grant additions', () => {
     }]);
   });
 
-  it('drops invalid content trigger regex without failing the whole bot config', () => {
+	  it('drops invalid legacy content trigger regex without failing the whole bot config', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'ct2',
       larkAppSecret: 's',

@@ -2164,7 +2164,7 @@ async function startInitialPassthroughSession(args: {
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId } = ctx;
   const triggerPromptOverride = ctx.promptOverride;
-  const triggerTitle = ctx.contentTrigger ? `[trigger] ${ctx.contentTrigger.name}` : undefined;
+  const triggerTitle = ctx.summaryCommand ? '[summary]' : undefined;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -2737,7 +2737,7 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId } = ctx;
   const triggerPromptOverride = ctx.promptOverride;
-  const triggerTitle = ctx.contentTrigger ? `[trigger] ${ctx.contentTrigger.name}` : undefined;
+  const triggerTitle = ctx.summaryCommand ? '[summary]' : undefined;
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 

@@ -352,27 +352,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
   }
 
   function renderSummaryTriggerSection(b: any): string {
-    const trigger = b.summaryTrigger ?? { enabled: false, keyword: '总结', limit: 50, sinceHours: 24 };
-    const enabled = trigger.enabled === true;
-    const keyword = typeof trigger.keyword === 'string' && trigger.keyword ? trigger.keyword : '总结';
-    const limit = Number.isInteger(trigger.limit) && trigger.limit >= 0 ? trigger.limit : 50;
-    const sinceHours = Number.isInteger(trigger.sinceHours) && trigger.sinceHours >= 0 ? trigger.sinceHours : 24;
+    const range = b.summaryRange ?? { limit: 50, sinceHours: 24 };
+    const limit = Number.isInteger(range.limit) && range.limit >= 0 ? range.limit : 50;
+    const sinceHours = Number.isInteger(range.sinceHours) && range.sinceHours >= 0 ? range.sinceHours : 24;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionSummaryTrigger')}</h3>
-      <label class="toggle-row">
-        <input type="checkbox" data-action="toggle-summary-trigger" ${enabled ? 'checked' : ''}>
-        <span class="switch" aria-hidden="true"></span>
-        <span class="toggle-tx"><strong>${t('botDefaults.summaryTrigger')}</strong>
-        <small>${t('botDefaults.summaryTriggerHelp')}</small></span>
-      </label>
-      <div class="bd-row">
-        <label>
-          <span>${t('botDefaults.summaryKeyword')}</span>
-          <input type="text" data-input="summaryKeyword"
-            placeholder="${escapeHtml(t('botDefaults.summaryKeywordPlaceholder'))}"
-            value="${escapeHtml(keyword)}">
-        </label>
-      </div>
       <div class="bd-row bd-summary-limits">
         <label>
           <span>${t('botDefaults.summaryLimit')}</span>
@@ -906,9 +890,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         });
       }
 
-      // ── 默认总结 content trigger（关键词免 @）─────────────────────────────
-      const summaryCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-summary-trigger]');
-      const summaryKeywordInput = card.querySelector<HTMLInputElement>('input[data-input=summaryKeyword]');
+      // ── /summary 总结范围 ───────────────────────────────────────────────
       const summaryLimitInput = card.querySelector<HTMLInputElement>('input[data-input=summaryLimit]');
       const summarySinceInput = card.querySelector<HTMLInputElement>('input[data-input=summarySinceHours]');
       const summarySaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-summary-trigger]');
@@ -921,17 +903,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         return Number(raw);
       }
 
-      if (summaryCb && summaryKeywordInput && summaryLimitInput && summarySinceInput && summarySaveBtn) {
+      if (summaryLimitInput && summarySinceInput && summarySaveBtn) {
         summarySaveBtn.addEventListener('click', async () => {
           if (!summaryStatusEl) return;
           summaryStatusEl.textContent = '';
           summaryStatusEl.className = 'oncall-status';
-          const keyword = summaryKeywordInput.value.trim();
-          if (!keyword) {
-            summaryStatusEl.textContent = `✗ ${t('botDefaults.summaryKeywordRequired')}`;
-            summaryStatusEl.classList.add('hint-warn-inline');
-            return;
-          }
           const limit = readNonNegativeInt(summaryLimitInput, 50);
           const sinceHours = readNonNegativeInt(summarySinceInput, 24);
           if (limit == null || sinceHours == null) {
@@ -942,12 +918,10 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
           summarySaveBtn.disabled = true;
           try {
-            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/summary-trigger`, {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/summary-range`, {
               method: 'PUT',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({
-                enabled: summaryCb.checked,
-                keyword,
                 limit,
                 sinceHours,
               }),
@@ -956,13 +930,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             if (r.ok && body.ok) {
               summaryStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
               summaryStatusEl.classList.add('hint-ok');
-              const next = body.summaryTrigger ?? { enabled: summaryCb.checked, keyword, limit, sinceHours };
-              summaryCb.checked = next.enabled === true;
-              summaryKeywordInput.value = typeof next.keyword === 'string' ? next.keyword : keyword;
+              const next = body.summaryRange ?? { limit, sinceHours };
               summaryLimitInput.value = String(Number.isInteger(next.limit) && next.limit >= 0 ? next.limit : limit);
               summarySinceInput.value = String(Number.isInteger(next.sinceHours) && next.sinceHours >= 0 ? next.sinceHours : sinceHours);
               const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
-              if (cached) cached.summaryTrigger = next;
+              if (cached) cached.summaryRange = next;
             } else {
               summaryStatusEl.textContent = `✗ ${body.error ?? r.status}`;
               summaryStatusEl.classList.add('hint-warn-inline');

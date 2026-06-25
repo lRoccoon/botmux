@@ -1999,9 +1999,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // PUT /api/bots/:appId/summary-trigger — proxy to that bot's daemon. Body
-    // `{ enabled, keyword, limit, sinceHours }`; daemon updates the
-    // dashboard-managed content trigger while preserving hand-written triggers.
+    // PUT /api/bots/:appId/summary-range — proxy to that bot's daemon. Body
+    // `{ limit, sinceHours }`; daemon updates the explicit /summary range.
+    let mBotSummaryRange: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSummaryRange = url.pathname.match(/^\/api\/bots\/([^/]+)\/summary-range$/))) {
+      const appId = decodeURIComponent(mBotSummaryRange[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-summary-range`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Backward-compatible alias from the short-lived keyword-trigger dashboard.
     let mBotSummaryTrigger: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotSummaryTrigger = url.pathname.match(/^\/api\/bots\/([^/]+)\/summary-trigger$/))) {
       const appId = decodeURIComponent(mBotSummaryTrigger[1]);

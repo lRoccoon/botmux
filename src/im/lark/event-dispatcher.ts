@@ -15,7 +15,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { extractCardContent, resolveNonsupportMessage, stripLeadingMentions, unwrapUserDslContent } from './message-parser.js';
+import { resolveNonsupportMessage, stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel } from './doc-comment.js';
@@ -29,8 +29,8 @@ import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
-import { buildContentTriggerPrompt, findMatchingContentTrigger, type ContentTriggerChatKind, type ContentTriggerRuntimeContext, type MatchedContentTrigger } from './content-trigger.js';
-import { buildDashboardSummaryTrigger, summaryTriggerFromContentTriggers } from '../../services/content-trigger-preset-store.js';
+import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
+import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -984,10 +984,10 @@ export interface RoutingContext {
   anchor: string;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
-  /** Content trigger prompt that should be sent to the CLI instead of raw text. */
+  /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
-  /** Metadata for the content trigger that produced promptOverride. */
-  contentTrigger?: ContentTriggerRuntimeContext;
+  /** Metadata for the summary command that produced promptOverride. */
+  summaryCommand?: SummaryCommandRuntimeContext;
   larkAppId: string;
 }
 
@@ -1085,30 +1085,6 @@ export function extractMessageTextForRouting(message: any): string | null {
     }
   } catch { /* malformed content — skip */ }
   return null;
-}
-
-function extractMessageTextForContentTrigger(message: any): string | null {
-  const text = extractMessageTextForRouting(message);
-  if (text) return text;
-  if (!message?.content) return null;
-
-  try {
-    const obj = JSON.parse(message.content);
-    const messageType = message.message_type ?? message.msg_type;
-    const looksLikeCard = messageType === 'interactive'
-      || typeof obj?.user_dsl === 'string'
-      || typeof obj?.title === 'string'
-      || !!obj?.header
-      || !!obj?.body
-      || Array.isArray(obj?.elements);
-    if (!looksLikeCard) return null;
-    const rawCard = unwrapUserDslContent(message.content) ?? message.content;
-    const rendered = extractCardContent(rawCard).trim();
-    if (!rendered || rendered === '[卡片]' || rendered === '[卡片 (模板)]') return null;
-    return rendered;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -1288,53 +1264,23 @@ export async function decideRouting(
   return { scope, anchor };
 }
 
-async function classifyContentTriggerChatKind(input: {
+async function classifySummaryChatKind(input: {
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';
   routingSource: RoutingSource;
-}): Promise<ContentTriggerChatKind | undefined> {
+}): Promise<SummaryChatKind | undefined> {
   if (input.chatType !== 'group') return undefined;
   if (input.routingSource === 'topic-chat') return 'topic';
   if (input.routingSource === 'regular-group-chat' || input.routingSource === 'regular-group-thread') return 'regularGroup';
   // Real thread replies can occur in topic groups and in regular groups that
-  // use threaded replies. Ask Lark for the current chat mode only on the opt-in
-  // content-trigger path so normal @ routing does not pay this extra lookup.
+  // use threaded replies. Ask Lark for the current chat mode only for explicit
+  // /summary so normal routing does not pay this extra lookup.
   if (input.routingSource === 'real-thread') {
     const mode = await getChatMode(input.larkAppId, input.chatId, { forceRefresh: true });
     return mode === 'topic' ? 'topic' : 'regularGroup';
   }
   return undefined;
-}
-
-async function resolveContentTriggerMatch(input: {
-  larkAppId: string;
-  chatId: string;
-  chatType: 'group' | 'p2p';
-  routingSource: RoutingSource;
-  message: any;
-  botAuthored?: boolean;
-}): Promise<MatchedContentTrigger | undefined> {
-  const triggers = getBot(input.larkAppId).config.contentTriggers;
-  if (!triggers || triggers.length === 0) return undefined;
-  const text = extractMessageTextForContentTrigger(input.message);
-  const chatKind = await classifyContentTriggerChatKind(input);
-  return findMatchingContentTrigger(triggers, text, chatKind, { botAuthored: input.botAuthored });
-}
-
-function hasContentTriggerCandidates(larkAppId: string, options?: { botAuthored?: boolean }): boolean {
-  const triggers = getBot(larkAppId).config.contentTriggers;
-  if (!triggers || triggers.length === 0) return false;
-  return triggers.some(trigger => trigger.enabled && (!options?.botAuthored || trigger.allowBotMessages === true));
-}
-
-async function maybeResolveMessageForContentTrigger(larkAppId: string, data: any, options?: { botAuthored?: boolean }): Promise<void> {
-  if (!hasContentTriggerCandidates(larkAppId, options)) return;
-  const type = data?.message?.message_type;
-  if (type !== 'interactive' && type !== 'nonsupport') return;
-  await resolveNonsupportMessage(data, larkAppId).catch(err =>
-    logger.debug(`[content-trigger] failed to resolve ${type} message before matching: ${err}`),
-  );
 }
 
 const SUMMARY_COMMAND_RE = /^\/summary(?:\s|$)/i;
@@ -1353,20 +1299,19 @@ async function resolveSummaryCommandMatch(input: {
   routingSource: RoutingSource;
   message: any;
   senderOpenId: string | undefined;
-}): Promise<MatchedContentTrigger | undefined> {
+}): Promise<SummaryCommandMatch | undefined> {
   if (input.chatType !== 'group') return undefined;
   if (!isBotMentioned(input.larkAppId, input.message, input.senderOpenId)) return undefined;
   const triggerText = summaryCommandText(input.message);
   if (!triggerText) return undefined;
-  const chatKind = await classifyContentTriggerChatKind(input);
+  const chatKind = await classifySummaryChatKind(input);
   if (!chatKind) return undefined;
-  const prefs = summaryTriggerFromContentTriggers(getBot(input.larkAppId).config.contentTriggers);
-  const trigger = {
-    ...buildDashboardSummaryTrigger({ ...prefs, enabled: true }),
-    name: 'summary-command',
-    match: { type: 'keyword' as const, pattern: '/summary', caseSensitive: false },
+  return {
+    chatKind,
+    triggerText,
+    range: summaryRangeFromBotConfig(getBot(input.larkAppId).config),
+    prompt: DEFAULT_SUMMARY_PROMPT,
   };
-  return { trigger, chatKind, triggerText };
 }
 
 /** 从评论事件 payload 里挖出 { fileToken, fileType, commentId, replyId,
@@ -1567,38 +1512,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
           const foreignBotMentionedThisBot = isBotMentioned(larkAppId, message, undefined);
           if (!foreignBotMentionedThisBot) {
-            if (!hasContentTriggerCandidates(larkAppId, { botAuthored: true })) return;
-            await maybeResolveMessageForContentTrigger(larkAppId, data, { botAuthored: true });
-            const decision = await decideRoutingWithSource(larkAppId, message);
-            const contentTriggerMatch = await resolveContentTriggerMatch({
-              larkAppId,
-              chatId,
-              chatType,
-              routingSource: decision.source,
-              message,
-              botAuthored: true,
-            });
-            if (!contentTriggerMatch) return;
-
-            const ctx: RoutingContext = {
-              chatId,
-              messageId,
-              chatType,
-              larkAppId,
-              scope: decision.scope,
-              anchor: decision.anchor,
-              promptOverride: await buildContentTriggerPrompt({ larkAppId, chatId, message, match: contentTriggerMatch }),
-              contentTrigger: { name: contentTriggerMatch.trigger.name, chatKind: contentTriggerMatch.chatKind },
-            };
-            logger.info(
-              `[content-trigger] "${contentTriggerMatch.trigger.name}" matched bot-authored msg=${messageId.substring(0, 12)} ` +
-              `chat=${chatId.substring(0, 12)} kind=${contentTriggerMatch.chatKind}`,
-            );
-            const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
-            await serializeByAnchor(ctx.anchor, () => ownsSession
-              ? handlers.handleThreadReply(data, ctx)
-              : handlers.handleNewTopic(data, ctx))
-              .catch(err => logger.error(`Error handling bot content-trigger: ${err}`));
             return;
           }
           const decision = await decideRoutingWithSource(larkAppId, message);
@@ -1854,16 +1767,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
         }
 
-        if (!explicitlyMentionedThisBot) {
-          await maybeResolveMessageForContentTrigger(larkAppId, data);
-        }
-        const contentTriggerMatch = await resolveContentTriggerMatch({
-          larkAppId,
-          chatId,
-          chatType,
-          routingSource,
-          message,
-        });
         const summaryCommandMatch = await resolveSummaryCommandMatch({
           larkAppId,
           chatId,
@@ -1872,7 +1775,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           message,
           senderOpenId,
         });
-        const contentTriggered = !!contentTriggerMatch && isAllowed;
         const summaryCommandTriggered = !!summaryCommandMatch && isAllowed;
 
         // Permission gating — same shape as before, just keyed on
@@ -1904,7 +1806,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // handled by the first clause.)
           const mentionMode = resolveGroupMentionMode(larkAppId);
           const relax = (!!replyRootId && isAllowed)
-            || contentTriggered
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id)
             || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
@@ -1942,18 +1843,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           return;
         }
 
-        const promptMatch = summaryCommandTriggered && summaryCommandMatch
-          ? summaryCommandMatch
-          : contentTriggered && contentTriggerMatch
-            ? contentTriggerMatch
-            : undefined;
-        const promptOverride = promptMatch
-          ? await buildContentTriggerPrompt({ larkAppId, chatId, message, match: promptMatch })
+        const promptOverride = summaryCommandTriggered && summaryCommandMatch
+          ? await buildSummaryCommandPrompt({ larkAppId, chatId, message, match: summaryCommandMatch })
           : undefined;
-        if (promptOverride && promptMatch) {
+        if (promptOverride && summaryCommandMatch) {
           logger.info(
-            `[content-trigger] "${promptMatch.trigger.name}" matched msg=${messageId.substring(0, 12)} ` +
-            `chat=${chatId.substring(0, 12)} kind=${promptMatch.chatKind}`,
+            `[summary-command] matched msg=${messageId.substring(0, 12)} ` +
+            `chat=${chatId.substring(0, 12)} kind=${summaryCommandMatch.chatKind}`,
           );
         }
         const ctx: RoutingContext = {
@@ -1964,8 +1860,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           ...routing,
           replyRootId,
           promptOverride,
-          contentTrigger: promptMatch
-            ? { name: promptMatch.trigger.name, chatKind: promptMatch.chatKind }
+          summaryCommand: summaryCommandTriggered && summaryCommandMatch
+            ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
             : undefined,
         };
         // Serialize per anchor so two messages to the same thread/chat are
