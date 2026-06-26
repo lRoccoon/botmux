@@ -31,8 +31,28 @@ vi.mock('node:os', () => ({
 
 import { execSync } from 'node:child_process';
 import { readFileSync, readlinkSync, existsSync, readdirSync } from 'node:fs';
-import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
+import { discoverAdoptableSessions, validateAdoptTarget, isBareShellComm } from '../src/core/session-discovery.js';
 import type { CliId } from '../src/adapters/cli/types.js';
+
+describe('isBareShellComm()', () => {
+  it('classifies interactive shells as bare shells', () => {
+    for (const sh of ['sh', 'bash', 'zsh', 'dash', 'ash', 'ksh', 'fish', 'tcsh', 'csh']) {
+      expect(isBareShellComm(sh)).toBe(true);
+    }
+  });
+  it('tolerates the leading-dot login-shell form (e.g. -zsh → .zsh on some ps)', () => {
+    expect(isBareShellComm('.zsh')).toBe(true);
+  });
+  it('does NOT classify agent CLIs or launchers as bare shells', () => {
+    for (const comm of ['codex', 'claude', 'node', 'python', 'relay', 'seed', 'coco']) {
+      expect(isBareShellComm(comm)).toBe(false);
+    }
+  });
+  it('returns false for undefined/empty', () => {
+    expect(isBareShellComm(undefined)).toBe(false);
+    expect(isBareShellComm('')).toBe(false);
+  });
+});
 
 const mockExecSync = vi.mocked(execSync);
 const mockReadFileSync = vi.mocked(readFileSync);

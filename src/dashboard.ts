@@ -2080,6 +2080,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/launch-shell — proxy to that bot's daemon. Body
+    // `{ launchShell: string }` (shell name or absolute path; '' = clear → $SHELL).
+    let mBotLaunchShell: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotLaunchShell = url.pathname.match(/^\/api\/bots\/([^/]+)\/launch-shell$/))) {
+      const appId = decodeURIComponent(mBotLaunchShell[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-launch-shell`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/env — proxy to that bot's daemon. Body
     // `{ env: string }` (raw JSON text; '' = clear).
     let mBotEnv: RegExpMatchArray | null;

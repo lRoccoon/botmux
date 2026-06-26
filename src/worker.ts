@@ -15,7 +15,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, createWriteStream, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, basename } from 'node:path';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
@@ -65,7 +65,7 @@ import {
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
-import { findLaunchedCliPid, scheduleWrapperRealCliPid } from './core/session-discovery.js';
+import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm } from './core/session-discovery.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
@@ -205,6 +205,13 @@ let isFlushing = false;
  *  when the CLI restarts. Consumed inside flushPending right before the first
  *  user prompt is drained, so the commands always precede it (see runStartupCommands). */
 let hasRunStartupCommands = false;
+/** Per-spawn latch: set once the launch-failure detector has decided the pane
+ *  leaf is a bare shell (the CLI never launched — e.g. a user rcfile that
+ *  `exec`-trampolines into another shell pre-empted the wrapper's `exec <cli>`).
+ *  Once set, flushPending refuses to type prompts into the bare shell (which
+ *  would just produce `zsh: parse error`) and the user gets one diagnostic
+ *  instead. Reset per spawn in spawnCli. */
+let bareShellLaunchBlocked = false;
 /** Ready-gate (Claude-family): holds the first prompt until the SessionStart
  *  hook fires a true-ready signal, so a cjadk-style startup selector's ❯ (which
  *  falsely matches readyPattern) can't eat the first message. Recreated + armed
@@ -3181,6 +3188,66 @@ function scheduleSubmitFailureNotify(
 }
 
 /**
+ * Launch-failure guard. Right before the FIRST prompt is typed, confirm the
+ * pane's leaf process is the agent CLI — not a bare interactive shell. The
+ * failure this catches: a user's login `$SHELL` (e.g. bash) whose rcfile
+ * `exec`-trampolines into another shell (`[ -t 1 ] && exec zsh`). botmux's
+ * tmux wrapper launches `<shell> -i -c '… exec /usr/bin/env <cli>'`; the `-i`
+ * sources the rcfile, the `exec zsh` replaces the shell BEFORE the `-c` body
+ * runs, and the pane is left at a bare shell. Typing the multi-line prompt into
+ * it just yields `zsh: parse error near '\n'` and the user is stuck (the exact
+ * bug this guards). Instead of typing into the shell we surface ONE actionable
+ * diagnostic and latch the session so no further prompt is mis-typed.
+ *
+ * Why this is the right moment / low false-positive: the first prompt is held
+ * until the CLI signals ready OR the 15s/45s first-prompt timeout fires, so by
+ * the time we get here a healthy CLI has long since `exec`'d (leaf comm =
+ * codex/node/…) — only a trampolined/failed launch is still a bare shell. We
+ * skip wrapperCli/adopt (their leaf is legitimately a launcher/observed pane)
+ * and the pty/herdr backends (which `exec` the CLI directly — getChildPid is the
+ * CLI itself, never a shell).
+ *
+ * Returns true when a bare-shell launch was detected (caller must NOT flush).
+ */
+function detectBareShellLaunch(): boolean {
+  if (bareShellLaunchBlocked) return true;
+  if (lastInitConfig?.adoptMode) return false;       // observing an existing pane, not launching
+  if (lastInitConfig?.wrapperCli) return false;      // launcher legitimately wraps the CLI (transient shell shim)
+  const pid = backend?.getChildPid?.();
+  if (!pid) return false;
+  const comm = readComm(pid);
+  if (!isBareShellComm(comm)) return false;          // CLI (rust/go/node) is running — healthy launch
+
+  // Bare shell is the pane leaf → the CLI never launched. Tier the message on
+  // whether the leaf shell differs from the one botmux launched with: a
+  // mismatch is the unmistakable signature of an rcfile `exec`-trampoline.
+  const launchShell = (lastInitConfig?.launchShell || process.env.SHELL || '').trim();
+  const expectedShell = launchShell ? basename(launchShell) : '';
+  const trampolined = !!expectedShell && comm !== expectedShell;
+  bareShellLaunchBlocked = true;
+  log(`Bare-shell launch detected: pane leaf comm=${comm}, expected launch shell=${expectedShell || '?'}, ` +
+    `cli=${lastInitConfig?.cliId}; suppressing first-prompt write (${trampolined ? 'rc trampoline' : 'CLI did not start'})`);
+
+  const cli = cliName();
+  let message: string;
+  if (trampolined) {
+    message =
+      `⚠️ 会话没能启动：pane 里现在是裸 \`${comm}\`，${cli} 没真正跑起来——所以我没把你的消息打进去（否则会被当 shell 命令执行，报 \`parse error\`）。\n\n` +
+      `最可能原因：botmux 用 \`${expectedShell}\` 启动 CLI，但 pane 落到了 \`${comm}\`。通常是 rc 文件（如 \`~/.${expectedShell}rc\`）里有 \`exec ${comm}\` 这类跳转——\`${expectedShell} -i\` 会 source rc，于是 shell 被顶替，CLI 的启动命令没机会跑。\n\n` +
+      `两种修法（任选其一，改完重启 daemon 再发一条消息）：\n` +
+      `① 给那行加守卫，只在手动开终端时切：\`[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec ${comm}\`（注意 PATH/nvm 等导出放在它之前）\n` +
+      `② 给这个 bot 配 \`launchShell: ${comm}\`（dashboard 机器人配置，或 \`/config launchShell ${comm}\`），直接用 \`${comm}\` 启动绕开 \`${expectedShell}\` 的 rc——但要确保 PATH/nvm 在 \`${comm}\` 的 rc 里。`;
+  } else {
+    message =
+      `⚠️ 会话没能启动：pane 里还停在 \`${comm}\`，${cli} 没真正跑起来——我没把消息打进去（否则会被当 shell 命令执行）。\n\n` +
+      `可能原因：rc 文件启动过慢/报错，或 \`${cli}\` 的可执行文件不在 PATH 上（CLI 没找到）。\n` +
+      `建议：在 web 终端里手动敲一下启动命令看报什么错；确认 CLI 二进制能在 PATH 上找到；或精简 rc 启动逻辑后重启 daemon 再试。`;
+  }
+  send({ type: 'user_notify', turnId: currentBotmuxTurnId, message });
+  return true;
+}
+
+/**
  * Drain the pending message queue sequentially.
  * Async with isFlushing mutex: awaits each writeInput, then immediately
  * sends the next message (type-ahead) without waiting for idle detection.
@@ -3190,6 +3257,7 @@ async function flushPending(): Promise<void> {
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
   if (pendingMessages.length === 0) return;  // nothing to flush — keep isPromptReady
+  if (bareShellLaunchBlocked) return;  // launch failed into a bare shell — don't type prompts into it
   // Ready-gate: hold the FIRST prompt until the SessionStart hook fires a true-
   // ready signal. A cjadk-style startup selector's ❯ falsely matches readyPattern
   // and would otherwise eat this message. releaseReadyGate() re-invokes us once
@@ -3240,6 +3308,15 @@ async function flushPending(): Promise<void> {
   }
 
   try {
+    // Launch-failure guard, BEFORE startup commands or any user prompt: if the
+    // pane leaf is a bare shell (the CLI never launched — e.g. a user rcfile that
+    // `exec`-trampolines into another shell), don't type anything into it (it
+    // would just be `zsh: parse error`); surface one diagnostic and bail. Must
+    // precede runStartupCommands so a bot with startupCommands doesn't get them
+    // typed into the bare shell first.
+    if (!hasRunStartupCommands && detectBareShellLaunch()) {
+      return;  // finally{} releases the mutex; pendingMessages stay queued, untouched
+    }
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
     // paths funnel through flushPending — the ready-gate settle for Claude-family
@@ -3885,6 +3962,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // arm it. spawnCli is synchronous up to backend spawn, so this lands before
   // any flushPending consumes the flag.
   hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent });
+  // Re-arm the bare-shell launch detector for each fresh spawn. A reattach to a
+  // live pane is a known-good running CLI, so skip detection there (same gate as
+  // startup commands) — only fresh spawns can land in a trampolined bare shell.
+  bareShellLaunchBlocked = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
@@ -4236,6 +4317,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     rows: PTY_ROWS,
     env: childEnv as Record<string, string>,
     injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+    launchShell: lastInitConfig?.launchShell,
   });
 
   // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)

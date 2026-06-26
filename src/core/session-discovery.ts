@@ -77,6 +77,22 @@ const COMM_ARGV_LAUNCHERS = new Set([
   'MainThread',
 ]);
 
+/** Interactive-shell comms. When a pane's leaf process is one of these AFTER
+ *  botmux is ready to type the first prompt, the CLI never actually launched —
+ *  e.g. the shell wrapper's `exec <cli>` was pre-empted by a user rcfile that
+ *  `exec`-trampolines into another shell. None of the supported CLIs runs AS a
+ *  bare shell (they're rust/go binaries or node), so this set never collides
+ *  with a healthy CLI leaf. Used by the worker's launch-failure detector. */
+const BARE_SHELL_COMMS = new Set([
+  'sh', 'bash', 'zsh', 'dash', 'ash', 'ksh', 'mksh', 'fish', 'tcsh', 'csh',
+]);
+
+/** True when `comm` names an interactive shell rather than an agent CLI. */
+export function isBareShellComm(comm: string | undefined): boolean {
+  if (!comm) return false;
+  return BARE_SHELL_COMMS.has(comm.startsWith('.') ? comm.slice(1) : comm);
+}
+
 export function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefined {
   const normalizedComm = comm.startsWith('.') ? comm.slice(1) : comm;
   const direct = CLI_COMM_MAP[comm] ?? CLI_COMM_MAP[normalizedComm];
