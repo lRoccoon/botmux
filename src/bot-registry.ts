@@ -75,6 +75,20 @@ export interface BotConfig {
    */
   wrapperCli?: string;
   /**
+   * Per-bot launch-shell override for the persistent backends (tmux/zellij).
+   * When set, botmux launches the CLI under this shell instead of the daemon's
+   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`sh`) or an absolute path
+   * (`/usr/bin/zsh`). The escape hatch for a login `$SHELL` (e.g. bash) whose
+   * rcfile `exec`-trampolines into another shell: that trampoline replaces the
+   * launch shell before it can `exec` the CLI, leaving a bare shell the first
+   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: zsh`
+   * launches under zsh directly and bypasses the bash `.bashrc`. CAVEAT:
+   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (e.g.
+   * `.zshrc`/`.zprofile`), not the bypassed one. Ignored by the pty backend
+   * (which `exec`s the CLI directly, no shell wrapper, so it's trampoline-immune).
+   */
+  launchShell?: string;
+  /**
    * Optional model name passed to the CLI at spawn time (e.g. `claude --model
    * opus`). Each adapter decides how to inject it — adapters whose CLI has no
    * `--model` flag silently ignore the field. When unset, the CLI uses its own
@@ -862,6 +876,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       cliPathOverride: entry.cliPathOverride,
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
+        : undefined,
+      launchShell: typeof entry.launchShell === 'string' && entry.launchShell.trim()
+        ? entry.launchShell.trim()
         : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()

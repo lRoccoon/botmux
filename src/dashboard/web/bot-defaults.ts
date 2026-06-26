@@ -239,7 +239,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderEnvSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderLaunchShellSection(b)}${renderEnvSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -509,6 +509,25 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       <div class="actions">
         <button type="button" class="primary" data-action="save-startup-commands">${t('botDefaults.startupCommandsSave')}</button>
         <span class="oncall-status" data-startup-commands-status></span>
+      </div>
+    </div>`;
+  }
+
+  // 启动 shell launchShell：启动 CLI 用的 shell（zsh|bash|sh 或绝对路径），覆盖 $SHELL。
+  // 用于登录 $SHELL（如 bash）的 rc 文件里 `exec zsh` 跳转、导致 CLI 起不来的场景。
+  // next-session 生效。PUT /api/bot-launch-shell 落 bots.json。
+  function renderLaunchShellSection(b: any): string {
+    const val: string = typeof b.launchShell === 'string' ? b.launchShell : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionLaunchShell')}</h4>
+      <p class="bd-section-note">${t('botDefaults.launchShellHelp')}</p>
+      <input type="text" data-input="launchShell"
+        placeholder="${escapeHtml(t('botDefaults.launchShellPlaceholder'))}"
+        value="${escapeHtml(val)}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-launch-shell">${t('botDefaults.launchShellSave')}</button>
+        <span class="oncall-status" data-launch-shell-status></span>
       </div>
     </div>`;
   }
@@ -1337,6 +1356,43 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             startupStatusEl.classList.add('hint-warn-inline');
           } finally {
             startupSaveBtn.disabled = false;
+          }
+        });
+      }
+
+      // ── 启动 shell launchShell（shell 名或绝对路径；空＝清除→回 $SHELL） ──────
+      const launchShellEl = card.querySelector<HTMLInputElement>('input[data-input=launchShell]');
+      const launchShellSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-launch-shell]');
+      const launchShellStatusEl = card.querySelector<HTMLSpanElement>('[data-launch-shell-status]');
+      if (launchShellEl && launchShellSaveBtn) {
+        launchShellSaveBtn.addEventListener('click', async () => {
+          if (!launchShellStatusEl) return;
+          launchShellStatusEl.textContent = '';
+          launchShellStatusEl.className = 'oncall-status';
+          launchShellSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/launch-shell`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ launchShell: launchShellEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              launchShellStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              launchShellStatusEl.classList.add('hint-ok');
+              const next: string = typeof body.launchShell === 'string' ? body.launchShell : '';
+              launchShellEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.launchShell = next;
+            } else {
+              launchShellStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              launchShellStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            launchShellStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            launchShellStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            launchShellSaveBtn.disabled = false;
           }
         });
       }

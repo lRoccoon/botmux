@@ -1243,6 +1243,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     p2pMode,
     maxLiveWorkers,
     startupCommands,
+    launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
@@ -1379,6 +1380,31 @@ ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
+});
+
+// Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：
+// 空字符串＝清除（回 $SHELL）。走 applyConfigField（与 /config launchShell 同一写盘
+// + 内存热更新路径），next-session 生效（下个会话起用新 shell 启动 CLI）。
+ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { launchShell?: unknown };
+  try { body = await readJsonBody<{ launchShell?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('launchShell');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.launchShell === 'string' ? body.launchShell : '';
+  let value: string | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回 $SHELL
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
 });
 
 // Per-bot 环境变量 env。Body `{ env: string }`（原始 JSON 文本，如
