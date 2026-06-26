@@ -49,6 +49,7 @@ import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
+import { TERMINAL_FAVICON_DATA_URI } from './utils/terminal-favicon.js';
 import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey, ScreenStatus } from './types.js';
 import { t, setDefaultLocale } from './i18n/index.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
@@ -157,6 +158,25 @@ const authedClients = new WeakSet<WebSocket>();
 /** Per-WS-client tmux/zellij attach PTYs. */
 const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
+
+/**
+ * Resolve terminal write permission for one request, honoring a platform-injected
+ * `X-Botmux-Role` header. The central platform fronts `/s/*` and sets the role
+ * (owner | teammate | guest) after authenticating the viewer, stripping any
+ * client-supplied header; it reaches the worker via dashboard /s bridge →
+ * terminal-proxy → here. When the header is present we trust it (platform-fronted
+ * access): only `owner` may drive the terminal; everything else (teammate / guest
+ * / anything else) is read-only. When the header is absent (local direct access,
+ * no platform in front), fall back to the legacy write-token query param.
+ */
+function resolveTerminalWrite(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
+  const role = req.headers['x-botmux-role'];
+  if (typeof role === 'string' && role) {
+    const hasWrite = role === 'owner';
+    return { hasWrite, platformReadonly: !hasWrite };
+  }
+  return { hasWrite: tokenMatches, platformReadonly: false };
+}
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach
  *  clients: cleared keybinds + locked mode so every keystroke passes straight
@@ -271,7 +291,16 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
     await new Promise(r => setTimeout(r, 200));
     (be as any).sendSpecialKeys('Enter');
   } else {
-    be.write(content + '\r');
+    // PtyBackend has no sendText/sendSpecialKeys, so write the keystrokes
+    // directly — but still beat between the text and the Enter. Writing
+    // `content + '\r'` in one chunk submits before the CLI's slash-command
+    // parser has registered the `/cmd` match, so the command is left
+    // unsent in the input box (observed with `/goal <text>` on a pty
+    // workflow worker: typed but never executed). Mirror the tmux path's
+    // 200ms beat.
+    be.write(content);
+    await new Promise(r => setTimeout(r, 200));
+    be.write('\r');
   }
 }
 
@@ -4574,9 +4603,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         res.end('Bad Request');
         return;
       }
-      const hasWrite = url.searchParams.get('token') === writeToken;
+      const tokenMatches = url.searchParams.get('token') === writeToken;
+      const { hasWrite, platformReadonly } = resolveTerminalWrite(req, tokenMatches);
+      const loginHdr = req.headers['x-botmux-login-url'];
+      const loginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr) ? loginHdr : '';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite));
+      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl));
     });
 
     wss = new WebSocketServer({ server: httpServer });
@@ -4592,7 +4624,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.close(1008, 'Bad Request');
         return;
       }
-      const hasWrite = url.searchParams.get('token') === writeToken;
+      const tokenMatches = url.searchParams.get('token') === writeToken;
+      const { hasWrite } = resolveTerminalWrite(req, tokenMatches);
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 
@@ -4786,7 +4819,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
               backend?.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
-              if (!authedClients.has(ws)) return; // read-only
+              if (!authedClients.has(ws)) {
+                // Read-only: allow ONLY wheel scroll sequences (SGR buttons 64-67).
+                // Scrolling the CLI's own view is non-destructive and lets read-only
+                // viewers page back through an alt-screen TUI's history (Claude etc.,
+                // which has no local scrollback). Everything else is dropped.
+                if (!/^(\x1b\[<6[4-7];\d+;\d+M)+$/.test(msg.data)) return;
+              }
               backend?.write(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
@@ -4808,7 +4847,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
   });
 }
 
-function getTerminalHtml(hasWrite: boolean): string {
+function getTerminalHtml(hasWrite: boolean, platformReadonly = false, loginUrl = ''): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
 <html>
@@ -4816,6 +4855,7 @@ function getTerminalHtml(hasWrite: boolean): string {
 <meta charset="utf-8">
 <meta id="vp" name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>${cliName()} - ${label}</title>
+<link rel="icon" type="image/png" href="${TERMINAL_FAVICON_DATA_URI}">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -4855,11 +4895,17 @@ body.touch #terminal .xterm-screen *{
   background:rgba(247,118,142,0.12);border:1px solid rgba(247,118,142,0.35);border-radius:4px;
   backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
 #readonly-banner.show{display:inline-block}
+#login-banner{display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:50;
+  padding:4px 10px;font:12px monospace;color:#e0af68;white-space:nowrap;text-decoration:none;cursor:pointer;
+  background:rgba(224,175,104,0.12);border:1px solid rgba(224,175,104,0.35);border-radius:4px;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+#login-banner.show{display:inline-block}
 </style>
 </head>
 <body>
 <div id="terminal"></div>
 <div id="readonly-banner">只读模式 · 无写入权限</div>
+${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopener">owner 登录后可操作 →</a>` : '<div id="login-banner">owner 登录后可操作</div>'}
 <div id="toolbar">
   <button data-k="esc">Esc</button>
   <button data-k="ctrlc">^C</button>
@@ -4881,7 +4927,11 @@ body.touch #terminal .xterm-screen *{
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.getElementById('vp').content='width=1100,viewport-fit=cover';document.body.classList.add('touch');}
 var hasToken=${hasWrite};
-if(!hasToken){var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
+var platformReadonly=${platformReadonly};
+if(!hasToken){
+  if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
+  else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
+}
 
 var term=new Terminal({
   theme:{background:'#1a1b26',foreground:'#a9b1d6',cursor:'#c0caf5',
@@ -5000,12 +5050,45 @@ window.addEventListener('resize',onViewportResize);
   ws.onerror=function(){ws.close()};
 })();
 
-// ── Read-only scroll handling ──
-if(!hasToken&&!${isTmuxMode && !isPipeMode}){
-  // Non-tmux read-only: CLI mouse mode blocks local scroll, override with scrollLines
+// ── Wheel / touch scroll handling ──
+// Alt-screen + mouse-mode CLIs (e.g. Claude Code) keep NO scrollback in xterm OR
+// tmux — their whole transcript is redrawn by the app inside the fixed alt-screen
+// grid, so term.scrollLines() reveals nothing. In the alternate buffer we forward
+// scrolling as SGR mouse-wheel events so the CLI scrolls its own transcript and
+// repaints (works in read-only too: the server only lets wheel sequences through).
+// Normal-buffer CLIs keep xterm's native scrollback scroll. Capture-phase +
+// stopPropagation pre-empts xterm's own handler. Skipped for pure tmux/zellij
+// ATTACH (gate), where the attach client owns scrolling via copy-mode.
+//
+// Accumulate intended scroll DISTANCE (px) and emit one wheel tick per STEP px —
+// decoupled from how many wheel/touch events the browser fires per gesture
+// (high-res trackpads fire dozens), so a small gesture stays a small scroll and
+// doesn't compound into a whole screen. px<0 = scroll up (toward history). The
+// per-call cap stops a single huge delta (page tick / fling) from over-firing.
+var _scrollAccum=0;var _SCROLL_STEP=33;
+function _fwdScroll(px){
+  if(!ws_||ws_.readyState!==1)return;
+  _scrollAccum+=px;var data='',n=0;
+  while(Math.abs(_scrollAccum)>=_SCROLL_STEP&&n<6){
+    var up=_scrollAccum<0; // px<0 → wheel-up (history)
+    data+='\\x1b[<'+(up?64:65)+';1;1M';
+    _scrollAccum+=up?_SCROLL_STEP:-_SCROLL_STEP;n++;
+  }
+  if(data)ws_.send(JSON.stringify({type:'input',data:data}));
+}
+if(!${isTmuxMode && !isPipeMode}){
   document.getElementById('terminal').addEventListener('wheel',function(e){
-    e.preventDefault();term.scrollLines(e.deltaY>0?3:-3);
-  },{passive:false});
+    if(term.buffer.active.type!=='alternate'){
+      // Normal buffer: xterm scrolls its own scrollback natively. In read-only a
+      // mouse-mode CLI could swallow the wheel, so drive scrollback directly.
+      if(!hasToken){e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);}
+      return;
+    }
+    e.preventDefault();e.stopPropagation();
+    // Normalise deltaMode to px: line→~16px, page→~one screen.
+    var px=e.deltaMode===1?e.deltaY*16:e.deltaMode===2?e.deltaY*term.rows*16:e.deltaY;
+    _fwdScroll(px);
+  },{capture:true,passive:false});
 }
 
 // ── Touch shortcut toolbar ──
@@ -5035,11 +5118,29 @@ if(isTouch&&hasToken){
   }
 }
 
-// Single-finger touch scrolling is handled natively by xterm's own Viewport
-// (handleTouchMove → scrollTop), so no custom handler here — a parallel one
-// would double-drive scrollTop and fight xterm.  overscroll-behavior:none on
-// .xterm-viewport (see <style>) kills the iOS rubber-band; the WebGL/Canvas
-// renderer above is what actually makes scrolling over text smooth.
+// Single-finger touch scrolling: normal-buffer CLIs use xterm's own Viewport
+// (handleTouchMove → scrollTop) natively. Alt-screen CLIs (Claude) have no xterm
+// scrollback, so native touch scroll does nothing — mirror the wheel fix and
+// forward the drag to the CLI as SGR wheel events so it scrolls its own
+// transcript. Only the alternate buffer is intercepted (capture + stopPropagation);
+// the normal buffer falls through to xterm untouched, so no double-drive of
+// scrollTop. overscroll-behavior:none (see <style>) kills the iOS rubber-band.
+if(!${isTmuxMode && !isPipeMode}){
+  var _tTerm=document.getElementById('terminal');
+  var _tLastY=null;
+  _tTerm.addEventListener('touchstart',function(e){
+    if(e.touches.length===1)_tLastY=e.touches[0].clientY;
+  },{capture:true,passive:true});
+  _tTerm.addEventListener('touchmove',function(e){
+    // Normal buffer / multi-touch / no start → let xterm (or the browser) handle it.
+    if(term.buffer.active.type!=='alternate'||_tLastY===null||e.touches.length!==1)return;
+    e.preventDefault();e.stopPropagation();
+    var y=e.touches[0].clientY;
+    _fwdScroll(_tLastY-y); // finger drags down (y grows) → px<0 → scroll up (history)
+    _tLastY=y;
+  },{capture:true,passive:false});
+  _tTerm.addEventListener('touchend',function(){_tLastY=null;},{capture:true,passive:true});
+}
 </script>
 </body>
 </html>`;

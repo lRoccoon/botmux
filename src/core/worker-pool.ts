@@ -949,17 +949,33 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
   cleanupLegacyMcpConfig(cliId);
 }
 
+/** The user's global skills dir that botmux must NOT pollute (Claude now injects
+ *  its skills per-session via `--plugin-dir`). Single source of truth for the
+ *  path so the early once-pass and the post-restore re-sweep stay in sync. */
+const GLOBAL_CLAUDE_SKILLS_DIR = '~/.claude/skills';
+
+/** Unconditionally sweep botmux-owned skills out of the user's global
+ *  `~/.claude/skills`. botmux owns the `botmux-` namespace there and injects its
+ *  skills per-session via `--plugin-dir`, so anything matching is a leak that
+ *  would otherwise surface (and mis-fire) in the user's standalone `claude`.
+ *  Idempotent & best-effort — safe to call repeatedly. */
+export function sweepGlobalBotmuxSkills(): void {
+  removeGlobalBotmuxSkills(GLOBAL_CLAUDE_SKILLS_DIR);
+}
+
 let globalBotmuxSkillsCleaned = false;
 /** One-time, CLI-independent cleanup of botmux skills that older versions
- *  installed into the global `~/.claude/skills`. Claude now injects skills via
- *  `--plugin-dir`, so any leftover `botmux-*` there leaks into the user's
- *  standalone `claude` regardless of which CLI THIS daemon's bot uses — so the
- *  cleanup must NOT be gated on `adapter.pluginDir` (which only fires for a
- *  Claude bot). Runs at daemon startup via ensureCliEnv. */
+ *  installed into the global `~/.claude/skills`. Runs early at daemon startup
+ *  via ensureCliEnv (CLI-independent: the leak surfaces in standalone `claude`
+ *  no matter which CLI THIS daemon's bot uses, so it must NOT be gated on
+ *  `adapter.pluginDir`). NOTE: this early pass can lose a restart race — an
+ *  outgoing old-build daemon may re-create the dirs a few ms later — so
+ *  {@link sweepGlobalBotmuxSkills} is called again post-restore (see daemon.ts)
+ *  to catch that on the same startup instead of leaving it until next restart. */
 function cleanupGlobalBotmuxSkillsOnce(): void {
   if (globalBotmuxSkillsCleaned) return;
   globalBotmuxSkillsCleaned = true;
-  removeGlobalBotmuxSkills('~/.claude/skills');
+  sweepGlobalBotmuxSkills();
 }
 
 // ─── Claude Code folder-trust pre-acceptance ─────────────────────────────────
@@ -1481,6 +1497,15 @@ export async function transferSession(
 
 // ─── Fork worker ────────────────────────────────────────────────────────────
 
+/** True if `p` resolves (via realpath) to the user's home dir. Used to exclude
+ *  $HOME — including a symlinked/aliased home or a different textual form — from
+ *  the session-workingDir back-fill, so a sibling bot never inherits the home dir.
+ *  Falls back to a string compare if realpath can't resolve (e.g. transient race). */
+function resolvesToHome(p: string): boolean {
+  try { return realpathSync(p) === realpathSync(homedir()); }
+  catch { return p === homedir(); }
+}
+
 export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
@@ -1513,6 +1538,24 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // that gap without touching the persisted session.workingDir "unset = follow default"
   // semantics: this is re-derived on every fork/restore.
   ds.workingDir = cwd;
+
+  // Also persist the effective launch dir onto the SESSION record so a sibling
+  // bot @-ed into the same anchor can inherit it (inherit-peer reads the
+  // persisted session.workingDir cross-process, even across daemons). Without
+  // this, a session running on the bot-default/fallback dir leaves
+  // session.workingDir empty and is invisible to cross-bot same-dir inheritance.
+  // Only FILL IN a missing workingDir (default/fallback-spawned sessions) — never
+  // overwrite an already-pinned value (oncall/repo-card sessions keep their stored
+  // form). Persist only a genuinely-resolved dir, never the homedir() crash-fallback
+  // (cwd !== rawCwd → a transiently-missing dir can't pin to ~). Also exclude a
+  // LEGITIMATELY-resolved homedir: a bot whose workingDir is unset/`~` resolves to
+  // $HOME, and pinning that would let a sibling bot inherit $HOME (launch in the home
+  // dir with no repo context) instead of getting its own repo card. Compared via
+  // realpath so a symlinked/aliased $HOME is excluded too, not just the literal string.
+  if (!ds.session.workingDir && cwd === rawCwd && !resolvesToHome(cwd)) {
+    ds.session.workingDir = cwd;
+    sessionStore.updateSession(ds.session);
+  }
 
   // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a
