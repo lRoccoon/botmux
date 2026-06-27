@@ -73,19 +73,22 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   // too, but doing it here makes the service contract explicit and keeps
   // invalidBotIds reporting stable across underlying API changes.
   const otherBots = opts.larkAppIds.filter(id => id !== opts.creatorLarkAppId);
-  // 飞书 chat.create 的 bot_id_list 有数量上限（实测 >15 个直接 400）。分批：首批随 create 建群，
-  // 其余 bot 用 chatMembers.create 增量加入，同样按批，避免再次触顶。失败的并入 invalidBotIds。
-  const BOT_BATCH = 10;
-  const firstBatch = otherBots.slice(0, BOT_BATCH);
-  const restBots = otherBots.slice(BOT_BATCH);
+  // 飞书 chat.create 的 bot_id_list 上限仅 5、chatMembers.create 的 id_list 同样很小（实测 >5 即 400）。
+  // 故建群时不带 bot（只 creator + 邀请人），所有 bot 一律按每批 5 个增量加入，避免触顶。批里只要有
+  // 一个非法 id（如已停用的 app），飞书会整批拒（code≠0）→ 逐个重试以保住同批的有效 bot。失败并入 invalidBotIds。
+  const BOT_BATCH = 5;
   const r = await createChat(opts.creatorLarkAppId, {
     name: opts.name,
-    botIds: firstBatch,
+    botIds: [],
     userIds: opts.userOpenIds ?? [],
   });
-  for (let i = 0; i < restBots.length; i += BOT_BATCH) {
-    const batch = restBots.slice(i, i + BOT_BATCH);
-    const added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
+  for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
+    const batch = otherBots.slice(i, i + BOT_BATCH);
+    let added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
+    if (added.some(a => !a.ok) && batch.length > 1) {
+      added = [];
+      for (const id of batch) added.push(...await addBotToChat(opts.creatorLarkAppId, r.chatId, [id]));
+    }
     for (const a of added) if (!a.ok) r.invalidBotIds.push(a.id);
   }
 

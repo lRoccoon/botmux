@@ -62,6 +62,23 @@ By default it doesn't interrupt the current turn; new messages are queued (type-
 
 Yes. For any "native CLI + wrapper / gateway" combination, write a wrapper script that passes `"$@"` through, then set `cliPathOverride` to that script's path when editing the bot in `botmux setup`.
 
+## Sessions never start / the first message errors with `zsh: parse error near '\n'`?
+
+This usually means your login shell (`$SHELL`, often bash) has logic in its startup file that "switches to another shell" — most typically in `~/.bashrc`:
+
+```bash
+if [ -t 1 ]; then exec zsh; fi   # a common hack when chsh doesn't take effect
+```
+
+botmux launches the session inside tmux via `<$SHELL> -i -c '… start the CLI'`. The `-i` sources that startup file, so `exec zsh` replaces the shell before the command that actually starts the CLI ever runs — the pane is left at a bare shell, and the first message typed into it produces `zsh: parse error`.
+
+Since v2.95.0 botmux detects this "the session never really started" state and posts a diagnostic card instead of typing the message into the bare shell. Two ways to fix it:
+
+- **Set `launchShell` (recommended)**: tell the bot to launch directly under the target shell, bypassing the trampolining startup file. `/config launchShell zsh`, or the dashboard ("Bot defaults → Launch shell"), or add `"launchShell": "zsh"` to `bots.json`. Note: PATH / nvm etc. must then live in the chosen shell's startup files (e.g. `.zshrc`).
+- **Fix the startup file**: guard the switch so it only fires for a real interactive terminal: `[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec zsh` (put PATH / nvm exports before it).
+
+Then `botmux restart` and resend a message. Only the `tmux` / `zellij` backends are affected; the `pty` backend launches the CLI directly and is immune.
+
 ## Can a bot added to a new group see the earlier chat history?
 
 Yes. Just tell it "look at the chat history", or quote a specific message. The prerequisite is that the Lark bot's permissions are fully enabled (including group message reading).

@@ -13,6 +13,8 @@ export interface PlatformBotInfo {
   name: string;
   avatar?: string;
   cli?: string;
+  /** 团队页是否展示这个 bot（默认 true，按 bot 配置 showInTeam 上报）。 */
+  showInTeam?: boolean;
 }
 
 export interface TunnelClientOptions {

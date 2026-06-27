@@ -264,6 +264,20 @@ export interface BotConfig {
    */
   wrapperCli?: string;
   /**
+   * Per-bot launch-shell override for the persistent backends (tmux/zellij).
+   * When set, botmux launches the CLI under this shell instead of the daemon's
+   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`sh`) or an absolute path
+   * (`/usr/bin/zsh`). The escape hatch for a login `$SHELL` (e.g. bash) whose
+   * rcfile `exec`-trampolines into another shell: that trampoline replaces the
+   * launch shell before it can `exec` the CLI, leaving a bare shell the first
+   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: zsh`
+   * launches under zsh directly and bypasses the bash `.bashrc`. CAVEAT:
+   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (e.g.
+   * `.zshrc`/`.zprofile`), not the bypassed one. Ignored by the pty backend
+   * (which `exec`s the CLI directly, no shell wrapper, so it's trampoline-immune).
+   */
+  launchShell?: string;
+  /**
    * Optional model name passed to the CLI at spawn time (e.g. `claude --model
    * opus`). Each adapter decides how to inject it — adapters whose CLI has no
    * `--model` flag silently ignore the field. When unset, the CLI uses its own
@@ -362,7 +376,7 @@ export interface BotConfig {
   /**
    * 开启后：仅靠 per-user 授权（chatGrants / globalGrants）放行的发送者，禁止使用**任何
    * 斜杠命令**——botmux 自身的 DAEMON 命令、透传（PASSTHROUGH）命令、全部 `/workflow`
-   * 子命令、`/introduce`、`/t`/`/topic` —— 只能普通对话。owner / allowedUsers / oncall /
+   * （即兴 grill）/ `/template`（跑模板）子命令、`/introduce`、`/t`/`/topic` —— 只能普通对话。owner / allowedUsers / oncall /
    * allowedChatGroup 整群成员不受影响。判定以 slash-command invocation 命中为准（不是"凡以
    * `/` 开头的文本"，避免误伤讨论命令用法的普通对话）。默认 false（保持现状：被授权人可用透传）。
    */
@@ -461,6 +475,22 @@ export interface BotConfig {
    * `/card` group-visible & live.
    */
   privateCard?: boolean;
+  /**
+   * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
+   * into a chat/thread where a sibling bot already has an active session, it
+   * reuses that sibling's workingDir and skips its own repo-selection card.
+   * This is independent of /oncall. Default ON (undefined = on); set to false
+   * to make THIS bot always fall through to its own repo card / default dir.
+   * Toggled from the dashboard Bot Defaults tab; persisted via card-prefs-store.
+   */
+  botToBotSameDir?: boolean;
+  /**
+   * 平台团队页是否展示这个 bot. When false, this bot is hidden from the central
+   * platform's team roster (人→机器→bot view). Default ON (undefined = shown);
+   * set to false to keep an internal/utility bot off the team page.
+   * Reported to the platform via the dashboard's bot-info upload.
+   */
+  showInTeam?: boolean;
   /**
    * 主动开工 — 场景①. When true, the bot auto-starts a session when it is added
    * to a new chat that contains at least one of its allowedUsers (see
@@ -695,6 +725,30 @@ export function getAllBots(): BotState[] {
 export function findOncallChat(larkAppId: string, chatId: string): OncallChat | undefined {
   const bot = bots.get(larkAppId);
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
+}
+
+/**
+ * The bot's effective default working dir for a NEW session, as a raw
+ * (possibly `~`-prefixed) path — the caller still expands + validates it.
+ *
+ * Two sources, presented as a mutually-exclusive 3-way choice in the dashboard
+ * ("默认工作目录模式": 关闭 / 仅默认目录 / Oncall 模式) but if both happen to be set
+ * (legacy / chat-command config) `defaultWorkingDir` wins:
+ *   1) `defaultWorkingDir` — pin a dir for new sessions; no permission change.
+ *   2) `defaultOncall.workingDir` when `defaultOncall.enabled` — "Oncall 模式"
+ *      extends its directory to ALL of this bot's sessions (p2p / 话题 / 普通群
+ *      fallback), not just the group auto-bind. The group auto-bind (which also
+ *      opens talk to the whole group) still happens separately upstream; this
+ *      fallback is what makes the bot's OTHER sessions land in the same dir.
+ *
+ * Returns undefined when neither is configured. Reading this NEVER writes state
+ * or binds a chat to oncall, so the resolved session's permission model is
+ * unchanged regardless of which source supplied the path.
+ */
+export function effectiveDefaultWorkingDir(cfg: BotConfig): string | undefined {
+  return cfg.defaultWorkingDir
+    || (cfg.defaultOncall?.enabled ? cfg.defaultOncall.workingDir : undefined)
+    || undefined;
 }
 
 // Cross-bot oncall chat discovery — cached by config-file mtime.
@@ -1021,6 +1075,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
         : undefined,
+      launchShell: typeof entry.launchShell === 'string' && entry.launchShell.trim()
+        ? entry.launchShell.trim()
+        : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
@@ -1071,6 +1128,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
+      // Default ON: only an explicit false is meaningful/persisted (undefined = on).
+      botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
+      // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。
+      showInTeam: entry.showInTeam === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
       // so an empty string doesn't linger in bots.json.
