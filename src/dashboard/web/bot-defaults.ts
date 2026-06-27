@@ -240,7 +240,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
         <section class="bd-tile">${renderSessionModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderLaunchShellSection(b)}${renderEnvSection(b)}</section>
-        <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
+        <section class="bd-tile">${renderCardBehaviorSection(b)}${renderSummaryTriggerSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
     </article>`;
@@ -382,6 +382,30 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <small>${t('botDefaults.botToBotSameDirHelp')}</small></span>
       </label>
       <div class="actions"><span class="oncall-status" data-crossbot-status></span></div>
+    </section>`;
+  }
+
+  function renderSummaryTriggerSection(b: any): string {
+    const range = b.summaryRange ?? { limit: 50, sinceHours: 24 };
+    const limit = Number.isInteger(range.limit) && range.limit >= 0 ? range.limit : 50;
+    const sinceHours = Number.isInteger(range.sinceHours) && range.sinceHours >= 0 ? range.sinceHours : 24;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionSummaryTrigger')}</h3>
+      <div class="bd-row bd-summary-limits">
+        <label>
+          <span>${t('botDefaults.summaryLimit')}</span>
+          <input type="number" min="0" step="1" data-input="summaryLimit" value="${limit}">
+        </label>
+        <label>
+          <span>${t('botDefaults.summarySinceHours')}</span>
+          <input type="number" min="0" step="1" data-input="summarySinceHours" value="${sinceHours}">
+        </label>
+      </div>
+      <small class="bd-help">${t('botDefaults.summaryLimitHelp')}</small>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-summary-trigger">${t('botDefaults.summarySave')}</button>
+        <span class="oncall-status" data-summary-trigger-status></span>
+      </div>
     </section>`;
   }
 
@@ -940,6 +964,64 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (crossBotCb) {
         crossBotCb.addEventListener('change', () => {
           putCardPref({ botToBotSameDir: crossBotCb.checked }, crossBotCb, crossBotStatusEl);
+        });
+      }
+
+      // ── /summary 总结范围 ───────────────────────────────────────────────
+      const summaryLimitInput = card.querySelector<HTMLInputElement>('input[data-input=summaryLimit]');
+      const summarySinceInput = card.querySelector<HTMLInputElement>('input[data-input=summarySinceHours]');
+      const summarySaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-summary-trigger]');
+      const summaryStatusEl = card.querySelector<HTMLSpanElement>('[data-summary-trigger-status]');
+
+      function readNonNegativeInt(input: HTMLInputElement, fallback: number): number | null {
+        const raw = input.value.trim();
+        if (raw === '') return fallback;
+        if (!/^(0|[1-9]\d*)$/.test(raw)) return null;
+        return Number(raw);
+      }
+
+      if (summaryLimitInput && summarySinceInput && summarySaveBtn) {
+        summarySaveBtn.addEventListener('click', async () => {
+          if (!summaryStatusEl) return;
+          summaryStatusEl.textContent = '';
+          summaryStatusEl.className = 'oncall-status';
+          const limit = readNonNegativeInt(summaryLimitInput, 50);
+          const sinceHours = readNonNegativeInt(summarySinceInput, 24);
+          if (limit == null || sinceHours == null) {
+            summaryStatusEl.textContent = `✗ ${t('botDefaults.summaryNumberInvalid')}`;
+            summaryStatusEl.classList.add('hint-warn-inline');
+            return;
+          }
+
+          summarySaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/summary-range`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                limit,
+                sinceHours,
+              }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              summaryStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              summaryStatusEl.classList.add('hint-ok');
+              const next = body.summaryRange ?? { limit, sinceHours };
+              summaryLimitInput.value = String(Number.isInteger(next.limit) && next.limit >= 0 ? next.limit : limit);
+              summarySinceInput.value = String(Number.isInteger(next.sinceHours) && next.sinceHours >= 0 ? next.sinceHours : sinceHours);
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.summaryRange = next;
+            } else {
+              summaryStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              summaryStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            summaryStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            summaryStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            summarySaveBtn.disabled = false;
+          }
         });
       }
 

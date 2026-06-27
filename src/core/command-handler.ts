@@ -2697,6 +2697,7 @@ export async function handleCommand(
           t('help.insight', undefined, loc),
           t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
+          t('help.summary', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
           // 展示当前 bot 实际生效的透传集合：固定白名单 + adapter 默认 + 有效自定义项。

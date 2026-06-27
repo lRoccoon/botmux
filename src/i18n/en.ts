@@ -438,6 +438,7 @@ export const messages: Record<string, string> = {
   'help.insight': '/insight    - Show tool-call summary and risk suggestions for this session (operators only)',
   'help.land': '/land       - Preview sandbox-session diffs and let the owner confirm applying them to disk',
   'help.subscribe_doc': '/subscribe-lark-doc <doc link|list|off> - Subscribe a Feishu doc: its comments feed into this session, my replies go back into the comment (needs /login first)',
+  'help.summary': '@bot /summary - Read the current topic or configured regular-group history range and generate a summary (default: latest 50 messages / 24 hours)',
   'help.heading_passthrough': '🔀 Passthrough to {cliName} (forwarded verbatim to its built-in slash commands):',
   'help.heading_schedule': '⏰ Scheduled tasks:',
   'help.schedule_create': '/schedule daily 17:50 summarize AI news  - create a scheduled task (natural language)',

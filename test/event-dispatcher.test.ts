@@ -35,12 +35,14 @@ vi.mock('../src/utils/atomic-write.js', () => ({
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
+const mockGetBotOpenId = vi.fn((larkAppId: string) => mockGetBot(larkAppId)?.botOpenId as string | undefined);
 const mockGetOwnerOpenId = vi.fn(() => undefined as string | undefined);
 const mockIsChatOncallBoundForAnyBot = vi.fn<(chatId: string) => boolean>(() => false);
 const mockFindOncallChat = vi.fn<(larkAppId: string, chatId: string) => { chatId: string; workingDir: string } | undefined>(() => undefined);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: any[]) => mockGetBot(...args),
   getAllBots: () => mockGetAllBots(),
+  getBotOpenId: (...args: any[]) => mockGetBotOpenId(...(args as [string])),
   getOwnerOpenId: (...args: any[]) => mockGetOwnerOpenId(...args),
   findOncallChat: (...args: any[]) => mockFindOncallChat(...(args as [string, string])),
   isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
@@ -52,6 +54,10 @@ const mockGetCachedChatMode = vi.fn(() => undefined as 'group' | 'topic' | 'p2p'
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
 const mockUpdateMessage = vi.fn(async () => true);
+const mockListChatMessages = vi.fn(async () => [] as any[]);
+const mockListChatMessagesUntil = vi.fn(async () => [] as any[]);
+const mockListThreadMessages = vi.fn(async () => [] as any[]);
+const mockGetMessageDetail = vi.fn(async () => ({ items: [] as any[] }));
 // 默认所有 open_id 都判为「非真人」（bot）→ 保持既有用例「全部登记」的预期；
 // 需要模拟真人的用例用 mockResolvedValueOnce(true)。
 const mockIsHumanOpenId = vi.fn(async () => false);
@@ -62,7 +68,11 @@ vi.mock('../src/im/lark/client.js', () => ({
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
+  getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
   isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
+  listChatMessages: (...args: any[]) => mockListChatMessages(...args),
+  listChatMessagesUntil: (...args: any[]) => mockListChatMessagesUntil(...args),
+  listThreadMessages: (...args: any[]) => mockListThreadMessages(...args),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -112,6 +122,13 @@ const MY_OPEN_ID = 'ou_bot_a_open_id';
 const OTHER_BOT_OPEN_ID = 'ou_bot_b_open_id';
 const USER_OPEN_ID = 'ou_user_123';
 
+beforeEach(() => {
+  mockListChatMessages.mockReset().mockResolvedValue([]);
+  mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
+  mockListThreadMessages.mockReset().mockResolvedValue([]);
+  mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
+});
+
 async function flushEventWork() {
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -126,12 +143,13 @@ function setupBotState(opts?: {
   configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared' | 'chat-topic';
-  regularGroupMentionMode?: 'always' | 'topic' | 'never';
-  autoStartOnNewTopic?: boolean;
-  autoGrantRequestCards?: boolean;
-  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
-  p2pMode?: 'thread' | 'chat';
-}) {
+	  regularGroupMentionMode?: 'always' | 'topic' | 'never';
+	  autoStartOnNewTopic?: boolean;
+	  autoGrantRequestCards?: boolean;
+	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
+	  p2pMode?: 'thread' | 'chat';
+	  summaryRange?: { limit?: number; sinceHours?: number };
+	}) {
   mockGetBot.mockReturnValue({
     config: {
       larkAppId: MY_APP_ID,
@@ -147,15 +165,16 @@ function setupBotState(opts?: {
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       autoGrantRequestCards: opts?.autoGrantRequestCards,
-      chatReplyModes: opts?.chatReplyModes,
-      p2pMode: opts?.p2pMode,
-    },
+	      chatReplyModes: opts?.chatReplyModes,
+	      p2pMode: opts?.p2pMode,
+	      summaryRange: opts?.summaryRange,
+	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
   });
 }
 
-function makeHandlers(): EventHandlers & {
+	function makeHandlers(): EventHandlers & {
   handleNewTopic: ReturnType<typeof vi.fn>;
   handleThreadReply: ReturnType<typeof vi.fn>;
   handleCardAction: ReturnType<typeof vi.fn>;
@@ -2644,6 +2663,310 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('im.message.receive_v1 — /summary command', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    handlers = makeHandlers();
+    handlers.isSessionOwner.mockReturnValue(false);
+    mockGetChatMode.mockResolvedValue('group');
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('keeps non-@ regular group messages silent', async () => {
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '只是普通聊天' }),
+      messageId: 'msg-no-trigger',
+      chatId: 'chat-content-trigger',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockListChatMessages).not.toHaveBeenCalled();
+    expect(mockListChatMessagesUntil).not.toHaveBeenCalled();
+    expect(mockListThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it('routes @bot /summary using default 50 messages and 24 hours', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'old',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '二十五小时前的旧消息' }) },
+        sender: { id: 'ou_old', sender_type: 'user' },
+        create_time: String(triggerMs - 25 * 60 * 60_000),
+      },
+      {
+        message_id: 'fresh',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '一小时前的新消息' }) },
+        sender: { id: 'ou_fresh', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-command',
+      chatId: 'chat-summary-command',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat-summary-command', expect.objectContaining({
+      stopAfter: expect.any(Function),
+    }));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-summary-command',
+      summaryCommand: { name: 'summary-command', chatKind: 'regularGroup' },
+      promptOverride: expect.stringContaining('请根据当前会话历史生成总结。'),
+    }));
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('一小时前的新消息');
+    expect(ctx.promptOverride).not.toContain('二十五小时前的旧消息');
+  });
+
+  it('uses configured dashboard summary range for @bot /summary', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'old',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '很久以前的消息' }) },
+        sender: { id: 'ou_old', sender_type: 'user' },
+        create_time: String(triggerMs - 200 * 60 * 60_000),
+      },
+      {
+        message_id: 'fresh',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '最近消息' }) },
+        sender: { id: 'ou_fresh', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-command-configured',
+      chatId: 'chat-summary-command',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat-summary-command', expect.objectContaining({
+      stopAfter: expect.any(Function),
+    }));
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('很久以前的消息');
+    expect(ctx.promptOverride).toContain('最近消息');
+  });
+
+  it('summarizes regular group history after the previous @this bot /summary', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'before-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '上一轮已经总结过的内容' }) },
+        sender: { id: 'ou_before', sender_type: 'user' },
+        create_time: String(triggerMs - 4 * 60 * 60_000),
+      },
+      {
+        message_id: 'previous-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '@_bot_a /summary' }) },
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+        sender: { id: USER_OPEN_ID, sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'after-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '本轮新增讨论' }) },
+        sender: { id: 'ou_after', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-incremental',
+      chatId: 'chat-summary-incremental',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('window="since-last-summary"');
+    expect(ctx.promptOverride).toContain('本轮新增讨论');
+    expect(ctx.promptOverride).not.toContain('上一轮已经总结过的内容');
+    expect(ctx.promptOverride).not.toContain('previous-summary');
+  });
+
+  it('does not use another bot mention as the previous /summary boundary', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'before-other-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '应该仍然在本次总结窗口内' }) },
+        sender: { id: 'ou_before', sender_type: 'user' },
+        create_time: String(triggerMs - 4 * 60 * 60_000),
+      },
+      {
+        message_id: 'other-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '@_bot_b /summary' }) },
+        mentions: [{ key: '@_bot_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } }],
+        sender: { id: USER_OPEN_ID, sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'after-other-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '后续讨论' }) },
+        sender: { id: 'ou_after', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-ignore-other-bot',
+      chatId: 'chat-summary-ignore-other-bot',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('window="configured-range"');
+    expect(ctx.promptOverride).toContain('应该仍然在本次总结窗口内');
+    expect(ctx.promptOverride).toContain('后续讨论');
+  });
+
+  it('summarizes topic history after the previous @this bot /summary', async () => {
+    mockGetChatMode.mockResolvedValue('topic');
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListThreadMessages.mockResolvedValue([
+      {
+        message_id: 'topic-before-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '话题里上一轮已经总结过的内容' }) },
+        sender: { id: 'ou_before', sender_type: 'user' },
+        create_time: String(triggerMs - 4 * 60 * 60_000),
+      },
+      {
+        message_id: 'topic-previous-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '@_bot_a /summary' }) },
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+        sender: { id: USER_OPEN_ID, sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'topic-after-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '话题里本轮新增讨论' }) },
+        sender: { id: 'ou_after', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      rootId: 'topic-root-summary',
+      threadId: 'topic-thread-summary',
+      messageId: 'msg-topic-summary-incremental',
+      chatId: 'chat-topic-summary-incremental',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockListThreadMessages).toHaveBeenCalledWith(MY_APP_ID, 'chat-topic-summary-incremental', 'topic-root-summary', 0);
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('window="since-last-summary"');
+    expect(ctx.promptOverride).toContain('话题里本轮新增讨论');
+    expect(ctx.promptOverride).not.toContain('话题里上一轮已经总结过的内容');
+  });
+
+	  it('keeps non-@ /summary silent', async () => {
+	    setupBotState({
+	      allowedUsers: [USER_OPEN_ID],
+	    });
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/summary' }),
+      messageId: 'msg-summary-no-mention',
+      chatId: 'chat-summary-no-mention',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockListChatMessages).not.toHaveBeenCalled();
+    expect(mockListChatMessagesUntil).not.toHaveBeenCalled();
+    expect(mockListThreadMessages).not.toHaveBeenCalled();
   });
 });
 

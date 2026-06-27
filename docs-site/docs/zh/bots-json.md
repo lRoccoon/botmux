@@ -111,6 +111,34 @@
 | `autoStartOnGroupJoinPrompt` | 配合上面：自动开工的首轮 prompt；留空 / 空白则空消息开场，让 bot 自己读群上下文。`autoStartOnGroupJoin` 关闭时无意义 |
 | `autoStartOnNewTopic` | `true` 时，话题群里每个新话题的首条消息无需 @ 也自动开工（普通群无效）。默认被动（仅 @ 触发） |
 
+## 总结命令
+
+| 字段 | 说明 |
+|------|------|
+| `summaryRange` | 显式总结命令 `@机器人 /summary` 使用的历史读取范围。`limit` 表示普通群最近 N 条消息，默认 50；`sinceHours` 表示普通群最近 N 小时，默认 24。任一字段设为 `0` 表示该维度不限制。话题群始终读取当前话题/thread 历史，再按总结窗口过滤 |
+
+示例：
+
+```json
+{
+  "summaryRange": {
+    "limit": 50,
+    "sinceHours": 24
+  }
+}
+```
+
+- 只有显式 `@机器人 /summary` 会触发总结；不 @ 机器人时仍按普通群/话题的既有路由规则处理，不会因为关键词自动唤醒。
+- dashboard 的「/summary 总结范围」保存的就是 `summaryRange`。
+- 如果本次触发前存在上一条 `@同一机器人 /summary`，总结窗口只包含上一条之后到本次触发为止的消息；找不到上一条时回退到 `limit` / `sinceHours`。
+- `limit` 与 `sinceHours` 同时也是安全上限；两者都为 `0` 时表示不做该维度限制。
+
+## 旧内容触发配置
+
+| 字段 | 说明 |
+|------|------|
+| `contentTriggers` | **Legacy / 不再生效。** 旧版本曾用于关键词 / 正则免 @ 触发，但当前消息路由不会再根据 `contentTriggers` 唤醒 bot。保留该字段解析仅用于兼容旧 `bots.json`：如果存在名为 `dashboard-default-summary-trigger` 的旧 dashboard 配置，botmux 会尽量从其中迁移/读取 `limit` 与 `sinceHours` 作为 `summaryRange` 的兜底值。新配置请使用 `summaryRange` |
+
 ## 语音
 
 | 字段 | 说明 |

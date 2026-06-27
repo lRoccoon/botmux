@@ -3388,7 +3388,12 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
-  const limit = parseInt(argValue(rest, '--limit') ?? '50', 10);
+  // Clamp to a positive count: the underlying list helpers treat pageSize <= 0
+  // (and non-finite) as "unlimited / read the whole chat", which is reserved for
+  // internal callers. A stray `--limit 0` or a typo like `--limit abc` (→ NaN)
+  // must NOT silently dump the entire history.
+  const parsedLimit = parseInt(argValue(rest, '--limit') ?? '50', 10);
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 50;
   const scopeArg = argValue(rest, '--scope') ?? 'session';
   const sessionIdArg = argValue(rest, '--session-id');
   const { sid, larkAppId: appId, session: s } = await resolveSessionAppId(sessionIdArg);

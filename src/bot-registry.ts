@@ -13,6 +13,48 @@ import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
+export type ContentTriggerMatchType = 'keyword' | 'regex';
+export type ContentTriggerActionType = 'start-or-wake-session';
+
+export interface SummaryRangeConfig {
+  /** 0 means no count limit; omitted defaults to 50. */
+  limit?: number;
+  /** 0 means no time limit; omitted defaults to 24 hours. */
+  sinceHours?: number;
+}
+
+export interface ContentTriggerConfig {
+  name: string;
+  enabled: boolean;
+  scope: ContentTriggerScope;
+  /**
+   * Default false. When true, this trigger may be matched by non-@ messages
+   * authored by other bots. The current bot's own messages are still ignored.
+   */
+  allowBotMessages?: boolean;
+  match: {
+    type: ContentTriggerMatchType;
+    pattern: string;
+    caseSensitive: boolean;
+  };
+  history: {
+    topic: {
+      mode: 'current-thread';
+    };
+    regularGroup: {
+      mode: 'recent-messages';
+      /** 0 means no count limit; omitted defaults to 50. */
+      limit?: number;
+      /** 0 means no time limit; omitted means no time limit. */
+      sinceHours?: number;
+    };
+  };
+  action: {
+    type: ContentTriggerActionType;
+    prompt: string;
+  };
+}
 
 function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   if (typeof raw !== 'string') return undefined;
@@ -22,6 +64,153 @@ function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
   if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
   return undefined;
+}
+
+function normalizeContentTriggerScope(raw: unknown): ContentTriggerScope | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'both' || v === 'all') return 'both';
+  if (v === 'topic' || v === 'thread' || v === 'topic-group' || v === 'topic_group') return 'topic';
+  if (v === 'regulargroup' || v === 'regular-group' || v === 'regular_group' || v === 'group') return 'regularGroup';
+  return undefined;
+}
+
+function normalizeNonNegativeInt(raw: unknown): number | undefined {
+  if (typeof raw !== 'number') return undefined;
+  if (!Number.isInteger(raw) || raw < 0) return undefined;
+  return raw;
+}
+
+function normalizeSummaryRange(raw: unknown): SummaryRangeConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const out: SummaryRangeConfig = {};
+  const limit = normalizeNonNegativeInt(entry.limit);
+  const sinceHours = normalizeNonNegativeInt(entry.sinceHours);
+  if (limit !== undefined) out.limit = limit;
+  if (sinceHours !== undefined) out.sinceHours = sinceHours;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeContentTriggers(raw: unknown, botIndex: number): ContentTriggerConfig[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: ContentTriggerConfig[] = [];
+
+  raw.forEach((item, triggerIndex) => {
+    const loc = `Bot config [${botIndex}] contentTriggers[${triggerIndex}]`;
+    const drop = (reason: string) => logger.warn(`${loc} ignored: ${reason}`);
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      drop('must be an object');
+      return;
+    }
+    const entry = item as Record<string, unknown>;
+    const name = typeof entry.name === 'string' && entry.name.trim()
+      ? entry.name.trim()
+      : `content-trigger-${triggerIndex + 1}`;
+    const enabled = entry.enabled !== false;
+    const scope = normalizeContentTriggerScope(entry.scope);
+    if (!scope) {
+      drop(`invalid scope ${JSON.stringify(entry.scope)}`);
+      return;
+    }
+
+    const matchRaw = entry.match;
+    if (!matchRaw || typeof matchRaw !== 'object' || Array.isArray(matchRaw)) {
+      drop('match must be an object');
+      return;
+    }
+    const match = matchRaw as Record<string, unknown>;
+    const type = match.type === 'keyword' || match.type === 'regex' ? match.type : undefined;
+    if (!type) {
+      drop(`invalid match.type ${JSON.stringify(match.type)}`);
+      return;
+    }
+    const pattern = typeof match.pattern === 'string' ? match.pattern : '';
+    if (!pattern) {
+      drop('match.pattern must be a non-empty string');
+      return;
+    }
+    const caseSensitive = match.caseSensitive === true;
+    if (type === 'regex') {
+      try {
+        // Validate only. Runtime recompiles defensively in case an in-memory
+        // config is mutated after startup.
+        new RegExp(pattern, caseSensitive ? 'u' : 'iu');
+      } catch (err) {
+        drop(`invalid regex ${JSON.stringify(pattern)} (${err instanceof Error ? err.message : String(err)})`);
+        return;
+      }
+    }
+
+    const actionRaw = entry.action;
+    if (!actionRaw || typeof actionRaw !== 'object' || Array.isArray(actionRaw)) {
+      drop('action must be an object');
+      return;
+    }
+    const action = actionRaw as Record<string, unknown>;
+    if (action.type !== 'start-or-wake-session') {
+      drop(`invalid action.type ${JSON.stringify(action.type)}`);
+      return;
+    }
+    const prompt = typeof action.prompt === 'string' ? action.prompt.trim() : '';
+    if (!prompt) {
+      drop('action.prompt must be a non-empty string');
+      return;
+    }
+
+    const historyRaw = entry.history && typeof entry.history === 'object' && !Array.isArray(entry.history)
+      ? entry.history as Record<string, unknown>
+      : {};
+    const topicRaw = historyRaw.topic && typeof historyRaw.topic === 'object' && !Array.isArray(historyRaw.topic)
+      ? historyRaw.topic as Record<string, unknown>
+      : {};
+    const regularRaw = historyRaw.regularGroup && typeof historyRaw.regularGroup === 'object' && !Array.isArray(historyRaw.regularGroup)
+      ? historyRaw.regularGroup as Record<string, unknown>
+      : {};
+    const topicMode = topicRaw.mode === undefined || topicRaw.mode === 'current-thread'
+      ? 'current-thread'
+      : undefined;
+    if (!topicMode) {
+      drop(`invalid history.topic.mode ${JSON.stringify(topicRaw.mode)}`);
+      return;
+    }
+    const regularMode = regularRaw.mode === undefined || regularRaw.mode === 'recent-messages'
+      ? 'recent-messages'
+      : undefined;
+    if (!regularMode) {
+      drop(`invalid history.regularGroup.mode ${JSON.stringify(regularRaw.mode)}`);
+      return;
+    }
+    const limit = regularRaw.limit === undefined ? 50 : normalizeNonNegativeInt(regularRaw.limit);
+    if (limit === undefined) {
+      drop(`invalid history.regularGroup.limit ${JSON.stringify(regularRaw.limit)}`);
+      return;
+    }
+    const sinceHours = regularRaw.sinceHours === undefined ? undefined : normalizeNonNegativeInt(regularRaw.sinceHours);
+    if (regularRaw.sinceHours !== undefined && sinceHours === undefined) {
+      drop(`invalid history.regularGroup.sinceHours ${JSON.stringify(regularRaw.sinceHours)}`);
+      return;
+    }
+
+    out.push({
+      name,
+      enabled,
+      scope,
+      ...(entry.allowBotMessages === true ? { allowBotMessages: true } : {}),
+      match: { type, pattern, caseSensitive },
+      history: {
+        topic: { mode: 'current-thread' },
+        regularGroup: {
+          mode: 'recent-messages',
+          limit,
+          sinceHours,
+        },
+      },
+      action: { type: 'start-or-wake-session', prompt },
+    });
+  });
+
+  return out.length > 0 ? out : undefined;
 }
 
 export interface OncallChat {
@@ -362,6 +551,13 @@ export interface BotConfig {
    * 单条订阅的触发范围之后可在 dashboard 逐文档改（doc-subscriptions 表）。
    */
   docSubscribeDefaultMode?: 'mention-only' | 'all';
+  /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */
+  summaryRange?: SummaryRangeConfig;
+  /**
+   * Legacy content/keyword trigger config. Kept parseable for config
+   * compatibility, but message routing no longer fires non-@ content triggers.
+   */
+  contentTriggers?: ContentTriggerConfig[];
   /**
    * Per-bot voice-engine override for the voice-summary feature. Merged OVER
    * the global `voice` block in ~/.botmux/config.json (per-bot wins field by
@@ -844,6 +1040,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
     const skills = readBotSkillPolicy(entry.skills);
+    const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
+    const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
     // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
@@ -957,6 +1155,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。
       docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,
+      summaryRange,
+      contentTriggers,
       voice,
     });
   }

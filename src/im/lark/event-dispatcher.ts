@@ -15,7 +15,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripLeadingMentions, mentionOpenId } from './message-parser.js';
+import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
@@ -29,6 +29,8 @@ import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
+import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
+import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -997,6 +999,10 @@ export interface RoutingContext {
   anchor: string;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
+  /** Command prompt that should be sent to the CLI instead of raw text. */
+  promptOverride?: string;
+  /** Metadata for the summary command that produced promptOverride. */
+  summaryCommand?: SummaryCommandRuntimeContext;
   larkAppId: string;
 }
 
@@ -1276,6 +1282,54 @@ export async function decideRouting(
 ): Promise<{ scope: 'thread' | 'chat'; anchor: string }> {
   const { scope, anchor } = await decideRoutingWithSource(larkAppId, message);
   return { scope, anchor };
+}
+
+async function classifySummaryChatKind(input: {
+  larkAppId: string;
+  chatId: string;
+  routingSource: RoutingSource;
+}): Promise<SummaryChatKind | undefined> {
+  if (input.routingSource === 'topic-chat') return 'topic';
+  if (input.routingSource === 'regular-group-chat' || input.routingSource === 'regular-group-thread') return 'regularGroup';
+  // Real thread replies can occur in topic groups and in regular groups that
+  // use threaded replies. Ask Lark for the current chat mode only for explicit
+  // /summary so normal routing does not pay this extra lookup.
+  if (input.routingSource === 'real-thread') {
+    const mode = await getChatMode(input.larkAppId, input.chatId, { forceRefresh: true });
+    return mode === 'topic' ? 'topic' : 'regularGroup';
+  }
+  return undefined;
+}
+
+const SUMMARY_COMMAND_RE = /^\/summary(?:\s|$)/i;
+
+function summaryCommandText(message: any): string | undefined {
+  const text = extractMessageTextForRouting(message);
+  if (!text) return undefined;
+  const stripped = stripLeadingMentions(text.trim(), message?.mentions ?? []).trim();
+  return SUMMARY_COMMAND_RE.test(stripped) ? stripped : undefined;
+}
+
+async function resolveSummaryCommandMatch(input: {
+  larkAppId: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  routingSource: RoutingSource;
+  message: any;
+  senderOpenId: string | undefined;
+}): Promise<SummaryCommandMatch | undefined> {
+  if (input.chatType !== 'group') return undefined;
+  if (!isBotMentioned(input.larkAppId, input.message, input.senderOpenId)) return undefined;
+  const triggerText = summaryCommandText(input.message);
+  if (!triggerText) return undefined;
+  const chatKind = await classifySummaryChatKind(input);
+  if (!chatKind) return undefined;
+  return {
+    chatKind,
+    triggerText,
+    range: summaryRangeFromBotConfig(getBot(input.larkAppId).config),
+    prompt: DEFAULT_SUMMARY_PROMPT,
+  };
 }
 
 /** 从评论事件 payload 里挖出 { fileToken, fileType, commentId, replyId,
@@ -1727,11 +1781,22 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             }
             routing.scope = 'thread';
             routing.anchor = messageId;
+            routingSource = 'topic-chat';
             // ownsSession was true on the stale chatId anchor; the new anchor
             // (messageId) is brand-new, so no current session owns it.
             ownsSession = false;
           }
         }
+
+        const summaryCommandMatch = await resolveSummaryCommandMatch({
+          larkAppId,
+          chatId,
+          chatType,
+          routingSource,
+          message,
+          senderOpenId,
+        });
+        const summaryCommandTriggered = !!summaryCommandMatch && isAllowed;
 
         // Permission gating — same shape as before, just keyed on
         // `ownsSession` (anchor-aware) instead of "rootId presence":
@@ -1799,7 +1864,27 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           return;
         }
 
-        const ctx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...routing, replyRootId };
+        const promptOverride = summaryCommandTriggered && summaryCommandMatch
+          ? await buildSummaryCommandPrompt({ larkAppId, chatId, message, match: summaryCommandMatch })
+          : undefined;
+        if (promptOverride && summaryCommandMatch) {
+          logger.info(
+            `[summary-command] matched msg=${messageId.substring(0, 12)} ` +
+            `chat=${chatId.substring(0, 12)} kind=${summaryCommandMatch.chatKind}`,
+          );
+        }
+        const ctx: RoutingContext = {
+          chatId,
+          messageId,
+          chatType,
+          larkAppId,
+          ...routing,
+          replyRootId,
+          promptOverride,
+          summaryCommand: summaryCommandTriggered && summaryCommandMatch
+            ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
+            : undefined,
+        };
         // Serialize per anchor so two messages to the same thread/chat are
         // processed in arrival order — never concurrently. Without this a fast
         // second message interleaves with the first's async session-spawn and is

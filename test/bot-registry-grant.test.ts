@@ -147,7 +147,7 @@ describe('bot-registry grant additions', () => {
     expect(cfg.repoPickerMode).toBeUndefined();
   });
 
-  it('parses p2pMode only as literal chat (else undefined = thread default)', () => {
+	  it('parses p2pMode only as literal chat (else undefined = thread default)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'p1', larkAppSecret: 's', p2pMode: 'chat' },
       { larkAppId: 'p2', larkAppSecret: 's', p2pMode: 'thread' },
@@ -158,5 +158,72 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[1].p2pMode).toBeUndefined(); // 'thread' normalizes to undefined
     expect(cfgs[2].p2pMode).toBeUndefined();
     expect(cfgs[3].p2pMode).toBeUndefined();
+  });
+
+  it('parses summaryRange and preserves explicit unlimited settings', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'sr1', larkAppSecret: 's', summaryRange: { limit: 0, sinceHours: 0 } },
+      { larkAppId: 'sr2', larkAppSecret: 's', summaryRange: { limit: 20, sinceHours: 8 } },
+      { larkAppId: 'sr3', larkAppSecret: 's', summaryRange: { limit: -1, sinceHours: 1.5 } },
+    ]));
+
+    expect(cfgs[0].summaryRange).toEqual({ limit: 0, sinceHours: 0 });
+    expect(cfgs[1].summaryRange).toEqual({ limit: 20, sinceHours: 8 });
+    expect(cfgs[2].summaryRange).toBeUndefined();
+  });
+
+  it('parses legacy contentTriggers and preserves explicit unlimited history settings', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'ct1',
+      larkAppSecret: 's',
+      contentTriggers: [{
+        name: 'summary-trigger',
+        enabled: true,
+        scope: 'both',
+        allowBotMessages: true,
+        match: { type: 'keyword', pattern: '总结', caseSensitive: false },
+        history: {
+          topic: { mode: 'current-thread' },
+          regularGroup: { mode: 'recent-messages', limit: 0, sinceHours: 0 },
+        },
+        action: { type: 'start-or-wake-session', prompt: '请总结当前历史。' },
+      }],
+    }]));
+
+    expect(cfgs[0].contentTriggers).toEqual([{
+      name: 'summary-trigger',
+      enabled: true,
+      scope: 'both',
+      allowBotMessages: true,
+      match: { type: 'keyword', pattern: '总结', caseSensitive: false },
+      history: {
+        topic: { mode: 'current-thread' },
+        regularGroup: { mode: 'recent-messages', limit: 0, sinceHours: 0 },
+      },
+      action: { type: 'start-or-wake-session', prompt: '请总结当前历史。' },
+    }]);
+  });
+
+	  it('drops invalid legacy content trigger regex without failing the whole bot config', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'ct2',
+      larkAppSecret: 's',
+      contentTriggers: [
+        {
+          name: 'bad-regex',
+          scope: 'both',
+          match: { type: 'regex', pattern: '[', caseSensitive: false },
+          action: { type: 'start-or-wake-session', prompt: 'bad' },
+        },
+        {
+          name: 'good-regex',
+          scope: 'regularGroup',
+          match: { type: 'regex', pattern: 'done\\s*$', caseSensitive: true },
+          action: { type: 'start-or-wake-session', prompt: 'good' },
+        },
+      ],
+    }]));
+
+    expect(cfgs[0].contentTriggers?.map(t => t.name)).toEqual(['good-regex']);
   });
 });

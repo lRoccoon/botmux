@@ -947,16 +947,21 @@ async function resolveThreadId(c: any, rootMessageId: string): Promise<string | 
  *  Callers can still ask for more via pageSize — we just paginate harder. */
 const LARK_MESSAGE_LIST_MAX_PAGE = 50;
 
+function wantsUnlimitedMessages(pageSize: number): boolean {
+  return pageSize <= 0 || !Number.isFinite(pageSize);
+}
+
 /** List thread messages using container_id_type="thread" (fast path). */
 async function listByThread(c: any, threadId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];
   let pageToken: string | undefined;
+  const unlimited = wantsUnlimitedMessages(pageSize);
 
   do {
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: 'thread',
       container_id: threadId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeAsc',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -970,10 +975,10 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
     }
 
     pageToken = res.data?.page_token;
-    if (allMessages.length >= pageSize) break;
+    if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
-  return allMessages.slice(0, pageSize);
+  return unlimited ? allMessages : allMessages.slice(0, pageSize);
 }
 
 /** List chat-container messages, most-recent first but returned chronologically
@@ -988,12 +993,13 @@ export async function listChatMessages(
   const c = getBotClient(larkAppId);
   const allMessages: any[] = [];
   let pageToken: string | undefined;
+  const unlimited = wantsUnlimitedMessages(pageSize);
 
   do {
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: 'chat',
       container_id: chatId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeDesc',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -1007,11 +1013,61 @@ export async function listChatMessages(
     }
 
     pageToken = res.data?.page_token;
-    if (allMessages.length >= pageSize) break;
+    if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
   // Cap to pageSize newest, then reverse to chronological for the caller.
-  return allMessages.slice(0, pageSize).reverse();
+  return (unlimited ? allMessages : allMessages.slice(0, pageSize)).reverse();
+}
+
+export interface ChatMessageScanOptions {
+  /** Lark page size per request. Clamped to the API max of 50. */
+  pageSize?: number;
+  /**
+   * Called while scanning newest -> oldest. Returning true stops after the
+   * current message has been included in the returned chronological list.
+   */
+  stopAfter?: (message: any, seenCount: number) => boolean;
+}
+
+/** Scan chat-container messages newest -> oldest until the caller's stop
+ * condition is met, then return the scanned window chronologically. */
+export async function listChatMessagesUntil(
+  larkAppId: string,
+  chatId: string,
+  options: ChatMessageScanOptions = {},
+): Promise<any[]> {
+  const c = getBotClient(larkAppId);
+  const allMessages: any[] = [];
+  let pageToken: string | undefined;
+  const rawPageSize = Number.isFinite(options.pageSize) ? Math.floor(options.pageSize as number) : LARK_MESSAGE_LIST_MAX_PAGE;
+  const pageSize = Math.min(Math.max(rawPageSize, 1), LARK_MESSAGE_LIST_MAX_PAGE);
+
+  do {
+    const res = await larkGet(c, '/open-apis/im/v1/messages', {
+      container_id_type: 'chat',
+      container_id: chatId,
+      page_size: pageSize,
+      sort_type: 'ByCreateTimeDesc',
+      ...(pageToken ? { page_token: pageToken } : {}),
+    });
+
+    if (res.code !== 0) {
+      throw new Error(`Failed to list chat messages: ${res.msg} (code: ${res.code})`);
+    }
+
+    const items = res.data?.items ?? [];
+    for (const item of items) {
+      allMessages.push(item);
+      if (options.stopAfter?.(item, allMessages.length)) {
+        return allMessages.reverse();
+      }
+    }
+
+    pageToken = res.data?.page_token;
+  } while (pageToken);
+
+  return allMessages.reverse();
 }
 
 export interface AmbientChatMessageOptions {
@@ -1073,12 +1129,13 @@ export async function listAmbientChatMessages(
 async function listByChatFilter(c: any, chatId: string, rootMessageId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];
   let pageToken: string | undefined;
+  const unlimited = wantsUnlimitedMessages(pageSize);
 
   do {
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: 'chat',
       container_id: chatId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeDesc',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -1096,11 +1153,11 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
     }
 
     pageToken = res.data?.page_token;
-    if (allMessages.length >= pageSize) break;
+    if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
   allMessages.sort((a, b) => (a.create_time ?? '').localeCompare(b.create_time ?? ''));
-  return allMessages;
+  return unlimited ? allMessages : allMessages.slice(0, pageSize);
 }
 
 /**

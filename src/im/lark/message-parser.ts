@@ -544,7 +544,7 @@ function isBotmuxFooterLine(line: string): boolean {
  * This is similar to post message body.  We also handle the original card JSON
  * (header/config/elements with tag objects) for locally-cached cards.
  */
-function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
+export function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
   try {
     const card = JSON.parse(rawContent);
 
