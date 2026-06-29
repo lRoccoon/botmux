@@ -57,6 +57,11 @@ import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest } from '../services/trigger-types.js';
 import { buildGoalBoard } from '../verified-delivery/goal-board.js';
+import {
+  buildGoalAttentionBoardWithContext,
+  buildLocalGoalAttentionLiveRisks,
+  withGoalAttentionLiveRisks,
+} from './goal-attention.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -906,6 +911,30 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
 
 ipcRoute('GET', '/api/goals', (_req, res) => {
   jsonRes(res, 200, buildGoalBoard());
+});
+
+ipcRoute('GET', '/api/goals/attention', (req, res) => {
+  const url = new URL(req.url ?? '/api/goals/attention', 'http://127.0.0.1');
+  const chatId = url.searchParams.get('chatId')?.trim() || undefined;
+  const board = buildGoalAttentionBoardWithContext({ chatId });
+  const liveRisks = buildLocalGoalAttentionLiveRisks({
+    board,
+    activeSessions: getActiveSessionsRegistry(),
+    larkAppId: cachedLarkAppId,
+  });
+  jsonRes(res, 200, withGoalAttentionLiveRisks(board, liveRisks));
+});
+
+ipcRoute('GET', '/api/goals/attention/live', (req, res) => {
+  const url = new URL(req.url ?? '/api/goals/attention/live', 'http://127.0.0.1');
+  const chatId = url.searchParams.get('chatId')?.trim() || undefined;
+  const board = buildGoalAttentionBoardWithContext({ chatId });
+  const liveRisks = buildLocalGoalAttentionLiveRisks({
+    board,
+    activeSessions: getActiveSessionsRegistry(),
+    larkAppId: cachedLarkAppId,
+  });
+  jsonRes(res, 200, { systemRisk: liveRisks });
 });
 
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
