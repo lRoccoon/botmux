@@ -18,6 +18,7 @@ import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
+import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
 import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
@@ -1288,7 +1289,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     p2pMode,
     maxLiveWorkers,
     startupCommands,
+    launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
+    summaryRange: summaryRangeFromBotConfig(getBot(cachedLarkAppId).config),
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
 });
@@ -1310,7 +1313,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     disableStreamingCard?: boolean; silentTurnReactions?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
-    regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never';
+    regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
   } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
@@ -1325,7 +1328,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     const m = normalizeChatReplyMode(body.regularGroupReplyMode);
     if (m) patch.regularGroupReplyMode = m;
   }
-  if (body.regularGroupMentionMode === 'always' || body.regularGroupMentionMode === 'topic' || body.regularGroupMentionMode === 'never') {
+  if (body.regularGroupMentionMode === 'always' || body.regularGroupMentionMode === 'topic' || body.regularGroupMentionMode === 'never' || body.regularGroupMentionMode === 'ambient') {
     patch.regularGroupMentionMode = body.regularGroupMentionMode;
   }
   if (body.docSubscribeDefaultMode === 'mention-only' || body.docSubscribeDefaultMode === 'all') {
@@ -1336,6 +1339,31 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, ...r.prefs });
+});
+
+// Per-bot explicit `/summary` history range. Body `{ limit, sinceHours }`.
+ipcRoute('PUT', '/api/bot-summary-range', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const r = await updateDashboardSummaryRange(cachedLarkAppId, raw);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, summaryRange: r.summaryRange });
+});
+
+// Backward-compatible dashboard endpoint from the short-lived keyword-trigger UI.
+ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? { limit: (raw as Record<string, unknown>).limit, sinceHours: (raw as Record<string, unknown>).sinceHours }
+    : raw;
+  const r = await updateDashboardSummaryRange(cachedLarkAppId, body);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, summaryRange: r.summaryRange });
 });
 
 // Per-bot 授权偏好。Body 任意子集：
@@ -1424,6 +1452,31 @@ ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
+});
+
+// Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：
+// 空字符串＝清除（回 $SHELL）。走 applyConfigField（与 /config launchShell 同一写盘
+// + 内存热更新路径），next-session 生效（下个会话起用新 shell 启动 CLI）。
+ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { launchShell?: unknown };
+  try { body = await readJsonBody<{ launchShell?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('launchShell');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.launchShell === 'string' ? body.launchShell : '';
+  let value: string | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回 $SHELL
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
 });
 
 // Per-bot 环境变量 env。Body `{ env: string }`（原始 JSON 文本，如

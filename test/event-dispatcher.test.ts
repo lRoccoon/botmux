@@ -35,12 +35,14 @@ vi.mock('../src/utils/atomic-write.js', () => ({
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
+const mockGetBotOpenId = vi.fn((larkAppId: string) => mockGetBot(larkAppId)?.botOpenId as string | undefined);
 const mockGetOwnerOpenId = vi.fn(() => undefined as string | undefined);
 const mockIsChatOncallBoundForAnyBot = vi.fn<(chatId: string) => boolean>(() => false);
 const mockFindOncallChat = vi.fn<(larkAppId: string, chatId: string) => { chatId: string; workingDir: string } | undefined>(() => undefined);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: any[]) => mockGetBot(...args),
   getAllBots: () => mockGetAllBots(),
+  getBotOpenId: (...args: any[]) => mockGetBotOpenId(...(args as [string])),
   getOwnerOpenId: (...args: any[]) => mockGetOwnerOpenId(...args),
   findOncallChat: (...args: any[]) => mockFindOncallChat(...(args as [string, string])),
   isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
@@ -52,6 +54,10 @@ const mockGetCachedChatMode = vi.fn(() => undefined as 'group' | 'topic' | 'p2p'
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
 const mockUpdateMessage = vi.fn(async () => true);
+const mockListChatMessages = vi.fn(async () => [] as any[]);
+const mockListChatMessagesUntil = vi.fn(async () => [] as any[]);
+const mockListThreadMessages = vi.fn(async () => [] as any[]);
+const mockGetMessageDetail = vi.fn(async () => ({ items: [] as any[] }));
 // 默认所有 open_id 都判为「非真人」（bot）→ 保持既有用例「全部登记」的预期；
 // 需要模拟真人的用例用 mockResolvedValueOnce(true)。
 const mockIsHumanOpenId = vi.fn(async () => false);
@@ -62,7 +68,11 @@ vi.mock('../src/im/lark/client.js', () => ({
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
+  getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
   isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
+  listChatMessages: (...args: any[]) => mockListChatMessages(...args),
+  listChatMessagesUntil: (...args: any[]) => mockListChatMessagesUntil(...args),
+  listThreadMessages: (...args: any[]) => mockListThreadMessages(...args),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -100,7 +110,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
 import { _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
@@ -111,6 +121,13 @@ const MY_APP_ID = 'app-bot-a';
 const MY_OPEN_ID = 'ou_bot_a_open_id';
 const OTHER_BOT_OPEN_ID = 'ou_bot_b_open_id';
 const USER_OPEN_ID = 'ou_user_123';
+
+beforeEach(() => {
+  mockListChatMessages.mockReset().mockResolvedValue([]);
+  mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
+  mockListThreadMessages.mockReset().mockResolvedValue([]);
+  mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
+});
 
 async function flushEventWork() {
   await new Promise(resolve => setImmediate(resolve));
@@ -126,12 +143,13 @@ function setupBotState(opts?: {
   configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared' | 'chat-topic';
-  regularGroupMentionMode?: 'always' | 'topic' | 'never';
-  autoStartOnNewTopic?: boolean;
-  autoGrantRequestCards?: boolean;
-  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
-  p2pMode?: 'thread' | 'chat';
-}) {
+	  regularGroupMentionMode?: 'always' | 'topic' | 'never';
+	  autoStartOnNewTopic?: boolean;
+	  autoGrantRequestCards?: boolean;
+	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
+	  p2pMode?: 'thread' | 'chat';
+	  summaryRange?: { limit?: number; sinceHours?: number };
+	}) {
   mockGetBot.mockReturnValue({
     config: {
       larkAppId: MY_APP_ID,
@@ -147,15 +165,16 @@ function setupBotState(opts?: {
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       autoGrantRequestCards: opts?.autoGrantRequestCards,
-      chatReplyModes: opts?.chatReplyModes,
-      p2pMode: opts?.p2pMode,
-    },
+	      chatReplyModes: opts?.chatReplyModes,
+	      p2pMode: opts?.p2pMode,
+	      summaryRange: opts?.summaryRange,
+	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
   });
 }
 
-function makeHandlers(): EventHandlers & {
+	function makeHandlers(): EventHandlers & {
   handleNewTopic: ReturnType<typeof vi.fn>;
   handleThreadReply: ReturnType<typeof vi.fn>;
   handleCardAction: ReturnType<typeof vi.fn>;
@@ -353,6 +372,95 @@ describe('isBotMentioned', () => {
       mentions: [{ key: '@_bot', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
     };
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
+  });
+});
+
+// The 'ambient' mention policy answers un-@ messages but backs off the moment
+// the user @mentions a *different* member (person/bot) — the redirect carve-out.
+// mentionsAnotherMember is that predicate. 'never' ignores it (unconditional).
+describe('mentionsAnotherMember (ambient redirect carve-out)', () => {
+  beforeEach(() => {
+    setupBotState();
+  });
+
+  it('returns true when the message @mentions another member via mentions array', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'Other', id: { open_id: 'ou_other' } }],
+      content: JSON.stringify({ text: '@Other 你看下' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  it('returns true when another BOT is @mentioned via REST string-form id (regression — naked m.id.open_id misses this)', () => {
+    // The headline scenario for the carve-out: "@another bot → back off". On the
+    // REST shape mention.id arrives as a bare string, and a bot @ is a "cli_…"
+    // string. mentionOpenId() must absorb it, otherwise the ambient bot keeps
+    // answering instead of yielding to the bot the user actually summoned.
+    const message = {
+      mentions: [{ key: '@_other', name: 'OtherBot', id: 'cli_other_bot', id_type: 'open_id' }],
+      content: JSON.stringify({ text: '@OtherBot 你来答' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  it('returns true when another member is @mentioned via string-form id with no id_type (defaults to open_id)', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'Other', id: 'ou_other' }],
+      content: JSON.stringify({ text: '@Other 你看下' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  it('returns false when only THIS bot is @mentioned via string-form id (no false redirect)', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID, id_type: 'open_id' }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
+  });
+
+  it('returns true when another member is @mentioned via inline at node (post content)', () => {
+    const postContent = JSON.stringify({
+      zh_cn: {
+        content: [[
+          { tag: 'at', user_id: 'ou_other' },
+          { tag: 'text', text: ' 帮我看下' },
+        ]],
+      },
+    });
+    expect(mentionsAnotherMember(MY_APP_ID, { content: postContent, mentions: [] })).toBe(true);
+  });
+
+  it('returns false when only THIS bot is @mentioned', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
+  });
+
+  it('returns false for @all (everyone incl. me — not a redirect to someone else)', () => {
+    const message = {
+      mentions: [{ key: '@_all_', name: 'all', id: { open_id: 'all' } }],
+      content: JSON.stringify({ text: '@all 通知' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
+  });
+
+  it('returns false when no one is @mentioned (plain ambient message)', () => {
+    const message = { mentions: [], content: JSON.stringify({ text: '随便说一句' }) };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
+  });
+
+  it('returns true when both this bot AND another member are @mentioned (still a hand-off signal)', () => {
+    const message = {
+      mentions: [
+        { key: '@_bot', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_other', name: 'Other', id: { open_id: 'ou_other' } },
+      ],
+      content: JSON.stringify({ text: '@BotA @Other' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
   });
 });
 
@@ -1785,6 +1893,179 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
+
+  // ── ambient tier — end-to-end gating across the three no-@ decision points ──
+  // mentionsAnotherMember is unit-tested above; these drive the FULL dispatch
+  // path to prove the redirect carve-out is wired into every gate that drops the
+  // @ requirement: the top-level gate, shared-topic seeding, and alias fold-back.
+  // Each gate gets a positive (ambient answers) + the carve-out (@ someone else
+  // → yields). @all is never a redirect, so it still answers.
+
+  it('ambient: a non-@ top-level message from an allowed user is answered (like never)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'no @ at all — ambient default responder answers' }),
+      messageId: 'msg-ambient-toplevel',
+      chatId: 'chat-ambient',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-ambient',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ambient: a top-level message that @mentions ANOTHER member (not this bot) is ignored — yields the turn', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Someone 你来看看这个' }),
+      messageId: 'msg-ambient-redirect',
+      chatId: 'chat-ambient-redirect',
+      chatType: 'group',
+      mentions: [{ key: '@_other', name: 'Someone', id: { open_id: 'ou_someone_else' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // The redirect carve-out: @ing someone else hands the turn away → stay quiet.
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ambient: a top-level @all message is still answered (@all is not a redirect to someone else)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@all 大家注意' }),
+      messageId: 'msg-ambient-atall',
+      chatId: 'chat-ambient-atall',
+      chatType: 'group',
+      mentions: [{ key: '@_all', name: 'all', id: { open_id: 'all' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-ambient-atall',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('shared + ambient: a non-@ top-level message OPENS a topic (seeds replyRootId), like never', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'shared', regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReturnValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'no @ but should open a shared topic' }),
+      messageId: 'msg-shared-ambient-seed',
+      chatId: 'chat-shared-ambient',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-shared-ambient',
+      replyRootId: 'msg-shared-ambient-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('shared + ambient: a non-@ top-level message that @mentions another member does NOT seed a topic (yields)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'shared', regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReturnValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Someone 这个交给你' }),
+      messageId: 'msg-shared-ambient-redirect',
+      chatId: 'chat-shared-ambient-redirect',
+      chatType: 'group',
+      mentions: [{ key: '@_other', name: 'Someone', id: { open_id: 'ou_someone_else' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // Seeding gate backs off → no topic opened, and the top-level gate also yields.
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ambient: a non-@ follow-up inside a shared-topic alias thread folds back into the chat session (like topic/never)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-ambient-alias', sessionId: 'sess-chat' });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-ambient-alias');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow up in alias topic, no @' }),
+      rootId: 'msg-ambient-alias-1',
+      messageId: 'msg-ambient-alias-2',
+      chatId: 'chat-ambient-alias',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-ambient-alias',
+      replyRootId: 'msg-ambient-alias-1',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('ambient: a follow-up inside a shared-topic alias thread that @mentions another member does NOT fold back (yields)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'ambient' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-ambient-alias', sessionId: 'sess-chat' });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-ambient-alias');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Someone 你接着看' }),
+      rootId: 'msg-ambient-alias-1',
+      messageId: 'msg-ambient-alias-redirect',
+      chatId: 'chat-ambient-alias',
+      chatType: 'group',
+      mentions: [{ key: '@_other', name: 'Someone', id: { open_id: 'ou_someone_else' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // The fold-back is skipped (redirect) → the alias resolver is never consulted
+    // and the message is not pulled into the shared chat session.
+    expect(handlers.resolveReplyThreadAlias).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
 });
 
 describe('im.message.receive_v1 — regular group thread replies preference', () => {
@@ -2644,6 +2925,310 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('im.message.receive_v1 — /summary command', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    handlers = makeHandlers();
+    handlers.isSessionOwner.mockReturnValue(false);
+    mockGetChatMode.mockResolvedValue('group');
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('keeps non-@ regular group messages silent', async () => {
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '只是普通聊天' }),
+      messageId: 'msg-no-trigger',
+      chatId: 'chat-content-trigger',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockListChatMessages).not.toHaveBeenCalled();
+    expect(mockListChatMessagesUntil).not.toHaveBeenCalled();
+    expect(mockListThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it('routes @bot /summary using default 50 messages and 24 hours', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'old',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '二十五小时前的旧消息' }) },
+        sender: { id: 'ou_old', sender_type: 'user' },
+        create_time: String(triggerMs - 25 * 60 * 60_000),
+      },
+      {
+        message_id: 'fresh',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '一小时前的新消息' }) },
+        sender: { id: 'ou_fresh', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-command',
+      chatId: 'chat-summary-command',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat-summary-command', expect.objectContaining({
+      stopAfter: expect.any(Function),
+    }));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-summary-command',
+      summaryCommand: { name: 'summary-command', chatKind: 'regularGroup' },
+      promptOverride: expect.stringContaining('请根据当前会话历史生成总结。'),
+    }));
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('一小时前的新消息');
+    expect(ctx.promptOverride).not.toContain('二十五小时前的旧消息');
+  });
+
+  it('uses configured dashboard summary range for @bot /summary', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'old',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '很久以前的消息' }) },
+        sender: { id: 'ou_old', sender_type: 'user' },
+        create_time: String(triggerMs - 200 * 60 * 60_000),
+      },
+      {
+        message_id: 'fresh',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '最近消息' }) },
+        sender: { id: 'ou_fresh', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-command-configured',
+      chatId: 'chat-summary-command',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat-summary-command', expect.objectContaining({
+      stopAfter: expect.any(Function),
+    }));
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('很久以前的消息');
+    expect(ctx.promptOverride).toContain('最近消息');
+  });
+
+  it('summarizes regular group history after the previous @this bot /summary', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'before-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '上一轮已经总结过的内容' }) },
+        sender: { id: 'ou_before', sender_type: 'user' },
+        create_time: String(triggerMs - 4 * 60 * 60_000),
+      },
+      {
+        message_id: 'previous-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '@_bot_a /summary' }) },
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+        sender: { id: USER_OPEN_ID, sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'after-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '本轮新增讨论' }) },
+        sender: { id: 'ou_after', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-incremental',
+      chatId: 'chat-summary-incremental',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('window="since-last-summary"');
+    expect(ctx.promptOverride).toContain('本轮新增讨论');
+    expect(ctx.promptOverride).not.toContain('上一轮已经总结过的内容');
+    expect(ctx.promptOverride).not.toContain('previous-summary');
+  });
+
+  it('does not use another bot mention as the previous /summary boundary', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'before-other-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '应该仍然在本次总结窗口内' }) },
+        sender: { id: 'ou_before', sender_type: 'user' },
+        create_time: String(triggerMs - 4 * 60 * 60_000),
+      },
+      {
+        message_id: 'other-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '@_bot_b /summary' }) },
+        mentions: [{ key: '@_bot_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } }],
+        sender: { id: USER_OPEN_ID, sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'after-other-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '后续讨论' }) },
+        sender: { id: 'ou_after', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-ignore-other-bot',
+      chatId: 'chat-summary-ignore-other-bot',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('window="configured-range"');
+    expect(ctx.promptOverride).toContain('应该仍然在本次总结窗口内');
+    expect(ctx.promptOverride).toContain('后续讨论');
+  });
+
+  it('summarizes topic history after the previous @this bot /summary', async () => {
+    mockGetChatMode.mockResolvedValue('topic');
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListThreadMessages.mockResolvedValue([
+      {
+        message_id: 'topic-before-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '话题里上一轮已经总结过的内容' }) },
+        sender: { id: 'ou_before', sender_type: 'user' },
+        create_time: String(triggerMs - 4 * 60 * 60_000),
+      },
+      {
+        message_id: 'topic-previous-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '@_bot_a /summary' }) },
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+        sender: { id: USER_OPEN_ID, sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'topic-after-summary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '话题里本轮新增讨论' }) },
+        sender: { id: 'ou_after', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      rootId: 'topic-root-summary',
+      threadId: 'topic-thread-summary',
+      messageId: 'msg-topic-summary-incremental',
+      chatId: 'chat-topic-summary-incremental',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockListThreadMessages).toHaveBeenCalledWith(MY_APP_ID, 'chat-topic-summary-incremental', 'topic-root-summary', 0);
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('window="since-last-summary"');
+    expect(ctx.promptOverride).toContain('话题里本轮新增讨论');
+    expect(ctx.promptOverride).not.toContain('话题里上一轮已经总结过的内容');
+  });
+
+	  it('keeps non-@ /summary silent', async () => {
+	    setupBotState({
+	      allowedUsers: [USER_OPEN_ID],
+	    });
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/summary' }),
+      messageId: 'msg-summary-no-mention',
+      chatId: 'chat-summary-no-mention',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockListChatMessages).not.toHaveBeenCalled();
+    expect(mockListChatMessagesUntil).not.toHaveBeenCalled();
+    expect(mockListThreadMessages).not.toHaveBeenCalled();
   });
 });
 

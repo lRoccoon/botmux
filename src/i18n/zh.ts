@@ -441,6 +441,7 @@ export const messages: Record<string, string> = {
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
   'help.land': '/land       - 查看沙盒会话改动 diff，并由 owner 在卡片上确认落盘',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 订阅飞书文档：文档评论喂进本会话，我的回复发回评论（首次需 /login）',
+  'help.summary': '@机器人 /summary - 读取当前话题或普通群配置范围内的历史消息并生成总结（默认最近 50 条 / 24 小时）',
   'help.heading_passthrough': '🔀 透传给 {cliName}（字面送达，供其内置 slash 命令处理）：',
   'help.heading_schedule': '⏰ 定时任务：',
   'help.schedule_create': '/schedule 每日17:50 帮我看AI新闻   - 创建定时任务（自然语言）',

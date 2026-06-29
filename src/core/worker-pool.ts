@@ -1688,6 +1688,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     cliId: botCfg.cliId,
     cliPathOverride: botCfg.cliPathOverride,
     wrapperCli: botCfg.wrapperCli,
+    launchShell: botCfg.launchShell,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
     // Startup commands run on every fresh spawn (incl. resume) so session-only

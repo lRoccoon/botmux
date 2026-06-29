@@ -46,6 +46,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `cliPathOverride` | Absolute path to the CLI entry point, for wrapping a wrapper / router (ccr, claude-w, aiden-x-claude, etc.) |
 | `disableCliBypass` | When `true`, the CLI's auto-approve / sandbox-bypass flags (`--yolo`, `--dangerously-*`) are not appended automatically; omitted / `false` keeps the original behavior |
 | `backendType` | Session backend, one of `pty` / `tmux` / `herdr` / `zellij`. Leave empty to **auto-detect**: chooses `tmux` if tmux is available, otherwise `pty` (`herdr` and `zellij` are never auto-selected and must be specified explicitly). `tmux` / `herdr` / `zellij` are all persistent sessions and fall back to `pty` automatically if the corresponding binary probe fails (`zellij` requires ≥ 0.44); `pty` attaches directly to the process and does not persist across restarts. See [tmux backend](/en/tmux) |
+| `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`: a shell name (`zsh` / `bash` / `sh`) or an absolute path (e.g. `/usr/bin/zsh`). For when the login `$SHELL` (e.g. bash) has an rcfile that `exec`-trampolines into another shell (`exec zsh`), pre-empting the CLI under botmux's `bash -i` launch so the session never starts (bare-shell `parse error`) — pinning it launches under that shell directly, bypassing the skipped rcfile. **Note**: PATH / nvm / pnpm must then live in the chosen shell's rcfiles (e.g. `.zshrc` / `.zprofile`). Empty = use `$SHELL`. Takes effect next session; `tmux` / `zellij` backends only (`pty` execs the CLI directly and is unaffected). Also configurable in the dashboard ("Bot defaults → Launch shell") or via `/config launchShell <value>` |
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
@@ -109,6 +110,34 @@ Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while an
 | `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
+
+## Summary command
+
+| Field | Description |
+|------|------|
+| `summaryRange` | History range used by the explicit `@bot /summary` command. `limit` is the latest N messages in a regular group, defaulting to 50; `sinceHours` is the latest N hours in a regular group, defaulting to 24. Set either field to `0` to remove that limit. Topic groups always read the current topic/thread history, then apply the summary window |
+
+Example:
+
+```json
+{
+  "summaryRange": {
+    "limit": 50,
+    "sinceHours": 24
+  }
+}
+```
+
+- Only the explicit `@bot /summary` command triggers a summary. Messages that do not mention the bot still follow the existing group/topic routing rules and are not woken up by keywords.
+- The dashboard "/summary Range" controls this `summaryRange` field.
+- If an earlier `@same bot /summary` exists before the current trigger, the summary window includes only messages after that earlier command and up to the current trigger; otherwise botmux falls back to `limit` / `sinceHours`.
+- `limit` and `sinceHours` are also safety caps. If both are `0`, that dimension is not limited.
+
+## Legacy content trigger config
+
+| Field | Description |
+|------|------|
+| `contentTriggers` | **Legacy / no longer active.** Older builds used this field for keyword / regex triggers without an @mention, but current message routing no longer wakes a bot from `contentTriggers`. The parser keeps this field only for `bots.json` compatibility: if an old dashboard-managed trigger named `dashboard-default-summary-trigger` exists, botmux may read its `limit` / `sinceHours` as a fallback for `summaryRange`. New configs should use `summaryRange` |
 
 ## Voice
 

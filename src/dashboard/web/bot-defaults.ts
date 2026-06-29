@@ -239,8 +239,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderEnvSection(b)}</section>
-        <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderLaunchShellSection(b)}${renderEnvSection(b)}</section>
+        <section class="bd-tile">${renderCardBehaviorSection(b)}${renderSummaryTriggerSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
     </article>`;
@@ -385,6 +385,30 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </section>`;
   }
 
+  function renderSummaryTriggerSection(b: any): string {
+    const range = b.summaryRange ?? { limit: 50, sinceHours: 24 };
+    const limit = Number.isInteger(range.limit) && range.limit >= 0 ? range.limit : 50;
+    const sinceHours = Number.isInteger(range.sinceHours) && range.sinceHours >= 0 ? range.sinceHours : 24;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionSummaryTrigger')}</h3>
+      <div class="bd-row bd-summary-limits">
+        <label>
+          <span>${t('botDefaults.summaryLimit')}</span>
+          <input type="number" min="0" step="1" data-input="summaryLimit" value="${limit}">
+        </label>
+        <label>
+          <span>${t('botDefaults.summarySinceHours')}</span>
+          <input type="number" min="0" step="1" data-input="summarySinceHours" value="${sinceHours}">
+        </label>
+      </div>
+      <small class="bd-help">${t('botDefaults.summaryLimitHelp')}</small>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-summary-trigger">${t('botDefaults.summarySave')}</button>
+        <span class="oncall-status" data-summary-trigger-status></span>
+      </div>
+    </section>`;
+  }
+
   // 会话模式：私聊（p2pMode）+ 普通群（regularGroupReplyMode）两个默认会话方式
   // 放在同一板块，各自一个下拉、一改即保存。
   //   • p2pMode             → PUT /api/bots/:appId/p2p-mode（走 applyConfigField，与 /botconfig 同路径）
@@ -395,7 +419,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     const p2p: string = b.p2pMode === 'chat' ? 'chat' : 'thread';
     const regular: string = (b.regularGroupReplyMode === 'new-topic' || b.regularGroupReplyMode === 'shared' || b.regularGroupReplyMode === 'chat-topic')
       ? b.regularGroupReplyMode : 'chat';
-    const mention: string = (b.regularGroupMentionMode === 'topic' || b.regularGroupMentionMode === 'never')
+    const mention: string = (b.regularGroupMentionMode === 'topic' || b.regularGroupMentionMode === 'never' || b.regularGroupMentionMode === 'ambient')
       ? b.regularGroupMentionMode : 'always';
     const docMode: string = b.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
     const opt = (v: string, label: string) =>
@@ -441,6 +465,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             ${mopt('always', t('botDefaults.mentionModeAlways'))}
             ${mopt('topic', t('botDefaults.mentionModeTopic'))}
             ${mopt('never', t('botDefaults.mentionModeNever'))}
+            ${mopt('ambient', t('botDefaults.mentionModeAmbient'))}
           </select>
         </label>
         <small class="bd-help">${t('botDefaults.mentionModeHelp')}</small>
@@ -509,6 +534,25 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       <div class="actions">
         <button type="button" class="primary" data-action="save-startup-commands">${t('botDefaults.startupCommandsSave')}</button>
         <span class="oncall-status" data-startup-commands-status></span>
+      </div>
+    </div>`;
+  }
+
+  // 启动 shell launchShell：启动 CLI 用的 shell（zsh|bash|sh 或绝对路径），覆盖 $SHELL。
+  // 用于登录 $SHELL（如 bash）的 rc 文件里 `exec zsh` 跳转、导致 CLI 起不来的场景。
+  // next-session 生效。PUT /api/bot-launch-shell 落 bots.json。
+  function renderLaunchShellSection(b: any): string {
+    const val: string = typeof b.launchShell === 'string' ? b.launchShell : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionLaunchShell')}</h4>
+      <p class="bd-section-note">${t('botDefaults.launchShellHelp')}</p>
+      <input type="text" data-input="launchShell"
+        placeholder="${escapeHtml(t('botDefaults.launchShellPlaceholder'))}"
+        value="${escapeHtml(val)}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-launch-shell">${t('botDefaults.launchShellSave')}</button>
+        <span class="oncall-status" data-launch-shell-status></span>
       </div>
     </div>`;
   }
@@ -921,6 +965,64 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (crossBotCb) {
         crossBotCb.addEventListener('change', () => {
           putCardPref({ botToBotSameDir: crossBotCb.checked }, crossBotCb, crossBotStatusEl);
+        });
+      }
+
+      // ── /summary 总结范围 ───────────────────────────────────────────────
+      const summaryLimitInput = card.querySelector<HTMLInputElement>('input[data-input=summaryLimit]');
+      const summarySinceInput = card.querySelector<HTMLInputElement>('input[data-input=summarySinceHours]');
+      const summarySaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-summary-trigger]');
+      const summaryStatusEl = card.querySelector<HTMLSpanElement>('[data-summary-trigger-status]');
+
+      function readNonNegativeInt(input: HTMLInputElement, fallback: number): number | null {
+        const raw = input.value.trim();
+        if (raw === '') return fallback;
+        if (!/^(0|[1-9]\d*)$/.test(raw)) return null;
+        return Number(raw);
+      }
+
+      if (summaryLimitInput && summarySinceInput && summarySaveBtn) {
+        summarySaveBtn.addEventListener('click', async () => {
+          if (!summaryStatusEl) return;
+          summaryStatusEl.textContent = '';
+          summaryStatusEl.className = 'oncall-status';
+          const limit = readNonNegativeInt(summaryLimitInput, 50);
+          const sinceHours = readNonNegativeInt(summarySinceInput, 24);
+          if (limit == null || sinceHours == null) {
+            summaryStatusEl.textContent = `✗ ${t('botDefaults.summaryNumberInvalid')}`;
+            summaryStatusEl.classList.add('hint-warn-inline');
+            return;
+          }
+
+          summarySaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/summary-range`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                limit,
+                sinceHours,
+              }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              summaryStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              summaryStatusEl.classList.add('hint-ok');
+              const next = body.summaryRange ?? { limit, sinceHours };
+              summaryLimitInput.value = String(Number.isInteger(next.limit) && next.limit >= 0 ? next.limit : limit);
+              summarySinceInput.value = String(Number.isInteger(next.sinceHours) && next.sinceHours >= 0 ? next.sinceHours : sinceHours);
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.summaryRange = next;
+            } else {
+              summaryStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              summaryStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            summaryStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            summaryStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            summarySaveBtn.disabled = false;
+          }
         });
       }
 
@@ -1337,6 +1439,43 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             startupStatusEl.classList.add('hint-warn-inline');
           } finally {
             startupSaveBtn.disabled = false;
+          }
+        });
+      }
+
+      // ── 启动 shell launchShell（shell 名或绝对路径；空＝清除→回 $SHELL） ──────
+      const launchShellEl = card.querySelector<HTMLInputElement>('input[data-input=launchShell]');
+      const launchShellSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-launch-shell]');
+      const launchShellStatusEl = card.querySelector<HTMLSpanElement>('[data-launch-shell-status]');
+      if (launchShellEl && launchShellSaveBtn) {
+        launchShellSaveBtn.addEventListener('click', async () => {
+          if (!launchShellStatusEl) return;
+          launchShellStatusEl.textContent = '';
+          launchShellStatusEl.className = 'oncall-status';
+          launchShellSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/launch-shell`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ launchShell: launchShellEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              launchShellStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              launchShellStatusEl.classList.add('hint-ok');
+              const next: string = typeof body.launchShell === 'string' ? body.launchShell : '';
+              launchShellEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.launchShell = next;
+            } else {
+              launchShellStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              launchShellStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            launchShellStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            launchShellStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            launchShellSaveBtn.disabled = false;
           }
         });
       }
