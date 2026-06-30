@@ -3,7 +3,10 @@
  * a fresh machine that just `npm i -g botmux`'d gets tmux + screenshot fonts
  * provisioned without manual setup.
  *
- * - tmux is required: a failed install throws so cli.ts can exit non-zero.
+ * - tmux is required (PTY 退役): when it's GENUINELY ABSENT and a bot wants the
+ *   tmux backend, cli.ts hard-fails `start`/`restart` (non-zero exit, no pm2
+ *   spawn) — see shouldHardFailStartupForMissingTmux. A present-but-broken tmux
+ *   degrades gracefully via the per-session worker gate instead.
  * - fonts are nice-to-have: failures only print a warning.
  * - herdr is on-demand: only runs when at least one bot in bots.json has
  *   `backendType: 'herdr'`. Avoids dragging an extra binary onto every host.
@@ -26,6 +29,37 @@ export interface DependenciesReport {
 }
 
 export { botmuxFontDir } from './ensure-fonts.js';
+
+/**
+ * Decide whether `botmux start`/`restart` should HARD-FAIL (refuse to spawn the
+ * daemon) because tmux is missing. PR#289 Option A.
+ *
+ * Hard-fail ONLY when ALL of:
+ *   - the tmux binary is GENUINELY ABSENT (`tmuxBinaryPresent === false`). This
+ *     is deterministic and implies there is no tmux server — hence no surviving
+ *     session to protect — so refusing to start loses nothing.
+ *   - at least one bot actually wants the tmux backend (`anyBotWantsTmux`). A
+ *     box whose bots all run pty/herdr/zellij doesn't need tmux at all.
+ *   - the operator hasn't opted into the PTY escape hatch (`BACKEND_TYPE=pty`).
+ *
+ * Crucially we do NOT hard-fail when the binary IS present but its functional
+ * probe failed: that probe is the same disposable `tmux new-session` check the
+ * per-session gate retries, and a transient flake there must not block the
+ * daemon from coming up and reattaching live sessions — that would re-introduce
+ * the PR#249 false-negative at startup granularity. Present-but-broken tmux
+ * degrades gracefully via the per-session worker gate (an actionable card).
+ */
+export function shouldHardFailStartupForMissingTmux(opts: {
+  tmuxInstalled: boolean;
+  tmuxBinaryPresent: boolean;
+  anyBotWantsTmux: boolean;
+  ptyOptIn: boolean;
+}): boolean {
+  if (opts.ptyOptIn) return false;
+  if (opts.tmuxInstalled) return false;
+  if (opts.tmuxBinaryPresent) return false;
+  return opts.anyBotWantsTmux;
+}
 
 const BOTS_JSON_FILE = join(homedir(), '.botmux', 'bots.json');
 
