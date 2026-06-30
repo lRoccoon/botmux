@@ -2243,11 +2243,18 @@ function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
 /**
  * Resolve the pinned working dir for a brand-new topic via the layered lookup:
  *   1) this bot's OWN oncall binding (per-bot: another bot's binding never pins
- *      this bot — cross-bot dir alignment is handled by layer 3 inherit-peer)
+ *      this bot — cross-bot dir alignment is handled by layer 4 inherit-peer)
  *   2) this bot's defaultOncall — auto-binds a brand-new chat when the flag is on
  *      (this WRITES state, so it must run identically on every spawn path)
- *   3) a sibling session's workingDir (cross-bot / chat-scope inheritance)
- *   4) this bot's `defaultWorkingDir` (pure runtime fallback)
+ *   3) this bot's OWN effective `defaultWorkingDir` (legacy `defaultWorkingDir`,
+ *      or the `defaultOncall.workingDir` all-sessions fallback — see
+ *      {@link resolveBotDefaultWorkingDir}). An explicit per-bot config is the
+ *      bot's own intent, so it OUTRANKS cross-bot inheritance: a sibling's
+ *      incidental session dir must never override a dir this bot configured for
+ *      itself. Only a bot that configured nothing of its own falls to layer 4.
+ *   4) a sibling session's workingDir (cross-bot / chat-scope inheritance) —
+ *      last-resort convenience so a freshly @mentioned collaborator bot with no
+ *      dir of its own follows the topic instead of bouncing through a repo card.
  * Returns the dir plus the oncall / inherited source so callers can log the reason.
  * Shared by the normal spawn path and the first-message `/repo` command branch so
  * both honor the defaultOncall auto-bind the same way.
@@ -2263,17 +2270,21 @@ async function resolvePinnedWorkingDir(ctx: {
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
-  const inheritedFrom = !oncallEntry
+  // Layer 3: this bot's own effective default. Resolved BEFORE inheritance so an
+  // explicit per-bot dir wins over a sibling bot's active session dir.
+  const botDefaultWorkingDir = !oncallEntry
+    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
+    : undefined;
+  // Layer 4: sibling/peer inheritance — only when this bot has neither an oncall
+  // binding nor any default dir of its own.
+  const inheritedFrom = (!oncallEntry && !botDefaultWorkingDir)
     ? findInheritablePeer({
         scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType,
         selfAppId: ctx.larkAppId,
         botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
       })
     : null;
-  const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
-    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
-    : undefined;
-  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  const pinnedWorkingDir = oncallEntry?.workingDir ?? botDefaultWorkingDir ?? inheritedFrom?.workingDir;
   return { pinnedWorkingDir, oncallEntry, inheritedFrom };
 }
 
