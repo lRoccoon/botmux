@@ -1425,10 +1425,9 @@ async function ensureSystemDependencies(): Promise<void> {
     return;
   }
 
-  let anyBotWantsTmux = false;
-  try {
-    anyBotWantsTmux = loadBotsJson().some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux');
-  } catch { /* no/unreadable bots.json — treat as "no bot wants tmux" */ }
+  // loadBotsJson() returns [] when bots.json is absent (→ no bot wants tmux) and
+  // hard-exits on a malformed file (existing fast-fail) — it never throws here.
+  const anyBotWantsTmux = loadBotsJson().some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux');
   const ptyOptIn = (process.env.BACKEND_TYPE ?? '').toLowerCase() === 'pty';
 
   if (shouldHardFailStartupForMissingTmux({
