@@ -16,7 +16,7 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, type BotState, type OncallChat } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, type BotState, type OncallChat, type VcMeetingAgentConfig } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -143,6 +143,7 @@ import { getRunsDir } from './workflows/runs-dir.js';
 import { loadEffectInputSidecar } from './workflows/effect-input.js';
 import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
+import { triggerWorkflowFromEnvelope } from './workflows/trigger-from-envelope.js';
 import type { RawParamInput } from './workflows/params.js';
 import type { AbortCancelReason } from './workflows/runtime.js';
 import {
@@ -169,11 +170,55 @@ import {
 import { parseAskBody } from './core/ask-api.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
+import { normalizeVcMeetingEvents } from './vc-agent/normalizer.js';
+import {
+  beginVcIngestionPass,
+  buildVcMeetingWorkflowPayload,
+  collectStableTranscriptItems,
+  createVcMeetingSessionState,
+  ingestNormalizedVcMeetingItems,
+  markVcTranscriptItemsFlushed,
+} from './vc-agent/meeting-state.js';
+import { joinMeetingAsBot } from './vc-agent/polling-source.js';
+import { buildVcMeetingTriggerRequest } from './vc-agent/trigger.js';
+import type { NormalizedVcMeetingItem, VcMeetingPushContext, VcMeetingSessionState } from './vc-agent/types.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
 const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
+
+type VcMeetingDaemonSession = {
+  larkAppId: string;
+  state: VcMeetingSessionState;
+  pendingItems: NormalizedVcMeetingItem[];
+  flushTimer?: ReturnType<typeof setInterval>;
+  flushing: boolean;
+  dispatchSeq: number;
+  ended: boolean;
+};
+
+type VcMeetingFlushResult = {
+  ok: boolean;
+  final: boolean;
+};
+
+const vcMeetingSessions = new Map<string, VcMeetingDaemonSession>();
+
+const DEFAULT_VC_MEETING_STABILIZE_MS = 5_000;
+const DEFAULT_VC_MEETING_FLUSH_INTERVAL_MS = 2_000;
+
+function vcMeetingSessionKey(larkAppId: string, meetingId: string): string {
+  return `${larkAppId}:${meetingId}`;
+}
+
+function rawExcerptForLog(raw: unknown, limit = 800): string {
+  try {
+    return JSON.stringify(raw).slice(0, limit);
+  } catch {
+    return String(raw).slice(0, limit);
+  }
+}
 
 function sessionHasReplyThreadAlias(s: Pick<Session, 'scope' | 'replyThreadAliases'>, rootId: string): boolean {
   return s.scope === 'chat' && !!s.replyThreadAliases?.[rootId];
@@ -2189,6 +2234,224 @@ function parseTriggerChatBinding(
   return { chatId: r.chatId.trim(), larkAppId: r.larkAppId.trim() };
 }
 
+function effectiveVcMeetingAgentConfig(larkAppId: string): VcMeetingAgentConfig | undefined {
+  const cfg = getBot(larkAppId)?.config.vcMeetingAgent;
+  return cfg?.enabled === true ? cfg : undefined;
+}
+
+function vcMeetingTargetChatId(cfg: VcMeetingAgentConfig): string | undefined {
+  return cfg.chatId ?? cfg.notificationChatId;
+}
+
+function getOrCreateVcMeetingDaemonSession(
+  larkAppId: string,
+  meeting: VcMeetingPushContext['meeting'],
+  cfg: VcMeetingAgentConfig,
+): VcMeetingDaemonSession | undefined {
+  if (!meeting.id) return undefined;
+  const key = vcMeetingSessionKey(larkAppId, meeting.id);
+  let session = vcMeetingSessions.get(key);
+  if (!session) {
+    session = {
+      larkAppId,
+      state: createVcMeetingSessionState({
+        meeting,
+        source: 'push',
+        attentionTargetOpenId: cfg.attentionTargetOpenId,
+        notificationChatId: cfg.notificationChatId,
+      }),
+      pendingItems: [],
+      flushing: false,
+      dispatchSeq: 0,
+      ended: false,
+    };
+    vcMeetingSessions.set(key, session);
+    scheduleVcMeetingFlush(key, cfg);
+    logger.info(`[vc-agent] session created meeting=${meeting.id} bot=${larkAppId}`);
+  } else {
+    session.state.meeting = { ...session.state.meeting, ...meeting, id: session.state.meeting.id || meeting.id };
+  }
+  return session;
+}
+
+function scheduleVcMeetingFlush(key: string, cfg: VcMeetingAgentConfig): void {
+  const session = vcMeetingSessions.get(key);
+  if (!session || session.flushTimer) return;
+  if (!cfg.workflowId || !vcMeetingTargetChatId(cfg)) {
+    logger.info(`[vc-agent] session ${key} will ingest only: missing vcMeetingAgent.workflowId or chatId/notificationChatId`);
+    return;
+  }
+  const flushIntervalMs = cfg.flushIntervalMs ?? DEFAULT_VC_MEETING_FLUSH_INTERVAL_MS;
+  session.flushTimer = setInterval(() => {
+    flushVcMeetingDaemonSession(key, { final: false }).then((result) => {
+      const latest = vcMeetingSessions.get(key);
+      if (result.ok && result.final && latest?.ended) {
+        if (latest.flushTimer) clearInterval(latest.flushTimer);
+        vcMeetingSessions.delete(key);
+        logger.info(`[vc-agent] session closed ${key}`);
+      }
+    }).catch((err) => {
+      logger.error(`[vc-agent] flush failed ${key}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, flushIntervalMs);
+  session.flushTimer.unref?.();
+}
+
+async function flushVcMeetingDaemonSession(key: string, opts: { final: boolean }): Promise<VcMeetingFlushResult> {
+  const session = vcMeetingSessions.get(key);
+  if (!session) return { ok: true, final: opts.final };
+  const final = opts.final || session.ended;
+  if (session.flushing) return { ok: false, final };
+  const cfg = effectiveVcMeetingAgentConfig(session.larkAppId);
+  if (!cfg) return { ok: true, final };
+  const workflowId = cfg.workflowId;
+  const chatId = vcMeetingTargetChatId(cfg);
+  if (!workflowId || !chatId) {
+    logger.info(`[vc-agent] flush skipped meeting=${session.state.meeting.id}: missing vcMeetingAgent.workflowId or chatId/notificationChatId`);
+    return { ok: true, final };
+  }
+  session.flushing = true;
+  try {
+    const stableTranscripts = collectStableTranscriptItems(session.state, {
+      stabilizeMs: final ? 0 : (cfg.stabilizeMs ?? DEFAULT_VC_MEETING_STABILIZE_MS),
+      now: new Date(),
+      markFlushed: false,
+    });
+    const pendingItems = [...session.pendingItems];
+    const outgoing: NormalizedVcMeetingItem[] = [
+      ...pendingItems,
+      ...stableTranscripts,
+    ];
+    if (outgoing.length === 0) return { ok: true, final };
+
+    const payload = buildVcMeetingWorkflowPayload(session.state, outgoing);
+    const requestId = `vc_${session.state.meeting.id}_${++session.dispatchSeq}`;
+    const trigger = buildVcMeetingTriggerRequest({
+      larkAppId: session.larkAppId,
+      workflowId,
+      chatId,
+      payload,
+      requestId,
+      instruction: cfg.instruction,
+    });
+    const result = await triggerWorkflowFromEnvelope(trigger, {
+      larkAppId: session.larkAppId,
+      runWorkflow: (input) => triggerWorkflowRun(input, workflowTriggerDeps()),
+    });
+    if (!result.ok) {
+      logger.warn(`[vc-agent] workflow trigger failed meeting=${session.state.meeting.id}: ${result.errorCode ?? 'unknown'} ${result.error ?? result.message ?? ''}`);
+      return { ok: false, final };
+    }
+    session.pendingItems.splice(0, pendingItems.length);
+    markVcTranscriptItemsFlushed(session.state, stableTranscripts);
+    logger.info(`[vc-agent] workflow queued meeting=${session.state.meeting.id} items=${outgoing.length} run=${result.target?.workflowRunId ?? '?'} final=${final}`);
+    return { ok: true, final };
+  } catch (err) {
+    logger.warn(`[vc-agent] workflow trigger threw meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: false, final };
+  } finally {
+    session.flushing = false;
+  }
+}
+
+async function closeVcMeetingDaemonSession(key: string): Promise<void> {
+  const session = vcMeetingSessions.get(key);
+  if (!session) return;
+  session.ended = true;
+  const result = await flushVcMeetingDaemonSession(key, { final: true });
+  if (!result.ok) {
+    const cfg = effectiveVcMeetingAgentConfig(session.larkAppId);
+    if (cfg) scheduleVcMeetingFlush(key, cfg);
+    logger.warn(`[vc-agent] final flush failed; keeping ended session ${key} for retry`);
+    return;
+  }
+  if (session.flushTimer) clearInterval(session.flushTimer);
+  vcMeetingSessions.delete(key);
+  logger.info(`[vc-agent] session closed ${key}`);
+}
+
+async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
+  const cfg = effectiveVcMeetingAgentConfig(ctx.larkAppId);
+  if (!cfg) {
+    logger.info(`[vc-agent] ${ctx.kind} ignored: vcMeetingAgent.enabled is not true for ${ctx.larkAppId}`);
+    return;
+  }
+  logger.info(`[vc-agent] push ${ctx.kind} eventId=${ctx.eventId ?? '?'} meetingId=${ctx.meeting.id || '?'} meetingNo=${ctx.meeting.meetingNo ?? '?'}`);
+
+  if (ctx.kind === 'meeting_invited') {
+    let meeting = ctx.meeting;
+    if (cfg.autoJoin) {
+      if (meeting.meetingNo) {
+        if (!cfg.larkCliProfile) {
+          logger.warn(`[vc-agent] autoJoin disabled for invite eventId=${ctx.eventId ?? '?'}: missing vcMeetingAgent.larkCliProfile; refusing to use lark-cli default profile for bot ${ctx.larkAppId}`);
+        } else {
+          try {
+            const inviteMeetingId = meeting.id;
+            const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: cfg.larkCliProfile });
+            meeting = { ...meeting, id: joined.meetingId };
+            logger.info(`[vc-agent] auto-joined meeting=${meeting.id} meetingNo=${meeting.meetingNo} profile=${cfg.larkCliProfile}`);
+            if (inviteMeetingId && inviteMeetingId !== joined.meetingId) {
+              logger.warn(`[vc-agent] invite meeting.id (${inviteMeetingId}) differs from joined meeting.id (${joined.meetingId}); verify invite/join/activity id equivalence in P0-0`);
+            }
+          } catch (err) {
+            logger.warn(`[vc-agent] auto-join failed meetingNo=${meeting.meetingNo}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      } else {
+        logger.warn('[vc-agent] autoJoin enabled but invite event has no meeting_no; waiting for activity push');
+      }
+    }
+    if (!meeting.id) {
+      logger.info(`[vc-agent] invite received but no meeting id yet eventId=${ctx.eventId ?? '?'}`);
+      return;
+    }
+    getOrCreateVcMeetingDaemonSession(ctx.larkAppId, meeting, cfg);
+    return;
+  }
+
+  if (!ctx.meeting.id) {
+    logger.warn(`[vc-agent] ${ctx.kind} dropped: missing meeting.id eventId=${ctx.eventId ?? '?'} raw=${rawExcerptForLog(ctx.raw)}`);
+    return;
+  }
+
+  if (ctx.kind === 'meeting_ended') {
+    const key = vcMeetingSessionKey(ctx.larkAppId, ctx.meeting.id);
+    if (!vcMeetingSessions.has(key)) {
+      logger.info(`[vc-agent] ended ignored for untracked meeting=${ctx.meeting.id} bot=${ctx.larkAppId}`);
+      return;
+    }
+    await closeVcMeetingDaemonSession(key);
+    return;
+  }
+
+  const session = getOrCreateVcMeetingDaemonSession(ctx.larkAppId, ctx.meeting, cfg);
+  if (!session) return;
+
+  beginVcIngestionPass(session.state);
+  const batch = normalizeVcMeetingEvents(ctx.raw, { meetingId: ctx.meeting.id, source: 'push' });
+  if (batch.items.length === 0) {
+    logger.warn(`[vc-agent] activity push normalized to 0 items; check meeting_actitivty_items schema eventId=${ctx.eventId ?? '?'} raw=${rawExcerptForLog(ctx.raw)}`);
+    return;
+  }
+  session.state.meeting = { ...session.state.meeting, ...batch.meeting, ...ctx.meeting, id: ctx.meeting.id };
+  const ingest = ingestNormalizedVcMeetingItems(session.state, batch.items);
+  session.pendingItems.push(...ingest.acceptedItems);
+  logger.info(`[vc-agent] activity ingested meeting=${ctx.meeting.id} items=${batch.items.length} accepted=${ingest.acceptedItems.length} changedTranscripts=${ingest.changedTranscripts.length}`);
+}
+
+export const __vcMeetingAgentTest = {
+  handlePush: handleVcMeetingPush,
+  sessionCount: () => vcMeetingSessions.size,
+  hasSession: (larkAppId: string, meetingId: string) =>
+    vcMeetingSessions.has(vcMeetingSessionKey(larkAppId, meetingId)),
+  reset: () => {
+    for (const session of vcMeetingSessions.values()) {
+      if (session.flushTimer) clearInterval(session.flushTimer);
+    }
+    vcMeetingSessions.clear();
+  },
+};
+
 // ─── Event handling ──────────────────────────────────────────────────────────
 
 /**
@@ -4033,6 +4296,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
       handleBotAdded: (chatId, operatorOpenId, appId) => handleBotAdded(chatId, operatorOpenId, appId),
       handleDocComment: (ctx) => handleDocComment(ctx),
+      handleVcMeetingPush: (ctx) => handleVcMeetingPush(ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
       resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
@@ -4185,6 +4449,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const watcher of workflowEventWatchers.values()) watcher.close();
     workflowEventWatchers.clear();
     workflowRuns.clear();
+    for (const session of vcMeetingSessions.values()) {
+      if (session.flushTimer) clearInterval(session.flushTimer);
+    }
+    vcMeetingSessions.clear();
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);

@@ -81,6 +81,41 @@ function normalizeNonNegativeInt(raw: unknown): number | undefined {
   return raw;
 }
 
+function normalizePositiveInt(raw: unknown): number | undefined {
+  if (typeof raw !== 'number') return undefined;
+  if (!Number.isInteger(raw) || raw <= 0) return undefined;
+  return raw;
+}
+
+function normalizeNonEmptyString(raw: unknown): string | undefined {
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+}
+
+function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const out: VcMeetingAgentConfig = {};
+  if (entry.enabled === true) out.enabled = true;
+  if (entry.autoJoin === true) out.autoJoin = true;
+  const workflowId = normalizeNonEmptyString(entry.workflowId);
+  const chatId = normalizeNonEmptyString(entry.chatId);
+  const notificationChatId = normalizeNonEmptyString(entry.notificationChatId);
+  const attentionTargetOpenId = normalizeNonEmptyString(entry.attentionTargetOpenId);
+  const larkCliProfile = normalizeNonEmptyString(entry.larkCliProfile);
+  const instruction = normalizeNonEmptyString(entry.instruction);
+  const stabilizeMs = normalizePositiveInt(entry.stabilizeMs);
+  const flushIntervalMs = normalizePositiveInt(entry.flushIntervalMs);
+  if (workflowId) out.workflowId = workflowId;
+  if (chatId) out.chatId = chatId;
+  if (notificationChatId) out.notificationChatId = notificationChatId;
+  if (attentionTargetOpenId) out.attentionTargetOpenId = attentionTargetOpenId;
+  if (larkCliProfile) out.larkCliProfile = larkCliProfile;
+  if (instruction) out.instruction = instruction;
+  if (stabilizeMs !== undefined) out.stabilizeMs = stabilizeMs;
+  if (flushIntervalMs !== undefined) out.flushIntervalMs = flushIntervalMs;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizeSummaryRange(raw: unknown): SummaryRangeConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
@@ -237,6 +272,19 @@ export interface BotDefaultOncall {
   since: number;
 }
 
+export interface VcMeetingAgentConfig {
+  enabled?: boolean;
+  autoJoin?: boolean;
+  workflowId?: string;
+  chatId?: string;
+  notificationChatId?: string;
+  attentionTargetOpenId?: string;
+  larkCliProfile?: string;
+  instruction?: string;
+  stabilizeMs?: number;
+  flushIntervalMs?: number;
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -319,6 +367,8 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /** Native Lark VC bot meeting copilot bridge. Push is primary; polling remains gate/backfill. */
+  vcMeetingAgent?: VcMeetingAgentConfig;
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
@@ -1058,6 +1108,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const skills = readBotSkillPolicy(entry.skills);
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
+    const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
     // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
@@ -1108,6 +1159,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      vcMeetingAgent,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
