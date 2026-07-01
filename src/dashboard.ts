@@ -41,7 +41,8 @@ import {
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { buildDashboardUrl } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -492,15 +493,14 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
-    // Bundle filenames are fixed (app.js/style.css), so without revalidation
-    // browsers heuristic-cache them and serve a stale build after a deploy
-    // (new JS + old CSS → broken layout). `no-cache` + an mtime/size ETag makes
-    // the browser revalidate every load: 304 when unchanged (cheap), fresh 200
-    // when the build changed. No manual hard-refresh needed after deploy.
+    // Fixed entry filenames (index.html/app.js/style.css) need revalidation so
+    // a deploy never serves new JS with old CSS. Lazy chunks are content-hashed
+    // and can be cached immutably once the current app.js points at them.
+    const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
     const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
     const headers: Record<string, string> = {
       'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
-      'cache-control': 'no-cache',
+      'cache-control': immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
       etag,
     };
     if (req.headers['if-none-match'] === etag) {
@@ -804,9 +804,11 @@ function verifyCliRequest(req: IncomingMessage, pathname: string):
   return { ok: true };
 }
 
-/** Build the dashboard URL for a token, using the actually-bound port. */
+/** Build the dashboard URL for a token, using the actually-bound port. Routes
+ *  through the central-platform machine subdomain when 远程访问 is on and this
+ *  host is bound (see buildDashboardUrl); falls back to the local host:port. */
 function dashboardUrlFor(token: string): string {
-  return `http://${config.dashboard.externalHost}:${boundDashboardPort}/?t=${token}`;
+  return buildDashboardUrl({ host: config.dashboard.externalHost, port: boundDashboardPort, token });
 }
 
 type SkillJobStatus = 'running' | 'succeeded' | 'failed';
@@ -1068,6 +1070,11 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/__cli/reload-binding') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      // `botmux bind` wrote platform.json + (default-on) remoteAccess in the CLI
+      // process; this dashboard process holds a short-TTL config cache that may
+      // still read the pre-bind value. Drop it so the immediately-following
+      // /__cli/current (and live card links) resolve the platform dashboard URL.
+      invalidateGlobalConfigCache();
       try {
         platformTunnel?.stop();
       } catch {
@@ -2592,6 +2599,13 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     try { clientSocket.destroy(); } catch { /* ignore */ }
   }
 });
+
+// 拉长 keep-alive 空闲超时：中心化平台反代用 keep-alive 连接池复用隧道连接，但 Node 默认
+// keepAliveTimeout 才 5s——空闲>5s 后 dashboard 把连接关了，而平台侧 Agent 可能还把它留在池里
+// 复用 → 撞到刚关的连接、首批请求 502。把它拉到 75s（headersTimeout 需更大），让池里的连接在
+// 正常使用间隔内不被这端提前关掉，平台复用稳、不再有 stale-reuse 的首批 502。本地直连无副作用。
+server.keepAliveTimeout = 75_000;
+server.headersTimeout = 80_000;
 
 // Probe upward on EADDRINUSE rather than crashing with an unhandled 'error':
 // a second botmux instance on this host (or a stray process) holding the

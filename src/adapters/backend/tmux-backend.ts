@@ -711,7 +711,11 @@ function configureTmuxSessionOptions(sessionName: string): void {
   try {
     const t = shellescape(sessionName);
     const env = tmuxEnv();
-    execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
+    // status bar ON — see TmuxPipeBackend.applySessionOptions for the rationale:
+    // shows the window list to a user who manually `tmux attach`es, and is a
+    // client-level overlay that never enters the pane stream the card / web
+    // terminal capture, so it has zero effect on them.
+    execSync(`tmux set-option -t ${t} status on`, { stdio: 'ignore', env });
     execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
     // set-clipboard is a server option — enable OSC 52 passthrough for web copy
     execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
