@@ -2768,22 +2768,37 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
 }
 
 // 大厅打卡节流：按「发送 bot ×大厅」记最小间隔与尝试上限——按 bot 记会让多团队
-// bot 在第一个大厅烧光预算后，新加入的大厅永远轮空（实测踩过）。上限防御发送
-// 持续失败/点名解析不到时的无谓重试；进程重启重置。
-const hallAnnounceState = new Map<string, { lastAt: number; tries: number }>();
+// bot 在第一个大厅烧光预算后，新加入的大厅永远轮空（实测踩过）。只有真正发出
+// 消息才消耗次数；状态落盘，重启不重发（否则每次重启都往大厅刷一轮）。
 const HALL_ANNOUNCE_MIN_INTERVAL_MS = 10 * 60 * 1000;
 const HALL_ANNOUNCE_MAX_TRIES = 6;
+const hallAnnounceStatePath = () => join(config.session.dataDir, 'hall-announce-state.json');
+function readHallAnnounceState(): Record<string, { lastAt: number; tries: number }> {
+  try { return JSON.parse(readFileSync(hallAnnounceStatePath(), 'utf-8')); } catch { return {}; }
+}
+function bumpHallAnnounceState(key: string): void {
+  const all = readHallAnnounceState();
+  const cur = all[key];
+  all[key] = { lastAt: Date.now(), tries: (cur?.tries ?? 0) + 1 };
+  try { atomicWriteFileSync(hallAnnounceStatePath(), JSON.stringify(all, null, 2) + '\n'); } catch { /* 尽力而为 */ }
+}
+/** 发送方 daemon 的 mention cross-ref（name → 本 app 视角 open_id）。 */
+function readBotCrossRef(appId: string): Record<string, string> {
+  try { return JSON.parse(readFileSync(join(config.session.dataDir, `bot-openids-${appId}.json`), 'utf-8')); } catch { return {}; }
+}
 
 /**
  * 大厅打卡编排（union_id 自学）。实测大厅（bot-only 群）只有「直接点名 @」会
  * 投递事件——普通消息、自 @、@all 全部静默，自家回声在大多数应用上永远等不来。
  * 机制（与 event-dispatcher 的 hall 分支对偶）：
- * - 每个大厅里每个未入册的本机 bot X 发打卡，点名 @ 同大厅其他本机成员
- *   （open_id 由 X 自己 daemon 的 cross-ref 解析，per-app），并带 #hall-echo；
- * - 被点到的未入册 bot 直接从 mentions[] 学到自己的 union_id；
- * - 收到 #hall-echo 的 bot 回 @ 打卡者一次（open_id 取自事件 sender_id，无需
- *   cross-ref）→ 打卡者从回执学到自己。任一方向可解析即收敛。
- * 学到后随心跳上报平台进 roster；全部入册后跳过。跨机器成员由对方机器编排。
+ * - 有未入册成员的大厅里，每个本机 bot 点名 @ 自己 cross-ref 能解析到的未入册
+ *   成员（含别的机器的——mention 跨机器投递，对方跑新版即可学）；被点到的直接
+ *   从 mentions[] 学到自己的 union_id。已入册 bot 也参与——纯教学。
+ * - 自己未入册时消息带 #hall-echo，被点到的 bot 回 @ 一次（open_id 取事件
+ *   sender_id，无需 cross-ref）→ 打卡者从回执学到自己。任一方向可解析即收敛。
+ * 消息只在有意义时才发：解析不到任何目标时不发不计次（唯一例外：未入册 bot 的
+ * 首次尝试发一条裸打卡，给有 receive-all scope 的应用留回声机会）。状态落盘，
+ * 重启不重发——解析不到目标反复裸发刷屏这个坑踩过了（自动review 实测）。
  */
 async function maybeAnnounceHallPresence(): Promise<void> {
   try {
@@ -2792,22 +2807,31 @@ async function maybeAnnounceHallPresence(): Promise<void> {
     if (teams.length === 0) return;
     const localBotIds = new Set(readPlatformBotsInfo().map(b => b.appId));
     const now = Date.now();
+    const state = readHallAnnounceState();
     for (const team of teams) {
       const hallChatId = team.groupChatIds[0];
       if (!hallChatId) continue;
-      const locals = team.bots.filter(b => localBotIds.has(b.appId));
-      for (const bot of locals) {
-        if (getBotUnionId(dataDir, bot.appId)) continue;      // 已入册 → 永久跳过
+      // 未入册成员（全大厅，含别的机器）：本机的以本地 store 为准（比 roster 新鲜），
+      // 远端的以 roster 的 unionId 为准。
+      const isLearned = (b: { appId: string; unionId?: string }) =>
+        localBotIds.has(b.appId) ? !!getBotUnionId(dataDir, b.appId) : !!b.unionId;
+      const unlearned = team.bots.filter(b => !isLearned(b));
+      if (unlearned.length === 0) continue;
+      const unlearnedNames = new Set(unlearned.map(b => b.name).filter(Boolean) as string[]);
+      for (const bot of team.bots) {
+        if (!localBotIds.has(bot.appId)) continue;            // 只编排本机 bot
+        const selfLearned = isLearned(bot);
         const throttleKey = `${bot.appId}::${hallChatId}`;
-        const st = hallAnnounceState.get(throttleKey);
+        const st = state[throttleKey];
         if (st && (now - st.lastAt < HALL_ANNOUNCE_MIN_INTERVAL_MS || st.tries >= HALL_ANNOUNCE_MAX_TRIES)) continue;
-        hallAnnounceState.set(throttleKey, { lastAt: now, tries: (st?.tries ?? 0) + 1 });
-        // 点名目标：同大厅其他本机成员，已入册的优先（它们会回执教我），至多 4 个。
-        const targets = locals
-          .filter(b => b.appId !== bot.appId && b.name)
-          .sort((a, b2) => Number(!!getBotUnionId(dataDir, b2.appId)) - Number(!!getBotUnionId(dataDir, a.appId)))
-          .slice(0, 4)
-          .map(b => b.name as string);
+        // 点名目标 = 自己 cross-ref 能解析到的未入册成员（发不出 @ 的目标点了也白点）。
+        const crossRef = readBotCrossRef(bot.appId);
+        const targets = [...unlearnedNames].filter(n => n !== bot.name && typeof crossRef[n] === 'string').slice(0, 4);
+        // 没有可教的目标：已入册 → 无事可做；未入册 → 仅首次发裸打卡碰回声运气，
+        // 之后静默等别人教（不发不计次，cross-ref 或 roster 变化后自然恢复）。
+        if (targets.length === 0 && (selfLearned || (st?.tries ?? 0) > 0)) continue;
+        bumpHallAnnounceState(throttleKey);
+        state[throttleKey] = { lastAt: now, tries: (st?.tries ?? 0) + 1 };
         try {
           const r = await proxyToDaemon(bot.appId, '/api/platform/hall-announce', {
             method: 'POST',
