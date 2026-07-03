@@ -90,7 +90,7 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<boole
   // closeSession→killWorker 摸不到 pane，必须在这里亲手杀；而活 worker（运行时
   // 热切场景）走 closeSession 的 close IPC 由 worker 侧优雅拆除 backing——先硬杀
   // pane 会跟 worker 的退出处理赛跑。
-  if (backendType && !ds.worker) {
+  if (backendType && (!ds.worker || ds.worker.killed)) {
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session and killing ${backendType} ${backendName}`);
     killPersistentSession(backendType, backendName);
