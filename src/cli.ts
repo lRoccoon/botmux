@@ -5,6 +5,7 @@
  * Usage:
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
+ *   botmux setup list|add|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux start          — start daemon (pm2)
  *   botmux stop           — stop daemon
  *   botmux restart [--include-pm2] — restart daemon (optionally restart PM2 God too)
@@ -21,7 +22,7 @@
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
@@ -48,11 +49,20 @@ import {
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
 import { resolveCliSelection, selectionKeyForBot } from './setup/cli-selection.js';
+import {
+  buildBotFromAddFlags,
+  editInputFromFlags,
+  isScriptedSetupInvocation,
+  maskAppSecret,
+  parseSetupCommand,
+  SETUP_CLI_USAGE,
+  type SetupCommand,
+} from './setup/setup-args.js';
 import { pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
-import { invalidWorkingDirs } from './utils/working-dir.js';
+import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
@@ -263,6 +273,21 @@ function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingD
   console.log(`\n❌ ${context} 指向的目录不存在或不是目录:`);
   for (const dir of invalid) console.log(`   - ${dir}`);
   console.log('   请先创建目录，或重新填写一个已存在的工作目录。');
+  return false;
+}
+
+/**
+ * 固定默认目录（defaultWorkingDir）写盘前的存在性校验。运行时 daemon 对无效
+ * defaultWorkingDir 只是 WARN 后回退弹仓库选择卡，用户很难察觉配置根本没生效，
+ * 所以 setup 侧必须在写盘前就挡下来。未配置视为通过。
+ */
+function ensureBotDefaultWorkingDirExists(bot: Record<string, any>): boolean {
+  const raw = typeof bot.defaultWorkingDir === 'string' ? bot.defaultWorkingDir.trim() : '';
+  if (!raw) return true;
+  const missing = missingDirResolved(raw);
+  if (!missing) return true;
+  console.log(`\n❌ 固定默认目录不存在或不是目录: ${missing}`);
+  console.log('   请先创建目录，或改用仓库选择卡片模式。');
   return false;
 }
 
@@ -689,7 +714,34 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     console.log('   不写 bots.json。请重新运行 botmux setup。');
     return null;
   }
-  const workingDir = await ask(rl, '默认工作目录 [~]: ');
+  // 新话题工作目录：两种模式二选一。旧问法只问「默认工作目录」但写的是
+  // workingDir——那只是仓库选择卡片的扫描根，新话题照样弹卡，误导性强；
+  // 真正「直接进目录、不弹卡」的是 defaultWorkingDir，现在显式让用户选。
+  printInputHelp('新话题工作目录', [
+    '1) 仓库选择卡片：新话题先弹卡片，从扫描到的 git 仓库中选一个再启动（推荐）。',
+    '2) 固定默认目录：新话题直接在指定目录启动、不弹卡片（之后可用 /config 或 botmux setup edit 修改）。',
+  ]);
+  const dirMode = (await ask(rl, '工作目录模式: 1) 仓库选择卡片  2) 固定默认目录  (1/2) [1]: ')).trim();
+  let workingDir: string | undefined;
+  let defaultWorkingDir: string | undefined;
+  if (dirMode === '2') {
+    // 必填 + 存在性校验循环（与 promptRequiredOwner 同款姿势）——运行时 daemon
+    // 对无效 defaultWorkingDir 只会静默回退弹卡，setup 阶段必须挡住。
+    for (;;) {
+      const dir = (await ask(rl, '默认工作目录（新话题直接在此目录启动）: ')).trim();
+      if (!dir) {
+        console.log('   ❌ 固定默认目录模式必须填写目录。');
+        continue;
+      }
+      if (ensureBotDefaultWorkingDirExists({ defaultWorkingDir: dir })) {
+        defaultWorkingDir = dir;
+        break;
+      }
+    }
+  } else {
+    const raw = await ask(rl, '仓库扫描根目录（卡片会列出其下的 git 仓库，逗号分隔多个）[~]: ');
+    workingDir = raw.trim() || '~';
+  }
 
   const bot: Record<string, any> = {
     larkAppId: creds.appId,
@@ -697,9 +749,11 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     cliId,
     // aiden × claude/codex 等启动前缀；普通 CLI 不写此字段。
     ...(wrapperCli ? { wrapperCli } : {}),
-    // 总是写 workingDir, 留空用 '~'. 用户手动编辑 bots.json 时一眼能看到字段
-    // 在哪儿, 不用去 README 查字段名.
-    workingDir: workingDir.trim() || '~',
+    // 仓库选择模式总是写 workingDir（留空用 '~'），用户手动编辑 bots.json 时
+    // 一眼能看到字段在哪儿；固定默认目录模式只写 defaultWorkingDir，扫描根
+    // 回退默认 ~，bots.json 不留多余字段。
+    ...(workingDir ? { workingDir } : {}),
+    ...(defaultWorkingDir ? { defaultWorkingDir } : {}),
   };
   // brand 落盘：只在国际版 (lark) 时写字段，feishu 留空——保持旧 bots.json 干净，
   // 且 botBrand()/normalizeBrand() 读不到时 default 到 feishu，向后兼容。
@@ -726,7 +780,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     bot.allowedUsers = await promptRequiredOwner(rl);
   }
 
-  if (!ensureBotWorkingDirsExist(bot, '默认工作目录')) return null;
+  if (!ensureBotWorkingDirsExist(bot, '仓库扫描根目录')) return null;
 
   return normalizeBotConfig(bot);
 }
@@ -834,11 +888,35 @@ async function promptEditBotConfig(
   ]);
   input.backendType = await ask(rl, `会话后端 backendType [${formatOptionalValue(bot.backendType)}]: `);
 
-  printInputHelp('默认工作目录', [
-    '可选。新会话默认进入的目录，支持逗号分隔多个候选目录。',
-    '留空保留当前值；输入 - 清空并回到默认 ~。',
+  // 新话题工作目录：模式二选一（与 promptBotConfig 的新建流程同款问法）。
+  const currentDirMode = bot.defaultWorkingDir
+    ? `2（固定默认目录: ${bot.defaultWorkingDir}）`
+    : `1（仓库选择卡片，扫描根: ${bot.workingDir ?? '~'}）`;
+  printInputHelp('新话题工作目录', [
+    '1) 仓库选择卡片：新话题先弹卡片选 git 仓库；下一问填卡片的扫描根目录。',
+    '2) 固定默认目录：新话题直接在指定目录启动、不弹卡片。',
+    `当前模式: ${currentDirMode}。留空保留当前配置。`,
   ]);
-  input.workingDir = await ask(rl, `默认工作目录 [${formatOptionalValue(bot.workingDir)}]: `);
+  const dirMode = (await ask(rl, '工作目录模式 (1/2) [保留当前]: ')).trim();
+  if (dirMode === '1') {
+    printInputHelp('仓库扫描根目录', [
+      '仓库选择卡片会列出这些目录下的 git 仓库，支持逗号分隔多个。',
+      '留空保留当前值；输入 - 清空并回到默认 ~。',
+    ]);
+    input.workingDir = await ask(rl, `仓库扫描根目录 [${formatOptionalValue(bot.workingDir)}]: `);
+    if (bot.defaultWorkingDir) {
+      console.log('   已切回仓库选择卡片模式，原固定默认目录将被清空。');
+      input.defaultWorkingDir = '-';
+    }
+  } else if (dirMode === '2') {
+    printInputHelp('固定默认目录', [
+      '新话题直接在此目录启动、不弹仓库选择卡片。',
+      '留空保留当前值；输入 - 清空并回到仓库选择卡片模式。',
+    ]);
+    input.defaultWorkingDir = await ask(rl, `固定默认目录 [${formatOptionalValue(bot.defaultWorkingDir)}]: `);
+  } else if (dirMode) {
+    console.log('   ⚠️ 未识别的选择，保留当前工作目录配置。');
+  }
 
   printInputHelp('允许的用户', [
     '可选。限制哪些飞书用户可以操作机器人，支持完整邮箱（如 alice@example.com）、union_id（on_xxx）或 open_id（ou_xxx），多个值用逗号分隔。',
@@ -921,6 +999,253 @@ async function writeSingleBotConfig(): Promise<boolean> {
   return true;
 }
 
+// ─── Scripted (non-TUI) setup ────────────────────────────────────────────────
+
+/** 脚本化 setup 统一失败出口：--json 输出结构化错误到 stdout，退出码 1。 */
+function failSetupScripted(json: boolean, message: string): void {
+  if (json) console.log(JSON.stringify({ ok: false, error: message }));
+  else console.error(`❌ ${message}`);
+  process.exitCode = 1;
+}
+
+/** 某个（可能带 ~ 前缀的）路径若不存在/不是目录，返回展开后的绝对路径；合法返回 null。 */
+function missingDirResolved(raw: string): string | null {
+  const resolved = resolve(expandHomePath(raw));
+  try {
+    if (statSync(resolved).isDirectory()) return null;
+  } catch { /* not a dir */ }
+  return resolved;
+}
+
+/** workingDir / workingDirs / defaultWorkingDir 里所有无效目录（脚本化模式一次性报全）。 */
+function invalidBotDirs(bot: Record<string, any>): string[] {
+  const invalid = [...invalidWorkingDirs(bot)];
+  const raw = typeof bot.defaultWorkingDir === 'string' ? bot.defaultWorkingDir.trim() : '';
+  if (raw) {
+    const missing = missingDirResolved(raw);
+    if (missing) invalid.push(missing);
+  }
+  return invalid;
+}
+
+/** list/add/edit 的 JSON 输出视图：bot 条目 + 进程名，secret 脱敏（stdout 可能被贴进聊天/日志）。 */
+function botJsonView(bot: Record<string, any>, index: number): Record<string, any> {
+  return {
+    processName: botProcessName(bot, index, PM2_NAME),
+    ...bot,
+    larkAppSecret: maskAppSecret(bot?.larkAppSecret),
+  };
+}
+
+/**
+ * `botmux setup list|add|edit|remove` — 脚本化（非 TUI）bot 管理。
+ * 给 coding agent / 脚本一个字段级稳定接口，不依赖交互问答顺序（管道喂数字
+ * 的老姿势在问题序列变化时会静默错位）。校验口径与 TUI 一致：目录存在性、
+ * owner 必填、凭证变更时的 tenant_access_token 校验，任一失败不写盘。
+ */
+async function cmdSetupScripted(argv: string[]): Promise<void> {
+  const wantsJson = argv.includes('--json');
+  let cmd: SetupCommand;
+  try {
+    cmd = parseSetupCommand(argv);
+  } catch (err: any) {
+    failSetupScripted(wantsJson, err?.message ?? String(err));
+    return;
+  }
+
+  if (cmd.action === 'help') {
+    console.log(SETUP_CLI_USAGE);
+    return;
+  }
+
+  ensureConfigDir();
+  const bots = loadBotsJson();
+
+  if (cmd.action === 'list') {
+    if (cmd.json) {
+      console.log(JSON.stringify(bots.map((b, i) => botJsonView(b, i)), null, 2));
+    } else if (bots.length === 0) {
+      console.log('尚未配置机器人。运行 botmux setup（交互式）或 botmux setup add 添加。');
+    } else {
+      console.log(formatBotConfigTable(bots));
+      console.log('\n完整字段用 --json 查看（secret 脱敏；明文只在 ~/.botmux/bots.json）。');
+    }
+    return;
+  }
+
+  if (cmd.action === 'add') {
+    let bot: Record<string, any>;
+    try {
+      bot = buildBotFromAddFlags(cmd.flags);
+    } catch (err: any) {
+      failSetupScripted(cmd.json, err?.message ?? String(err));
+      return;
+    }
+
+    // 单机器人 .env 老配置：与 TUI「添加新机器人」一致，先迁移进 bots.json 再追加。
+    let existing = bots;
+    let migratedEnv = false;
+    if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
+      const legacy = parseDotEnvToBotConfig();
+      if (legacy.larkAppId && legacy.larkAppSecret) {
+        existing = [legacy];
+        migratedEnv = true;
+      }
+    }
+
+    if (existing.some(b => b?.larkAppId === bot.larkAppId)) {
+      failSetupScripted(cmd.json, `AppID ${bot.larkAppId} 已存在，修改请用 botmux setup edit ${bot.larkAppId}。`);
+      return;
+    }
+    const badDirs = invalidBotDirs(bot);
+    if (badDirs.length > 0) {
+      failSetupScripted(cmd.json, `目录不存在或不是目录: ${badDirs.join(', ')}。请先创建，未写入配置。`);
+      return;
+    }
+
+    // 凭证校验与 TUI 同口径：换不到 tenant_access_token 一律不写盘。
+    const { validateCredentials } = await import('./setup/verify-permissions.js');
+    const v = await validateCredentials(bot.larkAppId, bot.larkAppSecret, botBrand(bot));
+    if (!v.ok) {
+      failSetupScripted(cmd.json, `凭证校验失败 (${v.error}): ${v.message}`);
+      return;
+    }
+
+    writeBotsJsonAtomic([...existing, bot]);
+    if (migratedEnv) renameSync(ENV_FILE, ENV_FILE + '.bak');
+
+    // 开放平台自动配置（权限导入/发版）需要扫码，脚本化模式默认跳过、显式 opt-in。
+    if (cmd.openPlatformAuto) {
+      await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot));
+    }
+
+    const index = existing.length;
+    if (cmd.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        action: 'add',
+        bot: botJsonView(bot, index),
+        botsFile: BOTS_JSON_FILE,
+        envMigrated: migratedEnv || undefined,
+        openPlatform: cmd.openPlatformAuto ? 'attempted' : 'skipped',
+        next: 'botmux restart',
+      }, null, 2));
+    } else {
+      console.log(`✅ 已添加机器人 ${botProcessName(bot, index, PM2_NAME)} (${bot.larkAppId})，共 ${index + 1} 个`);
+      console.log(`   配置文件: ${BOTS_JSON_FILE}`);
+      if (migratedEnv) console.log(`   旧 .env 已迁移并备份: ${ENV_FILE}.bak`);
+      if (!cmd.openPlatformAuto) {
+        console.log('   已跳过开放平台自动配置（权限导入/发版）。需要时加 --open-platform-auto（要扫码），或运行交互式 botmux setup。');
+      }
+      console.log('下一步: botmux restart');
+    }
+    return;
+  }
+
+  if (cmd.action === 'edit') {
+    const index = parseBotSelection(cmd.selector, bots);
+    if (index === undefined) {
+      failSetupScripted(cmd.json, `找不到机器人 "${cmd.selector}"（接受进程名 botmux-N 或 AppID，botmux setup list 可查）。`);
+      return;
+    }
+    const original = bots[index];
+
+    let edited: Record<string, any>;
+    let modelCleared = false;
+    try {
+      const input = editInputFromFlags(cmd.flags);
+      if (Object.keys(input).length === 0) {
+        throw new Error('edit 至少需要一个字段参数（如 --cli codex）。查看用法：botmux setup help');
+      }
+      // 切换 CLI 强制清空旧 model（与 TUI 同理：旧值属于上一个 CLI，套用会 spawn 报错）。
+      const nextCliId = input.cliChoice ? resolveCliId(input.cliChoice) : undefined;
+      if (nextCliId && nextCliId !== (original.cliId ?? 'claude-code') && original.model && input.model === undefined) {
+        input.model = null;
+        modelCleared = true;
+      }
+      edited = applyBotConfigEdits(original, input);
+      assertOwnerWhenChatGroups(edited);
+    } catch (err: any) {
+      failSetupScripted(cmd.json, err?.message ?? String(err));
+      return;
+    }
+
+    const badDirs = invalidBotDirs(edited);
+    if (badDirs.length > 0) {
+      failSetupScripted(cmd.json, `目录不存在或不是目录: ${badDirs.join(', ')}。配置未修改。`);
+      return;
+    }
+
+    const appIdChanged = edited.larkAppId !== original.larkAppId;
+    if (appIdChanged && bots.some((b, i) => i !== index && b?.larkAppId === edited.larkAppId)) {
+      failSetupScripted(cmd.json, `AppID ${edited.larkAppId} 已被另一个机器人使用，配置未修改。`);
+      return;
+    }
+    if (appIdChanged || edited.larkAppSecret !== original.larkAppSecret) {
+      const { validateCredentials } = await import('./setup/verify-permissions.js');
+      const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
+      if (!v.ok) {
+        failSetupScripted(cmd.json, `凭证校验失败 (${v.error}): ${v.message}。配置未修改。`);
+        return;
+      }
+    }
+
+    const nextBots = bots.slice();
+    nextBots[index] = edited;
+    copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+    writeBotsJsonAtomic(nextBots);
+
+    const changed = [...new Set([...Object.keys(original), ...Object.keys(edited)])]
+      .filter(k => JSON.stringify(original[k]) !== JSON.stringify(edited[k]));
+    if (cmd.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        action: 'edit',
+        bot: botJsonView(edited, index),
+        changed,
+        modelCleared: modelCleared || undefined,
+        backup: BOTS_JSON_FILE + '.bak',
+        next: 'botmux restart',
+      }, null, 2));
+    } else {
+      console.log(`✅ 已更新机器人 ${botProcessName(edited, index, PM2_NAME)} (${edited.larkAppId})`);
+      console.log(`   变更字段: ${changed.join(', ') || '（无实际变化）'}`);
+      if (modelCleared) console.log('   ⚠️ 已切换 CLI，原 model 字段已清空（需要时用 --model 或 /config 重设）。');
+      if (appIdChanged) console.log('   ⚠️ LARK_APP_ID 已变更：历史会话/群聊状态不迁移，新应用可能需重新配置开放平台权限。');
+      console.log(`   旧配置已备份: ${BOTS_JSON_FILE}.bak`);
+      console.log('下一步: botmux restart');
+    }
+    return;
+  }
+
+  // remove
+  if (!cmd.yes) {
+    failSetupScripted(cmd.json, '非交互删除需要显式 --yes 确认。');
+    return;
+  }
+  const result = removeBotConfig(bots, cmd.selector);
+  if (!result) {
+    failSetupScripted(cmd.json, `找不到机器人 "${cmd.selector}"（接受进程名 botmux-N 或 AppID，botmux setup list 可查）。`);
+    return;
+  }
+  copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+  writeBotsJsonAtomic(result.bots);
+  if (cmd.json) {
+    console.log(JSON.stringify({
+      ok: true,
+      action: 'remove',
+      removed: botJsonView(result.removed, result.index),
+      remaining: result.bots.length,
+      backup: BOTS_JSON_FILE + '.bak',
+      next: 'botmux restart',
+    }, null, 2));
+  } else {
+    console.log(`✅ 已删除机器人 ${botProcessName(result.removed, result.index, PM2_NAME)} (${result.removed.larkAppId})，剩余 ${result.bots.length} 个`);
+    console.log(`   旧配置已备份: ${BOTS_JSON_FILE}.bak`);
+    console.log('下一步: botmux restart');
+  }
+}
+
 // ─── Commands ────────────────────────────────────────────────────────────────
 
 async function cmdSetup(): Promise<void> {
@@ -982,7 +1307,7 @@ async function cmdSetup(): Promise<void> {
         console.log(`\n❌ 编辑失败: ${err?.message ?? String(err)}`);
         return;
       }
-      if (!ensureBotWorkingDirsExist(edited, '默认工作目录')) {
+      if (!ensureBotWorkingDirsExist(edited, '仓库扫描根目录') || !ensureBotDefaultWorkingDirExists(edited)) {
         rl.close();
         console.log('   配置未修改。');
         return;
@@ -5697,7 +6022,14 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
 switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
-  case 'setup':   await cmdSetup(); break;
+  case 'setup': {
+    // 带子命令（list/add/edit/remove/help）走脚本化非 TUI 模式；空参数 / 纯
+    // flag（如 --no-open-platform-auto）保持原交互 TUI，向后兼容。
+    const setupArgs = process.argv.slice(3);
+    if (isScriptedSetupInvocation(setupArgs)) await cmdSetupScripted(setupArgs);
+    else await cmdSetup();
+    break;
+  }
   case 'start':   await cmdStart(); break;
   case 'stop':    cmdStop(); break;
   case 'restart': await cmdRestart(); break;

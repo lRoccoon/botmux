@@ -91,13 +91,36 @@ Run `botmux setup` and follow the interactive menu:
 1. **New config**: type `1` and press Enter (with an existing config, type `2` to add a bot).
 2. **Create the bot**: type `1` → **Scan-to-create (recommended)**: scan with the Lark mobile app and a PersonalAgent app is created with AppID/AppSecret persisted automatically, **with event subscriptions + bot capability pre-configured** — no manual browser navigation. Uses the official `@larksuiteoapi/node-sdk` device flow. (You can also type `2` to paste AppID/Secret manually — see "Create the app manually" folded below.)
 3. **Pick the CLI**: choose the CLI to bridge (e.g. type `1` for Claude Code).
-4. **Default working dir**: usually the **parent directory** of your git projects (e.g. `~/projects`); new topics scan **downward** for git repos (up to 3 levels). Avoid `~` (too many folders to traverse).
+4. **Working dir for new topics** — pick one of two modes:
+   - **Repo-select card (recommended)**: each new topic pops a card listing scanned git repos to choose from. The follow-up question asks for the **repo scan root(s)** — usually the **parent directory** of your git projects (e.g. `~/projects`, comma-separated for multiple); the card scans **downward** for git repos (up to 3 levels). Avoid `~` (too many folders to traverse).
+   - **Fixed default dir**: new topics start straight in the given directory with **no card** (persisted as `defaultWorkingDir`; change later via `/config` or `botmux setup edit`).
 
 Then comes the **2nd scan**: botmux's built-in Feishu Web login automatically imports permissions, configures the `http://127.0.0.1:9768/callback` redirect URL, and creates + submits a publish version. On failure it falls back and prints the manual steps (folded below) without affecting the config already written; importing only part of the permissions still counts as success — add the rest later on the Open Platform.
 
 > ✅ **Both Feishu (feishu.cn) and Lark international (larksuite.com) tenants are supported.** Scan-to-create auto-detects the tenant brand (China / international) and remembers it — no manual choice needed; the manual paste path asks once. Each bot connects to its own brand's domain, so one machine can run Feishu and Lark bots side by side, with login credentials isolated per app.
 
 At the end, setup validates credentials with a `tenant_access_token` call (only writing `bots.json` on success) and writes the full scope JSON to `~/.botmux/lark-scopes.json` for reference.
+
+<details>
+<summary><b>Scripted (non-TUI) setup</b> — field-level subcommands for coding agents / automation, independent of the interactive question order</summary>
+
+```bash
+botmux setup list --json                     # list bots (secret masked)
+botmux setup add \
+  --app-id cli_xxx --app-secret xxx \
+  --allowed-users alice@example.com \
+  --cli codex --working-dir ~/projects       # add (credentials still validated before writing)
+botmux setup edit botmux-0 --cli claude-code \
+  --default-working-dir /data/proj           # per-field edits; pass - to clear a field
+botmux setup remove botmux-1 --yes           # non-interactive removal requires --yes
+botmux setup help                            # full flag reference
+```
+
+- `--working-dir` is the repo-select card's scan root; `--default-working-dir` is the fixed default dir (new topics start there directly, no card) — the same two modes as the TUI question.
+- `--json` prints machine-readable results (with `ok` / `error`); Open Platform auto-config is skipped by default — opt in with `--open-platform-auto` (requires QR scan).
+- If you previously scripted setup by piping numbered answers into the TUI, migrate to these subcommands: whenever the question sequence changes (this release adds the working-dir mode question), piped answers silently shift.
+
+</details>
 
 ### 3. Start
 
