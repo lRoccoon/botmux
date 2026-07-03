@@ -149,6 +149,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 }));
 
 import { restoreActiveSessions, closeCliMismatchedSessionsForBot } from '../src/core/session-manager.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { forkWorker, closeSession } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -485,6 +486,22 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     for (const s of [queued, adopt, otherBot]) {
       expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
     }
+  });
+
+  it('live-worker mismatch → closes gracefully WITHOUT pre-killing the backing pane', async () => {
+    // With a live worker, closeSession's close IPC lets the worker tear down
+    // its own backing session; a daemon-side hard kill first would race the
+    // worker's exit handling. Pre-kill is reserved for worker-less records.
+    const s = makeActivePersistentSession('om_rt_live');
+    s.cliId = 'codex';
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    (ds as any).worker = { killed: false };
+    vi.mocked(TmuxBackend.killSession).mockClear();
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(TmuxBackend.killSession).not.toHaveBeenCalled();
   });
 
   it('returns 0 when the registry is not initialized', async () => {
