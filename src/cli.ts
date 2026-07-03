@@ -554,24 +554,20 @@ async function finishOpenPlatformSetup(appId: string, brand: 'feishu' | 'lark'):
 }
 
 /**
- * 让用户选"扫码建应用"还是"手动粘 AppID/Secret".
- *
- * 默认走扫码: 调 SDK `registerApp` → 拿 client_id/client_secret. 失败 (用户拒绝/
- * 超时/网络/取消) 一律降级到手动, 不阻塞流程.
- *
- * Codex review 边界:
- * - secret 不进 argv / 日志 / 错误链 (registerApp 内部 safeMsg 已做; 手动模式下
- *   AppSecret 通过 rl.question 异步读取, 不会出现在 process.argv)
- * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
- */
-/**
  * 「选择已有应用」路径：复用/扫码飞书 Web 登录态 → 拉当前账号可见的自建应用
- * 列表 → 交互选择 → 自动读取该应用的 AppSecret。任一步失败返回 ok:false，
- * 调用方降级到手动输入。仅支持飞书 (feishu.cn) 租户（Web console 机制所限）。
+ * 列表 → 交互选择 → 自动读取该应用的 AppSecret。仅支持飞书 (feishu.cn) 租户
+ * （Web console 机制所限）。
+ *
+ * 失败返回区分两类，调用方据此导航：
+ *   - back   — 用户主动退出（列表 Esc / 放弃手动粘 secret）→ 回「飞书应用来源」
+ *   - failed — 技术性失败（登录 / 列表 / console 访问）→ 提示后回「飞书应用来源」
  */
 async function pickExistingAppCredentials(
   rl: ReturnType<typeof createInterface>,
-): Promise<{ ok: true; appId: string; appSecret: string; brand: Brand } | { ok: false }> {
+): Promise<
+  | { ok: true; appId: string; appSecret: string; brand: Brand }
+  | { ok: false; reason: 'back' | 'failed' }
+> {
   const {
     prepareFeishuWebSession,
     createOpenPlatformApiClient,
@@ -589,13 +585,13 @@ async function pickExistingAppCredentials(
   });
   if (!prepared.ok) {
     console.log(`⚠️  飞书 Web 登录失败 (${prepared.reason}): ${prepared.message}`);
-    return { ok: false };
+    return { ok: false, reason: 'failed' };
   }
 
   const clientRes = await createOpenPlatformApiClient(prepared.cookies);
   if (!clientRes.ok) {
     console.log(`⚠️  开放平台访问失败 (${clientRes.reason}): ${clientRes.message}`);
-    return { ok: false };
+    return { ok: false, reason: 'failed' };
   }
 
   let apps;
@@ -603,11 +599,11 @@ async function pickExistingAppCredentials(
     apps = await listOpenPlatformApps(clientRes.client);
   } catch (err: any) {
     console.log(`⚠️  拉取应用列表失败: ${err?.message ?? String(err)}`);
-    return { ok: false };
+    return { ok: false, reason: 'failed' };
   }
   if (apps.length === 0) {
     console.log('⚠️  当前账号名下没有可选的自建应用。');
-    return { ok: false };
+    return { ok: false, reason: 'failed' };
   }
 
   // 已在 bots.json 里的应用打标——可以重复选（比如换机器重配），但要让人知道。
@@ -618,9 +614,9 @@ async function pickExistingAppCredentials(
       label: a.name,
       hint: `${a.clientId}${configured.has(a.clientId) ? ' · 已在 bots.json' : ''}`,
     })),
-    footer: 'Esc 返回',
+    footer: 'Esc 返回上一步',
   });
-  if (idx === null) return { ok: false };
+  if (idx === null) return { ok: false, reason: 'back' };
   const app = apps[idx];
 
   try {
@@ -629,86 +625,114 @@ async function pickExistingAppCredentials(
     return { ok: true, appId: app.clientId, appSecret, brand: 'feishu' };
   } catch (err: any) {
     console.log(`⚠️  自动读取 AppSecret 失败: ${err?.message ?? String(err)}`);
-    const manual = (await ask(rl, `请手动粘贴 ${app.clientId} 的 AppSecret（留空放弃）: `)).trim();
-    if (!manual) return { ok: false };
+    const manual = (await ask(rl, `请手动粘贴 ${app.clientId} 的 AppSecret（留空返回上一步）: `)).trim();
+    if (!manual) return { ok: false, reason: 'back' };
     return { ok: true, appId: app.clientId, appSecret: manual, brand: 'feishu' };
   }
 }
 
+/**
+ * 拿应用凭证：扫码创建新应用 / 选择已有应用 / 手动输入，三选一。
+ *
+ * 导航语义（TTY）：子界面 Esc / 主动放弃一律**返回「飞书应用来源」菜单**，
+ * 只有在来源菜单本身 Esc（或扫码时 Ctrl-C）才取消整个 setup；技术性失败
+ * 提示后同样回到来源菜单，让用户改走其他方式。非 TTY 没有 Esc，保持
+ * 旧的「失败降级手动输入」直落语义，避免菜单循环在管道输入下打转。
+ *
+ * Codex review 边界:
+ * - secret 不进 argv / 日志 / 错误链 (registerApp 内部 safeMsg 已做; 手动模式下
+ *   AppSecret 通过 rl.question 异步读取, 不会出现在 process.argv)
+ * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
+ */
 async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
   | { ok: true; appId: string; appSecret: string; brand: Brand; userOpenId?: string }
   | { ok: false; reason: 'cancelled' }
 > {
+  const interactive = process.stdin.isTTY && process.stdout.isTTY;
   console.log('── 飞书应用 ──\n');
-  const method = await pickChoice(rl, {
-    title: '飞书应用来源',
-    items: [
-      { label: '扫码创建新应用（推荐）', hint: '飞书 App 扫码，自动创建并拿到 AppID/Secret' },
-      { label: '选择已有应用', hint: '飞书 Web 登录列出你创建过的应用，自动取 AppID/Secret（仅飞书租户）' },
-      { label: '手动输入 AppID/Secret', hint: '已在开放平台创建好应用' },
-    ],
-    defaultIndex: 0,
-    footer: 'Esc 取消 setup',
-  });
-  if (method === null) return { ok: false, reason: 'cancelled' };
+  for (;;) {
+    const method = await pickChoice(rl, {
+      title: '飞书应用来源',
+      items: [
+        { label: '扫码创建新应用（推荐）', hint: '飞书 App 扫码，自动创建并拿到 AppID/Secret' },
+        { label: '选择已有应用', hint: '飞书 Web 登录列出你创建过的应用，自动取 AppID/Secret（仅飞书租户）' },
+        { label: '手动输入 AppID/Secret', hint: '已在开放平台创建好应用' },
+      ],
+      defaultIndex: 0,
+      footer: 'Esc 取消 setup',
+    });
+    if (method === null) return { ok: false, reason: 'cancelled' };
 
-  if (method === 0) {
-    // 动态导入避免冷启动加载 SDK
-    const { tryRegisterApp } = await import('./setup/register-app.js');
-    const result = await tryRegisterApp();
-    if (result.ok) {
-      // brand 由扫码 device flow 的 tenant_brand 自动识别（registerApp 内部已
-      // 切到对应域名轮询）。feishu / lark 都直接落盘——daemon 链路全程从
-      // BotConfig.brand 派生 host（Client / WSClient domain、裸 fetch、深链）。
-      console.log(`\n✅ 应用创建成功`);
-      console.log(`   App ID: ${result.appId}`);
-      console.log(`   租户类型: ${result.brand === 'lark' ? 'Lark 国际版 (larksuite.com)' : '飞书 (feishu.cn)'}`);
-      if (result.userOpenId) {
-        console.log(`   扫码人 open_id: ${result.userOpenId}（将默认作为 allowedUsers）`);
+    if (method === 0) {
+      // 动态导入避免冷启动加载 SDK
+      const { tryRegisterApp } = await import('./setup/register-app.js');
+      const result = await tryRegisterApp();
+      if (result.ok) {
+        // brand 由扫码 device flow 的 tenant_brand 自动识别（registerApp 内部已
+        // 切到对应域名轮询）。feishu / lark 都直接落盘——daemon 链路全程从
+        // BotConfig.brand 派生 host（Client / WSClient domain、裸 fetch、深链）。
+        console.log(`\n✅ 应用创建成功`);
+        console.log(`   App ID: ${result.appId}`);
+        console.log(`   租户类型: ${result.brand === 'lark' ? 'Lark 国际版 (larksuite.com)' : '飞书 (feishu.cn)'}`);
+        if (result.userOpenId) {
+          console.log(`   扫码人 open_id: ${result.userOpenId}（将默认作为 allowedUsers）`);
+        }
+        return {
+          ok: true,
+          appId: result.appId,
+          appSecret: result.appSecret,
+          brand: result.brand,
+          userOpenId: result.userOpenId,
+        };
       }
-      return {
-        ok: true,
-        appId: result.appId,
-        appSecret: result.appSecret,
-        brand: result.brand,
-        userOpenId: result.userOpenId,
-      };
+      console.log(`\n⚠️  扫码失败 (${result.error}): ${result.message}`);
+      if (result.error === 'aborted') {
+        // 用户主动取消整个 setup, 不再问手动 fallback
+        return { ok: false, reason: 'cancelled' };
+      }
+      if (interactive) {
+        console.log('   已返回「飞书应用来源」，可重试或改走其他方式。\n');
+        continue;
+      }
+      console.log('   降级到手动输入 AppID/Secret。\n');
     }
-    console.log(`\n⚠️  扫码失败 (${result.error}): ${result.message}`);
-    if (result.error === 'aborted') {
-      // 用户主动取消整个 setup, 不再问手动 fallback
+
+    if (method === 1) {
+      const existing = await pickExistingAppCredentials(rl);
+      if (existing.ok) return existing;
+      if (interactive) {
+        // back（Esc / 主动放弃）静默回菜单；failed 已打印过原因，补一句导航。
+        if (existing.reason === 'failed') console.log('   已返回「飞书应用来源」，可重试或改走其他方式。\n');
+        continue;
+      }
+      console.log('   降级到手动输入 AppID/Secret。\n');
+    }
+
+    // 手动输入（method 2；非 TTY 下也是 0/1 失败后的直落兜底）：扫码路径已用
+    // tenant_brand 自动识别；手动路径没有这个信号，兜底让用户手选租户类型
+    // （决定建应用 / 运行时的域名）。
+    const brandIdx = await pickChoice(rl, {
+      title: '租户类型',
+      items: [
+        { label: '飞书（中国版）', hint: 'open.feishu.cn' },
+        { label: 'Lark（国际版）', hint: 'open.larksuite.com' },
+      ],
+      defaultIndex: 0,
+      footer: 'Esc 返回上一步',
+    });
+    if (brandIdx === null && interactive) continue; // Esc → 回「飞书应用来源」
+    const brand: Brand = brandIdx === 1 ? 'lark' : 'feishu';
+
+    console.log(`\n请在浏览器打开 ${larkHosts(brand).openApi}/app 创建应用，然后回来粘 ID/Secret。\n`);
+    const appId = (await ask(rl, 'AppID (cli_xxx): ')).trim();
+    const appSecret = (await ask(rl, 'AppSecret: ')).trim();
+
+    if (!appId || !appSecret) {
+      console.log('\n❌ AppID/AppSecret 不能为空，setup 中止。');
       return { ok: false, reason: 'cancelled' };
     }
-    console.log('   降级到手动输入 AppID/Secret。\n');
+    return { ok: true, appId, appSecret, brand };
   }
-
-  if (method === 1) {
-    const existing = await pickExistingAppCredentials(rl);
-    if (existing.ok) return existing;
-    console.log('   降级到手动输入 AppID/Secret。\n');
-  }
-
-  // 手动 fallback / 手动选项：扫码路径已用 tenant_brand 自动识别；手动路径
-  // 没有这个信号，兜底让用户手选租户类型（决定建应用 / 运行时的域名）。
-  const brandIdx = await pickChoice(rl, {
-    title: '租户类型',
-    items: [
-      { label: '飞书（中国版）', hint: 'open.feishu.cn' },
-      { label: 'Lark（国际版）', hint: 'open.larksuite.com' },
-    ],
-    defaultIndex: 0,
-  });
-  const brand: Brand = brandIdx === 1 ? 'lark' : 'feishu';
-
-  console.log(`\n请在浏览器打开 ${larkHosts(brand).openApi}/app 创建应用，然后回来粘 ID/Secret。\n`);
-  const appId = (await ask(rl, 'AppID (cli_xxx): ')).trim();
-  const appSecret = (await ask(rl, 'AppSecret: ')).trim();
-
-  if (!appId || !appSecret) {
-    console.log('\n❌ AppID/AppSecret 不能为空，setup 中止。');
-    return { ok: false, reason: 'cancelled' };
-  }
-  return { ok: true, appId, appSecret, brand };
 }
 
 /**
