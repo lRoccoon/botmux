@@ -9,10 +9,14 @@
  * onboarding 第二个二维码同一个飞书 Web QR 登录流程）→ onQrCode 渲染二维码给前端
  * 轮询展示 → 扫码成功即写回 feishu-session.json，之后改名直接走真·改名路径。
  *
- * 进程边界：dashboard 与所有 daemon 同机（proxyToDaemon 走 127.0.0.1），
- * feishu-session.json 是机器级共享文件——dashboard 进程写、任何 daemon 改名读，
- * 无需 per-bot / 跨机协调。因此本 manager 是**机器级单例**（不按 bot 区分），
- * 与 {@link BotOnboardingManager} 同进程、同二维码渲染基础设施。
+ * 进程边界（重要前提）：当前部署模型下 dashboard 与所有 daemon **同机**
+ * （proxyToDaemon 走 127.0.0.1），feishu-session.json 是机器级共享文件——
+ * dashboard 进程写、任何 daemon 改名读，无需 per-bot / 跨机协调。因此本 manager
+ * 是**机器级单例**（不按 bot 区分），与 {@link BotOnboardingManager} 同进程、
+ * 同二维码渲染基础设施。⚠️ 若将来把 dashboard 与 daemon 拆到不同机器，这条
+ * 「同机共享文件」假设即失效：改名 daemon 读不到 dashboard 那台写的 session，
+ * 届时需把 session jar 下发到目标机、或把登录 manager 下沉到 daemon 侧
+ * （proxyToDaemon 到具体 bot 的 daemon 执行登录，写它自己机器的 session）。
  */
 import {
   prepareFeishuWebSession,
