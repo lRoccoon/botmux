@@ -47,6 +47,54 @@ describe('tmuxEnv()', () => {
     expect(stripped.TMUX_TMPDIR).toBe('/custom/tmp');
   });
 
+  it('strips botmux session/bot-scoped vars so they never seed the tmux server global env', () => {
+    // The leak this guards against: the first `tmux new-session` copies its
+    // client env into the server's *global* env, which then bleeds into the
+    // user's own co-tenant tmux sessions → a plain Claude Code there inherits
+    // BOTMUX_SESSION_ID/CHAT_ID and misroutes its AskUserQuestion hook to Lark.
+    const stripped = tmuxEnv({
+      BOTMUX: '1',
+      BOTMUX_SESSION_ID: '190222fc-bc5f-4481-849b-6161901b8506',
+      BOTMUX_CHAT_ID: 'oc_abc',
+      BOTMUX_LARK_APP_ID: 'cli_x',
+      BOTMUX_ROOT_MESSAGE_ID: 'om_x',
+      BOTMUX_BOT_INDEX: '12',           // daemon-internal, swept by the BOTMUX prefix
+      BOTMUX_QUIET_RESTART: '1',
+      SESSION_DATA_DIR: '/root/.botmux/data',
+      IS_SANDBOX: '1',
+      CLAUDE_CONFIG_DIR: '/root/.seed/.claude-runtime',
+      __OWNER_OPEN_ID: 'ou_x',
+      LARK_APP_ID: 'cli_bot',           // bare creds must not seed the global either
+      LARK_APP_SECRET: 'secret',
+      CLAUDECODE: '1',
+      // Legit passthrough — the tmux client still needs these.
+      PATH: '/usr/bin',
+      HOME: '/root',
+      LANG: 'en_US.UTF-8',
+      TERM: 'tmux-256color',
+    });
+    for (const leaked of [
+      'BOTMUX', 'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID',
+      'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_BOT_INDEX', 'BOTMUX_QUIET_RESTART',
+      'SESSION_DATA_DIR', 'IS_SANDBOX', 'CLAUDE_CONFIG_DIR', '__OWNER_OPEN_ID',
+      'LARK_APP_ID', 'LARK_APP_SECRET', 'CLAUDECODE',
+    ]) {
+      expect(stripped[leaked]).toBeUndefined();
+    }
+    // Non-botmux env the tmux client legitimately needs survives.
+    expect(stripped.HOME).toBe('/root');
+    expect(stripped.LANG).toBe('en_US.UTF-8');
+    expect(stripped.TERM).toBe('tmux-256color');
+    expect(stripped.PATH?.split(':')[0]).toBe('/usr/bin');
+  });
+
+  it('does not strip lookalike keys that merely contain "BOTMUX" mid-name', () => {
+    // The sweep is a prefix match (startsWith), not a substring match, so a
+    // user var like MY_BOTMUX_HINT is left untouched.
+    const stripped = tmuxEnv({ MY_BOTMUX_HINT: 'keep', PATH: '/usr/bin' });
+    expect(stripped.MY_BOTMUX_HINT).toBe('keep');
+  });
+
   it('is safe to call with no args (defaults to process.env)', () => {
     const stripped = tmuxEnv();
     expect(stripped.TMUX).toBeUndefined();

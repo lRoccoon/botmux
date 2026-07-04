@@ -4,7 +4,7 @@ import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
-import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import { REDACTED_CHILD_ENV_KEYS, isBotmuxManagedTmuxEnvKey } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
@@ -19,6 +19,9 @@ import { isExecutable } from '../../utils/executable.js';
  * global env. Key names are fixed identifiers — no shell-escaping needed.
  */
 const REDACTED_ENV_UNSET_CLAUSE = `unset ${REDACTED_CHILD_ENV_KEYS.join(' ')}`;
+
+/** Guard so the server-global-env self-heal runs at most once per daemon process. */
+let serverGlobalEnvScrubbed = false;
 
 /**
  * TmuxBackend — session backend using tmux for process persistence.
@@ -166,6 +169,60 @@ export class TmuxBackend implements SessionBackend {
   }
 
   /**
+   * One-time self-heal: strip botmux-managed keys from the tmux SERVER's global
+   * environment. A server booted by an upgraded botmux is already clean (tmuxEnv
+   * strips the client env before `new-session`), but a server started by an
+   * OLDER botmux — or one that has outlived many daemon restarts — still carries
+   * a stale BOTMUX_SESSION_ID / BOTMUX_CHAT_ID / SESSION_DATA_DIR / … in its
+   * global env. That leaks into every co-tenant session on the socket (the
+   * user's own `tmux`), whose Claude Code then misroutes its AskUserQuestion
+   * hook to the leaked thread.
+   *
+   * Scrubbing the global table does NOT touch already-running panes' process
+   * environments — only panes created AFTER the scrub inherit the cleaned table
+   * — so this is safe to run against a live server with active sessions: no
+   * running bmx-* CLI is disturbed, and the user's next new pane comes up clean.
+   * Runs once per daemon process (any spawn/reattach triggers it).
+   */
+  static scrubServerGlobalEnvOnce(): void {
+    if (serverGlobalEnvScrubbed) return;
+    serverGlobalEnvScrubbed = true;
+    let names: string[];
+    try {
+      const out = execFileSync('tmux', ['show-environment', '-g'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+        env: tmuxEnv(),
+      });
+      names = out.split('\n')
+        // `show-environment -g` prints `NAME=value`, or `-NAME` for a var that
+        // was explicitly removed. Take the name in both shapes.
+        .map(line => (line.startsWith('-') ? line.slice(1) : line.split('=', 1)[0]).trim())
+        .filter(name => name.length > 0 && isBotmuxManagedTmuxEnvKey(name));
+    } catch {
+      // No server running yet (nothing to scrub — a fresh one boots clean) or
+      // tmux unavailable. Benign.
+      return;
+    }
+    for (const name of new Set(names)) {
+      try {
+        // `-u` fully removes the entry from the global table (a genuinely clean
+        // `show-environment -g`); `-r` would only leave a `-NAME` tombstone.
+        // Both stop new panes from inheriting it, but the re-seed vector is
+        // already closed (tmuxEnv strips the client env), so remove it outright.
+        execFileSync('tmux', ['set-environment', '-g', '-u', name], {
+          stdio: 'ignore',
+          timeout: 2000,
+          env: tmuxEnv(),
+        });
+      } catch {
+        // Var may have been removed concurrently — benign.
+      }
+    }
+  }
+
+  /**
    * Create a parked diagnostic session after a CLI has exited. The worker uses
    * this only after it has already captured the failed pane's output, so the
    * browser can still attach to `bmx-*` and see the startup error while daemon
@@ -203,6 +260,9 @@ export class TmuxBackend implements SessionBackend {
   // ─── SessionBackend implementation ────────────────────────────────────────
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    // Self-heal a server polluted by a pre-upgrade botmux before we touch it
+    // (once per daemon process; no-op on a server this build booted clean).
+    TmuxBackend.scrubServerGlobalEnvOnce();
     this.reattaching = TmuxBackend.hasSession(this.sessionName);
     logger.debug(
       `[tmux:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +

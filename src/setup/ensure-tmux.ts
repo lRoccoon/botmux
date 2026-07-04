@@ -24,6 +24,7 @@ import { execSync, spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
+import { isBotmuxManagedTmuxEnvKey } from '../utils/child-env.js';
 
 export interface TmuxResult {
   installed: boolean;
@@ -82,6 +83,16 @@ function probeTmuxVersion(): string | undefined {
  * when forwarding caller-provided env). TMUX_TMPDIR is intentionally left
  * alone — it just changes the socket directory and is the user's deliberate
  * override if set.
+ *
+ * tmuxEnv ALSO strips botmux's own session/bot-scoped vars
+ * (isBotmuxManagedTmuxEnvKey): when botmux's first `tmux new-session` boots the
+ * server, tmux copies this client env into the server's *global* environment,
+ * which then leaks into every co-tenant session on the socket — including the
+ * user's own interactive tmux, whose Claude Code would then misroute its
+ * AskUserQuestion hook to whatever BOTMUX_SESSION_ID/CHAT_ID it inherited. The
+ * pane gets the correct per-session values from the env(1) wrapper injection
+ * instead, so this strip is invisible to botmux's own sessions. See
+ * TMUX_CLIENT_STRIP_KEYS in utils/child-env.ts.
  */
 const TMUX_PATH_EXTRAS = [
   '/opt/homebrew/bin',
@@ -106,7 +117,14 @@ function withTmuxSearchPath(pathValue: string | undefined): string {
 }
 
 export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const { TMUX: _tmux, TMUX_PANE: _pane, ...rest } = env;
+  const rest: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    // TMUX/TMUX_PANE would re-target a dead parent server; botmux-managed keys
+    // would seed the server's shared global env and leak to co-tenant sessions.
+    if (key === 'TMUX' || key === 'TMUX_PANE') continue;
+    if (isBotmuxManagedTmuxEnvKey(key)) continue;
+    rest[key] = value;
+  }
   return {
     ...rest,
     PATH: withTmuxSearchPath(rest.PATH),

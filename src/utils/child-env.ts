@@ -16,6 +16,44 @@
 export const REDACTED_CHILD_ENV_KEYS = ['LARK_APP_ID', 'LARK_APP_SECRET', 'CLAUDECODE'] as const;
 
 /**
+ * Botmux-managed, session/bot-scoped env keys that reach the CLI pane via the
+ * `/usr/bin/env KEY=VAL` wrapper injection (buildBotmuxEnvAssignments), NOT via
+ * the tmux client env. They MUST be stripped from the env handed to the `tmux`
+ * binary (see tmuxEnv), because the first `tmux new-session` that boots a server
+ * copies its client env into the server's *global* environment — which then
+ * leaks into every co-tenant session sharing that socket, including the user's
+ * own interactive tmux. A leaked `BOTMUX_SESSION_ID` / `BOTMUX_CHAT_ID` makes a
+ * plain Claude Code run in the user's terminal believe it is a botmux session
+ * and misroute its AskUserQuestion hook to a Lark thread. Stripping is invisible
+ * to botmux's own sessions: the pane still gets the correct per-session values
+ * from the env(1) injection, which lands after rcfile load.
+ *
+ * The `BOTMUX` prefix is swept wholesale by {@link isBotmuxManagedTmuxEnvKey}
+ * (covers daemon-internal BOTMUX_BOT_INDEX / BOTMUX_QUIET_RESTART / … that were
+ * never meant to reach a pane). These non-prefixed keys are listed explicitly;
+ * the bare IM-app creds are folded in from REDACTED_CHILD_ENV_KEYS so a server
+ * botmux bootstraps can never seed them into its global env either.
+ */
+const TMUX_CLIENT_STRIP_KEYS: readonly string[] = [
+  '__OWNER_OPEN_ID',
+  'SESSION_DATA_DIR',
+  'IS_SANDBOX',
+  'CLAUDE_CONFIG_DIR',
+  'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
+  'CJADK_INTERACTIVE',
+  ...REDACTED_CHILD_ENV_KEYS,
+];
+
+/**
+ * True for any env key botmux manages and must keep out of the (shared) tmux
+ * server global environment. Used by tmuxEnv() to strip the tmux client env and
+ * by TmuxBackend.scrubServerGlobalEnvOnce() to clean an already-polluted server.
+ */
+export function isBotmuxManagedTmuxEnvKey(key: string): boolean {
+  return key.startsWith('BOTMUX') || TMUX_CLIENT_STRIP_KEYS.includes(key);
+}
+
+/**
  * Build the base environment for a spawned CLI child: copy the worker's env
  * and REMOVE the keys in REDACTED_CHILD_ENV_KEYS.
  *
