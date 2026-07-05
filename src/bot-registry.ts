@@ -11,6 +11,7 @@ import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizePluginIdList } from './core/plugins/ids.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
@@ -358,6 +359,9 @@ export interface BotConfig {
    * 性质不变。可由 /grant 卡片「全局」按钮写入，也可在 bots.json 手配 open_id。
    */
   globalGrants?: string[];
+  /** Plugin ids enabled for this bot. Runtime effective set is
+   *  global config `plugins` union this list. */
+  plugins?: string[];
   /**
    * 消息额度机制（默认关闭）。`defaultLimit` 的"是否配置"本身就是开关：
    *   • 未配置（undefined）→ 关闭：无显式数字的 /grant 仍是"无限授权"（当前行为）。
@@ -1056,6 +1060,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
     const skills = readBotSkillPolicy(entry.skills);
+    const plugins = normalizePluginIdList(entry.plugins);
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
 
@@ -1130,6 +1135,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       startupCommands,
       env,
       skills,
+      plugins,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.

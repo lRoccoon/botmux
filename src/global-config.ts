@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizePluginIdList } from './core/plugins/ids.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 
@@ -53,6 +54,9 @@ export interface GlobalConfig {
   /** Machine-wide user skill registry policy. Skill package storage itself lives under
    *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
   skills?: GlobalSkillConfig;
+  /** Machine-wide default plugin ids enabled for every bot. Per-bot plugins in
+   *  bots.json are unioned with this list at session/runtime resolution time. */
+  plugins?: string[];
   /** 远程访问. When true (and this machine is bound to the central platform),
    *  session web-terminal links, Feishu card terminal buttons, and connector
    *  webhook URLs use the central-platform machine subdomain instead of local
@@ -277,6 +281,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   const skills = readGlobalSkills(raw.skills);
   if (skills) out.skills = skills;
+  const plugins = normalizePluginIdList(raw.plugins);
+  if (plugins) out.plugins = plugins;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
   readCache = { path, value: out, at: Date.now() };
   return out;

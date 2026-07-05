@@ -98,6 +98,8 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo } from './platform/tunnel-client.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { readPluginRegistry } from './services/plugin-registry-store.js';
+import { pluginCurrentDir, resolvePluginPath } from './core/plugins/paths.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -511,6 +513,43 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
     res.writeHead(200, headers);
     res.end(readFileSync(fp));
     return true;
+  } catch {
+    return false;
+  }
+}
+
+function listDashboardPluginEntries(): Array<{ pluginId: string; id: string; route: string; entry: string; url: string; displayName?: string }> {
+  const out: Array<{ pluginId: string; id: string; route: string; entry: string; url: string; displayName?: string }> = [];
+  for (const record of Object.values(readPluginRegistry().plugins)) {
+    for (const entry of record.manifest.dashboard ?? []) {
+      out.push({
+        pluginId: record.id,
+        id: entry.id,
+        route: entry.route,
+        entry: entry.entry,
+        url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
+        ...(record.manifest.displayName ? { displayName: record.manifest.displayName } : {}),
+      });
+    }
+  }
+  return out.sort((a, b) => a.pluginId.localeCompare(b.pluginId) || a.id.localeCompare(b.id));
+}
+
+function servePluginStatic(res: ServerResponse, pathname: string): boolean {
+  const match = pathname.match(/^\/plugins\/([^/]+)\/(.+)$/);
+  if (!match) return false;
+  const pluginId = decodeURIComponent(match[1]);
+  const relPath = decodeURIComponent(match[2]);
+  const record = readPluginRegistry().plugins[pluginId];
+  if (!record) return false;
+  const dashboardEntries = record.manifest.dashboard ?? [];
+  const allowed = dashboardEntries.some((entry) => {
+    const base = entry.entry.replace(/\/[^/]*$/, '/');
+    return relPath === entry.entry || relPath.startsWith(base);
+  });
+  if (!allowed) return false;
+  try {
+    return serveFileAbs(res, resolvePluginPath(pluginCurrentDir(pluginId), relPath, 'dashboard_asset'));
   } catch {
     return false;
   }
@@ -1115,6 +1154,15 @@ const server = createServer(async (req, res) => {
       });
       res.end();
       return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/plugins/dashboard') {
+      return jsonRes(res, 200, { plugins: listDashboardPluginEntries() });
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/plugins/')) {
+      if (servePluginStatic(res, url.pathname)) return;
+      res.writeHead(404); res.end(); return;
     }
 
     // ─── Static frontend (index.html + /assets/* + /game/*) ────────────────

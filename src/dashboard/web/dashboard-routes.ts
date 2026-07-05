@@ -13,6 +13,15 @@ export interface DashboardRoute {
 
 export const dashboardRoutes: DashboardRoute[] = [
   {
+    id: 'plugins',
+    routePrefix: '#/plugins',
+    rerenderOnUiChange: false,
+    load: async () => {
+      const mod = await import('./plugin-page.js');
+      return root => { void mod.renderPluginPage(root); };
+    },
+  },
+  {
     id: 'legacy-workflow',
     routePrefix: '#/legacy-workflow',
     load: async () => {
