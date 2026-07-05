@@ -49,7 +49,7 @@ import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from './utils/instal
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
 import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
-import { spawnDetachedRestart, npmGlobalUpdateLockTarget } from './core/maintenance.js';
+import { spawnDetachedRestart, npmGlobalUpdateLockTarget, npmGlobalUpdateCwd } from './core/maintenance.js';
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
@@ -422,6 +422,7 @@ async function cachedChangelog(current: string, now = Date.now()): Promise<Chang
 function runNpmInstallLatest(): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const child = spawn('npm', ['install', '-g', 'botmux@latest'], {
+      cwd: npmGlobalUpdateCwd(),
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: process.platform === 'win32', // resolve npm.cmd on Windows

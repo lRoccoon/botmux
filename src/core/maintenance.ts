@@ -144,6 +144,11 @@ export function maintenanceRestartLogPath(): string {
   return join(homedir(), '.botmux', 'logs', 'maintenance-restart.log');
 }
 
+/** Stable cwd for global npm updates; avoids inheriting a deleted daemon cwd. */
+export function npmGlobalUpdateCwd(): string {
+  return homedir();
+}
+
 /**
  * Cross-process lock target that serializes `npm install -g botmux@latest`
  * between the scheduled auto-update (this daemon process) and a
@@ -235,7 +240,7 @@ function productionDeps(): MaintenanceDeps {
       // timeout fast so the tick logs it and slips to the next day (the manual
       // update is already bumping to latest anyway).
       withFileLockSync(npmGlobalUpdateLockTarget(), () => {
-        execSync('npm install -g botmux@latest', { stdio: 'inherit' });
+        execSync('npm install -g botmux@latest', { cwd: npmGlobalUpdateCwd(), stdio: 'inherit' });
       }, { maxWaitMs: 500 });
     },
     writeIntent: (intent) => writeRestartIntent(intent),

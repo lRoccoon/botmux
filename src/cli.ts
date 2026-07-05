@@ -67,6 +67,7 @@ import { firstPositional } from './cli/arg-utils.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { npmGlobalUpdateCwd } from './core/maintenance.js';
 import { loadDashboardSecret } from './dashboard/auth.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
@@ -2182,7 +2183,7 @@ function cmdStatus(): void {
 function cmdUpgrade(): void {
   console.log('🔄 升级中...');
   try {
-    execSync('npm install -g botmux@latest', { stdio: 'inherit' });
+    execSync('npm install -g botmux@latest', { cwd: npmGlobalUpdateCwd(), stdio: 'inherit' });
     console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
   } catch {
     console.error('❌ 升级失败，请手动运行: npm install -g botmux@latest');
