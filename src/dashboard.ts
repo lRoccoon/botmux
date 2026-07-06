@@ -235,6 +235,10 @@ function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: stri
       const child = spawn(process.execPath, [botmuxCliEntry(), 'start-bot', appId, '--json'], {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
+        // Run from HOME, not the dashboard's cwd (pm2 `cwd: PKG_ROOT`): a global
+        // npm update replaces that dir, so a still-running dashboard would spawn
+        // start-bot in a deleted directory (uv_cwd/ENOENT). See npmGlobalUpdateCwd.
+        cwd: npmGlobalUpdateCwd(),
       });
       const timer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch { /* already gone */ }
