@@ -144,7 +144,14 @@ export function maintenanceRestartLogPath(): string {
   return join(homedir(), '.botmux', 'logs', 'maintenance-restart.log');
 }
 
-/** Stable cwd for global npm updates; avoids inheriting a deleted daemon cwd. */
+/**
+ * Stable cwd (HOME) for spawns that must not inherit a possibly-deleted cwd.
+ * A global npm update replaces the botmux package dir, so any process whose cwd
+ * points there (notably the dashboard, started by pm2 with `cwd: PKG_ROOT`) is
+ * left holding a deleted directory. Both the `npm install -g` child and the
+ * detached restart driver spawned afterwards would then die at startup reading
+ * cwd (`uv_cwd`/ENOENT). Pinning them to HOME sidesteps that entirely.
+ */
 export function npmGlobalUpdateCwd(): string {
   return homedir();
 }
@@ -213,6 +220,10 @@ export function spawnDetachedRestart(reason: string): void {
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
     env: process.env,
+    // Run from HOME, not the caller's cwd: the dashboard (cwd: PKG_ROOT) triggers
+    // this right after a global npm update replaced that dir, so inheriting it
+    // would start the restart driver in a deleted directory. See npmGlobalUpdateCwd.
+    cwd: npmGlobalUpdateCwd(),
   });
   // A detached child's 'error' (e.g. spawn ENOENT) would otherwise throw
   // unhandled and crash this process — log it instead.
