@@ -11,6 +11,7 @@ import {
   createDashboardRouteState,
   loadAndRenderDashboardRoute,
 } from './route-lifecycle.js';
+import { maybeReloadBrowserForStaleRouteChunk } from './stale-chunk-reload.js';
 
 const root = document.getElementById('root')!;
 
@@ -284,6 +285,12 @@ async function route() {
     );
   } catch (err) {
     if (seq !== routeState.seq) return;
+    if (maybeReloadBrowserForStaleRouteChunk(err, {
+      href: window.location.href,
+      hash,
+      getSessionStorage: () => window.sessionStorage,
+      reload: () => window.location.reload(),
+    })) return;
     root.innerHTML = `<section class="page"><div class="empty">Dashboard route failed: ${escapeHtml(String(err))}</div></section>`;
     routeState.pageDispose = null;
     routeState.rerenderOnUiChange = true;
