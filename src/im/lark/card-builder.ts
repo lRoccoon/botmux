@@ -1859,27 +1859,31 @@ export function buildAdoptSelectCard(
     };
   });
 
-  const elements: any[] = [
-    {
-      tag: 'div',
-      text: { tag: 'lark_md', content: t('card.adopt.section_live', undefined, locale) },
-    },
-    {
-      tag: 'action',
-      actions: [
-        {
-          tag: 'select_static',
-          placeholder: { tag: 'plain_text', content: t('card.adopt.placeholder_select', undefined, locale) },
-          options,
-          value: { key: 'adopt_select', root_id: rootMessageId ?? '' },
-        },
-      ],
-    },
-  ];
+  const elements: any[] = [];
+
+  if (options.length > 0) {
+    elements.push(
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: t('card.adopt.section_live', undefined, locale) },
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'select_static',
+            placeholder: { tag: 'plain_text', content: t('card.adopt.placeholder_select', undefined, locale) },
+            options,
+            value: { key: 'adopt_select', root_id: rootMessageId ?? '' },
+          },
+        ],
+      },
+    );
+  }
 
   if (resumeOptions.length > 0) {
     elements.push(
-      { tag: 'hr' },
+      ...(elements.length > 0 ? [{ tag: 'hr' }] : []),
       {
         tag: 'div',
         text: { tag: 'lark_md', content: t('card.adopt.section_resume', undefined, locale) },

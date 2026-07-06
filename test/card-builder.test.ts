@@ -18,6 +18,7 @@ import {
   buildRelayPickerCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildAdoptSelectCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -84,6 +85,10 @@ function expectDirectUrl(actual: string, targetUrl: string): void {
   expect(actual).toBe(targetUrl);
 }
 
+function selectStaticActions(card: any): any[] {
+  return allActions(card).filter((a: any) => a.tag === 'select_static');
+}
+
 /** Opt into the Feishu sidebar wrapper for the current (isolated) HOME. */
 function enableOpenTerminalInFeishu(): void {
   writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { openTerminalInFeishu: true } }));
@@ -130,6 +135,53 @@ describe('getCliDisplayName', () => {
 
   it('should return "Pi" for pi', () => {
     expect(getCliDisplayName('pi')).toBe('Pi');
+  });
+});
+
+describe('buildAdoptSelectCard', () => {
+  it('does not render an empty live-session select when only resumable sessions exist', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'zh', [
+      {
+        cliSessionId: 'claude-session-1',
+        cwd: '/repo/botmux',
+        title: '继续之前的排查',
+        lastActivityAt: Date.now(),
+      },
+    ]));
+
+    const selects = selectStaticActions(card);
+    expect(selects).toHaveLength(1);
+    expect(selects[0].value.key).toBe('adopt_resume_select');
+    expect(selects[0].options).toHaveLength(1);
+    expect(selects[0].options.length).toBeGreaterThan(0);
+    expect(card.elements.some((e: any) => e.tag === 'hr')).toBe(false);
+  });
+
+  it('renders both live and resumable selects when both groups are non-empty', () => {
+    const card = parse(buildAdoptSelectCard([
+      {
+        source: 'tmux',
+        tmuxTarget: '0:1.0',
+        cliPid: 1234,
+        cliId: 'claude-code',
+        cwd: '/repo/live',
+        paneCols: 120,
+        paneRows: 40,
+      },
+    ], 'om_root', 'zh', [
+      {
+        cliSessionId: 'claude-session-1',
+        cwd: '/repo/history',
+        title: '历史会话',
+        lastActivityAt: Date.now(),
+      },
+    ]));
+
+    const selects = selectStaticActions(card);
+    expect(selects).toHaveLength(2);
+    expect(selects.map((s: any) => s.value.key)).toEqual(['adopt_select', 'adopt_resume_select']);
+    expect(selects.every((s: any) => s.options.length > 0)).toBe(true);
+    expect(card.elements.some((e: any) => e.tag === 'hr')).toBe(true);
   });
 });
 
