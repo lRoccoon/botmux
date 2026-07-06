@@ -9,6 +9,7 @@ import {
   globalBuiltinSkillInjectionDefault,
   resolveSkillInjectionModeForApp,
   shouldInstallGlobalSkills,
+  resolveSkillInjectionSupport,
   builtinSkillEntries,
   builtinSkillContent,
   buildBuiltinSkillCatalogBlock,
@@ -120,6 +121,23 @@ describe('skill injection-mode resolution', () => {
       writeBots([codexBot({ skillInjection: 'global' })], home);
       expect(shouldInstallGlobalSkills(join(home, '.gemini', 'skills'))).toBe(false);
     });
+  });
+});
+
+describe('resolveSkillInjectionSupport (dashboard control class)', () => {
+  it('classifies the whole CLI matrix by capability', () => {
+    // claude-family (incl. the relay/seed forks) → dynamic --plugin-dir injection
+    for (const id of ['claude-code', 'seed', 'relay'] as const) {
+      expect(resolveSkillInjectionSupport(id)).toBe('dynamic');
+    }
+    // global skills-dir CLIs → the global|prompt|off knob applies
+    for (const id of ['codex', 'gemini', 'opencode', 'cursor', 'coco', 'traex', 'pi', 'oh-my-pi', 'mtr', 'genius'] as const) {
+      expect(resolveSkillInjectionSupport(id)).toBe('global');
+    }
+    // no skill mechanism → control hidden
+    for (const id of ['antigravity', 'aiden', 'hermes', 'mir', 'mira', 'codex-app'] as const) {
+      expect(resolveSkillInjectionSupport(id)).toBe('none');
+    }
   });
 });
 

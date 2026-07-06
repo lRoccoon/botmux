@@ -93,6 +93,26 @@ export function shouldInstallGlobalSkills(skillsDir: string): boolean {
   return false;
 }
 
+/**
+ * How a CLI delivers botmux skills, for the dashboard control (and any other
+ * consumer that must branch on skill-delivery capability):
+ *  - 'dynamic': per-session `--plugin-dir` injection — the claude-family
+ *    (claude-code / seed / relay), which set `pluginDir`. Not configurable: they
+ *    always inject dynamically, no global leak. The mode knobs don't apply.
+ *  - 'global': a shared global skills dir (`skillsDir`) — codex/gemini/opencode/
+ *    cursor/coco/traex/pi/oh-my-pi/mtr/genius — where global|prompt|off applies.
+ *  - 'none': neither — the CLI has no skill mechanism (antigravity/aiden/hermes/
+ *    mir/mira/codex-app), so there's nothing to configure.
+ * Capability-based (not a hardcoded id list) so claude-family forks like relay
+ * are classified correctly without per-fork upkeep.
+ */
+export type SkillInjectionSupport = 'dynamic' | 'global' | 'none';
+export function resolveSkillInjectionSupport(cliId: CliId, cliPathOverride?: string): SkillInjectionSupport {
+  let ad;
+  try { ad = createCliAdapterSync(cliId, cliPathOverride); } catch { return 'none'; }
+  return ad.pluginDir ? 'dynamic' : ad.skillsDir ? 'global' : 'none';
+}
+
 // ─── Built-in skill catalog (prompt mode) ────────────────────────────────────
 
 export interface BuiltinSkillEntry { name: string; description: string; content: string; }

@@ -19,8 +19,7 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
-import { globalBuiltinSkillInjectionDefault } from '../skills/injection-mode.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
 import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
@@ -1372,8 +1371,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const cfg = getBot(cachedLarkAppId).config;
     const s = cfg.skillInjection;
     if (s === 'global' || s === 'prompt' || s === 'off') skillInjection = s;
-    const ad = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
-    skillInjectionSupport = ad.pluginDir ? 'dynamic' : ad.skillsDir ? 'global' : 'none';
+    skillInjectionSupport = resolveSkillInjectionSupport(cfg.cliId, cfg.cliPathOverride);
   } catch { /* unset → machine default; support → none */ }
   let cliId = '';
   let wrapperCli: string | null = null;
