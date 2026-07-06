@@ -2933,6 +2933,31 @@ input.row-select,
   color: var(--faint);
   font-family: var(--mono);
 }
+.roles-editor-inject {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 2px 0 -2px;
+}
+.roles-editor-inject > label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+/* Inherit the global themed <select> look (surface bg, border, chevron); only
+   nudge it more compact for this inline control. */
+.roles-editor-inject > select {
+  min-height: 28px;
+  padding: 3px 26px 3px 9px;
+  font-size: 12px;
+}
+.roles-editor-inject-hint {
+  font-size: 11px;
+  color: var(--faint);
+  flex: 1 1 240px;
+  min-width: 160px;
+}
 .roles-profile-detail {
   gap: 16px;
   min-height: 0;
