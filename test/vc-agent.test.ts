@@ -9,6 +9,7 @@ import {
   ingestNormalizedVcMeetingItems,
 } from '../src/vc-agent/meeting-state.js';
 import { assertLarkCliJsonOk } from '../src/vc-agent/polling-source.js';
+import { buildVcMeetingConfirmCard } from '../src/vc-agent/cards.js';
 
 describe('vc-agent normalizer and state', () => {
   it('normalizes polling meeting event items without relying on push event names', () => {
@@ -351,6 +352,27 @@ describe('vc-agent normalizer and state', () => {
     expect(ready[0]).toMatchObject({ source: 'push', text: 'push only' });
   });
 
+  it('prunes transcript dedup state by age when the transcript cap is exceeded', () => {
+    const state = createVcMeetingSessionState({ meeting: { id: 'm_1' } });
+    for (let i = 0; i < 3; i += 1) {
+      beginVcPollingPass(state, new Date(`2026-07-01T00:00:0${i}.000Z`));
+      ingestNormalizedVcMeetingItems(state, normalizeVcMeetingEvents({
+        meeting: { id: 'm_1' },
+        events: [{
+          event_type: 'transcript_received',
+          transcript_received_items: [
+            { sentence_id: `sent_${i}`, speaker: { open_id: 'ou_a' }, text: `line ${i}` },
+          ],
+        }],
+      }, { meetingId: 'm_1' }).items, {
+        now: new Date(`2026-07-01T00:00:0${i}.000Z`),
+        transcriptLimit: 2,
+      });
+    }
+
+    expect(Object.keys(state.dedup.transcriptBySentenceId).sort()).toEqual(['sent_1', 'sent_2']);
+  });
+
   it('uses transcript end/start time to advance the polling time-window cursor', () => {
     const state = createVcMeetingSessionState({ meeting: { id: 'm_1' } });
     beginVcPollingPass(state, new Date('2026-07-01T00:00:00.000Z'));
@@ -397,6 +419,23 @@ describe('vc-agent normalizer and state', () => {
         notificationChatId: 'oc_notify',
       },
     });
+  });
+
+  it('escapes HTML control chars in VC cards so meeting titles cannot inject mentions', () => {
+    const card = buildVcMeetingConfirmCard({
+      status: 'pending',
+      meeting: {
+        id: 'm_<at id=ou_x></at>',
+        topic: '</font><at id=all></at>',
+      },
+      targetOpenId: 'ou_target',
+      nonce: 'nonce_1',
+    });
+
+    const parsed = JSON.parse(card) as { elements: Array<{ tag: string; content?: string }> };
+    const markdown = parsed.elements.find(element => element.tag === 'markdown')?.content ?? '';
+    expect(markdown).not.toMatch(/<at\b/);
+    expect(markdown).toContain('&lt;at id=all&gt;&lt;/at&gt;');
   });
 
 });

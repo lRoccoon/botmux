@@ -205,7 +205,10 @@ import { addBotToChat, isInChat } from './services/groups-store.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
   findVcMeetingRuntimeSessionByListenerAndAgent,
+  hasVcMeetingEndedTombstone,
   listVcMeetingRuntimeSessions,
+  pruneExpiredVcMeetingRuntimeSessions,
+  recordVcMeetingEndedTombstone,
   recordVcMeetingRuntimeSession,
   removeVcMeetingRuntimeSession,
   type VcMeetingOutputPolicy,
@@ -229,6 +232,8 @@ const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
 type VcMeetingDaemonSession = {
   larkAppId: string;
   state: VcMeetingSessionState;
+  createdAt: number;
+  lastActivityAt: number;
   ended: boolean;
   joined: boolean;
   monitoringStarted: boolean;
@@ -361,6 +366,8 @@ const DEFAULT_VC_REALTIME_TEST_SPEAK_CLOSE_GRACE_MS = 3_000;
 const VC_MEETING_LISTENER_MESSAGE_MAX_CHARS = 3_200;
 const VC_MEETING_PENDING_ITEM_LIMIT = 50_000;
 const VC_MEETING_OUTPUT_MAX_CONTENT_CHARS = 200;
+const VC_MEETING_SESSION_LIMIT = 2_000;
+const VC_MEETING_SESSION_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
 const VC_MEETING_SYNC_INTERVAL_OPTIONS_MS = [15_000, 30_000, 60_000, 90_000] as const;
 const VC_MEETING_CUSTOM_SYNC_INTERVAL_MIN_SECONDS = 10;
 const VC_MEETING_CUSTOM_SYNC_INTERVAL_MAX_SECONDS = 3_600;
@@ -372,21 +379,44 @@ function vcMeetingSessionKey(larkAppId: string, meetingId: string): string {
   return `${larkAppId}:${meetingId}`;
 }
 
+function parseVcMeetingSessionKey(key: string): { larkAppId: string; meetingId: string } | undefined {
+  const sep = key.indexOf(':');
+  if (sep <= 0 || sep >= key.length - 1) return undefined;
+  return { larkAppId: key.slice(0, sep), meetingId: key.slice(sep + 1) };
+}
+
 function vcMeetingPendingInviteKey(larkAppId: string, meetingId: string): string {
   return vcMeetingSessionKey(larkAppId, meetingId);
 }
 
 function markVcMeetingEnded(key: string): void {
-  vcMeetingEndedTombstones.set(key, Date.now());
+  const now = Date.now();
+  vcMeetingEndedTombstones.set(key, now);
+  const parsed = parseVcMeetingSessionKey(key);
+  if (!parsed) return;
+  try {
+    recordVcMeetingEndedTombstone(
+      config.session.dataDir,
+      { larkAppId: parsed.larkAppId, meetingId: parsed.meetingId },
+      now,
+      VC_MEETING_ENDED_TOMBSTONE_TTL_MS,
+    );
+  } catch (err) {
+    logger.warn(`[vc-agent] failed to persist ended tombstone ${key}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function hasRecentVcMeetingEndedTombstone(key: string): boolean {
   const endedAt = vcMeetingEndedTombstones.get(key);
-  if (endedAt === undefined) return false;
-  if (Date.now() - endedAt > VC_MEETING_ENDED_TOMBSTONE_TTL_MS) {
+  const now = Date.now();
+  if (endedAt !== undefined) {
+    if (now - endedAt <= VC_MEETING_ENDED_TOMBSTONE_TTL_MS) return true;
     vcMeetingEndedTombstones.delete(key);
-    return false;
   }
+  const parsed = parseVcMeetingSessionKey(key);
+  if (!parsed) return false;
+  if (!hasVcMeetingEndedTombstone(config.session.dataDir, parsed.larkAppId, parsed.meetingId, now)) return false;
+  vcMeetingEndedTombstones.set(key, now);
   return true;
 }
 
@@ -2901,6 +2931,7 @@ function configuredVcMeetingListenerChatId(cfg: VcMeetingAgentConfig): string | 
 
 function persistVcMeetingRuntimeSession(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): void {
   const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+  if (session.ended) return;
   if (!listenerChatId || !session.state.meeting.id) return;
   recordVcMeetingRuntimeSession(config.session.dataDir, {
     larkAppId: session.larkAppId,
@@ -2933,6 +2964,7 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     logger.info(`[vc-agent] restore skipped for ${larkAppId}: global listener bot is ${listenerAppId}`);
     return;
   }
+  pruneExpiredVcMeetingRuntimeSessions(config.session.dataDir);
   for (const record of listVcMeetingRuntimeSessions(config.session.dataDir, larkAppId)) {
     const key = vcMeetingSessionKey(larkAppId, record.meeting.id);
     if (hasRecentVcMeetingEndedTombstone(key)) {
@@ -3074,6 +3106,7 @@ function getOrCreateVcMeetingDaemonSession(
   const key = vcMeetingSessionKey(larkAppId, meeting.id);
   let session = vcMeetingSessions.get(key);
   const listenerChatId = opts.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+  const now = Date.now();
   if (!session) {
     session = {
       larkAppId,
@@ -3083,6 +3116,8 @@ function getOrCreateVcMeetingDaemonSession(
         attentionTargetOpenId: cfg.attentionTargetOpenId,
         notificationChatId: listenerChatId,
       }),
+      createdAt: now,
+      lastActivityAt: now,
       ended: false,
       joined: opts.joined === true,
       monitoringStarted: false,
@@ -3096,8 +3131,10 @@ function getOrCreateVcMeetingDaemonSession(
       flushing: false,
     };
     vcMeetingSessions.set(key, session);
+    evictExcessVcMeetingDaemonSessions();
     logger.info(`[vc-agent] session created meeting=${meeting.id} bot=${larkAppId}`);
   } else {
+    session.lastActivityAt = now;
     session.state.meeting = { ...session.state.meeting, ...meeting, id: session.state.meeting.id || meeting.id };
     if (opts.joined) session.joined = true;
     if (listenerChatId && !session.listenerChatId) {
@@ -3111,13 +3148,50 @@ function getOrCreateVcMeetingDaemonSession(
   return session;
 }
 
-function discardUnjoinedVcMeetingSession(key: string): void {
-  const session = vcMeetingSessions.get(key);
-  if (!session || session.joined) return;
-  if (session.flushTimer) clearInterval(session.flushTimer);
+function cleanupVcMeetingDaemonSession(session: VcMeetingDaemonSession, reason: string): void {
+  if (session.flushTimer) {
+    clearInterval(session.flushTimer);
+    session.flushTimer = undefined;
+  }
   clearVcMeetingConsumerSelectionTimer(session);
   clearVcMeetingConsumerInjectTimer(session);
   clearVcMeetingOutputRequests(session);
+  void session.realtimeVoice?.stop(reason).catch(() => { /* ignore best-effort cleanup */ });
+}
+
+function evictExcessVcMeetingDaemonSessions(): void {
+  while (vcMeetingSessions.size > VC_MEETING_SESSION_LIMIT) {
+    let oldestKey: string | undefined;
+    let oldestActivity = Number.POSITIVE_INFINITY;
+    for (const [key, session] of vcMeetingSessions.entries()) {
+      if (session.lastActivityAt < oldestActivity) {
+        oldestActivity = session.lastActivityAt;
+        oldestKey = key;
+      }
+    }
+    if (!oldestKey) return;
+    const session = vcMeetingSessions.get(oldestKey);
+    if (!session) return;
+    cleanupVcMeetingDaemonSession(session, 'meeting-session-evicted');
+    removeVcMeetingRuntimeSession(config.session.dataDir, session.larkAppId, session.state.meeting.id);
+    vcMeetingSessions.delete(oldestKey);
+    logger.warn(`[vc-agent] evicted stale meeting session ${oldestKey}: session limit ${VC_MEETING_SESSION_LIMIT} exceeded`);
+  }
+}
+
+function expireIdleVcMeetingDaemonSession(key: string, session: VcMeetingDaemonSession): boolean {
+  if (Date.now() - session.lastActivityAt <= VC_MEETING_SESSION_IDLE_TTL_MS) return false;
+  cleanupVcMeetingDaemonSession(session, 'meeting-session-idle-expired');
+  removeVcMeetingRuntimeSession(config.session.dataDir, session.larkAppId, session.state.meeting.id);
+  vcMeetingSessions.delete(key);
+  logger.warn(`[vc-agent] expired idle meeting session ${key}: no activity for ${VC_MEETING_SESSION_IDLE_TTL_MS}ms`);
+  return true;
+}
+
+function discardUnjoinedVcMeetingSession(key: string): void {
+  const session = vcMeetingSessions.get(key);
+  if (!session || session.joined) return;
+  cleanupVcMeetingDaemonSession(session, 'unjoined-session-discarded');
   vcMeetingSessions.delete(key);
   logger.info(`[vc-agent] unjoined session discarded ${key}`);
 }
@@ -4326,6 +4400,9 @@ async function injectVcMeetingConsumerSession(
 }
 
 async function runVcMeetingSessionTick(key: string, cfg: VcMeetingAgentConfig): Promise<void> {
+  const session = vcMeetingSessions.get(key);
+  if (!session) return;
+  if (expireIdleVcMeetingDaemonSession(key, session)) return;
   const flush = await flushVcMeetingListenerSession(key, cfg);
   if (!flush.ok) {
     logger.warn(`[vc-agent] scheduled listener flush failed ${key}: ${flush.error ?? 'unknown'}`);
@@ -4601,6 +4678,9 @@ async function startVcMeetingMonitoring(input: {
         input.cfg,
         session,
       );
+      if (session.ended || hasRecentVcMeetingEndedTombstone(currentKey)) {
+        throw new Error('meeting ended while monitoring was starting');
+      }
       session.monitoringStarted = true;
       persistVcMeetingRuntimeSession(session, input.cfg);
       scheduleVcMeetingListenerFlush(currentKey, input.cfg);
@@ -4702,6 +4782,7 @@ function scheduleVcMeetingListenerFlush(
 async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfig): Promise<void> {
   const session = vcMeetingSessions.get(key);
   if (!session) return;
+  if (session.ended) return;
   session.ended = true;
   markVcMeetingEnded(key);
   removeVcMeetingRuntimeSession(config.session.dataDir, session.larkAppId, session.state.meeting.id);
@@ -7415,9 +7496,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const watcher of workflowEventWatchers.values()) watcher.close();
     workflowEventWatchers.clear();
     workflowRuns.clear();
-    for (const session of vcMeetingSessions.values()) {
-      if (session.flushTimer) clearInterval(session.flushTimer);
-    }
+    for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);

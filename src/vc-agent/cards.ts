@@ -57,6 +57,9 @@ export interface VcMeetingOutputReviewCardInput {
 
 function escapeMd(text: string | undefined): string {
   return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
     .replace(/\\/g, '\\\\')
     .replace(/`/g, '\\`')
     .replace(/\*/g, '\\*')

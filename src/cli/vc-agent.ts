@@ -166,19 +166,31 @@ async function cmdPoll(args: string[]): Promise<void> {
 
   console.error(`vc-agent polling started: meetingId=${meetingId}${joined ? ' joined=true' : ''} output=json`);
 
+  let consecutiveFailures = 0;
   for (let poll = 0; poll < maxPolls; poll += 1) {
     beginVcPollingPass(state);
     const fallbackStart = pageTokenMode === 'incremental' || state.ingestion.lastSeenEventTime === undefined
       ? undefined
       : new Date(Math.max(0, state.ingestion.lastSeenEventTime - lookbackMs)).toISOString();
-    const { batch } = fetchMeetingEventsAsBot({
-      meetingId,
-      pageToken: pageTokenMode === 'incremental' ? state.ingestion.pageToken : undefined,
-      start: fallbackStart,
-      pageSize,
-      pageAll: true,
-      profile: argValue(args, '--profile'),
-    });
+    let batch: ReturnType<typeof fetchMeetingEventsAsBot>['batch'];
+    try {
+      ({ batch } = fetchMeetingEventsAsBot({
+        meetingId,
+        pageToken: pageTokenMode === 'incremental' ? state.ingestion.pageToken : undefined,
+        start: fallbackStart,
+        pageSize,
+        pageAll: true,
+        profile: argValue(args, '--profile'),
+      }));
+      consecutiveFailures = 0;
+    } catch (err) {
+      if (maxPolls === 1) throw err;
+      consecutiveFailures += 1;
+      const backoffMs = Math.min(60_000, pollMs * Math.min(consecutiveFailures, 6));
+      console.error(`vc-agent poll failed poll=${poll + 1} failures=${consecutiveFailures}: ${err instanceof Error ? err.message : String(err)}; retrying in ${backoffMs}ms`);
+      if (poll + 1 < maxPolls) await sleep(backoffMs);
+      continue;
+    }
     state.meeting = { ...state.meeting, ...batch.meeting, id: meetingId };
     state.ingestion.pageToken = batch.pageToken;
 

@@ -208,6 +208,9 @@ vi.mock('../src/services/vc-meeting-runtime-store.js', () => ({
   listVcMeetingRuntimeSessions: vi.fn((_dataDir: string, larkAppId: string) =>
     runtimeStoreRecords.filter(record => record.larkAppId === larkAppId),
   ),
+  pruneExpiredVcMeetingRuntimeSessions: vi.fn(() => 0),
+  hasVcMeetingEndedTombstone: vi.fn(() => false),
+  recordVcMeetingEndedTombstone: vi.fn(() => undefined),
   findVcMeetingRuntimeSessionByListenerAndAgent: vi.fn((_dataDir: string, input: {
     listenerChatId: string;
     selectedAgentAppId: string;
@@ -2230,7 +2233,7 @@ describe('VC meeting daemon session lifecycle', () => {
                 {
                   message_id: 'msg_consumer_fast_1',
                   sender: { open_id: 'ou_a', user_name: 'Alice' },
-                  text: '@老滕 这个问题需要马上看一下',
+                  text: '@用户 这个问题需要马上看一下',
                 },
               ],
             },
@@ -2242,7 +2245,7 @@ describe('VC meeting daemon session lifecycle', () => {
     await new Promise(resolve => setTimeout(resolve, 2));
 
     expect(triggerSessionCalls).toHaveLength(1);
-    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('@老滕 这个问题需要马上看一下');
+    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('@用户 这个问题需要马上看一下');
   });
 
   it('routes selected remote meeting consumer agent injections to the target daemon', async () => {

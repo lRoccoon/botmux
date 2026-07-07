@@ -29,7 +29,16 @@ export interface VcMeetingRuntimeSessionRecord {
 export type VcMeetingOutputPolicy = 'deny' | 'approval' | 'allow';
 
 const FILE_NAME = 'vc-meeting-runtime-sessions.json';
+const ENDED_TOMBSTONE_FILE_NAME = 'vc-meeting-ended-tombstones.json';
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_ENDED_TOMBSTONE_TTL_MS = 30 * 60 * 1000;
+
+interface VcMeetingEndedTombstoneRecord {
+  larkAppId: string;
+  meetingId: string;
+  endedAt: number;
+  expiresAt: number;
+}
 
 type ListenerAgentIndexCache = {
   fp: string;
@@ -44,6 +53,10 @@ let listenerAgentIndexCache: ListenerAgentIndexCache | undefined;
 
 function filePath(dataDir: string): string {
   return join(dataDir, FILE_NAME);
+}
+
+function endedTombstoneFilePath(dataDir: string): string {
+  return join(dataDir, ENDED_TOMBSTONE_FILE_NAME);
 }
 
 function sessionKey(larkAppId: string, meetingId: string): string {
@@ -85,6 +98,34 @@ function writeStore(dataDir: string, store: Record<string, VcMeetingRuntimeSessi
   writeFileSync(tmp, JSON.stringify(store, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
   renameSync(tmp, fp);
   invalidateListenerAgentIndex();
+}
+
+function readEndedTombstoneStore(dataDir: string): Record<string, VcMeetingEndedTombstoneRecord> {
+  const fp = endedTombstoneFilePath(dataDir);
+  if (!existsSync(fp)) return {};
+  try {
+    const raw = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, unknown>;
+    const out: Record<string, VcMeetingEndedTombstoneRecord> = {};
+    for (const [key, value] of Object.entries(raw)) {
+      const record = normalizeEndedTombstoneRecord(value);
+      if (record) out[key] = record;
+    }
+    return out;
+  } catch (err) {
+    logger.warn(
+      `[vc-meeting-runtime-store] failed to read ${fp}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {};
+  }
+}
+
+function writeEndedTombstoneStore(dataDir: string, store: Record<string, VcMeetingEndedTombstoneRecord>): void {
+  const fp = endedTombstoneFilePath(dataDir);
+  const dir = dirname(fp);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(store, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
+  renameSync(tmp, fp);
 }
 
 function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefined {
@@ -139,6 +180,23 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
   };
 }
 
+function normalizeEndedTombstoneRecord(value: unknown): VcMeetingEndedTombstoneRecord | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const r = value as Record<string, unknown>;
+  if (typeof r.larkAppId !== 'string' || !r.larkAppId.trim()) return undefined;
+  if (typeof r.meetingId !== 'string' || !r.meetingId.trim()) return undefined;
+  const endedAt = typeof r.endedAt === 'number' && Number.isFinite(r.endedAt) ? r.endedAt : Date.now();
+  const expiresAt = typeof r.expiresAt === 'number' && Number.isFinite(r.expiresAt)
+    ? r.expiresAt
+    : endedAt + DEFAULT_ENDED_TOMBSTONE_TTL_MS;
+  return {
+    larkAppId: r.larkAppId.trim(),
+    meetingId: r.meetingId.trim(),
+    endedAt,
+    expiresAt,
+  };
+}
+
 function isOutputPolicy(value: unknown): value is VcMeetingOutputPolicy {
   return value === 'deny' || value === 'approval' || value === 'allow';
 }
@@ -149,18 +207,24 @@ export function listVcMeetingRuntimeSessions(
   now = Date.now(),
 ): VcMeetingRuntimeSessionRecord[] {
   const store = readStore(dataDir);
-  let changed = false;
   const out: VcMeetingRuntimeSessionRecord[] = [];
-  for (const [key, record] of Object.entries(store)) {
-    if (record.expiresAt <= now) {
-      delete store[key];
-      changed = true;
-      continue;
-    }
+  for (const record of Object.values(store)) {
+    if (record.expiresAt <= now) continue;
     if (record.larkAppId === larkAppId) out.push(record);
   }
-  if (changed) writeStore(dataDir, store);
   return out;
+}
+
+export function pruneExpiredVcMeetingRuntimeSessions(dataDir: string, now = Date.now()): number {
+  const store = readStore(dataDir);
+  let removed = 0;
+  for (const [key, record] of Object.entries(store)) {
+    if (record.expiresAt > now) continue;
+    delete store[key];
+    removed += 1;
+  }
+  if (removed > 0) writeStore(dataDir, store);
+  return removed;
 }
 
 export function findVcMeetingRuntimeSessionByListenerAndAgent(
@@ -286,4 +350,48 @@ export function removeVcMeetingRuntimeSession(
   if (!store[key]) return;
   delete store[key];
   writeStore(dataDir, store);
+}
+
+export function recordVcMeetingEndedTombstone(
+  dataDir: string,
+  input: { larkAppId: string; meetingId: string },
+  now = Date.now(),
+  ttlMs = DEFAULT_ENDED_TOMBSTONE_TTL_MS,
+): void {
+  const larkAppId = input.larkAppId.trim();
+  const meetingId = input.meetingId.trim();
+  if (!larkAppId || !meetingId) return;
+  const store = readEndedTombstoneStore(dataDir);
+  const key = sessionKey(larkAppId, meetingId);
+  store[key] = {
+    larkAppId,
+    meetingId,
+    endedAt: now,
+    expiresAt: now + ttlMs,
+  };
+  for (const [itemKey, record] of Object.entries(store)) {
+    if (record.expiresAt <= now) delete store[itemKey];
+  }
+  writeEndedTombstoneStore(dataDir, store);
+}
+
+export function hasVcMeetingEndedTombstone(
+  dataDir: string,
+  larkAppId: string,
+  meetingId: string,
+  now = Date.now(),
+): boolean {
+  const normalizedLarkAppId = larkAppId.trim();
+  const normalizedMeetingId = meetingId.trim();
+  if (!normalizedLarkAppId || !normalizedMeetingId) return false;
+  const key = sessionKey(normalizedLarkAppId, normalizedMeetingId);
+  const store = readEndedTombstoneStore(dataDir);
+  const record = store[key];
+  if (!record) return false;
+  if (record.expiresAt <= now) {
+    delete store[key];
+    writeEndedTombstoneStore(dataDir, store);
+    return false;
+  }
+  return true;
 }

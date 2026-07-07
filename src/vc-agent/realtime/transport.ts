@@ -23,6 +23,7 @@ export class WebSocketRealtimeVoiceTransport implements RealtimeVoiceTransport {
   constructor(websocketUrl: string, opts: ConnectRealtimeVoiceTransportOptions = {}) {
     this.ws = new WebSocket(websocketUrl, {
       maxPayload: opts.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES,
+      perMessageDeflate: false,
     });
     this.openPromise = new Promise((resolve, reject) => {
       this.ws.once('open', () => resolve());

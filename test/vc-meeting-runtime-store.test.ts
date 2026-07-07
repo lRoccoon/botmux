@@ -4,7 +4,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   findVcMeetingRuntimeSessionByListenerAndAgent,
+  hasVcMeetingEndedTombstone,
   listVcMeetingRuntimeSessions,
+  pruneExpiredVcMeetingRuntimeSessions,
+  recordVcMeetingEndedTombstone,
   recordVcMeetingRuntimeSession,
   removeVcMeetingRuntimeSession,
 } from '../src/services/vc-meeting-runtime-store.js';
@@ -90,7 +93,7 @@ describe('vc meeting runtime store', () => {
     expect(listVcMeetingRuntimeSessions(dir, 'cli_a', 3_000)).toEqual([]);
   });
 
-  it('prunes expired records across apps while listing one app', () => {
+  it('lists active records without mutating expired records from other processes', () => {
     writeFileSync(join(dir, STORE_FILE), JSON.stringify({
       'cli_a:m_old': {
         larkAppId: 'cli_a',
@@ -118,6 +121,33 @@ describe('vc meeting runtime store', () => {
       updatedAt: 2_000,
       expiresAt: 100_000,
     }]);
+
+    const persisted = JSON.parse(readFileSync(join(dir, STORE_FILE), 'utf-8')) as Record<string, unknown>;
+    expect(persisted).toHaveProperty('cli_a:m_old');
+    expect(persisted).toHaveProperty('cli_b:m_live');
+  });
+
+  it('prunes expired records only through the explicit prune path', () => {
+    writeFileSync(join(dir, STORE_FILE), JSON.stringify({
+      'cli_a:m_old': {
+        larkAppId: 'cli_a',
+        meeting: { id: 'm_old' },
+        listenerChatId: 'oc_old',
+        createdAt: 1_000,
+        updatedAt: 1_000,
+        expiresAt: 1_500,
+      },
+      'cli_b:m_live': {
+        larkAppId: 'cli_b',
+        meeting: { id: 'm_live', meetingNo: '987654321' },
+        listenerChatId: 'oc_live',
+        createdAt: 1_000,
+        updatedAt: 2_000,
+        expiresAt: 100_000,
+      },
+    }, null, 2));
+
+    expect(pruneExpiredVcMeetingRuntimeSessions(dir, 2_000)).toBe(1);
 
     const persisted = JSON.parse(readFileSync(join(dir, STORE_FILE), 'utf-8')) as Record<string, unknown>;
     expect(persisted).not.toHaveProperty('cli_a:m_old');
@@ -186,5 +216,12 @@ describe('vc meeting runtime store', () => {
     }, 1_000);
 
     expect(existsSync(join(dir, STORE_FILE))).toBe(false);
+  });
+
+  it('records short lived ended tombstones for restore and late push guards', () => {
+    recordVcMeetingEndedTombstone(dir, { larkAppId: 'cli_a', meetingId: 'm1' }, 1_000, 500);
+
+    expect(hasVcMeetingEndedTombstone(dir, 'cli_a', 'm1', 1_200)).toBe(true);
+    expect(hasVcMeetingEndedTombstone(dir, 'cli_a', 'm1', 1_600)).toBe(false);
   });
 });

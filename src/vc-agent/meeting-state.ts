@@ -10,6 +10,7 @@ import type {
 } from './types.js';
 
 const DEFAULT_RECENT_LIMIT = 50_000;
+const DEFAULT_TRANSCRIPT_LIMIT = 50_000;
 
 export function createVcMeetingSessionState(input: {
   meeting: VcMeetingRef;
@@ -65,7 +66,7 @@ export function applyDropOnSeenMeetingItem(
 export function upsertTranscriptMeetingItem(
   state: VcMeetingSessionState,
   item: NormalizedVcTranscriptItem,
-  opts: { now?: Date; recentLimit?: number } = {},
+  opts: { now?: Date; recentLimit?: number; transcriptLimit?: number } = {},
 ): { changed: boolean; entry: VcTranscriptStateEntry } {
   const nowIso = (opts.now ?? new Date()).toISOString();
   const prior = state.dedup.transcriptBySentenceId[item.sentenceId];
@@ -93,6 +94,7 @@ export function upsertTranscriptMeetingItem(
     ...(prior?.flushedRevision !== undefined ? { flushedRevision: prior.flushedRevision } : {}),
   };
   state.dedup.transcriptBySentenceId[item.sentenceId] = entry;
+  pruneTranscriptEntries(state, opts.transcriptLimit ?? DEFAULT_TRANSCRIPT_LIMIT);
   remember(state.dedup.seenItemIds, item.itemKey, opts.recentLimit ?? DEFAULT_RECENT_LIMIT);
   remember(state.dedup.recentEventIds, item.eventId, opts.recentLimit ?? DEFAULT_RECENT_LIMIT);
   if (item.occurredAtMs !== undefined) {
@@ -101,10 +103,28 @@ export function upsertTranscriptMeetingItem(
   return { changed, entry };
 }
 
+function pruneTranscriptEntries(state: VcMeetingSessionState, limit: number): void {
+  if (!Number.isFinite(limit) || limit <= 0) return;
+  const ids = Object.keys(state.dedup.transcriptBySentenceId);
+  if (ids.length <= limit) return;
+  ids
+    .map(sentenceId => ({ sentenceId, entry: state.dedup.transcriptBySentenceId[sentenceId] }))
+    .filter((item): item is { sentenceId: string; entry: VcTranscriptStateEntry } => item.entry !== undefined)
+    .sort((a, b) => {
+      const aMs = Date.parse(a.entry.lastSeenAt);
+      const bMs = Date.parse(b.entry.lastSeenAt);
+      return (Number.isFinite(aMs) ? aMs : 0) - (Number.isFinite(bMs) ? bMs : 0);
+    })
+    .slice(0, ids.length - limit)
+    .forEach(({ sentenceId }) => {
+      delete state.dedup.transcriptBySentenceId[sentenceId];
+    });
+}
+
 export function ingestNormalizedVcMeetingItems(
   state: VcMeetingSessionState,
   items: NormalizedVcMeetingItem[],
-  opts: { now?: Date; recentLimit?: number } = {},
+  opts: { now?: Date; recentLimit?: number; transcriptLimit?: number } = {},
 ): VcMeetingIngestResult {
   const acceptedItems: NormalizedVcMeetingItem[] = [];
   const droppedDuplicateItems: NormalizedVcMeetingItem[] = [];
