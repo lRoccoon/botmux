@@ -1084,7 +1084,7 @@ export function evaluateTalk(
   }
   // 平台团队成员（人）：发送者 union_id 是本群所属平台团队的成员 → talk 免 grant。
   // 严格 chat 作用域（isPlatformTeamMemberChat 要求成员与群在同一团队），只放 talk：
-  // canOperate 不引这一腿，/restart 等仍限 allowedUsers。滕鹏飞在团队群里 @ bot 即免卡。
+  // canOperate 不引这一腿，/restart 等仍限 allowedUsers。授权用户在团队群里 @ bot 即免卡。
   if (memberUnionId && isPlatformTeamMemberChat(config.session.dataDir, chatId, memberUnionId)) {
     return { allowed: true, reason: 'teamMember' };
   }
