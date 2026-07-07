@@ -97,7 +97,6 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
   let backoff = BACKOFF_MIN_MS;
   // 本机平台团队（成员关系下沉到部署本地）
   let teams: PlatformTeam[] = opts.binding.teams ? [...opts.binding.teams] : [];
-  let connectFails = 0;
 
   const base = wsBase(opts.binding.platformUrl);
   const tokenQ = encodeURIComponent(opts.binding.machineToken);
@@ -132,8 +131,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     const onDialFail = (): void => {
       if (settled) return;
       if (--pending > 0) return; // 本轮还有在拨的，等它们
-      settled = true;
-      connectFails++; // 一整轮都没连上才计一次失败（驱动 backoff + 协议族翻转）
+      settled = true; // 一整轮都没连上才判负，按 backoff 重连
       dropLosers(null);
       scheduleReconnect();
     };
@@ -190,11 +188,10 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     }
   }
 
-  // 采纳某条已握手成功的控制连接：重置失败计数、挂正式收发 handler、发 register、起心跳。
+  // 采纳某条已握手成功的控制连接：重置重连退避、挂正式收发 handler、发 register、起心跳。
   function adoptControl(sock: WebSocket): void {
     ws = sock;
     controlDials = null;
-    connectFails = 0;
     backoff = BACKOFF_MIN_MS;
     opts.log('隧道已连接平台');
     sendRegister(sock);
