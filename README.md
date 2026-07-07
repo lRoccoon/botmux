@@ -153,7 +153,7 @@ BACKEND_TYPE=pty botmux start
 /adopt 0:2.0        # 直接接入指定 tmux pane（或传历史会话 id 直接 resume 导入）
 ```
 
-- **历史会话导入** — 卡片第二栏列出本机该 CLI 的历史会话（claude-code / seed / codex / traex / antigravity），选中即以 `--resume` 在原工作目录重建为标准 Botmux 会话，无需进程仍在运行、也不用先迁进 tmux
+- **历史会话导入** — 卡片第二栏列出本机该 CLI 的历史会话（claude-code / seed / codex / traex / antigravity / genius），选中即以 `--resume` 在原工作目录重建为标准 Botmux 会话，无需进程仍在运行、也不用先迁进 tmux
 - **共享模式** — Botmux 接入后，iTerm2 和飞书双向同步：流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端
 - **一键接管** — 点击流式卡片上的「🔄 接管」按钮，Botmux 以 `--resume` 重建会话，转为标准 Botmux 会话
 - **安全断开** — 点击「⏏ 断开」，Botmux 退出观察，原 CLI 不受影响
@@ -205,7 +205,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 ## 前置要求
 
 - **Node.js** >= 22
-- **AI 编程 CLI / 本地 Agent 应用** 已安装并完成认证（`claude`、`codex`、`coco`、`cursor-agent`、`gemini`、`opencode`、`hermes`、`seed`（Seed CLI，Claude Code 衍生）、`relay`（Relay CLI，Seed 新版）、`pi`、`omp`（oh-my-pi，Pi 衍生）、`copilot`（GitHub Copilot CLI）、`traex`（TRAE CLI）、`mircli`（Mir CLI）、`agy`（Antigravity）或 `kimi`（Kimi Code）在 PATH 中）
+- **AI 编程 CLI / 本地 Agent 应用** 已安装并完成认证（`claude`、`codex`、`coco`、`cursor-agent`、`gemini`、`genius`、`opencode`、`hermes`、`seed`（Seed CLI，Claude Code 衍生）、`relay`（Relay CLI，Seed 新版）、`pi`、`omp`（oh-my-pi，Pi 衍生）、`copilot`（GitHub Copilot CLI）、`traex`（TRAE CLI）、`mircli`（Mir CLI）、`agy`（Antigravity）或 `kimi`（Kimi Code）在 PATH 中）
   - **CoCo 最低版本 `0.120.32`**：type-ahead（会话忙时即可发新消息，由 CoCo 自己的消息队列接住）依赖 0.120.32+ 的行为；更早版本忙时输入可能丢失或串行，请升级后再用
 - **tmux** >= 3.x（可选，安装后自动启用会话常驻）
 - **CJK 字体**（用于截图渲染中文/emoji）：
@@ -227,18 +227,44 @@ npm install -g botmux
 
 ### 2. 创建应用并配置（`botmux setup`）
 
-跑 `botmux setup`，按交互菜单一步步选：
+跑 `botmux setup`，全程交互式选择（↑/↓ 选择、输入即搜索、⏎ 确认、Esc 取消；非交互终端自动回退为序号输入）：
 
-1. **新建配置**：输入 `1` 回车（已有配置时输入 `2` 添加机器人）。
-2. **创建机器人**：输入 `1` → **扫码创建（推荐）**，飞书扫码完成后自动建出 PersonalAgent 应用并落盘 AppID/AppSecret，**事件订阅 + bot 能力默认已配好**，无需手动浏览器创建。底层走 `@larksuiteoapi/node-sdk` 官方 device flow。（也可输入 `2` 手动粘贴 AppID/Secret，见文末折叠的「手动创建应用」。）
-3. **选择 CLI**：选本次要接入的 CLI（如接 Claude Code 就选 `1`）。
-4. **默认工作目录**：通常填 git 项目的**父级目录**（如 `~/projects`），新话题会从该目录**向下**查找 git 仓库（最多 3 层）；尽量别填 `~`（要遍历太多文件夹）。
+1. **操作**：首次安装直接进入创建流程；已有配置时先选「添加新机器人 / 重新配置 / 编辑现有机器人 / 删除机器人」。
+2. **飞书应用来源**：三选一——
+   - **扫码创建新应用（推荐）**：飞书扫码后自动建出 PersonalAgent 应用并落盘 AppID/AppSecret，**事件订阅 + bot 能力默认已配好**，无需手动浏览器创建。底层走 `@larksuiteoapi/node-sdk` 官方 device flow。
+   - **选择已有应用**：复用（或扫码获取）飞书 Web 登录态，列出你在开放平台创建过的应用，选中后**自动读取 AppID/AppSecret**——换机器重配、复用旧应用不用再去后台翻 Secret（仅飞书租户）。
+   - **手动输入 AppID/Secret**：见文末折叠的「手动创建应用」。
+3. **选择 CLI**：选本次要接入的 CLI（可搜索，如输入 `cla` 过滤出 Claude）。
+4. **新话题工作目录**：二选一——
+   - **固定默认目录（推荐）**：新话题直接在指定目录启动、**不弹卡片**（落 `defaultWorkingDir` 字段，之后可用 `/config` 或 `botmux setup edit` 修改）。想让机器人"直接进目录干活"选这个。
+   - **仓库选择卡片**：新话题先弹卡片，从扫描到的 git 仓库里选一个再启动，适合经常在多个仓库间切换。下一问填**仓库扫描根目录**，通常是 git 项目的**父级目录**（如 `~/projects`，支持逗号分隔多个），卡片从该目录**向下**查找 git 仓库（最多 3 层）；尽量别填 `~`（要遍历太多文件夹）。
 
 接着进入**第 2 次扫码**：botmux 内置的飞书 Web 登录会自动导入权限、配置 `http://127.0.0.1:9768/callback` 重定向 URL、创建并提交发布版本。失败会自动回退并打印手动步骤（见文末折叠），不影响已写入的配置；权限只导入了一部分也算成功，缺的可事后到开放平台补。
 
 > ✅ **飞书 (feishu.cn) 与 Lark 国际版 (larksuite.com) 均支持**。扫码创建时自动识别租户类型（国内 / 国际）并记住，无需手动选择；手动粘 AppID/Secret 时会让你选一次。每个机器人按所属版本独立连对应域名，同一台机器可同时跑飞书 + Lark 机器人，登录凭证按应用隔离、互不干扰。
 
 setup 末尾会用 `tenant_access_token` 校验凭证（通过才落盘 `bots.json`），并把完整权限 JSON 写到 `~/.botmux/lark-scopes.json` 备查。
+
+<details>
+<summary><b>脚本化（非 TUI）setup</b> —— 给 coding agent / 自动化脚本用的字段级子命令，不依赖交互问答顺序</summary>
+
+```bash
+botmux setup list --json                     # 列出机器人（secret 脱敏）
+botmux setup add \
+  --app-id cli_xxx --app-secret xxx \
+  --allowed-users alice@example.com \
+  --cli codex --working-dir ~/projects       # 添加（写盘前照样校验凭证）
+botmux setup edit botmux-0 --cli claude-code \
+  --default-working-dir /data/proj           # 按字段修改；值传 - 清空
+botmux setup remove botmux-1 --yes           # 非交互删除必须 --yes
+botmux setup help                            # 完整 flag 列表
+```
+
+- `--working-dir` 是仓库选择卡片的扫描根；`--default-working-dir` 是固定默认目录（新话题直接启动、不弹卡），对应 TUI 里工作目录模式的两个选项。
+- `--json` 输出机器可读结果（含 `ok` / `error`）；开放平台自动配置默认跳过，需要时显式加 `--open-platform-auto`（要扫码）。
+- 以前对交互问答「管道喂数字」的脚本请迁移到这些子命令：问答序列一变（本版本就新增了工作目录模式一问），喂数字会静默错位。
+
+</details>
 
 ### 3. 启动
 
@@ -269,7 +295,7 @@ botmux autostart enable
 
 <br>
 
-**手动创建应用**：去 [飞书开放平台](https://open.larkoffice.com/app) 建「企业自建应用」，在「凭证与基础信息」复制 **App ID / App Secret**，在 `botmux setup` 的「创建机器人」步骤选 `2` 粘贴回来。
+**手动创建应用**：去 [飞书开放平台](https://open.larkoffice.com/app) 建「企业自建应用」，在「凭证与基础信息」复制 **App ID / App Secret**，在 `botmux setup` 的「飞书应用来源」步骤选「手动输入 AppID/Secret」粘贴回来。
 
 ![创建应用](docs/setup/create-app.png)
 
