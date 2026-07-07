@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const sentMessages = vi.hoisted(() => [] as Array<{ receiveId: string; msgType: string; content: string; uuid?: string }>);
 const patchedMessages = vi.hoisted(() => [] as Array<{ messageId: string; content: string }>);
+const patchHolds = vi.hoisted(() => ({
+  count: 0,
+  resolvers: [] as Array<() => void>,
+}));
 const sendFailures = vi.hoisted(() => ({ count: 0 }));
 const sendHolds = vi.hoisted(() => ({
   count: 0,
@@ -72,6 +76,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
             return { code: 0, data: { message_id: `om_sent_${sentMessages.length}` } };
           }),
           patch: vi.fn(async (input: any) => {
+            if (patchHolds.count > 0) {
+              patchHolds.count -= 1;
+              await new Promise<void>(resolve => patchHolds.resolvers.push(resolve));
+            }
             patchedMessages.push({
               messageId: input?.path?.message_id,
               content: input?.data?.content,
@@ -418,6 +426,8 @@ describe('VC meeting daemon session lifecycle', () => {
     __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
     sentMessages.length = 0;
     patchedMessages.length = 0;
+    patchHolds.count = 0;
+    patchHolds.resolvers.length = 0;
     meetingTextOutputs.length = 0;
     sendFailures.count = 0;
     sendHolds.count = 0;
@@ -453,6 +463,8 @@ describe('VC meeting daemon session lifecycle', () => {
     __vcMeetingAgentTest.reset();
     sentMessages.length = 0;
     patchedMessages.length = 0;
+    patchHolds.count = 0;
+    patchHolds.resolvers.length = 0;
     meetingTextOutputs.length = 0;
     sendFailures.count = 0;
     sendHolds.count = 0;
@@ -1302,6 +1314,67 @@ describe('VC meeting daemon session lifecycle', () => {
     const finalCard = await waitForPatchedCardTitle('会议 agent 已启用', patchIndex);
     expect(finalCard?.header.title.content).toBe('会议 agent 已启用');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_262626262')?.selectedAgentAppId).toBe(AGENT_APP_ID);
+  });
+
+  it('does not block the consumer confirm response on the processing-card patch', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          selectionTimeoutMs: 20_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_consumer_processing_patch_hold',
+      meeting: { id: 'm_consumer_processing_patch_hold', meetingNo: '272727272', topic: 'Processing patch hold review' },
+      raw: { event: { meeting: { id: 'm_consumer_processing_patch_hold', meeting_no: '272727272' } } },
+    });
+
+    await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: lastInteractiveCardSelectOption('Claude Loopy'),
+    }, APP_ID);
+
+    patchHolds.count = 1;
+    const confirmAction = { value: lastInteractiveCardButton('确认') };
+    const patchIndex = patchedMessages.length;
+    const processing = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: confirmAction,
+    }, APP_ID);
+
+    expect(processing.header.title.content).toBe('会议处理设置中');
+    expect(patchHolds.resolvers).toHaveLength(1);
+    expect(addBotToChatCalls).toHaveLength(0);
+
+    const duplicate = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: confirmAction,
+    }, APP_ID);
+    expect(duplicate.toast.content).toContain('正在处理中');
+
+    patchHolds.resolvers.shift()?.();
+    const finalCard = await waitForPatchedCardTitle('会议 agent 已启用', patchIndex);
+    expect(finalCard?.header.title.content).toBe('会议 agent 已启用');
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_272727272')?.selectedAgentAppId).toBe(AGENT_APP_ID);
   });
 
   it('can apply a custom per-meeting sync interval from the consumer card', async () => {

@@ -3525,25 +3525,27 @@ async function applyVcMeetingConsumerSelectionInBackground(
   }
   session.consumerSelectionApplying = true;
   if (opts.cardMessageId) session.consumerCardMessageId = opts.cardMessageId;
-  await patchVcMeetingConsumerCard(session, cfg, 'processing', { messageId: opts.cardMessageId })
-    .catch((err) => logger.warn(
-      `[vc-agent] meeting consumer processing-card patch failed ${key}: ${err instanceof Error ? err.message : String(err)}`,
-    ));
-  void apply()
-    .then((result) => patchVcMeetingConsumerCard(
-      session,
-      cfg,
-      result.ok ? result.status : 'failed',
-      result.error ? { error: result.error } : {},
-    ))
-    .catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.warn(`[vc-agent] meeting consumer background apply failed ${key}: ${message}`);
-      return patchVcMeetingConsumerCard(session, cfg, 'failed', { error: message })
-        .catch((patchErr) => logger.warn(
-          `[vc-agent] meeting consumer background failed-card patch failed ${key}: ${patchErr instanceof Error ? patchErr.message : String(patchErr)}`,
-        ));
-    });
+  void (async () => {
+    await patchVcMeetingConsumerCard(session, cfg, 'processing', { messageId: opts.cardMessageId })
+      .catch((err) => logger.warn(
+        `[vc-agent] meeting consumer processing-card patch failed ${key}: ${err instanceof Error ? err.message : String(err)}`,
+      ));
+    return apply()
+      .then((result) => patchVcMeetingConsumerCard(
+        session,
+        cfg,
+        result.ok ? result.status : 'failed',
+        result.error ? { error: result.error } : {},
+      ))
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[vc-agent] meeting consumer background apply failed ${key}: ${message}`);
+        return patchVcMeetingConsumerCard(session, cfg, 'failed', { error: message })
+          .catch((patchErr) => logger.warn(
+            `[vc-agent] meeting consumer background failed-card patch failed ${key}: ${patchErr instanceof Error ? patchErr.message : String(patchErr)}`,
+          ));
+      });
+  })();
   return vcMeetingConsumerCardForSession('processing', session, cfg);
 }
 
