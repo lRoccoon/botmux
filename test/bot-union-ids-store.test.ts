@@ -1,63 +1,68 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+/**
+ * bot-union-ids-store: a local bot's OWN union_id learned from its message echo
+ * (the platform roster's source of truth).
+ * Run: pnpm vitest run test/bot-union-ids-store.test.ts
+ */
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { recordBotUnionId, getBotUnionIdByName, listBotUnionIds } from '../src/services/bot-union-ids-store.js';
+import { describe, it, expect, beforeEach } from 'vitest';
+
+import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../src/services/bot-union-ids-store.js';
+
+let dataDir: string;
+beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-unionid-')); });
 
 describe('bot-union-ids-store', () => {
-  let dir: string;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'bui-')); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
-
-  it('records and looks up by name (case-insensitive)', () => {
-    expect(recordBotUnionId(dir, 'traex-loopy(d2)', 'on_abc', 'ou_x')).toBe(true);
-    expect(getBotUnionIdByName(dir, 'traex-loopy(d2)')).toBe('on_abc');
-    // lookup is case-insensitive (cross-ref lowercases; consumers pass display case)
-    expect(getBotUnionIdByName(dir, 'TRAEX-LOOPY(D2)')).toBe('on_abc');
+  it('records and reads back a bot union_id', () => {
+    expect(getBotUnionId(dataDir, 'cli_a')).toBeUndefined();
+    expect(recordBotUnionId(dataDir, 'cli_a', 'on_a')).toBe(true);
+    expect(getBotUnionId(dataDir, 'cli_a')).toBe('on_a');
   });
 
-  it('returns undefined for unknown / empty names', () => {
-    expect(getBotUnionIdByName(dir, 'nope')).toBeUndefined();
-    expect(getBotUnionIdByName(dir, '')).toBeUndefined();
-    expect(getBotUnionIdByName(dir, '   ')).toBeUndefined();
+  it('is idempotent — same value reports no change', () => {
+    recordBotUnionId(dataDir, 'cli_a', 'on_a');
+    expect(recordBotUnionId(dataDir, 'cli_a', 'on_a')).toBe(false);
+    // a corrected value still writes
+    expect(recordBotUnionId(dataDir, 'cli_a', 'on_b')).toBe(true);
+    expect(getBotUnionId(dataDir, 'cli_a')).toBe('on_b');
   });
 
-  it('no-ops on empty name or union_id (no file written)', () => {
-    expect(recordBotUnionId(dir, '', 'on_x')).toBe(false);
-    expect(recordBotUnionId(dir, 'name', '')).toBe(false);
-    expect(existsSync(join(dir, 'bot-union-ids.json'))).toBe(false);
+  it('rejects empty ids without polluting the store', () => {
+    expect(recordBotUnionId(dataDir, '', 'on_a')).toBe(false);
+    expect(recordBotUnionId(dataDir, 'cli_a', '')).toBe(false);
+    expect(recordBotUnionId(dataDir, 'cli_a', '   ')).toBe(false);
+    expect(getBotUnionId(dataDir, 'cli_a')).toBeUndefined();
   });
 
-  it('upsert keeps firstSeenAt, bumps lastSeenAt, refreshes union_id', () => {
-    recordBotUnionId(dir, 'bot', 'on_old', 'ou_1', 1000);
-    const wrote = recordBotUnionId(dir, 'bot', 'on_new', 'ou_2', 5000);
-    expect(wrote).toBe(true);
-    expect(getBotUnionIdByName(dir, 'bot')).toBe('on_new');
-    const data = JSON.parse(readFileSync(join(dir, 'bot-union-ids.json'), 'utf-8'));
-    expect(data.byName['bot'].firstSeenAt).toBe(1000);
-    expect(data.byName['bot'].lastSeenAt).toBe(5000);
-    expect(data.byName['bot'].lastOpenId).toBe('ou_2');
+  it('keeps per-bot entries independent', () => {
+    recordBotUnionId(dataDir, 'cli_a', 'on_a');
+    recordBotUnionId(dataDir, 'cli_b', 'on_b');
+    expect(getBotUnionId(dataDir, 'cli_a')).toBe('on_a');
+    expect(getBotUnionId(dataDir, 'cli_b')).toBe('on_b');
   });
 
-  it('skips a redundant write when unchanged and recently seen', () => {
-    recordBotUnionId(dir, 'bot', 'on_x', 'ou_1', 1000);
-    // same union_id + open_id, 1 min later → within the 10-min skip window
-    expect(recordBotUnionId(dir, 'bot', 'on_x', 'ou_1', 1000 + 60_000)).toBe(false);
-    // same union_id but 11 min later → refresh lastSeenAt
-    expect(recordBotUnionId(dir, 'bot', 'on_x', 'ou_1', 1000 + 11 * 60_000)).toBe(true);
+  it('learns own union_id from a self @mention', () => {
+    const mentions = [
+      { id: { open_id: 'ou_other', union_id: 'on_other' } },
+      { id: { open_id: 'ou_self', union_id: 'on_self' } },
+    ];
+    expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', 'ou_self', mentions)).toBe(true);
+    expect(getBotUnionId(dataDir, 'cli_a')).toBe('on_self');
+    // idempotent on repeat
+    expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', 'ou_self', mentions)).toBe(false);
   });
 
-  it('listBotUnionIds returns all learned pairs (lowercased keys)', () => {
-    recordBotUnionId(dir, 'Alpha', 'on_a');
-    recordBotUnionId(dir, 'Beta', 'on_b');
-    expect(listBotUnionIds(dir)).toEqual({ alpha: 'on_a', beta: 'on_b' });
-  });
-
-  it('survives a corrupt file (returns empty, then overwrites)', () => {
-    const fp = join(dir, 'bot-union-ids.json');
-    writeFileSync(fp, '{ not json');
-    expect(getBotUnionIdByName(dir, 'x')).toBeUndefined();
-    expect(recordBotUnionId(dir, 'x', 'on_x')).toBe(true);
-    expect(getBotUnionIdByName(dir, 'x')).toBe('on_x');
+  it('ignores mentions that are not self, lack union_id, or use string/app_id ids', () => {
+    expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', 'ou_self', [
+      { id: { open_id: 'ou_other', union_id: 'on_other' } }, // 别人
+      { id: { open_id: 'ou_self' } },                        // 自己但没盖 union_id
+      { id: 'cli_a' },                                        // app_id 字符串形态
+    ])).toBe(false);
+    expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', undefined, [
+      { id: { open_id: 'ou_self', union_id: 'on_self' } },   // 自己 open_id 未知 → 无从匹配
+    ])).toBe(false);
+    expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', 'ou_self', undefined)).toBe(false);
+    expect(getBotUnionId(dataDir, 'cli_a')).toBeUndefined();
   });
 });

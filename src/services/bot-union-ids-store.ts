@@ -1,46 +1,28 @@
 /**
- * Per-deployment bot union_id registry — learned from observed events.
+ * Self bot union_id store: each LOCAL bot's own tenant-stable `union_id`.
  *
- * Cross-device verified-delivery authorizes a remote worker's delivery envelope
- * by `senderUnionId ∈ task.workerBotUnionIds` (union_id is the only worker id that
- * is BOTH tenant-stable cross-app AND present on every inbound message event —
- * see verified-delivery/types.ts). To populate `workerBotUnionIds` at dispatch,
- * and to let a deployment advertise its bots' `botUnionId` in the federation
- * roster, we need a source for a bot's union_id.
+ * Why we need it: the platform aggregates a team roster of bot union_ids and
+ * pushes it to member deployments (see [[platform-team-store]]), so receivers
+ * can trust a teammate bot in ANY chat without /grant. But a bot cannot ask
+ * Feishu for its own union_id — /bot/v3/info doesn't return it and the contact
+ * API can't resolve bot open_ids. Two event-borne sources exist:
+ * - @mention 盖章（主腿）: mentions[] 里每个被 @ 实体都带 union_id，且 @ 驱动
+ *   的事件投递不需要额外 scope——bot 在任何群被 @ 一次就学到自己的 union_id。
+ * - 自家消息回声（兜底）: bot 发的群消息回推自己 daemon 时 sender.sender_id
+ *   带 union_id——但仅限有 receive-all 群消息 scope 的应用，且 bot-only 大厅
+ *   实测完全不推事件，回声独木难支。
  *
- * There is no API that maps an app_id → its bot's union_id (a bot is not a user;
- * /bot/v3/info doesn't return one), and a daemon never receives its OWN bot's
- * messages. But when bot A sends a message into a chat bot B's daemon sees,
- * B observes A's `sender_id.union_id` — the canonical tenant union_id. So a
- * deployment learns its (and its peers') bots' union_ids by OBSERVING bot-sender
- * events. This store is that learned registry, shared across the deployment's
- * daemons via one file in dataDir.
+ * Written from the event dispatcher (once per bot — idempotent), read by the
+ * platform tunnel heartbeat (PlatformBotInfo.unionId).
  *
- * Keyed by **botName** (unique per deployment, and the join key both consumers
- * already hold): dispatch has the worker's `--bot <name>` label / roster name;
- * federation `localBots()` has each bot's `botName`. open_id can't be the key —
- * it is per-observing-app, so the open_id B saw for A differs from A's own.
- *
- * Storage: `{dataDir}/bot-union-ids.json`, atomic writes (unique tmp + rename).
+ * Storage: `{dataDir}/bot-union-ids.json` — { [larkAppId]: { unionId, learnedAt } }
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
-export interface BotUnionIdEntry {
-  unionId: string;
-  /** Last open_id observed alongside this union_id (in SOME observing app's
-   *  namespace) — diagnostic only; never used as a cross-app key. */
-  lastOpenId?: string;
-  firstSeenAt: number;
-  lastSeenAt: number;
-}
-
-interface FileShape {
-  version: 1;
-  /** botName → entry */
-  byName: Record<string, BotUnionIdEntry>;
-}
+type FileEntry = { unionId: string; learnedAt: number };
+type FileShape = Record<string, FileEntry>;
 
 function filePath(dataDir: string): string {
   return join(dataDir, 'bot-union-ids.json');
@@ -48,68 +30,64 @@ function filePath(dataDir: string): string {
 
 function readFile(dataDir: string): FileShape {
   const fp = filePath(dataDir);
-  if (!existsSync(fp)) return { version: 1, byName: {} };
+  if (!existsSync(fp)) return {};
   try {
     const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed.byName === 'object' && parsed.byName) return { version: 1, byName: parsed.byName };
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as FileShape;
   } catch { /* corrupt — fall through */ }
-  return { version: 1, byName: {} };
+  return {};
 }
 
-function writeFileAtomic(dataDir: string, data: FileShape): void {
-  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+/** This bot's own learned union_id, or undefined if not yet echoed. */
+export function getBotUnionId(dataDir: string, larkAppId: string): string | undefined {
+  const id = (larkAppId ?? '').trim();
+  if (!id) return undefined;
+  return readFile(dataDir)[id]?.unionId;
 }
 
 /**
- * Record a (botName, union_id) observation. Upserts by name: keeps firstSeenAt,
- * bumps lastSeenAt, refreshes union_id/open_id. No-ops on empty name or union_id,
- * or when the union_id is unchanged AND already fresh (avoids a write per event).
- * Returns true when the file was written.
+ * Persist a bot's own union_id learned from its message echo. Returns true iff
+ * the store changed (first learn or a corrected value), so callers can log
+ * exactly once. No-op on empty ids.
  */
 export function recordBotUnionId(
   dataDir: string,
-  name: string,
+  larkAppId: string,
   unionId: string,
-  openId?: string,
   now: number = Date.now(),
 ): boolean {
-  // Names are matched case-insensitively (the bot-openids cross-ref lowercases;
-  // consumers pass the display-case botName) — normalize the key here so record
-  // and lookup always agree.
-  const n = name?.trim().toLowerCase();
-  const u = unionId?.trim();
-  if (!n || !u) return false;
+  const app = (larkAppId ?? '').trim();
+  const uid = (unionId ?? '').trim();
+  if (!app || !uid) return false;
   const data = readFile(dataDir);
-  const prior = data.byName[n];
-  // Skip a write when nothing meaningful changed and the entry was seen recently
-  // (within 10 min) — keep the hot path allocation-light on every bot event.
-  if (prior && prior.unionId === u && prior.lastOpenId === (openId ?? prior.lastOpenId) && now - prior.lastSeenAt < 10 * 60 * 1000) {
-    return false;
-  }
-  data.byName[n] = {
-    unionId: u,
-    lastOpenId: openId ?? prior?.lastOpenId,
-    firstSeenAt: prior?.firstSeenAt ?? now,
-    lastSeenAt: now,
-  };
-  writeFileAtomic(dataDir, data);
+  if (data[app]?.unionId === uid) return false;
+  data[app] = { unionId: uid, learnedAt: now };
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
   return true;
 }
 
-/** The learned union_id for a bot name (case-insensitive), or undefined. */
-export function getBotUnionIdByName(dataDir: string, name: string): string | undefined {
-  const n = name?.trim().toLowerCase();
-  if (!n) return undefined;
-  return readFile(dataDir).byName[n]?.unionId;
-}
+/** A mention entry from a Lark message event (shape-tolerant subset). */
+type MentionLike = { id?: { open_id?: string; union_id?: string } | string };
 
-/** All learned (name → union_id) pairs (diagnostic / bulk fill). */
-export function listBotUnionIds(dataDir: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [name, e] of Object.entries(readFile(dataDir).byName)) out[name] = e.unionId;
-  return out;
+/**
+ * Learn our OWN union_id from a message's mentions[]: Lark stamps every
+ * mentioned entity with its union_id. Matches self strictly by open_id（app_id
+ * 形态的 mention 不带 union_id，无从学起，忽略）。Returns true iff the store
+ * changed. Idempotent — safe to call on every event.
+ */
+export function recordBotUnionIdFromMentions(
+  dataDir: string,
+  larkAppId: string,
+  selfOpenId: string | undefined,
+  mentions: MentionLike[] | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (!selfOpenId || !mentions?.length) return false;
+  for (const m of mentions) {
+    const id = m && typeof m.id === 'object' ? m.id : undefined;
+    if (id?.open_id === selfOpenId && typeof id.union_id === 'string' && id.union_id.trim()) {
+      return recordBotUnionId(dataDir, larkAppId, id.union_id, now);
+    }
+  }
+  return false;
 }
