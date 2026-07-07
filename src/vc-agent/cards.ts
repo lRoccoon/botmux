@@ -214,7 +214,7 @@ function consumerStatusBody(input: VcMeetingConsumerCardInput): { template: stri
         ...lines,
         `**默认**：${escapeMd(defaultLabel)}`,
         `**同步间隔**：${escapeMd(consumerSyncIntervalLabel(input.stagedIntervalMs ?? input.syncIntervalMs))}${input.stagedIntervalMs ? '（待确认）' : ''}`,
-        '**自定义间隔**：可填写 15-3600 秒，点击"确认"时会覆盖预设。',
+        '**自定义间隔**：可填写 10-3600 秒，点击"确认"时会覆盖预设。',
         ...(stagedModeLabel ? [`**当前选择**：${escapeMd(stagedModeLabel)}（待确认）`] : []),
       ].join('\n'),
     };
@@ -318,7 +318,7 @@ export function buildVcMeetingConsumerCard(input: VcMeetingConsumerCardInput): s
             tag: 'input',
             name: CONSUMER_SYNC_INTERVAL_INPUT_NAME,
             label: { tag: 'plain_text', content: '自定义同步间隔（秒）' },
-            placeholder: { tag: 'plain_text', content: '例如 45，范围 15-3600' },
+            placeholder: { tag: 'plain_text', content: '例如 45，范围 10-3600' },
             default_value: consumerSyncIntervalCustomDefault(input.stagedIntervalMs ?? input.syncIntervalMs),
           },
           {

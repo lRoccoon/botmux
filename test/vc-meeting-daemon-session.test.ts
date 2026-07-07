@@ -1433,6 +1433,72 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_252525252')?.selectedAgentAppId).toBe(AGENT_APP_ID);
   });
 
+  it('accepts custom sync intervals from 10 seconds and rejects smaller values', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_consumer_custom_interval_min',
+      meeting: { id: 'm_consumer_custom_interval_min', meetingNo: '282828282', topic: 'Consumer custom interval min review' },
+      raw: { event: { meeting: { id: 'm_consumer_custom_interval_min', meeting_no: '282828282' } } },
+    });
+
+    await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: lastInteractiveCardSelectOption('Claude Loopy'),
+    }, APP_ID);
+
+    const confirmButton = lastInteractiveCardButton('确认');
+    const tooSmall = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: {
+        value: confirmButton,
+        form_value: {
+          vc_meeting_custom_interval_seconds: '9',
+        },
+      },
+    }, APP_ID);
+    expect(tooSmall.toast.content).toContain('10-3600 秒');
+
+    const patchIndex = patchedMessages.length;
+    const processing = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: {
+        value: confirmButton,
+        form_value: {
+          vc_meeting_custom_interval_seconds: '10',
+        },
+      },
+    }, APP_ID);
+    expect(processing.header.title.content).toBe('会议处理设置中');
+
+    const selected = await waitForPatchedCardTitle('会议 agent 已启用', patchIndex);
+    expect(selected.header.title.content).toBe('会议 agent 已启用');
+    expect(interactiveCardMarkdownContent(selected)).toContain('10 秒');
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_282828282')?.syncIntervalMs).toBe(10_000);
+  });
+
   it('applies the staged selection when the confirm timeout fires', async () => {
     registerConsumerAgentBot();
     registerBot({
