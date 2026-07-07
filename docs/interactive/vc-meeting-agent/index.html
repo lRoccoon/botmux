@@ -1171,8 +1171,8 @@
               <span class="beat">同步节拍 30s<span class="beat-bar"><b></b></span></span>
             </div>
             <div class="live-body">
-              <div class="ln"><span class="t">00:12</span><span class="msg"><span class="who">滕鹏飞</span> · 这轮先验证选择卡确认按钮的交互</span></div>
-              <div class="ln"><span class="t">00:19</span><span class="msg"><span class="who">滕鹏飞</span> · <span class="at">@claude-loopy</span> 记录一下这个结论</span></div>
+              <div class="ln"><span class="t">00:12</span><span class="msg"><span class="who">示例用户</span> · 这轮先验证选择卡确认按钮的交互</span></div>
+              <div class="ln"><span class="t">00:19</span><span class="msg"><span class="who">示例用户</span> · <span class="at">@claude-loopy</span> 记录一下这个结论</span></div>
               <div class="ln sys"><span class="t">00:19</span><span class="msg">⚡ fast signal → 跳过节拍，立即注入 agent</span></div>
               <div class="ln"><span class="t">00:21</span><span class="msg"><span class="who agent">claude-loopy</span> · 已记录。确认卡：暂存 → 确认后生效。</span></div>
               <div class="ln gate"><span class="t">00:47</span><span class="msg">输出审批 · 会中弹幕 → 已批准，发往会议聊天</span></div>
@@ -1221,8 +1221,8 @@
                 </div>
                 <div class="m-stage">
                   <div class="m-tile talk" data-s="0">
-                    <span class="m-ava">滕</span>
-                    <span class="nm">滕鹏飞</span>
+                    <span class="m-ava">示</span>
+                    <span class="nm">示例用户</span>
                     <span class="m-wave" data-s="3"><i></i><i></i><i></i><i></i></span>
                   </div>
                   <div class="m-tile" data-s="0">
@@ -1246,7 +1246,7 @@
                 </div>
                 <div class="m-voice" data-s="7">🔊 <b>Bot 语音播报中</b>「本次会议 2 个结论、2 个 TODO，详细纪要已同步监听群」</div>
                 <div class="m-cap" data-s="3" id="mCap">
-                  <span class="spk">滕鹏飞：</span>这轮先验证选择卡确认按钮的交互
+                  <span class="spk">示例用户：</span>这轮先验证选择卡确认按钮的交互
                 </div>
                 <div class="m-ended" data-s="8"><div><b>会议已结束</b>时长 00:14 · 监听已收尾</div></div>
               </div>
@@ -1273,7 +1273,7 @@
                     <div>
                       <div class="g-nm">会议监听 Bot · 30s 同步</div>
                       <div class="g-bubble">
-                        <div><span class="cap-tag">字幕</span><b>滕鹏飞</b>：这轮先验证选择卡确认按钮的交互</div>
+                        <div><span class="cap-tag">字幕</span><b>示例用户</b>：这轮先验证选择卡确认按钮的交互</div>
                         <div style="margin-top:4px"><span class="cap-tag">字幕</span><b>王同事</b>：卡片样式我看没问题，可以合了</div>
                         <div style="margin-top:4px"><span class="cap-tag chat">聊天</span><b>王同事</b>：设计稿 → figma.com/botmux-vc</div>
                       </div>
@@ -1281,9 +1281,9 @@
                   </div>
                   <div class="g-sys" data-s="3">李产品 加入会议 · 参会 3 → 4 人</div>
                   <div class="g-msg" data-s="4">
-                    <span class="g-ava">滕</span>
+                    <span class="g-ava">示</span>
                     <div>
-                      <div class="g-nm">滕鹏飞</div>
+                      <div class="g-nm">示例用户</div>
                       <div class="g-bubble"><span class="at">@claude-loopy</span> 记录一下这个结论
                         <span class="g-tag" data-s="4">⚡ fast signal → 跳过节拍立即注入</span>
                       </div>
@@ -1300,7 +1300,7 @@
                     <span class="g-ava bot">B</span>
                     <div>
                       <div class="g-nm">会议监听 Bot · 字幕转写</div>
-                      <div class="g-bubble"><span class="cap-tag">字幕</span><b>滕鹏飞</b>：Claude，把「选择卡同步间隔默认 30 秒」记成 TODO
+                      <div class="g-bubble"><span class="cap-tag">字幕</span><b>示例用户</b>：Claude，把「选择卡同步间隔默认 30 秒」记成 TODO
                         <span class="g-tag" data-s="5">🎙 语音输入 → 转写注入 agent，无需动手打字</span>
                       </div>
                     </div>
@@ -1347,7 +1347,7 @@
                       <div class="g-card" style="border-left-color:#0fa968">
                         <div class="ttl">会议纪要 · 产品周会（00:14 · 4 人）</div>
                         <div class="g-quote">结论：① 选择卡改为暂存 → 确认后生效 ② 卡片样式验收通过，可以合入</div>
-                        <div class="g-quote">TODO：① 下轮 dogfood 验证确认交互（滕鹏飞） ② 同步间隔默认 30s（codex）</div>
+                        <div class="g-quote">TODO：① 下轮 dogfood 验证确认交互（示例用户） ② 同步间隔默认 30s（codex）</div>
                       </div>
                     </div>
                   </div>
@@ -1823,11 +1823,11 @@
         : DEMO_CAPTIONS[demoCur - 1];
       gEmpty.style.display = demoCur === 0 ? '' : 'none';
       if (demoCur >= 5) {
-        mCap.innerHTML = '<span class="spk">滕鹏飞：</span>Claude，把「选择卡同步间隔默认 30 秒」记成 TODO <span class="at">🎙</span>';
+        mCap.innerHTML = '<span class="spk">示例用户：</span>Claude，把「选择卡同步间隔默认 30 秒」记成 TODO <span class="at">🎙</span>';
       } else if (demoCur >= 4) {
-        mCap.innerHTML = '<span class="spk">滕鹏飞：</span><span class="at">@claude-loopy</span> 记录一下这个结论';
+        mCap.innerHTML = '<span class="spk">示例用户：</span><span class="at">@claude-loopy</span> 记录一下这个结论';
       } else {
-        mCap.innerHTML = '<span class="spk">滕鹏飞：</span>这轮先验证选择卡确认按钮的交互';
+        mCap.innerHTML = '<span class="spk">示例用户：</span>这轮先验证选择卡确认按钮的交互';
       }
       if (gConfirm) {
         gConfirm.textContent = demoCur >= 3 ? '已确认 ✓' : '确认';
