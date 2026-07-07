@@ -25,7 +25,7 @@ let publicReadOnly = false;
 
 // Management pages are token-gated end-to-end (no public GET) — a read-only
 // visitor must not reach them. `data-route` values from index.html's nav.
-const MANAGE_ROUTES = ['roles', 'role-profiles', 'bot-defaults', 'skills', 'team', 'connectors', 'insights', 'whiteboards'];
+const MANAGE_ROUTES = ['roles', 'role-profiles', 'bot-defaults', 'skills', 'plugins', 'team', 'connectors', 'insights', 'whiteboards'];
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 // Shown only when the dashboard token was rotated WHILE public read-only is off
@@ -217,7 +217,7 @@ function renderAuthRequiredPage(host: HTMLElement): void {
     'padding:40px 36px;box-shadow:0 8px 28px rgba(0,0,0,.12)">' +
     '<h2 style="margin:0 0 12px;font-size:20px;color:var(--fg)">此页需要授权链接</h2>' +
     '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted);font-size:14px">' +
-    '你当前是只读访问，管理页（群角色 / Profiles / Bot 配置 / 团队 / Webhook）需要授权链接。' +
+    '你当前是只读访问，管理页（群角色 / Profiles / Bot 配置 / Skills / 插件 / 团队 / Webhook）需要授权链接。' +
     '运行 <code>botmux dashboard</code> 获取最新链接后即可管理。</p>' +
     '<a href="#/" style="display:inline-block;padding:8px 22px;background:var(--accent);' +
     'color:var(--on-accent);border-radius:8px;text-decoration:none;font-size:14px">返回总览</a>' +
