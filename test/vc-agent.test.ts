@@ -65,7 +65,14 @@ describe('vc-agent normalizer and state', () => {
         meeting_actitivty_items: [
           {
             activity_event_type: 'transcript_received',
-            meeting: { id: 'm_push', meeting_no: '987654321', topic: 'Push review' },
+            meeting: {
+              id: 'm_push',
+              meeting_no: '987654321',
+              topic: 'Push review',
+              start_time_ms: '1780000000000',
+              host_user_id: 'ou_host',
+              host_name: 'Host',
+            },
             transcript_received_items: [
               {
                 sentence_id: 'sent_push_1',
@@ -93,7 +100,14 @@ describe('vc-agent normalizer and state', () => {
       },
     }, { meetingId: 'm_push', source: 'push' });
 
-    expect(batch.meeting).toMatchObject({ id: 'm_push', meetingNo: '987654321', topic: 'Push review' });
+    expect(batch.meeting).toMatchObject({
+      id: 'm_push',
+      meetingNo: '987654321',
+      topic: 'Push review',
+      startTimeMs: 1_780_000_000_000,
+      hostOpenId: 'ou_host',
+      hostName: 'Host',
+    });
     expect(batch.items.map((item) => item.type)).toEqual(['transcript_received', 'chat_received']);
     expect(batch.items.every((item) => item.source === 'push')).toBe(true);
     expect(batch.items[0]).toMatchObject({
@@ -108,6 +122,41 @@ describe('vc-agent normalizer and state', () => {
       itemKey: 'chat:msg_push_1',
       messageType: '1',
       text: 'push chat',
+    });
+  });
+
+  it('normalizes chat message fields nested under message with wrapper operator actor', () => {
+    const batch = normalizeVcMeetingEvents({
+      event: {
+        meeting_actitivty_items: [
+          {
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_push' },
+            operator: { id: 'ou_operator', name: 'Operator' },
+            chat_received_items: [
+              {
+                send_time_ms: '1780000005000',
+                message: {
+                  id: 'msg_nested',
+                  message_type: 'text',
+                  content: { text: 'nested chat' },
+                },
+              },
+            ],
+          },
+        ],
+      },
+    }, { meetingId: 'm_push', source: 'push' });
+
+    expect(batch.items).toHaveLength(1);
+    expect(batch.items[0]).toMatchObject({
+      type: 'chat_received',
+      itemKey: 'chat:msg_nested',
+      messageId: 'msg_nested',
+      messageType: 'text',
+      sender: { openId: 'ou_operator', name: 'Operator' },
+      occurredAtMs: 1_780_000_005_000,
+      text: 'nested chat',
     });
   });
 
@@ -141,6 +190,64 @@ describe('vc-agent normalizer and state', () => {
       type: 'chat_received',
       sender: { openId: 'ou_operator', name: 'Operator' },
       text: 'operator chat',
+    });
+  });
+
+  it('normalizes participant actor from the activity wrapper', () => {
+    const batch = normalizeVcMeetingEvents({
+      event: {
+        meeting_actitivty_items: [
+          {
+            activity_event_type: 'participant_joined',
+            meeting: { id: 'm_push' },
+            participant: { id: 'ou_participant', name: 'Participant', user_type: 101, role: 'host' },
+            participant_joined_items: [
+              { join_time_ms: '1780000006000' },
+            ],
+          },
+        ],
+      },
+    }, { meetingId: 'm_push', source: 'push' });
+
+    expect(batch.items).toHaveLength(1);
+    expect(batch.items[0]).toMatchObject({
+      type: 'participant_joined',
+      participant: { openId: 'ou_participant', name: 'Participant', userType: 101 },
+      occurredAtMs: 1_780_000_006_000,
+      role: 'host',
+    });
+  });
+
+  it('normalizes transcript text and speaker from nested and wrapper fields', () => {
+    const batch = normalizeVcMeetingEvents({
+      event: {
+        meeting_actitivty_items: [
+          {
+            activity_event_type: 'transcript_received',
+            meeting: { id: 'm_push' },
+            speaker: { id: 'ou_speaker', name: 'Speaker' },
+            transcript_received_items: [
+              {
+                sentence: { id: 'sent_nested', text: 'nested transcript', language: 'en_us' },
+                startTimeMs: '1780000007000',
+                endTimeMs: '1780000008000',
+              },
+            ],
+          },
+        ],
+      },
+    }, { meetingId: 'm_push', source: 'push' });
+
+    expect(batch.items).toHaveLength(1);
+    expect(batch.items[0]).toMatchObject({
+      type: 'transcript_received',
+      itemKey: 'transcript:sent_nested',
+      sentenceId: 'sent_nested',
+      speaker: { openId: 'ou_speaker', name: 'Speaker' },
+      startTimeMs: 1_780_000_007_000,
+      endTimeMs: 1_780_000_008_000,
+      language: 'en_us',
+      text: 'nested transcript',
     });
   });
 
