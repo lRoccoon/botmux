@@ -289,6 +289,13 @@ function lastInteractiveCardButton(label: string): Record<string, string> {
   throw new Error(`card button not found: ${label}`);
 }
 
+function interactiveCardButton(card: any, label: string): any {
+  for (const item of interactiveCardActionItems(card)) {
+    if (item?.tag === 'button' && item?.text?.content === label) return item;
+  }
+  throw new Error(`card button not found: ${label}`);
+}
+
 function lastInteractiveCardSelectOption(label: string): { value: Record<string, string>; option: string } {
   const cardMessage = [...sentMessages].reverse().find(msg => msg.msgType === 'interactive');
   if (!cardMessage) throw new Error('no interactive card was sent');
@@ -1113,6 +1120,9 @@ describe('VC meeting daemon session lifecycle', () => {
     const card = JSON.parse(sentMessages[1].content);
     expect(card.schema).toBe('2.0');
     expect(interactiveCardInputNames(card)).toContain('vc_meeting_custom_interval_seconds');
+    const confirmButton = interactiveCardButton(card, '确认');
+    expect(confirmButton.action_type).toBe('form_submit');
+    expect(confirmButton.value.action).toBe('vc_meeting_consumer_confirm');
     const labels = interactiveCardLabels(card);
     expect(labels).toContain('只监听消息');
     expect(labels).toContain('Claude Loopy');

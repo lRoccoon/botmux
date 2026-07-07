@@ -327,7 +327,7 @@ export function buildVcMeetingConsumerCard(input: VcMeetingConsumerCardInput): s
             text: { tag: 'plain_text', content: '确认' },
             type: 'primary_filled',
             width: 'fill',
-            form_action_type: 'submit',
+            action_type: 'form_submit',
             value: {
               action: 'vc_meeting_consumer_confirm',
               meeting_id: input.meeting.id,
