@@ -264,10 +264,8 @@ function lastInteractiveCardAction(action: string): Record<string, string> {
   const cardMessage = [...sentMessages].reverse().find(msg => msg.msgType === 'interactive');
   if (!cardMessage) throw new Error('no interactive card was sent');
   const card = JSON.parse(cardMessage.content);
-  for (const element of card.elements ?? []) {
-    for (const button of element.actions ?? []) {
-      if (button?.value?.action === action) return button.value;
-    }
+  for (const item of interactiveCardActionItems(card)) {
+    if (item?.value?.action === action) return item.value;
   }
   throw new Error(`card action not found: ${action}`);
 }
@@ -276,10 +274,8 @@ function lastInteractiveCardButton(label: string): Record<string, string> {
   const cardMessage = [...sentMessages].reverse().find(msg => msg.msgType === 'interactive');
   if (!cardMessage) throw new Error('no interactive card was sent');
   const card = JSON.parse(cardMessage.content);
-  for (const element of card.elements ?? []) {
-    for (const button of element.actions ?? []) {
-      if (button?.text?.content === label) return button.value;
-    }
+  for (const item of interactiveCardActionItems(card)) {
+    if (item?.tag === 'button' && item?.text?.content === label) return item.value;
   }
   throw new Error(`card button not found: ${label}`);
 }
@@ -312,14 +308,27 @@ async function selectConsumerAgentViaCard(label: string, operatorOpenId = TARGET
 }
 
 function interactiveCardLabels(card: any): string[] {
-  return (card.elements ?? []).flatMap((element: any) =>
-    (element.actions ?? []).flatMap((action: any) => {
-      if (action?.tag === 'select_static') {
-        return (action.options ?? []).map((option: any) => option.text?.content);
+  return interactiveCardActionItems(card).flatMap((action: any) => {
+    if (action?.tag === 'select_static') {
+      return (action.options ?? []).map((option: any) => option.text?.content);
+    }
+    return [action.text?.content];
+  });
+}
+
+function interactiveCardActionItems(card: any): any[] {
+  const actions: any[] = [];
+  const visitElements = (elements: any[]): void => {
+    for (const element of elements ?? []) {
+      if (Array.isArray(element.actions)) actions.push(...element.actions);
+      if (Array.isArray(element.elements)) visitElements(element.elements);
+      for (const column of element.columns ?? []) {
+        if (Array.isArray(column.elements)) visitElements(column.elements);
       }
-      return [action.text?.content];
-    }),
-  );
+    }
+  };
+  visitElements(card.elements ?? []);
+  return actions;
 }
 
 describe('VC meeting daemon session lifecycle', () => {
@@ -1108,14 +1117,14 @@ describe('VC meeting daemon session lifecycle', () => {
     });
 
     // 间隔下拉只暂存：卡片显示待确认，runtime store 尚未写入。
-    const intervalSelect = lastInteractiveCardSelectOption('120 秒');
+    const intervalSelect = lastInteractiveCardSelectOption('90 秒');
     const result = await __vcMeetingAgentTest.handleCardAction({
       operator: { open_id: TARGET_OPEN_ID },
       action: intervalSelect,
     }, APP_ID);
 
     expect(result.header.title.content).toBe('会议处理方式');
-    expect(result.elements[0].content).toContain('120 秒');
+    expect(result.elements[0].content).toContain('90 秒');
     expect(result.elements[0].content).toContain('待确认');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.syncIntervalMs).toBeUndefined();
 
@@ -1135,9 +1144,62 @@ describe('VC meeting daemon session lifecycle', () => {
     }, APP_ID);
 
     expect(selected.header.title.content).toBe('会议 agent 已启用');
-    expect(selected.elements[0].content).toContain('120 秒');
-    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.syncIntervalMs).toBe(120_000);
+    expect(selected.elements[0].content).toContain('90 秒');
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.syncIntervalMs).toBe(90_000);
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.selectedAgentAppId).toBe(AGENT_APP_ID);
+  });
+
+  it('can apply a custom per-meeting sync interval from the consumer card', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_consumer_custom_interval',
+      meeting: { id: 'm_consumer_custom_interval', meetingNo: '252525252', topic: 'Consumer custom interval review' },
+      raw: { event: { meeting: { id: 'm_consumer_custom_interval', meeting_no: '252525252' } } },
+    });
+
+    const agentSelect = lastInteractiveCardSelectOption('Claude Loopy');
+    await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: agentSelect,
+    }, APP_ID);
+
+    const selected = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: {
+        value: lastInteractiveCardButton('确认'),
+        form_value: {
+          vc_meeting_custom_interval_seconds: '45',
+        },
+      },
+    }, APP_ID);
+
+    expect(selected.header.title.content).toBe('会议 agent 已启用');
+    expect(selected.elements[0].content).toContain('45 秒');
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_252525252')?.syncIntervalMs).toBe(45_000);
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_252525252')?.selectedAgentAppId).toBe(AGENT_APP_ID);
   });
 
   it('applies the staged selection when the confirm timeout fires', async () => {

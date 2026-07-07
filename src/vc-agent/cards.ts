@@ -186,6 +186,15 @@ function consumerSyncIntervalLabel(ms: number | undefined): string {
   return `${seconds} 秒`;
 }
 
+const CONSUMER_SYNC_INTERVAL_INPUT_NAME = 'vc_meeting_custom_interval_seconds';
+
+function consumerSyncIntervalCustomDefault(ms: number | undefined): string {
+  if (!ms || !Number.isFinite(ms)) return '';
+  const presetMs = new Set([15_000, 30_000, 60_000, 90_000]);
+  if (presetMs.has(ms)) return '';
+  return String(Math.round(ms / 1000));
+}
+
 function consumerStatusBody(input: VcMeetingConsumerCardInput): { template: string; title: string; body: string } {
   const lines = baseLines({ meeting: input.meeting, status: 'pending', targetOpenId: '', nonce: '' });
   if (input.status === 'pending') {
@@ -204,6 +213,7 @@ function consumerStatusBody(input: VcMeetingConsumerCardInput): { template: stri
         ...lines,
         `**默认**：${escapeMd(defaultLabel)}`,
         `**同步间隔**：${escapeMd(consumerSyncIntervalLabel(input.stagedIntervalMs ?? input.syncIntervalMs))}${input.stagedIntervalMs ? '（待确认）' : ''}`,
+        '**自定义间隔**：可填写 15-3600 秒，点击"确认"时会覆盖预设。',
         ...(stagedModeLabel ? [`**当前选择**：${escapeMd(stagedModeLabel)}（待确认）`] : []),
       ].join('\n'),
     };
@@ -274,9 +284,10 @@ export function buildVcMeetingConsumerCard(input: VcMeetingConsumerCardInput): s
             nonce: input.nonce,
           },
           options: [
+            { text: { tag: 'plain_text', content: '15 秒' }, value: '15000' },
             { text: { tag: 'plain_text', content: '30 秒' }, value: '30000' },
             { text: { tag: 'plain_text', content: '60 秒' }, value: '60000' },
-            { text: { tag: 'plain_text', content: '120 秒' }, value: '120000' },
+            { text: { tag: 'plain_text', content: '90 秒' }, value: '90000' },
           ],
         },
         {
@@ -286,16 +297,6 @@ export function buildVcMeetingConsumerCard(input: VcMeetingConsumerCardInput): s
           value: {
             action: 'vc_meeting_consumer_stage',
             stage_kind: 'listenOnly',
-            meeting_id: input.meeting.id,
-            nonce: input.nonce,
-          },
-        },
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '确认' },
-          type: 'primary',
-          value: {
-            action: 'vc_meeting_consumer_confirm',
             meeting_id: input.meeting.id,
             nonce: input.nonce,
           },
@@ -313,6 +314,37 @@ export function buildVcMeetingConsumerCard(input: VcMeetingConsumerCardInput): s
         },
       ]
     : [];
+  const customIntervalElement = input.status === 'pending'
+    ? [{
+        tag: 'form',
+        name: 'vc_meeting_consumer_confirm_form',
+        elements: [
+          {
+            tag: 'input',
+            name: CONSUMER_SYNC_INTERVAL_INPUT_NAME,
+            label: { tag: 'plain_text', content: '自定义同步间隔（秒）' },
+            placeholder: { tag: 'plain_text', content: '例如 45，范围 15-3600' },
+            default_value: consumerSyncIntervalCustomDefault(input.stagedIntervalMs ?? input.syncIntervalMs),
+          },
+          {
+            tag: 'action',
+            actions: [
+              {
+                tag: 'button',
+                text: { tag: 'plain_text', content: '确认' },
+                type: 'primary',
+                form_action_type: 'submit',
+                value: {
+                  action: 'vc_meeting_consumer_confirm',
+                  meeting_id: input.meeting.id,
+                  nonce: input.nonce,
+                },
+              },
+            ],
+          },
+        ],
+      }]
+    : [];
   const card: Record<string, unknown> = {
     config: { wide_screen_mode: true },
     header: {
@@ -321,6 +353,7 @@ export function buildVcMeetingConsumerCard(input: VcMeetingConsumerCardInput): s
     },
     elements: [
       { tag: 'markdown', content: body },
+      ...customIntervalElement,
       ...(actions.length ? [{ tag: 'action', actions }] : []),
     ],
   };

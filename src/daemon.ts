@@ -360,7 +360,10 @@ const DEFAULT_VC_REALTIME_TEST_SPEAK_CLOSE_GRACE_MS = 3_000;
 const VC_MEETING_LISTENER_MESSAGE_MAX_CHARS = 3_200;
 const VC_MEETING_PENDING_ITEM_LIMIT = 50_000;
 const VC_MEETING_OUTPUT_MAX_CONTENT_CHARS = 200;
-const VC_MEETING_SYNC_INTERVAL_OPTIONS_MS = [30_000, 60_000, 120_000] as const;
+const VC_MEETING_SYNC_INTERVAL_OPTIONS_MS = [15_000, 30_000, 60_000, 90_000] as const;
+const VC_MEETING_CUSTOM_SYNC_INTERVAL_MIN_SECONDS = 15;
+const VC_MEETING_CUSTOM_SYNC_INTERVAL_MAX_SECONDS = 3_600;
+const VC_MEETING_CUSTOM_SYNC_INTERVAL_FIELD = 'vc_meeting_custom_interval_seconds';
 const vcMeetingEndedTombstones = new BoundedMap<string, number>(2_000);
 const vcMeetingPendingInvites = new BoundedMap<string, VcMeetingPendingInvite>(2_000);
 
@@ -419,6 +422,28 @@ function normalizeVcMeetingSyncIntervalMs(value: unknown): number | undefined {
   const raw = typeof value === 'string' ? Number(value) : value;
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined;
   return (VC_MEETING_SYNC_INTERVAL_OPTIONS_MS as readonly number[]).includes(raw) ? raw : undefined;
+}
+
+function normalizeVcMeetingCustomSyncIntervalMs(value: unknown): { ok: true; intervalMs?: number } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true };
+  const text = Array.isArray(value) ? String(value[0] ?? '').trim() : String(value).trim();
+  if (!text) return { ok: true };
+  const seconds = Number(text);
+  if (
+    !Number.isInteger(seconds)
+    || seconds < VC_MEETING_CUSTOM_SYNC_INTERVAL_MIN_SECONDS
+    || seconds > VC_MEETING_CUSTOM_SYNC_INTERVAL_MAX_SECONDS
+  ) {
+    return {
+      ok: false,
+      error: `自定义同步间隔需为 ${VC_MEETING_CUSTOM_SYNC_INTERVAL_MIN_SECONDS}-${VC_MEETING_CUSTOM_SYNC_INTERVAL_MAX_SECONDS} 秒的整数`,
+    };
+  }
+  return { ok: true, intervalMs: seconds * 1000 };
+}
+
+function vcMeetingCustomSyncIntervalFromCard(data: CardActionData): { ok: true; intervalMs?: number } | { ok: false; error: string } {
+  return normalizeVcMeetingCustomSyncIntervalMs(data.action?.form_value?.[VC_MEETING_CUSTOM_SYNC_INTERVAL_FIELD]);
 }
 
 function vcMeetingSessionFlushIntervalMs(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): number {
@@ -4799,6 +4824,13 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
     }
     if (!session.consumerSelectionNonce || session.consumerSelectionNonce !== value.nonce) {
       return vcMeetingConsumerCardForSession('expired', session, cfg);
+    }
+    const customInterval = vcMeetingCustomSyncIntervalFromCard(data);
+    if (!customInterval.ok) {
+      return { toast: { type: 'error', content: customInterval.error } };
+    }
+    if (customInterval.intervalMs !== undefined) {
+      session.consumerPendingIntervalMs = customInterval.intervalMs;
     }
     const result = await applyVcMeetingConsumerStagedState(key, session, cfg, { mode: 'default' });
     return vcMeetingConsumerCardForSession(result.ok ? result.status : 'failed', session, cfg, result.error ? { error: result.error } : {});
