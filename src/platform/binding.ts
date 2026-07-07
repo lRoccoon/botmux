@@ -81,12 +81,3 @@ export function setPlatformTeams(teams: PlatformTeam[]): PlatformTeam[] {
   writePlatformBinding(b);
   return teams;
 }
-
-/** 更新与平台通信的 IP 协议族偏好并落盘（隧道运行期换族成功后自愈式记忆）。 */
-export function setPlatformIpFamily(family: 4 | 6 | undefined): void {
-  const b = readPlatformBinding();
-  if (!b) return;
-  if (family === undefined) delete b.ipFamily;
-  else b.ipFamily = family;
-  writePlatformBinding(b);
-}
