@@ -345,6 +345,7 @@ const VC_MEETING_ENDED_TOMBSTONE_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_VC_MEETING_INVITE_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_VC_MEETING_STABILIZE_MS = 5_000;
 const DEFAULT_VC_MEETING_FLUSH_INTERVAL_MS = 30_000;
+const DEFAULT_VC_MEETING_TIME_ZONE = 'Asia/Shanghai';
 const DEFAULT_VC_MEETING_CONSUMER_SELECTION_TIMEOUT_MS = 20_000;
 const DEFAULT_VC_MEETING_CONSUMER_INJECT_INTERVAL_MS = 30_000;
 const DEFAULT_VC_MEETING_CONSUMER_MIN_BATCH_CHARS = 400;
@@ -452,6 +453,10 @@ function vcMeetingSessionFlushIntervalMs(session: VcMeetingDaemonSession, cfg: V
 
 function vcMeetingSessionConsumerInjectIntervalMs(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): number {
   return session.syncIntervalMs ?? vcMeetingConsumerInjectIntervalMs(cfg);
+}
+
+function vcMeetingDisplayTimeZone(cfg: VcMeetingAgentConfig): string {
+  return cfg.timeZone ?? DEFAULT_VC_MEETING_TIME_ZONE;
 }
 
 function vcMeetingConsumerMinBatchChars(cfg: VcMeetingAgentConfig): number {
@@ -3121,9 +3126,9 @@ function vcMeetingActorLabel(actor: { openId?: string; name?: string } | undefin
   return actor?.name?.trim() || actor?.openId || '未知成员';
 }
 
-function vcMeetingTimeLabel(ms: number | undefined): string {
+function vcMeetingTimeLabel(ms: number | undefined, timeZone: string): string {
   if (ms === undefined || !Number.isFinite(ms)) return '';
-  return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false });
+  return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false, timeZone });
 }
 
 function compactVcMeetingText(text: string | undefined): string {
@@ -3226,10 +3231,10 @@ type VcMeetingListenerEntry =
       line: string;
     };
 
-function formatVcMeetingTranscriptLine(item: NormalizedVcTranscriptItem): string | undefined {
+function formatVcMeetingTranscriptLine(item: NormalizedVcTranscriptItem, timeZone: string): string | undefined {
   const text = compactVcMeetingText(item.text);
   if (!text) return undefined;
-  const time = vcMeetingTimeLabel(item.endTimeMs ?? item.startTimeMs);
+  const time = vcMeetingTimeLabel(item.endTimeMs ?? item.startTimeMs, timeZone);
   const prefix = time ? `[字幕 ${time}]` : '[字幕]';
   return `${prefix} ${vcMeetingActorLabel(item.speaker)}：${text}`;
 }
@@ -3250,9 +3255,9 @@ function vcMeetingTranscriptEntry(item: NormalizedVcTranscriptItem, index: numbe
   };
 }
 
-function formatVcMeetingItemLine(item: NormalizedVcMeetingItem): string | undefined {
-  if (item.type === 'transcript_received') return formatVcMeetingTranscriptLine(item);
-  const time = vcMeetingTimeLabel(item.occurredAtMs);
+function formatVcMeetingItemLine(item: NormalizedVcMeetingItem, timeZone: string): string | undefined {
+  if (item.type === 'transcript_received') return formatVcMeetingTranscriptLine(item, timeZone);
+  const time = vcMeetingTimeLabel(item.occurredAtMs, timeZone);
   const prefix = (label: string) => time ? `[${label} ${time}]` : `[${label}]`;
   if (item.type === 'chat_received') {
     const chat = item as NormalizedVcChatItem;
@@ -3277,9 +3282,9 @@ function formatVcMeetingItemLine(item: NormalizedVcMeetingItem): string | undefi
   return undefined;
 }
 
-function vcMeetingEventEntry(item: NormalizedVcMeetingItem, index: number): VcMeetingListenerEntry | undefined {
+function vcMeetingEventEntry(item: NormalizedVcMeetingItem, index: number, timeZone: string): VcMeetingListenerEntry | undefined {
   if (item.type === 'transcript_received') return vcMeetingTranscriptEntry(item, index);
-  const line = formatVcMeetingItemLine(item);
+  const line = formatVcMeetingItemLine(item, timeZone);
   if (!line) return undefined;
   return {
     kind: 'event',
@@ -3289,9 +3294,9 @@ function vcMeetingEventEntry(item: NormalizedVcMeetingItem, index: number): VcMe
   };
 }
 
-function vcMeetingTimeRangeLabel(startMs?: number, endMs?: number): string {
-  const start = vcMeetingTimeLabel(startMs ?? endMs);
-  const end = vcMeetingTimeLabel(endMs ?? startMs);
+function vcMeetingTimeRangeLabel(startMs: number | undefined, endMs: number | undefined, timeZone: string): string {
+  const start = vcMeetingTimeLabel(startMs ?? endMs, timeZone);
+  const end = vcMeetingTimeLabel(endMs ?? startMs, timeZone);
   if (!start && !end) return '';
   if (!start || !end || start === end) return start || end;
   return `${start}-${end}`;
@@ -3300,6 +3305,7 @@ function vcMeetingTimeRangeLabel(startMs?: number, endMs?: number): string {
 function vcMeetingListenerHeaderLine(
   meeting: VcMeetingPushContext['meeting'],
   entries: VcMeetingListenerEntry[],
+  timeZone: string,
   opts: { final?: boolean },
 ): string {
   const times = entries
@@ -3307,7 +3313,7 @@ function vcMeetingListenerHeaderLine(
       ? [entry.startTimeMs, entry.endTimeMs, entry.sortTime]
       : [entry.sortTime])
     .filter((value): value is number => value !== undefined && Number.isFinite(value));
-  const range = times.length > 0 ? vcMeetingTimeRangeLabel(Math.min(...times), Math.max(...times)) : '';
+  const range = times.length > 0 ? vcMeetingTimeRangeLabel(Math.min(...times), Math.max(...times), timeZone) : '';
   const title = opts.final ? '会议收尾同步' : '会议同步';
   const suffix = range ? `（${range}）` : '';
   return `${title}${suffix}｜${vcMeetingTitle(meeting)}`;
@@ -3316,10 +3322,12 @@ function vcMeetingListenerHeaderLine(
 function buildVcMeetingListenerLines(
   meeting: VcMeetingPushContext['meeting'],
   items: NormalizedVcMeetingItem[],
+  cfg: VcMeetingAgentConfig,
   opts: { final?: boolean } = {},
 ): string[] {
+  const timeZone = vcMeetingDisplayTimeZone(cfg);
   const entries = items
-    .map((item, index) => vcMeetingEventEntry(item, index))
+    .map((item, index) => vcMeetingEventEntry(item, index, timeZone))
     .filter((entry): entry is VcMeetingListenerEntry => !!entry)
     .sort((a, b) => {
       const at = a.sortTime ?? Number.MAX_SAFE_INTEGER;
@@ -3328,7 +3336,7 @@ function buildVcMeetingListenerLines(
     });
   if (entries.length === 0) return [];
 
-  const lines = [vcMeetingListenerHeaderLine(meeting, entries, opts)];
+  const lines = [vcMeetingListenerHeaderLine(meeting, entries, timeZone, opts)];
   let transcriptGroup: Extract<VcMeetingListenerEntry, { kind: 'transcript' }>[] = [];
 
   const flushTranscriptGroup = () => {
@@ -3337,7 +3345,7 @@ function buildVcMeetingListenerLines(
     const times = transcriptGroup
       .flatMap(entry => [entry.startTimeMs, entry.endTimeMs, entry.sortTime])
       .filter((value): value is number => value !== undefined && Number.isFinite(value));
-    const range = times.length > 0 ? vcMeetingTimeRangeLabel(Math.min(...times), Math.max(...times)) : '';
+    const range = times.length > 0 ? vcMeetingTimeRangeLabel(Math.min(...times), Math.max(...times), timeZone) : '';
     const prefix = range ? `[字幕 ${range}]` : '[字幕]';
     lines.push(`${prefix} ${first.actorLabel}：${transcriptGroup.map(entry => entry.text).join(' ')}`);
     transcriptGroup = [];
@@ -3583,6 +3591,10 @@ function isVcMeetingOutputAllowedOperator(session: VcMeetingDaemonSession, cfg: 
   return typeof openId === 'string' && vcMeetingOutputAllowedOpenIds(session, cfg).has(openId);
 }
 
+function isVcMeetingConsumerSelectionAllowedOperator(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig, openId: unknown): boolean {
+  return isVcMeetingOutputAllowedOperator(session, cfg, openId);
+}
+
 function clearVcMeetingOutputRequestTimer(req: VcMeetingPendingOutputRequest | undefined): void {
   if (req?.timer) {
     clearTimeout(req.timer);
@@ -3664,24 +3676,31 @@ function sanitizeVcMeetingOutputContent(value: unknown, fieldName: string): stri
 }
 
 function vcMeetingOutputTextForSend(req: VcMeetingPendingOutputRequest): string {
-  return req.channel === 'voice'
+  const text = req.channel === 'voice'
     ? (req.fallbackText?.trim() || req.content)
     : req.content;
+  const stripped = text.replace(/[@＠]/g, '').replace(/\s+/g, ' ').trim();
+  if (!stripped) throw new Error('meeting text output is empty after stripping @ mentions');
+  return stripped;
 }
 
 async function sendVcMeetingOutputText(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig, req: VcMeetingPendingOutputRequest): Promise<void> {
+  const text = vcMeetingOutputTextForSend(req);
   if (vcMeetingOutputTextSenderForTest) {
-    await vcMeetingOutputTextSenderForTest(session, req);
+    await vcMeetingOutputTextSenderForTest(session, {
+      ...req,
+      ...(req.channel === 'voice' ? { fallbackText: text } : { content: text }),
+    });
     return;
   }
   if (!vcMeetingTextOutputAvailable()) throw new Error(VC_MEETING_TEXT_OUTPUT_UNAVAILABLE);
   if (!cfg.larkCliProfile) throw new Error('larkCliProfile is required to send meeting text output');
-  sendMeetingTextMessageAsBot({
+  await Promise.resolve(sendMeetingTextMessageAsBot({
     meetingId: session.state.meeting.id,
-    text: vcMeetingOutputTextForSend(req),
+    text,
     uuid: req.id,
     profile: cfg.larkCliProfile,
-  });
+  }));
 }
 
 async function speakVcMeetingOutput(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig, req: VcMeetingPendingOutputRequest): Promise<void> {
@@ -4084,9 +4103,11 @@ function buildVcMeetingConsumerLines(
   items: NormalizedVcMeetingItem[],
   opts: { final?: boolean } = {},
 ): string[] {
+  const timeZone = vcMeetingDisplayTimeZone(cfg);
   const header = vcMeetingListenerHeaderLine(
     session.state.meeting,
-    items.map((item, index) => vcMeetingEventEntry(item, index)).filter((entry): entry is VcMeetingListenerEntry => !!entry),
+    items.map((item, index) => vcMeetingEventEntry(item, index, timeZone)).filter((entry): entry is VcMeetingListenerEntry => !!entry),
+    timeZone,
     opts,
   );
   const lines = [header];
@@ -4105,7 +4126,7 @@ function buildVcMeetingConsumerLines(
     if (item.type === 'transcript_received') {
       const text = compactVcMeetingText(item.text);
       if (!text) continue;
-      const time = vcMeetingTimeLabel(item.endTimeMs ?? item.startTimeMs ?? item.occurredAtMs);
+      const time = vcMeetingTimeLabel(item.endTimeMs ?? item.startTimeMs ?? item.occurredAtMs, timeZone);
       const trust = vcMeetingConsumerActorTrustLabel(session, cfg, item.speaker);
       lines.push(`${time ? `[字幕 ${time}]` : '[字幕]'} ${vcMeetingActorLabel(item.speaker)}（${trust}）：${text}`);
       continue;
@@ -4113,12 +4134,12 @@ function buildVcMeetingConsumerLines(
     if (item.type === 'chat_received') {
       const text = compactVcMeetingText(item.text);
       if (!text) continue;
-      const time = vcMeetingTimeLabel(item.occurredAtMs);
+      const time = vcMeetingTimeLabel(item.occurredAtMs, timeZone);
       const trust = vcMeetingConsumerActorTrustLabel(session, cfg, item.sender);
       lines.push(`${time ? `[聊天 ${time}]` : '[聊天]'} ${vcMeetingActorLabel(item.sender)}（${trust}）：${text}`);
       continue;
     }
-    const line = formatVcMeetingItemLine(item);
+    const line = formatVcMeetingItemLine(item, timeZone);
     if (line) lines.push(line);
   }
   return lines.length > 1 ? lines : [];
@@ -4637,7 +4658,7 @@ async function flushVcMeetingListenerSession(
       ...pendingSnapshot,
       ...stableTranscripts,
     ];
-    const lines = buildVcMeetingListenerLines(session.state.meeting, itemsToSend, { final: opts.final });
+    const lines = buildVcMeetingListenerLines(session.state.meeting, itemsToSend, cfg, { final: opts.final });
     if (lines.length === 0) return { ok: true, sent: 0 };
     const chunks = chunkVcMeetingListenerLines(lines);
     let sent = 0;
@@ -4682,6 +4703,7 @@ async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfi
   const session = vcMeetingSessions.get(key);
   if (!session) return;
   session.ended = true;
+  markVcMeetingEnded(key);
   removeVcMeetingRuntimeSession(config.session.dataDir, session.larkAppId, session.state.meeting.id);
   if (session.flushTimer) {
     clearInterval(session.flushTimer);
@@ -4713,7 +4735,6 @@ async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfi
     });
   }
   vcMeetingSessions.delete(key);
-  markVcMeetingEnded(key);
   logger.info(`[vc-agent] session closed ${key}`);
 }
 
@@ -4830,6 +4851,9 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
     if (!cfg || !session || session.ended) {
       return { toast: { type: 'warning', content: '会议监听已结束或不存在' } };
     }
+    if (!isVcMeetingConsumerSelectionAllowedOperator(session, cfg, data.operator?.open_id)) {
+      return { toast: { type: 'error', content: '只有本场会议授权人可以配置会议 agent' } };
+    }
     if (session.consumerSelectionApplying) {
       return { toast: { type: 'info', content: '会议 agent 选择正在处理中' } };
     }
@@ -4874,6 +4898,9 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
     if (!cfg || !session || session.ended) {
       return { toast: { type: 'warning', content: '会议监听已结束或不存在' } };
     }
+    if (!isVcMeetingConsumerSelectionAllowedOperator(session, cfg, data.operator?.open_id)) {
+      return { toast: { type: 'error', content: '只有本场会议授权人可以配置会议 agent' } };
+    }
     if (session.consumerSelectionApplying) {
       return { toast: { type: 'info', content: '会议 agent 选择正在处理中' } };
     }
@@ -4910,6 +4937,9 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
       : undefined;
     if (!cfg || !session || session.ended) {
       return { toast: { type: 'warning', content: '会议监听已结束或不存在' } };
+    }
+    if (!isVcMeetingConsumerSelectionAllowedOperator(session, cfg, data.operator?.open_id)) {
+      return { toast: { type: 'error', content: '只有本场会议授权人可以配置会议 agent' } };
     }
     if (session.consumerSelectionApplying) {
       return { toast: { type: 'info', content: '会议 agent 选择正在处理中' } };

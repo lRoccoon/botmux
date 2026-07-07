@@ -91,6 +91,18 @@ function normalizeNonEmptyString(raw: unknown): string | undefined {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
 }
 
+function normalizeTimeZone(raw: unknown): string | undefined {
+  const timeZone = normalizeNonEmptyString(raw);
+  if (!timeZone) return undefined;
+  try {
+    new Intl.DateTimeFormat('zh-CN', { timeZone }).format(new Date(0));
+    return timeZone;
+  } catch {
+    logger.warn(`vcMeetingAgent.timeZone ignored: invalid IANA time zone ${JSON.stringify(timeZone)}`);
+    return undefined;
+  }
+}
+
 function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
@@ -100,6 +112,7 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   const listenerChatId = normalizeNonEmptyString(entry.listenerChatId);
   const attentionTargetOpenId = normalizeNonEmptyString(entry.attentionTargetOpenId);
   const larkCliProfile = normalizeNonEmptyString(entry.larkCliProfile);
+  const timeZone = normalizeTimeZone(entry.timeZone ?? entry.timezone);
   const inviteTtlMs = normalizePositiveInt(entry.inviteTtlMs);
   const stabilizeMs = normalizePositiveInt(entry.stabilizeMs);
   const flushIntervalMs = normalizePositiveInt(entry.flushIntervalMs);
@@ -109,6 +122,7 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   if (listenerChatId) out.listenerChatId = listenerChatId;
   if (attentionTargetOpenId) out.attentionTargetOpenId = attentionTargetOpenId;
   if (larkCliProfile) out.larkCliProfile = larkCliProfile;
+  if (timeZone) out.timeZone = timeZone;
   if (inviteTtlMs !== undefined) out.inviteTtlMs = inviteTtlMs;
   if (stabilizeMs !== undefined) out.stabilizeMs = stabilizeMs;
   if (flushIntervalMs !== undefined) out.flushIntervalMs = flushIntervalMs;
@@ -351,6 +365,8 @@ export interface VcMeetingAgentConfig {
   notificationChatId?: string;
   attentionTargetOpenId?: string;
   larkCliProfile?: string;
+  /** IANA time zone used when rendering listener-group timestamps. Defaults to Asia/Shanghai. */
+  timeZone?: string;
   /** Pending invite confirmation TTL. Defaults to 30 minutes. */
   inviteTtlMs?: number;
   /** Transcript stability window before listener-group sync emits a sentence. */

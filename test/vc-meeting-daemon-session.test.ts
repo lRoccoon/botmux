@@ -994,6 +994,55 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(text).toContain('[字幕 16:00:05-16:00:06] Alice：third sentence');
   });
 
+  it('renders listener timestamps with the configured meeting time zone', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        listenerChatId: 'oc_listener',
+        stabilizeMs: 1,
+        timeZone: 'UTC',
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_activity_utc_transcript',
+      meeting: { id: 'm_utc', topic: 'UTC transcript review' },
+      raw: {
+        event: {
+          meeting_actitivty_items: [
+            {
+              activity_event_type: 'transcript_received',
+              meeting: { id: 'm_utc', topic: 'UTC transcript review' },
+              transcript_received_items: [
+                {
+                  sentence_id: 'sent_utc_1',
+                  speaker: { open_id: 'ou_b', user_name: 'Bob' },
+                  text: 'utc timestamp',
+                  start_time_ms: '2026-07-01T16:00:01+08:00',
+                  end_time_ms: '2026-07-01T16:00:02+08:00',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2));
+    const result = await __vcMeetingAgentTest.flushListener(APP_ID, 'm_utc');
+
+    expect(result.ok).toBe(true);
+    const text = JSON.parse(sentMessages[0].content).text as string;
+    expect(text).toContain('会议同步（08:00:01-08:00:02）｜UTC transcript review');
+    expect(text).toContain('[字幕 08:00:01-08:00:02] Bob：utc timestamp');
+  });
+
   it('does not mark stable transcripts flushed until listener send succeeds', async () => {
     registerBot({
       larkAppId: APP_ID,
@@ -1140,6 +1189,32 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(labels).toContain('Claude Loopy');
     expect(labels).toContain('Self should be included');
     expect(labels).not.toContain('Missing bot should be excluded');
+
+    const deniedIntervalStage = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: 'ou_someone_else' },
+      action: lastInteractiveCardSelectOption('90 秒'),
+    }, APP_ID);
+    expect(deniedIntervalStage.toast.content).toContain('只有本场会议授权人');
+
+    const deniedConfirm = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: 'ou_someone_else' },
+      action: { value: lastInteractiveCardButton('确认') },
+    }, APP_ID);
+    expect(deniedConfirm.toast.content).toContain('只有本场会议授权人');
+
+    const deniedLegacySelect = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: 'ou_someone_else' },
+      action: {
+        value: {
+          ...confirmButton.value,
+          action: 'vc_meeting_consumer_select',
+          consumer_mode: 'agent',
+          agent_app_id: AGENT_APP_ID,
+        },
+      },
+    }, APP_ID);
+    expect(deniedLegacySelect.toast.content).toContain('只有本场会议授权人');
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_222222222')?.consumerMode).toBe('pending');
 
     // 点"只监听消息"只暂存：卡片进入待确认态，runtime store 不写半选状态。
     const staged = await __vcMeetingAgentTest.handleCardAction({
@@ -2465,7 +2540,7 @@ describe('VC meeting daemon session lifecycle', () => {
       larkAppId: APP_ID,
       meetingId: 'm_joined_999999999',
       channel: 'text',
-      content: '这里有一个待确认的行动项。',
+      content: '@张三 这里有一个待确认的行动项。',
       reason: '需要提醒会场',
     });
     expect(submitted).toMatchObject({ ok: true, status: 'pending' });
@@ -2478,7 +2553,7 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(allowed.header.title.content).toBe('已发送会中弹幕');
     expect(meetingTextOutputs.at(-1)).toMatchObject({
       meetingId: 'm_joined_999999999',
-      text: '这里有一个待确认的行动项。',
+      text: '张三 这里有一个待确认的行动项。',
       channel: 'text',
     });
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_999999999')?.textOutputPolicy).toBe('allow');
@@ -2487,13 +2562,13 @@ describe('VC meeting daemon session lifecycle', () => {
       larkAppId: APP_ID,
       meetingId: 'm_joined_999999999',
       channel: 'text',
-      content: '自动文本现在可以直接发送。',
+      content: '＠李四 自动文本现在可以直接发送。',
     });
 
     expect(second).toMatchObject({ ok: true, status: 'sent' });
     expect(meetingTextOutputs.at(-1)).toMatchObject({
       meetingId: 'm_joined_999999999',
-      text: '自动文本现在可以直接发送。',
+      text: '李四 自动文本现在可以直接发送。',
       channel: 'text',
     });
   });
