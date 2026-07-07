@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { DesktopRuntimeState } from '../src/desktop/shared/types.js';
-import { autoStartCliRuntimeOnLaunch, shouldAutoStartCliRuntime } from '../src/desktop/main/auto-start.js';
+import type { DesktopRuntimeState } from '../../src/desktop/shared/types.js';
+import { autoStartCliRuntimeOnLaunch, shouldAutoStartCliRuntime } from '../../src/desktop/main/auto-start.js';
 
 function runtimeState(overrides: Partial<DesktopRuntimeState>): DesktopRuntimeState {
   return {

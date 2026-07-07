@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 describe('desktop dashboard compat validation', () => {
   it('accepts the supported desktop compat manifest', async () => {
-    const { validateDashboardCompat } = await import('../src/desktop/main/dashboard-compat.js');
+    const { validateDashboardCompat } = await import('../../src/desktop/main/dashboard-compat.js');
     const fetch = vi.fn().mockResolvedValue(response(200, {
       schemaVersion: 1,
       product: 'botmux',
@@ -18,7 +18,7 @@ describe('desktop dashboard compat validation', () => {
   });
 
   it('degrades safely when an old CLI does not expose the compat manifest', async () => {
-    const { validateDashboardCompat } = await import('../src/desktop/main/dashboard-compat.js');
+    const { validateDashboardCompat } = await import('../../src/desktop/main/dashboard-compat.js');
     const fetch = vi.fn().mockResolvedValue(response(404, { error: 'not found' }));
 
     const result = await validateDashboardCompat('http://127.0.0.1:7891/?token=x', { fetch });
@@ -31,7 +31,7 @@ describe('desktop dashboard compat validation', () => {
   });
 
   it('degrades safely when the compat manifest is malformed', async () => {
-    const { validateDashboardCompat } = await import('../src/desktop/main/dashboard-compat.js');
+    const { validateDashboardCompat } = await import('../../src/desktop/main/dashboard-compat.js');
     const fetch = vi.fn().mockResolvedValue(response(200, {
       schemaVersion: 1,
       product: 'botmux',
@@ -48,7 +48,7 @@ describe('desktop dashboard compat validation', () => {
   });
 
   it('treats invalid compat JSON as an incompatible manifest, not as a network outage', async () => {
-    const { validateDashboardCompat } = await import('../src/desktop/main/dashboard-compat.js');
+    const { validateDashboardCompat } = await import('../../src/desktop/main/dashboard-compat.js');
     const fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -65,7 +65,7 @@ describe('desktop dashboard compat validation', () => {
   });
 
   it('blocks embedding when the dashboard protocol is newer than this app supports', async () => {
-    const { validateDashboardCompat } = await import('../src/desktop/main/dashboard-compat.js');
+    const { validateDashboardCompat } = await import('../../src/desktop/main/dashboard-compat.js');
     const fetch = vi.fn().mockResolvedValue(response(200, {
       schemaVersion: 1,
       product: 'botmux',

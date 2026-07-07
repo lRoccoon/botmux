@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 describe('desktop dashboard shell mode', () => {
   it('keeps duplicate dashboard chrome suppression inside the desktop app', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -19,11 +19,11 @@ describe('desktop dashboard shell mode', () => {
 
   it('uses the embedded dashboard webview as the only dashboard surface', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -34,15 +34,15 @@ describe('desktop dashboard shell mode', () => {
 
   it('opens add bot through a dashboard route action without importing dashboard internals', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
     const dashboardSource = readFileSync(
-      fileURLToPath(new URL('../src/dashboard/web/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/dashboard/web/app.ts', import.meta.url)),
       'utf-8',
     );
     const onboardingSource = readFileSync(
-      fileURLToPath(new URL('../src/dashboard/web/bot-onboarding.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/dashboard/web/bot-onboarding.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -56,7 +56,7 @@ describe('desktop dashboard shell mode', () => {
 
   it('lets the embedded dashboard honor the desktop locale from hash params', () => {
     const appSource = readFileSync(
-      fileURLToPath(new URL('../src/dashboard/web/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/dashboard/web/app.ts', import.meta.url)),
       'utf-8',
     );
 

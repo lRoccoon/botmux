@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import type { RuntimeLaunchTarget } from '../src/desktop/main/runtime-service.js';
-import { defaultPm2ListTimeoutMs, listPm2Apps } from '../src/desktop/main/pm2-apps.js';
+import type { RuntimeLaunchTarget } from '../../src/desktop/main/runtime-service.js';
+import { defaultPm2ListTimeoutMs, listPm2Apps } from '../../src/desktop/main/pm2-apps.js';
 
 const paths = {
   botmuxHome: '/home/.botmux',

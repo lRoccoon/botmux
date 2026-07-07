@@ -45,7 +45,7 @@ describe('desktop IPC runtime monitor', () => {
 
   it('pushes desktop:state-changed on start and every monitor tick', async () => {
     vi.useFakeTimers();
-    const { createRuntimeStateMonitor } = await import('../src/desktop/main/ipc.js');
+    const { createRuntimeStateMonitor } = await import('../../src/desktop/main/ipc.js');
     const states = [
       { status: 'stopped', appVersion: '1.0.0' },
       { status: 'running', appVersion: '1.0.0' },
@@ -76,7 +76,7 @@ describe('desktop IPC runtime monitor', () => {
   });
 
   it('refreshes state after runtime actions complete', async () => {
-    const { registerDesktopIpc } = await import('../src/desktop/main/ipc.js');
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     const monitor = { refresh: vi.fn().mockResolvedValue(undefined) };
     const start = vi.fn().mockResolvedValue({ code: 0, stdout: 'started', stderr: '' });
 
@@ -100,7 +100,7 @@ describe('desktop IPC runtime monitor', () => {
   });
 
   it('sets the real Electron login item when launch-at-login changes', async () => {
-    const { registerDesktopIpc } = await import('../src/desktop/main/ipc.js');
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     registerDesktopIpc({
       paths: desktopPaths,
       runtime: {
@@ -130,7 +130,7 @@ describe('desktop dashboard locate IPC', () => {
   });
 
   it('returns the current dashboard URL without rotating while keeping the legacy fallback', async () => {
-    const { registerDesktopIpc } = await import('../src/desktop/main/ipc.js');
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -169,7 +169,7 @@ describe('desktop dashboard locate IPC', () => {
   });
 
   it('rotates a dashboard URL only when no active dashboard token exists', async () => {
-    const { registerDesktopIpc } = await import('../src/desktop/main/ipc.js');
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -207,7 +207,7 @@ describe('desktop dashboard locate IPC', () => {
   });
 
   it('returns incompatible when the dashboard compat manifest is missing', async () => {
-    const { registerDesktopIpc } = await import('../src/desktop/main/ipc.js');
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false,
       status: 404,
@@ -236,7 +236,7 @@ describe('desktop dashboard locate IPC', () => {
   });
 
   it('returns incompatible when degraded state already reports a CLI/App protocol mismatch', async () => {
-    const { registerDesktopIpc } = await import('../src/desktop/main/ipc.js');
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     const runtime = {
       getState: vi.fn().mockResolvedValue({
         status: 'degraded',
@@ -269,7 +269,7 @@ describe('desktop dashboard locate IPC', () => {
     ['unreachable', 'ECONNREFUSED while opening dashboard'],
     ['unknown', 'unexpected dashboard lookup failure'],
   ] as const)('maps dashboard lookup failures to %s', async (reason, stderr) => {
-    const { registerDesktopIpc } = await import('../src/desktop/main/ipc.js');
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     const runtime = {
       getState: vi.fn().mockResolvedValue({ status: 'running' }),
       start: vi.fn(),
@@ -294,7 +294,7 @@ describe('desktop dashboard locate IPC', () => {
   });
 
   it('returns structured failure when the runtime is not running', async () => {
-    const { registerDesktopIpc } = await import('../src/desktop/main/ipc.js');
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     const runtime = {
       getState: vi.fn().mockResolvedValue({ status: 'stopped', message: 'Start the runtime first' }),
       start: vi.fn(),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { runAppSmokeCommand, type AppSmokeDeps, type RunCaptureResult } from '../src/desktop/smoke.js';
+import { runAppSmokeCommand, type AppSmokeDeps, type RunCaptureResult } from '../../src/desktop/smoke.js';
 
 function makeDeps(
   paths: string[],

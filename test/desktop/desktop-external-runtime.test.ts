@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { discoverExternalRuntimeCandidate, selectExternalRuntimeCandidate } from '../src/desktop/main/external-runtime.js';
+import { discoverExternalRuntimeCandidate, selectExternalRuntimeCandidate } from '../../src/desktop/main/external-runtime.js';
 
 const paths = {
   botmuxHome: '/home/.botmux',
@@ -13,7 +13,7 @@ const paths = {
 describe('desktop external CLI runtime wiring', () => {
   it('wires external CLI discovery into the runtime service', () => {
     const mainSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/main.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/main.ts', import.meta.url)),
       'utf-8',
     );
 

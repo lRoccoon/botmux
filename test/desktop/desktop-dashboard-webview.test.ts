@@ -12,11 +12,11 @@ describe('desktop dashboard embed', () => {
 
   it('renders native dashboard chrome around the webview', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const styleSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/style.css', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/style.css', import.meta.url)),
       'utf-8',
     );
 
@@ -33,11 +33,11 @@ describe('desktop dashboard embed', () => {
 
   it('mirrors the browser dashboard navigation routes', () => {
     const dashboardHtml = readFileSync(
-      fileURLToPath(new URL('../src/dashboard/web/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/dashboard/web/index.html', import.meta.url)),
       'utf-8',
     );
     const desktopHtml = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
 
@@ -46,15 +46,15 @@ describe('desktop dashboard embed', () => {
 
   it('keeps lower-left runtime status distinct from topbar counts', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
     const runtimeStateSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/runtime-state.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/runtime-state.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -77,11 +77,11 @@ describe('desktop dashboard embed', () => {
 
   it('uses an isolated webview instead of a file-page iframe', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const windowSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/main/window.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/main/window.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -94,11 +94,11 @@ describe('desktop dashboard embed', () => {
 
   it('allows embedded dashboard target-blank links to reach the browser handoff', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const windowSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/main/window.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/main/window.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -113,15 +113,15 @@ describe('desktop dashboard embed', () => {
 
   it('keeps the webview laid out while visually hidden', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
     const styleSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/style.css', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/style.css', import.meta.url)),
       'utf-8',
     );
 
@@ -135,11 +135,11 @@ describe('desktop dashboard embed', () => {
 
   it('opens the embedded dashboard in desktop shell mode', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
     const dashboardUrlSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/dashboard-url.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/dashboard-url.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -153,11 +153,11 @@ describe('desktop dashboard embed', () => {
 
   it('uses structured dashboard locate before falling back to legacy URL lookup', () => {
     const preloadSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/preload.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/preload.ts', import.meta.url)),
       'utf-8',
     );
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -171,7 +171,7 @@ describe('desktop dashboard embed', () => {
 
   it('renders structured dashboard locate failure reason/message', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -184,7 +184,7 @@ describe('desktop dashboard embed', () => {
 
   it('switches sidebar routes without re-querying the dashboard URL after load', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -200,7 +200,7 @@ describe('desktop dashboard embed', () => {
 
   it('keeps sidebar route clicks working when webview focus swallows click follow-up', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -214,7 +214,7 @@ describe('desktop dashboard embed', () => {
 
   it('allows sidebar hash navigation on a loaded dashboard during non-protocol degraded state', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -228,7 +228,7 @@ describe('desktop dashboard embed', () => {
 
   it('keeps an already-loaded dashboard during ordinary runtime monitor refreshes', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -244,7 +244,7 @@ describe('desktop dashboard embed', () => {
 
   it('retries dashboard locate after a running-state compat failure', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -259,7 +259,7 @@ describe('desktop dashboard embed', () => {
 
   it('uses setup messages from runtime state before the generic add-bot empty state', () => {
     const runtimeStateSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/runtime-state.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/runtime-state.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -270,7 +270,7 @@ describe('desktop dashboard embed', () => {
 
   it('validates runtimeSource in pushed runtime state snapshots', () => {
     const runtimeStateSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/runtime-state.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/runtime-state.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -282,19 +282,19 @@ describe('desktop dashboard embed', () => {
 
   it('keeps legacy takeover IPC but does not offer a failing handoff action', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const preloadSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/preload.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/preload.ts', import.meta.url)),
       'utf-8',
     );
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
     const dashboardUrlSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/dashboard-url.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/dashboard-url.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -309,7 +309,7 @@ describe('desktop dashboard embed', () => {
 
   it('releases runtime action controls before slow state refresh completes', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -320,11 +320,11 @@ describe('desktop dashboard embed', () => {
 
   it('renders runtime actions as a polished icon control group', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const styleSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/style.css', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/style.css', import.meta.url)),
       'utf-8',
     );
 
@@ -348,19 +348,19 @@ describe('desktop dashboard embed', () => {
 
   it('syncs desktop locale into the embedded dashboard', () => {
     const html = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/index.html', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
     const styleSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/style.css', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/style.css', import.meta.url)),
       'utf-8',
     );
     const dashboardUrlSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/dashboard-url.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/dashboard-url.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -376,11 +376,11 @@ describe('desktop dashboard embed', () => {
 
   it('syncs desktop runtime version into the embedded dashboard update card', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
     const dashboardUrlSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/dashboard-url.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/dashboard-url.ts', import.meta.url)),
       'utf-8',
     );
 
@@ -394,7 +394,7 @@ describe('desktop dashboard embed', () => {
 
   it('opens add bot through the dashboard onboarding flow', () => {
     const rendererSource = readFileSync(
-      fileURLToPath(new URL('../src/desktop/renderer/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
       'utf-8',
     );
 

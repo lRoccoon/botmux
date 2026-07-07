@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
-type WindowModule = typeof import('../src/desktop/main/window.js');
+type WindowModule = typeof import('../../src/desktop/main/window.js');
 
 let shouldBlockTopLevelNavigation: WindowModule['shouldBlockTopLevelNavigation'];
 let shouldOpenGuestNavigationExternally: WindowModule['shouldOpenGuestNavigationExternally'];
@@ -14,7 +14,7 @@ vi.mock('electron', () => ({
 beforeAll(async () => {
   // Import after the Electron mock so these pure navigation guards do not depend
   // on a downloaded Electron binary in unit-test environments.
-  const mod = await import('../src/desktop/main/window.js');
+  const mod = await import('../../src/desktop/main/window.js');
   shouldBlockTopLevelNavigation = mod.shouldBlockTopLevelNavigation;
   shouldOpenGuestNavigationExternally = mod.shouldOpenGuestNavigationExternally;
   shouldOpenUrlExternally = mod.shouldOpenUrlExternally;

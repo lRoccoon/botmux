@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import type { DesktopRuntimeState } from '../src/desktop/shared/types.js';
+import type { DesktopRuntimeState } from '../../src/desktop/shared/types.js';
 import {
   buildRuntimeMeta,
   buildVersionLine,
   emptyDashboardMessage,
   isRuntimeState,
   shouldKeepLoadedDashboardDuringDegradedState,
-} from '../src/desktop/renderer/runtime-state.js';
+} from '../../src/desktop/renderer/runtime-state.js';
 import {
   currentDashboardUrlFromSrc,
   dashboardRouteFromUrl,
@@ -14,7 +14,7 @@ import {
   normalizeDashboardRoute,
   routeDashboardUrl,
   withDesktopShellRoute,
-} from '../src/desktop/renderer/dashboard-url.js';
+} from '../../src/desktop/renderer/dashboard-url.js';
 
 const t = (key: string, params?: Record<string, string | number>) => {
   const messages: Record<string, string> = {

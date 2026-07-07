@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { createRuntimeService, type ExternalRuntimeCandidate } from '../src/desktop/main/runtime-service.js';
+import { createRuntimeService, type ExternalRuntimeCandidate } from '../../src/desktop/main/runtime-service.js';
 
 const paths = {
   botmuxHome: '/home/.botmux',

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveDesktopPaths } from '../src/desktop/main/paths.js';
+import { resolveDesktopPaths } from '../../src/desktop/main/paths.js';
 
 describe('desktop paths', () => {
   it('uses ~/.botmux as Botmux Home by default', () => {

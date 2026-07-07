@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { buildCompatManifest, handleDesktopCompat } from '../src/dashboard/compat.js';
+import { buildCompatManifest, handleDesktopCompat } from '../../src/dashboard/compat.js';
 
 let server: Server | null = null;
 
