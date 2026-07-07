@@ -312,6 +312,29 @@ async function waitForNewPatchedCard(afterIndex = patchedMessages.length): Promi
   return undefined;
 }
 
+async function waitForPatchedCardTitle(title: string, afterIndex = patchedMessages.length): Promise<any | undefined> {
+  for (let i = 0; i < 40; i += 1) {
+    for (const msg of patchedMessages.slice(afterIndex)) {
+      const card = JSON.parse(msg.content);
+      if (card?.header?.title?.content === title) return card;
+    }
+    await Promise.resolve();
+  }
+  return undefined;
+}
+
+async function waitForConsumerApplyFinalCard(afterIndex = patchedMessages.length): Promise<any | undefined> {
+  for (let i = 0; i < 40; i += 1) {
+    for (const msg of patchedMessages.slice(afterIndex)) {
+      const card = JSON.parse(msg.content);
+      const title = card?.header?.title?.content;
+      if (title && title !== '会议处理设置中') return card;
+    }
+    await Promise.resolve();
+  }
+  return undefined;
+}
+
 /** 新交互流程：下拉选 agent 只暂存，点"确认"才生效。返回确认后的卡片响应。 */
 async function selectConsumerAgentViaCard(label: string, operatorOpenId = TARGET_OPEN_ID): Promise<any> {
   await __vcMeetingAgentTest.handleCardAction({
@@ -324,7 +347,7 @@ async function selectConsumerAgentViaCard(label: string, operatorOpenId = TARGET
     action: { value: lastInteractiveCardButton('确认') },
   }, APP_ID);
   if (result?.header?.title?.content === '会议处理设置中') {
-    return (await waitForNewPatchedCard(patchIndex)) ?? result;
+    return (await waitForConsumerApplyFinalCard(patchIndex)) ?? result;
   }
   return result;
 }
@@ -1197,7 +1220,7 @@ describe('VC meeting daemon session lifecycle', () => {
     }, APP_ID);
     expect(processing.header.title.content).toBe('会议处理设置中');
 
-    const selected = await waitForNewPatchedCard(patchIndex);
+    const selected = await waitForPatchedCardTitle('会议 agent 已启用', patchIndex);
     expect(selected.header.title.content).toBe('会议 agent 已启用');
     expect(interactiveCardMarkdownContent(selected)).toContain('90 秒');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.syncIntervalMs).toBe(90_000);
@@ -1250,6 +1273,8 @@ describe('VC meeting daemon session lifecycle', () => {
     }, APP_ID);
 
     expect(processing.header.title.content).toBe('会议处理设置中');
+    const processingPatch = await waitForPatchedCardTitle('会议处理设置中', patchIndex);
+    expect(processingPatch).toBeTruthy();
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_262626262')?.selectedAgentAppId).toBeUndefined();
 
     const duplicate = await __vcMeetingAgentTest.handleCardAction({
@@ -1264,7 +1289,7 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(addBotToChatHolds.resolvers).toHaveLength(1);
     addBotToChatHolds.resolvers.shift()?.();
 
-    const finalCard = await waitForNewPatchedCard(patchIndex);
+    const finalCard = await waitForPatchedCardTitle('会议 agent 已启用', patchIndex);
     expect(finalCard?.header.title.content).toBe('会议 agent 已启用');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_262626262')?.selectedAgentAppId).toBe(AGENT_APP_ID);
   });
@@ -1318,7 +1343,7 @@ describe('VC meeting daemon session lifecycle', () => {
     }, APP_ID);
     expect(processing.header.title.content).toBe('会议处理设置中');
 
-    const selected = await waitForNewPatchedCard(patchIndex);
+    const selected = await waitForPatchedCardTitle('会议 agent 已启用', patchIndex);
     expect(selected.header.title.content).toBe('会议 agent 已启用');
     expect(interactiveCardMarkdownContent(selected)).toContain('45 秒');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_252525252')?.syncIntervalMs).toBe(45_000);

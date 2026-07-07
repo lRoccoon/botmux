@@ -3511,12 +3511,24 @@ function rescheduleVcMeetingTimers(key: string, session: VcMeetingDaemonSession,
   if (session.consumerMode === 'agent') scheduleVcMeetingConsumerInjection(key, cfg);
 }
 
-function applyVcMeetingConsumerSelectionInBackground(
+type VcMeetingConsumerSelectionApplyOptions = { claimed?: boolean };
+
+async function applyVcMeetingConsumerSelectionInBackground(
   key: string,
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
   apply: () => Promise<{ ok: true; status: 'listenOnly' | 'agent'; error?: string } | { ok: false; error: string }>,
-): any {
+  opts: { cardMessageId?: string } = {},
+): Promise<any> {
+  if (session.consumerSelectionApplying) {
+    return { toast: { type: 'info', content: '会议 agent 选择正在处理中' } };
+  }
+  session.consumerSelectionApplying = true;
+  if (opts.cardMessageId) session.consumerCardMessageId = opts.cardMessageId;
+  await patchVcMeetingConsumerCard(session, cfg, 'processing', { messageId: opts.cardMessageId })
+    .catch((err) => logger.warn(
+      `[vc-agent] meeting consumer processing-card patch failed ${key}: ${err instanceof Error ? err.message : String(err)}`,
+    ));
   void apply()
     .then((result) => patchVcMeetingConsumerCard(
       session,
@@ -3539,12 +3551,13 @@ async function patchVcMeetingConsumerCard(
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
   status: Parameters<typeof buildVcMeetingConsumerCard>[0]['status'],
-  opts: { error?: string } = {},
+  opts: { error?: string; messageId?: string } = {},
 ): Promise<void> {
-  if (!session.consumerCardMessageId) return;
+  const messageId = opts.messageId ?? session.consumerCardMessageId;
+  if (!messageId) return;
   await updateMessage(
     session.larkAppId,
-    session.consumerCardMessageId,
+    messageId,
     JSON.stringify(vcMeetingConsumerCardForSession(status, session, cfg, opts)),
   );
 }
@@ -4332,11 +4345,16 @@ async function applyVcMeetingConsumerSelection(
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
   selection: VcMeetingConsumerSelection,
+  opts: VcMeetingConsumerSelectionApplyOptions = {},
 ): Promise<{ ok: true; status: 'listenOnly' | 'agent'; error?: string } | { ok: false; error: string }> {
-  if (session.consumerSelectionApplying) {
-    return { ok: false, error: 'meeting consumer selection is already being applied' };
+  if (!opts.claimed) {
+    if (session.consumerSelectionApplying) {
+      return { ok: false, error: 'meeting consumer selection is already being applied' };
+    }
+    session.consumerSelectionApplying = true;
+  } else if (!session.consumerSelectionApplying) {
+    session.consumerSelectionApplying = true;
   }
-  session.consumerSelectionApplying = true;
   const resolved = vcMeetingResolveConsumerSelection(cfg, selection);
   try {
     clearVcMeetingConsumerSelectionTimer(session);
@@ -4409,11 +4427,12 @@ async function applyVcMeetingConsumerStagedState(
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
   fallback: VcMeetingConsumerSelection,
+  opts: VcMeetingConsumerSelectionApplyOptions = {},
 ): Promise<Awaited<ReturnType<typeof applyVcMeetingConsumerSelection>>> {
   const choice: VcMeetingConsumerSelection = session.consumerPendingChoice ?? fallback;
   const stagedIntervalMs = session.consumerPendingIntervalMs;
   if (stagedIntervalMs) session.syncIntervalMs = stagedIntervalMs;
-  const result = await applyVcMeetingConsumerSelection(key, session, cfg, choice);
+  const result = await applyVcMeetingConsumerSelection(key, session, cfg, choice, opts);
   if (stagedIntervalMs) rescheduleVcMeetingTimers(key, session, cfg);
   return result;
 }
@@ -4872,7 +4891,8 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
         key,
         session,
         cfg,
-        () => applyVcMeetingConsumerStagedState(key, session, cfg, { mode: 'default' }),
+        () => applyVcMeetingConsumerStagedState(key, session, cfg, { mode: 'default' }, { claimed: true }),
+        { cardMessageId: data.context?.open_message_id ?? data.open_message_id },
       );
     }
     const result = await applyVcMeetingConsumerStagedState(key, session, cfg, { mode: 'default' });
@@ -4910,7 +4930,8 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
         key,
         session,
         cfg,
-        () => applyVcMeetingConsumerSelection(key, session, cfg, selection),
+        () => applyVcMeetingConsumerSelection(key, session, cfg, selection, { claimed: true }),
+        { cardMessageId: data.context?.open_message_id ?? data.open_message_id },
       );
     }
     const result = await applyVcMeetingConsumerSelection(key, session, cfg, selection);
