@@ -20,6 +20,10 @@ const onlineDaemons = vi.hoisted(() => new Map<string, { larkAppId: string; ipcP
 const remoteFetchCalls = vi.hoisted(() => [] as Array<{ url: string; init?: RequestInit; body?: any }>);
 const addBotToChatCalls = vi.hoisted(() => [] as Array<{ proxyLarkAppId: string; chatId: string; targetLarkAppIds: string[] }>);
 const addBotToChatFailures = vi.hoisted(() => ({ count: 0 }));
+const addBotToChatHolds = vi.hoisted(() => ({
+  count: 0,
+  resolvers: [] as Array<() => void>,
+}));
 const chatReplyModeCalls = vi.hoisted(() => [] as Array<{ larkAppId: string; chatId: string; mode: string }>);
 const runtimeStoreRecords = vi.hoisted(() => [] as Array<{
   larkAppId: string;
@@ -122,6 +126,10 @@ vi.mock('../src/services/groups-store.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/services/groups-store.js')>()),
   addBotToChat: vi.fn(async (proxyLarkAppId: string, chatId: string, targetLarkAppIds: string[]) => {
     addBotToChatCalls.push({ proxyLarkAppId, chatId, targetLarkAppIds });
+    if (addBotToChatHolds.count > 0) {
+      addBotToChatHolds.count -= 1;
+      await new Promise<void>(resolve => addBotToChatHolds.resolvers.push(resolve));
+    }
     if (addBotToChatFailures.count > 0) {
       addBotToChatFailures.count -= 1;
       return targetLarkAppIds.map(id => ({ id, ok: false, error: 'add failed' }));
@@ -294,16 +302,31 @@ function lastInteractiveCardSelectOption(label: string): { value: Record<string,
   throw new Error(`card select option not found: ${label}`);
 }
 
+async function waitForNewPatchedCard(afterIndex = patchedMessages.length): Promise<any | undefined> {
+  for (let i = 0; i < 20; i += 1) {
+    if (patchedMessages.length > afterIndex) {
+      return JSON.parse(patchedMessages.at(-1)!.content);
+    }
+    await Promise.resolve();
+  }
+  return undefined;
+}
+
 /** 新交互流程：下拉选 agent 只暂存，点"确认"才生效。返回确认后的卡片响应。 */
 async function selectConsumerAgentViaCard(label: string, operatorOpenId = TARGET_OPEN_ID): Promise<any> {
   await __vcMeetingAgentTest.handleCardAction({
     operator: { open_id: operatorOpenId },
     action: lastInteractiveCardSelectOption(label),
   }, APP_ID);
-  return __vcMeetingAgentTest.handleCardAction({
+  const patchIndex = patchedMessages.length;
+  const result = await __vcMeetingAgentTest.handleCardAction({
     operator: { open_id: operatorOpenId },
     action: { value: lastInteractiveCardButton('确认') },
   }, APP_ID);
+  if (result?.header?.title?.content === '会议处理设置中') {
+    return (await waitForNewPatchedCard(patchIndex)) ?? result;
+  }
+  return result;
 }
 
 function interactiveCardLabels(card: any): string[] {
@@ -375,6 +398,8 @@ describe('VC meeting daemon session lifecycle', () => {
     groupCreateHolds.resolvers.length = 0;
     addBotToChatCalls.length = 0;
     addBotToChatFailures.count = 0;
+    addBotToChatHolds.count = 0;
+    addBotToChatHolds.resolvers.length = 0;
     chatReplyModeCalls.length = 0;
     triggerSessionCalls.length = 0;
     onlineDaemons.clear();
@@ -408,6 +433,8 @@ describe('VC meeting daemon session lifecycle', () => {
     groupCreateHolds.resolvers.length = 0;
     addBotToChatCalls.length = 0;
     addBotToChatFailures.count = 0;
+    addBotToChatHolds.count = 0;
+    addBotToChatHolds.resolvers.length = 0;
     chatReplyModeCalls.length = 0;
     triggerSessionCalls.length = 0;
     onlineDaemons.clear();
@@ -1163,15 +1190,83 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(stagedCard.toast.content).toContain('已暂存');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.selectedAgentAppId).toBeUndefined();
 
-    const selected = await __vcMeetingAgentTest.handleCardAction({
+    const patchIndex = patchedMessages.length;
+    const processing = await __vcMeetingAgentTest.handleCardAction({
       operator: { open_id: TARGET_OPEN_ID },
       action: { value: lastInteractiveCardButton('确认') },
     }, APP_ID);
+    expect(processing.header.title.content).toBe('会议处理设置中');
 
+    const selected = await waitForNewPatchedCard(patchIndex);
     expect(selected.header.title.content).toBe('会议 agent 已启用');
     expect(interactiveCardMarkdownContent(selected)).toContain('90 秒');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.syncIntervalMs).toBe(90_000);
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.selectedAgentAppId).toBe(AGENT_APP_ID);
+  });
+
+  it('returns a processing consumer card immediately while agent selection is applying', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          selectionTimeoutMs: 20_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_consumer_processing',
+      meeting: { id: 'm_consumer_processing', meetingNo: '262626262', topic: 'Consumer processing review' },
+      raw: { event: { meeting: { id: 'm_consumer_processing', meeting_no: '262626262' } } },
+    });
+
+    await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: lastInteractiveCardSelectOption('Claude Loopy'),
+    }, APP_ID);
+
+    addBotToChatHolds.count = 1;
+    const confirmAction = { value: lastInteractiveCardButton('确认') };
+    const patchIndex = patchedMessages.length;
+    const processing = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: confirmAction,
+    }, APP_ID);
+
+    expect(processing.header.title.content).toBe('会议处理设置中');
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_262626262')?.selectedAgentAppId).toBeUndefined();
+
+    const duplicate = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: confirmAction,
+    }, APP_ID);
+    expect(duplicate.toast.content).toContain('正在处理中');
+
+    for (let i = 0; i < 20 && addBotToChatHolds.resolvers.length === 0; i += 1) {
+      await Promise.resolve();
+    }
+    expect(addBotToChatHolds.resolvers).toHaveLength(1);
+    addBotToChatHolds.resolvers.shift()?.();
+
+    const finalCard = await waitForNewPatchedCard(patchIndex);
+    expect(finalCard?.header.title.content).toBe('会议 agent 已启用');
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_262626262')?.selectedAgentAppId).toBe(AGENT_APP_ID);
   });
 
   it('can apply a custom per-meeting sync interval from the consumer card', async () => {
@@ -1211,7 +1306,8 @@ describe('VC meeting daemon session lifecycle', () => {
       action: agentSelect,
     }, APP_ID);
 
-    const selected = await __vcMeetingAgentTest.handleCardAction({
+    const patchIndex = patchedMessages.length;
+    const processing = await __vcMeetingAgentTest.handleCardAction({
       operator: { open_id: TARGET_OPEN_ID },
       action: {
         value: lastInteractiveCardButton('确认'),
@@ -1220,7 +1316,9 @@ describe('VC meeting daemon session lifecycle', () => {
         },
       },
     }, APP_ID);
+    expect(processing.header.title.content).toBe('会议处理设置中');
 
+    const selected = await waitForNewPatchedCard(patchIndex);
     expect(selected.header.title.content).toBe('会议 agent 已启用');
     expect(interactiveCardMarkdownContent(selected)).toContain('45 秒');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_252525252')?.syncIntervalMs).toBe(45_000);

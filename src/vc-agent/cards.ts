@@ -2,7 +2,7 @@ import type { VcMeetingRef } from './types.js';
 import type { VcMeetingConsumerAgentConfig } from '../bot-registry.js';
 
 export type VcMeetingConfirmCardStatus = 'pending' | 'started' | 'declined' | 'expired' | 'failed';
-export type VcMeetingConsumerCardStatus = 'pending' | 'listenOnly' | 'agent' | 'expired' | 'failed';
+export type VcMeetingConsumerCardStatus = 'pending' | 'processing' | 'listenOnly' | 'agent' | 'expired' | 'failed';
 export type VcMeetingOutputReviewCardStatus =
   | 'pending'
   | 'processing'
@@ -226,6 +226,18 @@ function consumerStatusBody(input: VcMeetingConsumerCardInput): { template: stri
       body: [
         '本次会议只同步字幕、聊天和参会变化，不启用 agent 处理。',
         ...(input.error ? [`选择 agent 失败，已回退只监听：${escapeMd(input.error)}`] : []),
+        '',
+        ...lines,
+      ].join('\n'),
+    };
+  }
+  if (input.status === 'processing') {
+    return {
+      template: 'blue',
+      title: '会议处理设置中',
+      body: [
+        '已收到确认，正在应用本次会议处理设置。',
+        '完成后卡片会自动更新，请不要重复点击。',
         '',
         ...lines,
       ].join('\n'),
