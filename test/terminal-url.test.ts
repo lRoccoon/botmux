@@ -1,6 +1,15 @@
 // test/terminal-url.test.ts
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { config } from '../src/config.js';
+
+vi.mock('../src/global-config.js', () => ({
+  isRemoteAccessEnabled: vi.fn(() => false),
+}));
+
+vi.mock('../src/platform/binding.js', () => ({
+  platformMachineBaseUrl: vi.fn(() => null),
+}));
+
 import {
   setTerminalProxyPort,
   setTerminalExternalPort,

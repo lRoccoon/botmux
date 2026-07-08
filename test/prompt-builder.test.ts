@@ -15,6 +15,10 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(() => ''),
+  execFile: vi.fn((_cmd: string, _args: any, _opts: any, cb?: any) => {
+    const done = typeof _args === 'function' ? _args : typeof _opts === 'function' ? _opts : cb;
+    if (done) done(null, '', '');
+  }),
   execFileSync: vi.fn(() => ''),
 }));
 

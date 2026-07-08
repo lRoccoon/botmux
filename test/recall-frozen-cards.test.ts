@@ -13,6 +13,14 @@ import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
+vi.mock('../src/global-config.js', () => ({
+  isRemoteAccessEnabled: vi.fn(() => false),
+}));
+
+vi.mock('../src/platform/binding.js', () => ({
+  platformMachineBaseUrl: vi.fn(() => null),
+}));
+
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
 const updateMessageMock = vi.fn(async (_appId: string, _messageId: string, _json: string) => {});
 const saveFrozenCardsMock = vi.fn();
