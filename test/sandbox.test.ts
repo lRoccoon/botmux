@@ -11,7 +11,8 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync, statSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, attachSandboxOutbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxVartmpRoot, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { spawnSync } from 'node:child_process';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, readRelayRequestFile, startOutboxWatcher, prepareSandbox, attachSandboxOutbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxVartmpRoot, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -363,6 +364,82 @@ describe('materializeOutboxFile (TOCTOU)', () => {
     expect(r).toBe(false);            // rejected (not a regular file)
     expect(existsSync(dest)).toBe(false);
     expect(elapsed).toBeLessThan(2000); // returned immediately, did NOT block
+  });
+});
+
+describe('readRelayRequestFile (TOCTOU)', () => {
+  it('reads a small regular request file', () => {
+    const outbox = tmp();
+    const req = join(outbox, 'x.req.json');
+    writeFileSync(req, JSON.stringify({ contentFile: 'c.content', flags: [] }));
+    try {
+      expect(readRelayRequestFile(req)).toContain('c.content');
+    } finally {
+      rmSync(outbox, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a symlink request file', () => {
+    const outbox = tmp(); const secretDir = tmp();
+    const secret = join(secretDir, 'secret.req.json');
+    writeFileSync(secret, JSON.stringify({ contentFile: 'secret.content' }));
+    symlinkSync(secret, join(outbox, 'x.req.json'));
+    try {
+      expect(readRelayRequestFile(join(outbox, 'x.req.json'))).toBeNull();
+    } finally {
+      rmSync(outbox, { recursive: true, force: true });
+      rmSync(secretDir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('refuses a FIFO request file without blocking', () => {
+    const outbox = tmp();
+    const fifo = join(outbox, 'x.req.json');
+    spawnSync('mkfifo', [fifo]);
+    const start = Date.now();
+    try {
+      expect(readRelayRequestFile(fifo)).toBeNull();
+      expect(Date.now() - start).toBeLessThan(2000);
+    } finally {
+      rmSync(outbox, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an oversized request file', () => {
+    const outbox = tmp();
+    const req = join(outbox, 'x.req.json');
+    writeFileSync(req, 'x'.repeat(64 * 1024 + 1));
+    try {
+      expect(readRelayRequestFile(req)).toBeNull();
+    } finally {
+      rmSync(outbox, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('startOutboxWatcher request hardening', () => {
+  it.skipIf(process.platform !== 'linux')('rejects a FIFO .req.json without blocking the worker tick', async () => {
+    const root = tmp();
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox, { recursive: true });
+    const req = join(outbox, 'bad.req.json');
+    spawnSync('mkfifo', [req]);
+
+    const stop = startOutboxWatcher(outbox, process.env, 'sid-hardening');
+    try {
+      const deadline = Date.now() + 3000;
+      let res: string | null = null;
+      while (Date.now() < deadline) {
+        const p = join(outbox, 'bad.res.json');
+        if (existsSync(p)) { res = readFileSync(p, 'utf8'); break; }
+        await new Promise(r => setTimeout(r, 50));
+      }
+      expect(res).not.toBeNull();
+      expect(JSON.parse(res!).stderr).toContain('relay rejected: request not a regular file or too large');
+    } finally {
+      stop();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -824,6 +824,39 @@ export function materializeOutboxFile(outbox: string, name: string, dest: string
   finally { closeSync(fd); if (outFd !== null) closeSync(outFd); }
 }
 
+const RELAY_REQUEST_MAX_BYTES = 64 * 1024;
+
+/**
+ * TOCTOU-safe read of the `.req.json` trigger file itself. The request file is
+ * also sandbox-controlled input, so it needs the same hardening as content and
+ * attachments: no symlinks, no FIFO/device files, no blocking opens, and a small
+ * size cap before JSON.parse. Returns null on any unsafe/non-regular/oversized
+ * input so the watcher can reject and keep its event loop moving.
+ */
+export function readRelayRequestFile(reqPath: string): string | null {
+  let fd: number;
+  try { fd = openSync(reqPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+  catch { return null; }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return null;
+    if (st.size > RELAY_REQUEST_MAX_BYTES) return null;
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const buf = Buffer.alloc(Math.min(8192, RELAY_REQUEST_MAX_BYTES));
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      total += n;
+      if (total > RELAY_REQUEST_MAX_BYTES) return null;
+      chunks.push(Buffer.from(buf.subarray(0, n)));
+    }
+    return Buffer.concat(chunks, total).toString('utf8');
+  } catch { return null; }
+  finally { closeSync(fd); }
+}
+
 /**
  * Daemon/worker-side outbox watcher. The sandboxed `botmux send` (relay mode)
  * drops `<id>.req.json`; we validate (validateRelayRequest) and then MATERIALIZE
@@ -859,7 +892,9 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
       const id = name.slice(0, -'.req.json'.length);
       const staged: string[] = [];
       let req: RelayRequest;
-      try { req = JSON.parse(readFileSync(reqPath, 'utf8')); }
+      const reqText = readRelayRequestFile(reqPath);
+      if (reqText === null) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: request not a regular file or too large'); continue; }
+      try { req = JSON.parse(reqText); }
       catch { finish(id, reqPath, name, staged, 1, '', 'relay: bad json'); continue; }
 
       const v = validateRelayRequest(req);
