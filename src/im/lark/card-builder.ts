@@ -2042,7 +2042,7 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
   const kind = input.attentionKind ?? 'blocked';
   const isHelp = kind === 'help';
   const header = isHelp
-    ? { template: 'blue', title: '🆘 worker 求助，需支援' }
+    ? { template: 'blue', title: '🆘 执行者求助，需要支援' }
     : { template: kind === 'blocked' ? 'orange' : 'red', title: '⚠️ 任务需要你拍板' };
   const mention = input.ownerOpenId ? `<at id=${input.ownerOpenId}></at> ` : '';
   const title = input.goalTitle ?? input.goalChatId;
@@ -2063,10 +2063,9 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
   if (input.supervisorSessionId) actionValue.supervisor_session_id = input.supervisorSessionId;
 
   const fields = [
-    { is_short: true, text: { tag: 'lark_md', content: `**Goal**\n${escapeMd(title)}` } },
-    { is_short: true, text: { tag: 'lark_md', content: `**类型**\n${escapeMd(kind)}` } },
-    input.taskId ? { is_short: true, text: { tag: 'lark_md', content: `**taskId**\n\`${escapeMd(input.taskId)}\`` } } : undefined,
-    { is_short: true, text: { tag: 'lark_md', content: `**goalChatId**\n\`${escapeMd(input.goalChatId)}\`` } },
+    { is_short: true, text: { tag: 'lark_md', content: `**目标**\n${escapeMd(title)}` } },
+    { is_short: true, text: { tag: 'lark_md', content: `**类型**\n${escapeMd(isHelp ? '求助' : '需拍板')}` } },
+    input.taskId ? { is_short: true, text: { tag: 'lark_md', content: `**任务**\n\`${escapeMd(input.taskId)}\`` } } : undefined,
   ].filter(Boolean);
 
   const elements: any[] = [
@@ -2075,8 +2074,8 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
       text: {
         tag: 'lark_md',
         content: [
-          `${mention}${isHelp ? 'worker 已显式求助，需要你提供支援或决策。' : 'goal 监管者遇到需要人类拍板的事项。'}`,
-          input.goalLink ? `[打开 goal 群](${input.goalLink})` : undefined,
+          `${mention}${isHelp ? '执行者正在求助，需要你提供支援或决策。' : '监管者遇到需要你拍板的事项。'}`,
+          input.goalLink ? `[打开目标群](${input.goalLink})` : undefined,
         ].filter(Boolean).join('\n'),
       },
     },
@@ -2117,7 +2116,7 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
       actions: [
         input.goalLink ? {
           tag: 'button',
-          text: { tag: 'plain_text', content: '打开 goal 群' },
+          text: { tag: 'plain_text', content: '打开目标群' },
           type: 'default',
           multi_url: {
             url: input.goalLink,
@@ -2147,7 +2146,7 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
         },
       ],
     },
-    { tag: 'note', elements: [{ tag: 'lark_md', content: '也可以直接引用回复这张卡片；两种方式都会转给 goal 监管者。' }] },
+    { tag: 'note', elements: [{ tag: 'lark_md', content: '也可以直接引用回复这张卡片；两种方式都会转给监管者。' }] },
   );
 
   return JSON.stringify({
@@ -2160,8 +2159,8 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
 export function buildGoalHumanAttentionResolvedCard(input: GoalHumanAttentionCardInput & { decisionText: string; decisionMode?: 'option' | 'free-text' }): string {
   const title = input.goalTitle ?? input.goalChatId;
   const fields = [
-    { is_short: true, text: { tag: 'lark_md', content: `**Goal**\n${escapeMd(title)}` } },
-    input.taskId ? { is_short: true, text: { tag: 'lark_md', content: `**taskId**\n\`${escapeMd(input.taskId)}\`` } } : undefined,
+    { is_short: true, text: { tag: 'lark_md', content: `**目标**\n${escapeMd(title)}` } },
+    input.taskId ? { is_short: true, text: { tag: 'lark_md', content: `**任务**\n\`${escapeMd(input.taskId)}\`` } } : undefined,
     { is_short: true, text: { tag: 'lark_md', content: `**状态**\n监管者处理中` } },
   ].filter(Boolean);
   const elements: any[] = [
@@ -2170,8 +2169,8 @@ export function buildGoalHumanAttentionResolvedCard(input: GoalHumanAttentionCar
       text: {
         tag: 'lark_md',
         content: [
-          '✅ 人类决策已下发给 goal 监管者。',
-          input.goalLink ? `[打开 goal 群](${input.goalLink})` : undefined,
+          '✅ 人类决策已下发给监管者。',
+          input.goalLink ? `[打开目标群](${input.goalLink})` : undefined,
         ].filter(Boolean).join('\n'),
       },
     },
@@ -2190,7 +2189,7 @@ export function buildGoalHumanAttentionResolvedCard(input: GoalHumanAttentionCar
       tag: 'action',
       actions: [{
         tag: 'button',
-        text: { tag: 'plain_text', content: '打开 goal 群' },
+        text: { tag: 'plain_text', content: '打开目标群' },
         type: 'default',
         multi_url: {
           url: input.goalLink,
