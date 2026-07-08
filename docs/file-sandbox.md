@@ -1,6 +1,6 @@
 # 文件沙盒（oncall 安全共享）
 
-把某个 bot 的 CLI 会话关进一个**按会话隔离的文件沙盒**，让你能把机器人放心分享给半受信任的人（oncall）：对方可以读真实工具链/CLI 配置并操作项目，但对 `$HOME` 和项目目录的写入会落到 overlay upper，不直接改宿主真实文件；飞书凭证也不会进入沙盒。
+把某个 bot 的 CLI 会话关进一个**按会话隔离的文件沙盒**，让你能把机器人放心分享给半受信任的人（oncall）：对方可以读真实工具链/CLI 配置并操作项目，但对 `$HOME` 和项目目录的写入会落到 overlay upper，不直接改宿主真实文件；`botmux send` 通过 relay 代发，不把发送凭证通过 env/argv/IPC 注入沙盒。
 
 > 调研与威胁模型见 [`sandbox-oncall-research-20260605.md`](./sandbox-oncall-research-20260605.md)。
 > 当前 scope = **只隔离文件**（Linux）。网络**不**隔离（`npm install` / `git fetch` 照常）；不防内核级容器逃逸——面向半受信任用户，不是面向恶意攻击者。
@@ -54,23 +54,25 @@ worker spawnCli
 
 ## botmux send 中转（关键）
 
-`botmux send` 原本**直连飞书**（读 `bots.json` 拿密钥）。沙盒里没有宿主 bot 配置/凭证，所以：
+`botmux send` 原本**直连飞书**（读 `bots.json` 拿密钥）。沙盒内的 shim 会改走 relay，中转本身不把发送凭证通过 env/argv/IPC 交给沙盒进程：
 
 1. 沙盒内 `botmux send` 检测到 `BOTMUX_SEND_RELAY=/var/tmp/botmux-sbx-<uid>/<sid>/outbox`，把内容、附件和 allowlist 后的展示参数写进 outbox，**不直连飞书**。
 2. daemon 侧 `startOutboxWatcher` 拾取 `.req.json`，把 outbox 内的内容/附件 TOCTOU-safe 地复制到 host-private staging。
 3. daemon 在**沙盒外**用真实凭证重跑 `send` 投递，并把 `.res.json` 写回 outbox。
 
-→ **所有飞书密钥全程不进沙盒**。
+→ relay 只保证「代发链路」不注入发送凭证。当前模型是 read-all/write-isolated，真实 HOME/配置文件默认仍可读；如果需要隐藏磁盘上的 botmux 配置、飞书密钥或其它敏感文件，必须额外配置 `sandboxHidePaths` / read isolation。
 
 ### 升级兼容
 
-旧版本已经运行中的 persistent sandbox 会话可能仍在使用旧 outbox：
+旧版本已经运行中的 persistent sandbox 会话可能仍在使用旧 HOME upper / outbox：
 
 ```
+/var/tmp/botmux-sbx/<sid>/home-upper
+/var/tmp/botmux-sbx/<sid>/outbox
 <dataDir>/sandboxes/<sid>/outbox
 ```
 
-daemon restart reattach 时会优先寻找新路径 `/var/tmp/botmux-sbx-<uid>/<sid>/outbox`；如果不存在，会 fallback 到旧路径，以便升级前已经运行的 sandbox 会话继续 relay。新建 sandbox 会话只使用 `/var/tmp/botmux-sbx-<uid>/<sid>/outbox`。
+daemon restart reattach 时会优先寻找新路径 `/var/tmp/botmux-sbx-<uid>/<sid>/outbox`；如果不存在，会 fallback 到旧路径，以便升级前已经运行的 sandbox 会话继续 relay。Claude bridge 的 HOME upper redirect 也会在旧 `/var/tmp/botmux-sbx/<sid>/home-upper` 存在且新路径不存在时继续指向旧路径，避免 persistent tmux sandbox 升级后看不到 CLI 写入。新建 sandbox 会话只使用 `/var/tmp/botmux-sbx-<uid>/<sid>/...`。
 
 ## 落盘（把改动交回）
 
@@ -80,7 +82,7 @@ agent 在 overlay 项目目录内改完后，改动位于 `<dataDir>/sandboxes/<
 
 - 文件隔离：项目/HOME 写入进入 upper，原文件未直接修改。
 - auth/login 路径：按 CLI adapter 声明真实可写，token refresh 可持久化。
-- send 中转：沙盒内 `botmux send`（含文件附件）→ outbox → daemon 代投 → 真实到达飞书，全程零凭证入沙盒。
+- send 中转：沙盒内 `botmux send`（含文件附件）→ outbox → daemon 代投 → 真实到达飞书；relay 链路不向沙盒注入发送凭证。
 - 真实 worker：CLI 经 worker spawn 钩子在 bwrap 内正常启动运行。
 
 ## 后续
