@@ -113,16 +113,16 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: false } });
   });
 
-  it('ensures and validates vcMeetingAgent.listenerBotAppId before writing the selected bot', async () => {
+  it('validates then enables vcMeetingAgent.listenerBotAppId before writing the selected bot', async () => {
     const deps = makeDeps({
       readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true } })),
     });
     const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: ' cli_listener ' } }, deps);
     expect(r.ok).toBe(true);
-    expect(deps.ensureVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_listener');
     expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_listener');
-    expect(vi.mocked(deps.ensureVcMeetingListenerBotConfig).mock.invocationCallOrder[0])
-      .toBeLessThan(vi.mocked(deps.validateVcMeetingListenerBotAppId).mock.invocationCallOrder[0]);
+    expect(deps.ensureVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_listener');
+    expect(vi.mocked(deps.validateVcMeetingListenerBotAppId).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(deps.ensureVcMeetingListenerBotConfig).mock.invocationCallOrder[0]);
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } });
   });
 
@@ -207,8 +207,8 @@ describe('applySettingsWrite — validation errors', () => {
     const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_bad' } }, deps);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
-    expect(deps.ensureVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_bad');
     expect(r.error).toBe('vcMeetingAgent_listenerBot_missing_scopes: vc:meeting.bot.join:write');
+    expect(deps.ensureVcMeetingListenerBotConfig).not.toHaveBeenCalled();
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
@@ -220,7 +220,8 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('vcMeetingAgent_listenerBot_config_write_failed: bot_not_in_config');
-    expect(deps.validateVcMeetingListenerBotAppId).not.toHaveBeenCalled();
+    expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_missing');
+    expect(deps.ensureVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_missing');
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 

@@ -1441,7 +1441,7 @@
               <div class="step-no">5</div>
               <div>
                 <h4>配置 botmux <span class="status ok">命令优先</span></h4>
-                <p>不要把手改 <code>bots.json</code> 当主路径。先用 <code>botmux setup</code> 注册或更新 bot（写盘前会校验凭证），再到 Dashboard → Settings 开启「允许本机使用会议监听能力」并选择监听 bot；保存时 Dashboard 会自动给选中的 bot 补会议监听默认配置并校验 VC 权限。</p>
+                <p>不要把手改 <code>bots.json</code> 当主路径。先用 <code>botmux setup</code> 注册或更新 bot（写盘前会校验凭证），确认该 bot 已有 <code>larkCliProfile</code>，再到 Dashboard → Settings 开启「允许本机使用会议监听能力」并选择监听 bot；保存时 Dashboard 会先校验 profile 与 VC 权限，校验通过后自动启用会议监听。</p>
                 <div class="copy-row" style="margin-top:12px">
                   <h4 style="font-size:13.5px">命令方式</h4>
                   <button class="copy-btn" type="button" data-copy="#cfgSnippet">复制</button>
@@ -1946,7 +1946,7 @@ botmux setup add --app-id ${appId || '<APP_ID>'} --app-secret <SECRET> \\
 
 ## 4. 配置会议监听
 先让用户打开 Dashboard → Settings：开启「允许本机使用会议监听能力」并选择这个 bot。
-保存时 Dashboard 会自动给选中的 bot 写入 vcMeetingAgent.enabled / larkCliProfile 并校验权限。
+保存时 Dashboard 会校验选中的 bot 已有 larkCliProfile 与 VC 权限，校验通过后自动写入 vcMeetingAgent.enabled。
 不要把手改 JSON 作为用户待办。只有脚本化环境没有 Dashboard 时，你再最小修改 ~/.botmux/bots.json：
   "vcMeetingAgent": {
     "enabled": true,

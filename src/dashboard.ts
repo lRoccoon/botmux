@@ -390,8 +390,7 @@ async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: t
   }
   const bot = bots.find(b => b.larkAppId === appId);
   if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
-  const cfg = bot.vcMeetingAgent;
-  if (cfg?.enabled !== true) return { ok: false, error: 'vcMeetingAgent_listenerBot_disabled' };
+  const cfg = bot.vcMeetingAgent ?? {};
   if (!cfg.larkCliProfile) return { ok: false, error: 'vcMeetingAgent_listenerBot_missing_larkCliProfile' };
 
   const granted = await fetchGrantedScopesForBotConfig(bot);
@@ -418,10 +417,6 @@ async function ensureVcMeetingListenerBotConfig(appId: string): Promise<{ ok: tr
       next.enabled = true;
       changed = true;
     }
-    if (typeof next.larkCliProfile !== 'string' || !next.larkCliProfile.trim()) {
-      next.larkCliProfile = appId;
-      changed = true;
-    }
     entry.vcMeetingAgent = next;
     return { write: changed, result: null };
   });
@@ -432,7 +427,6 @@ async function ensureVcMeetingListenerBotConfig(appId: string): Promise<{ ok: tr
     bot.config.vcMeetingAgent = {
       ...(bot.config.vcMeetingAgent ?? {}),
       enabled: true,
-      larkCliProfile: bot.config.vcMeetingAgent?.larkCliProfile || appId,
     };
   } catch {
     // The dashboard can edit bots.json even when that bot's daemon is offline.

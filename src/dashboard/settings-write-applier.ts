@@ -78,9 +78,9 @@ export interface SettingsWriteApplierDeps {
   isLocale: (v: unknown) => v is 'zh' | 'en';
   /** Fan out locale reload to all online daemons. */
   reloadLocaleOnAllDaemons?: () => Promise<void>;
-  /** Validate a global VC listener bot selection before persisting it. */
+  /** Validate a global VC listener bot selection before mutating bot/global config. */
   validateVcMeetingListenerBotAppId?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
-  /** Ensure the selected bot has the per-bot meeting-listener defaults needed by validation/runtime. */
+  /** Enable the selected bot's per-bot meeting-listener config after validation passes. */
   ensureVcMeetingListenerBotConfig?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
@@ -212,13 +212,13 @@ export async function applySettingsWrite(
         delete next.listenerBotAppId;
       } else if (typeof vc.listenerBotAppId === 'string' && vc.listenerBotAppId.trim()) {
         const listenerBotAppId = vc.listenerBotAppId.trim();
-        if (deps.ensureVcMeetingListenerBotConfig) {
-          const ensured = await deps.ensureVcMeetingListenerBotConfig(listenerBotAppId);
-          if (!ensured.ok) return { ok: false, error: ensured.error };
-        }
         if (deps.validateVcMeetingListenerBotAppId) {
           const validation = await deps.validateVcMeetingListenerBotAppId(listenerBotAppId);
           if (!validation.ok) return { ok: false, error: validation.error };
+        }
+        if (deps.ensureVcMeetingListenerBotConfig) {
+          const ensured = await deps.ensureVcMeetingListenerBotConfig(listenerBotAppId);
+          if (!ensured.ok) return { ok: false, error: ensured.error };
         }
         next.listenerBotAppId = listenerBotAppId;
       } else {

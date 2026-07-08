@@ -551,9 +551,11 @@ function SettingsBody(props: {
             {settings.vcMeetingAgent.listenerBotOptions.map(bot => {
               const label = bot.botName || bot.larkAppId;
               const detail = bot.cliId ? ` · ${bot.cliId}` : '';
-              const suffix = bot.vcMeetingAgentEnabled === true
-                ? (bot.hasLarkCliProfile === true ? '' : ` · ${tr('settings.vcMeetingListenerBotNoProfile')}`)
-                : ` · ${tr('settings.vcMeetingListenerBotDisabled')}`;
+              const suffixParts = [
+                bot.vcMeetingAgentEnabled === true ? undefined : tr('settings.vcMeetingListenerBotDisabled'),
+                bot.hasLarkCliProfile === true ? undefined : tr('settings.vcMeetingListenerBotNoProfile'),
+              ].filter(Boolean);
+              const suffix = suffixParts.length > 0 ? ` · ${suffixParts.join(' · ')}` : '';
               return (
                 <option key={bot.larkAppId} value={bot.larkAppId}>
                   {label}{detail}{suffix}
