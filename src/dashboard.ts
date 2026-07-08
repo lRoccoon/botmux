@@ -456,13 +456,17 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
         if (idx < 0) throw new Error('bot_not_in_config');
         const entry = raw[idx] as Record<string, unknown>;
         const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+        let entryChanged = false;
         if (next.enabled !== true) {
           next.enabled = true;
           next.dashboardManagedListener = true;
-          changed = true;
+          entryChanged = true;
         }
-        compactVcMeetingAgentEntry(entry, next);
-        changedAppIds.add(nextAppId);
+        if (entryChanged) {
+          compactVcMeetingAgentEntry(entry, next);
+          changed = true;
+          changedAppIds.add(nextAppId);
+        }
       }
 
       if (prevAppId && prevAppId !== nextAppId) {
