@@ -22,6 +22,6 @@ describe('relaySend outbox privacy', () => {
     const region = cliSource.slice(relayIdx, cmdSendIdx);
     expect(region).toContain("writeFileSync(cfile, content, { mode: 0o600 })");
     expect(region).toContain("writeFileSync(join(relayDir, base), readFileSync(p), { mode: 0o600 })");
-    expect(region).toContain("atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, flags }), { mode: 0o600 })");
+    expect(region).toContain("atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, videos, videoCovers, flags }), { mode: 0o600 })");
   });
 });
