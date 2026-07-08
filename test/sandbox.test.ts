@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync, statSync } from 'node:fs';
 import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, attachSandboxOutbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
@@ -371,6 +371,9 @@ describe.skipIf(process.platform !== 'linux')('sandbox outbox layout', () => {
       expect(r!.outbox).toBe(newOutbox);
       expect(r!.outbox.startsWith(sessionRoot)).toBe(false);
       expect(r!.workDir).toBe(projUpper);
+      expect(statSync(join('/var/tmp/botmux-sbx')).mode & 0o077).toBe(0);
+      expect(statSync(join('/var/tmp/botmux-sbx', sid)).mode & 0o077).toBe(0);
+      expect(statSync(newOutbox).mode & 0o077).toBe(0);
     } finally {
       r?.cleanup();
       rmSync(dataDir, { recursive: true, force: true });
@@ -391,6 +394,7 @@ describe.skipIf(process.platform !== 'linux')('sandbox outbox layout', () => {
       expect(r).not.toBeNull();
       expect(r!.outbox).toBe(legacyOutbox);
       expect(r!.workDir).toBe(projUpper);
+      expect(statSync(legacyOutbox).mode & 0o077).toBe(0);
     } finally {
       r?.cleanup();
       rmSync(dataDir, { recursive: true, force: true });
@@ -415,6 +419,9 @@ describe.skipIf(process.platform !== 'linux')('sandbox outbox layout', () => {
       expect(r.env.BOTMUX_SEND_RELAY).toBe(expected);
       expect(r.outbox.startsWith(sessionRoot)).toBe(false);
       expect(r.args.some((x, i) => x === '--bind' && r!.args[i + 1] === expected && r!.args[i + 2] === expected)).toBe(true);
+      expect(statSync(join('/var/tmp/botmux-sbx')).mode & 0o077).toBe(0);
+      expect(statSync(join('/var/tmp/botmux-sbx', sid)).mode & 0o077).toBe(0);
+      expect(statSync(expected).mode & 0o077).toBe(0);
     } finally {
       r?.cleanup();
       rmSync(dataDir, { recursive: true, force: true });

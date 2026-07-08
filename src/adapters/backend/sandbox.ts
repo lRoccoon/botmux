@@ -30,6 +30,22 @@ import { spawn, spawnSync } from 'node:child_process';
  *  (overlayfs forbids upper/work inside lower). */
 const VARTMP_ROOT = '/var/tmp/botmux-sbx';
 
+/** Create a daemon-private directory and repair legacy/default mkdir modes.
+ *  Anything under /var/tmp is on a shared multi-user surface, while the outbox
+ *  carries in-flight Lark message bodies/attachments. Refuse to proceed unless
+ *  group/other bits are gone after chmod. */
+function ensurePrivateDir(dir: string): boolean {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700); // repair dirs created before this hardening or under a loose umask
+    const st = statSync(dir);
+    return st.isDirectory() && (st.mode & 0o077) === 0;
+  } catch (err) {
+    console.error(`[sandbox] failed to prepare private dir ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
 // ───────────────────────────── overlay primitives ────────────────────────────
 
 /**
@@ -419,6 +435,7 @@ export function prepareSandbox(opts: {
   const outbox = join(vartmp, 'outbox');
   const homeUpper = join(vartmp, 'home-upper');
   const homeWork = join(vartmp, 'home-work');
+  if (!ensurePrivateDir(VARTMP_ROOT) || !ensurePrivateDir(vartmp) || !ensurePrivateDir(outbox)) return null;
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
   const home = resolveSandboxMountPath(homedir());
@@ -573,7 +590,9 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
   if (!existsSync(newOutbox) && !existsSync(legacyOutbox) && !existsSync(projUpper)) return null; // never sandboxed
   const outbox = existsSync(newOutbox) ? newOutbox : (existsSync(legacyOutbox) ? legacyOutbox : newOutbox);
   // Ensure the outbox exists (the watcher reads it); never (re)mount here.
-  try { mkdirSync(outbox, { recursive: true }); } catch { /* */ }
+  if (outbox === newOutbox) {
+    if (!ensurePrivateDir(VARTMP_ROOT) || !ensurePrivateDir(vartmp) || !ensurePrivateDir(outbox)) return null;
+  } else if (!ensurePrivateDir(outbox)) return null;
   const projMerged = join(sessionRoot, 'proj-merged');
   const homeMerged = join(sessionRoot, 'home-merged');
   return {
@@ -786,7 +805,7 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
 
   const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string) => {
     // 原子写：沙盒侧 CLI 在 existsSync 轮询这个 res.json，rename 保证它读到完整 JSON。
-    try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
+    try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr }), { mode: 0o600 }); } catch { /* */ }
     try { rmSync(reqPath, { force: true }); } catch { /* */ }
     for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);
@@ -808,7 +827,7 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
       const v = validateRelayRequest(req);
       if (!v.ok) { finish(id, reqPath, name, staged, 1, '', `relay rejected: ${v.error}`); continue; }
 
-      try { mkdirSync(staging, { recursive: true }); } catch { /* */ }
+      try { mkdirSync(staging, { recursive: true, mode: 0o700 }); chmodSync(staging, 0o700); } catch { /* */ }
       // Materialize content (TOCTOU-safe) into the private staging dir.
       const contentDest = join(staging, `${id}.content`);
       if (!materializeOutboxFile(outbox, v.value.contentName, contentDest)) {
