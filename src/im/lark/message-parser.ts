@@ -71,6 +71,17 @@ export function mentionOpenId(m: { id?: { open_id?: string; app_id?: string } | 
   return undefined;
 }
 
+export function mentionUnionId(m: { id?: { union_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
+  const id = m?.id;
+  if (id == null) return undefined;
+  if (typeof id === 'object') return id.union_id || undefined;
+  if (typeof id === 'string') {
+    if (m?.id_type !== 'union_id') return undefined;
+    return id || undefined;
+  }
+  return undefined;
+}
+
 /**
  * When the WebSocket event delivers message_type "nonsupport", call the REST API
  * to fetch the real message content and patch the event data in-place.
@@ -310,6 +321,7 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
           key: m.key,
           name: m.name,
           openId: mentionOpenId(m),
+          unionId: mentionUnionId(m),
           idType: m.id_type,
         }))
       : undefined;

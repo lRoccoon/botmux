@@ -200,6 +200,7 @@ export interface LarkMention {
   key: string;        // e.g. "@_user_1"
   name: string;       // display name
   openId?: string;    // open_id of the mentioned user/bot
+  unionId?: string;   // stable user id across bot app namespaces when present
   idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
 }
 
