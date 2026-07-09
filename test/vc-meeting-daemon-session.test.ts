@@ -261,13 +261,14 @@ vi.mock('../src/services/vc-meeting-runtime-store.js', () => ({
   }),
 }));
 
-import { registerBot } from '../src/bot-registry.js';
+import { getBot, registerBot } from '../src/bot-registry.js';
 import { __vcMeetingAgentTest } from '../src/daemon.js';
 
 const APP_ID = 'cli_vc_daemon_test';
 const OTHER_APP_ID = 'cli_vc_other_test';
 const TARGET_OPEN_ID = 'ou_target';
 const AGENT_APP_ID = 'cli_agent_claude';
+const UNRELATED_AGENT_APP_ID = 'cli_agent_unrelated';
 const REMOTE_AGENT_APP_ID = 'cli_agent_remote_codex';
 
 function registerConsumerAgentBot(
@@ -2419,12 +2420,13 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(meetingTextOutputs).toHaveLength(0);
   });
 
-  it('proxies /vc-auth from the selected consumer agent to the listener meeting session', async () => {
+  it('rejects /vc-auth sent to the selected consumer agent with listener-only guidance', async () => {
     registerConsumerAgentBot();
     registerBot({
       larkAppId: APP_ID,
       larkAppSecret: 'secret',
       cliId: 'claude-code',
+      displayName: 'VC Listener',
       vcMeetingAgent: {
         enabled: true,
         larkCliProfile: APP_ID,
@@ -2441,6 +2443,7 @@ describe('VC meeting daemon session lifecycle', () => {
         },
       },
     });
+    getBot(APP_ID).botName = 'VC Listener';
 
     await __vcMeetingAgentTest.handlePush({
       larkAppId: APP_ID,
@@ -2484,42 +2487,14 @@ describe('VC meeting daemon session lifecycle', () => {
       senderUnionId: 'on_owner',
     });
     expect(handled).toBe(true);
-    expect(sentMessages.at(-1)?.content).toContain('已临时授权 Alice');
+    expect(sentMessages.at(-1)?.content).toContain('临时授权只能由本场会议监听 bot（VC Listener）处理。');
+    expect(sentMessages.at(-1)?.content).toContain('请在监听群里直接 @VC Listener 发送');
+    expect(sentMessages.at(-1)?.content).toContain('这条命令发给执行 agent 不会生效，也不会代转授权。');
     expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual([]);
-    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionUnionIds).toEqual(['on_alice']);
-
-    triggerSessionCalls.length = 0;
-    await __vcMeetingAgentTest.handlePush({
-      larkAppId: APP_ID,
-      kind: 'meeting_activity',
-      eventType: 'vc.bot.meeting_activity_v1',
-      eventId: 'evt_temp_auth_proxy_question',
-      meeting: { id: 'm_joined_555555562', meetingNo: '555555562', topic: 'Temporary auth proxy' },
-      raw: {
-        event: {
-          meeting_activity_items: [
-            {
-              activity_event_type: 'chat_received',
-              meeting: { id: 'm_joined_555555562', meeting_no: '555555562', topic: 'Temporary auth proxy' },
-              chat_received_items: [
-                {
-                  message_id: 'msg_temp_auth_proxy_1',
-                  operator: { id: { open_id: 'ou_alice_listener_ns', union_id: 'on_alice' }, user_name: 'Alice' },
-                  text: '这个问题现在要处理吗？',
-                },
-              ],
-            },
-          ],
-        },
-      },
-    });
-    await new Promise(resolve => setTimeout(resolve, 2));
-
-    expect(triggerSessionCalls).toHaveLength(1);
-    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('Alice（授权用户/指令源）：这个问题现在要处理吗？');
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionUnionIds ?? []).toEqual([]);
   });
 
-  it('forwards selected-agent /vc-auth to a remote listener daemon', async () => {
+  it('does not forward selected-agent /vc-auth to a remote listener daemon', async () => {
     registerConsumerAgentBot();
     onlineDaemons.set(OTHER_APP_ID, {
       larkAppId: OTHER_APP_ID,
@@ -2547,9 +2522,6 @@ describe('VC meeting daemon session lifecycle', () => {
         body = undefined;
       }
       remoteFetchCalls.push({ url, init, body });
-      if (url.endsWith('/api/vc-meetings/temporary-auth')) {
-        return new Response(JSON.stringify({ ok: true }), { status: 200 });
-      }
       return new Response(JSON.stringify({ ok: false, error: 'unexpected url' }), { status: 404 });
     }));
 
@@ -2563,23 +2535,12 @@ describe('VC meeting daemon session lifecycle', () => {
     });
     expect(handled).toBe(true);
 
-    expect(remoteFetchCalls).toHaveLength(1);
-    expect(remoteFetchCalls[0].url).toBe('http://127.0.0.1:39002/api/vc-meetings/temporary-auth');
-    expect(remoteFetchCalls[0].body).toMatchObject({
-      larkAppId: OTHER_APP_ID,
-      meetingId: 'm_remote_listener_auth',
-      listenerChatId: 'oc_remote_listener',
-      commandContent: '/vc-auth @Alice',
-      senderOpenId: 'ou_owner_agent_ns',
-      senderUnionId: 'on_owner',
-      openIdNamespaceLarkAppId: AGENT_APP_ID,
-    });
-    expect(remoteFetchCalls[0].body.mentions).toEqual([
-      { key: '@_user_1', name: 'Alice', openId: 'ou_alice_agent_ns', unionId: 'on_alice' },
-    ]);
+    expect(remoteFetchCalls).toHaveLength(0);
+    expect(sentMessages.at(-1)?.content).toContain(`临时授权只能由本场会议监听 bot（${OTHER_APP_ID}）处理。`);
+    expect(sentMessages.at(-1)?.content).toContain('不会生效，也不会代转授权');
   });
 
-  it('explains cross-bot /vc-auth denial when the listener has not observed the approver union id', async () => {
+  it('does not run selected-agent /vc-auth even when the approver union id is unavailable', async () => {
     registerConsumerAgentBot();
     registerBot({
       larkAppId: APP_ID,
@@ -2621,7 +2582,38 @@ describe('VC meeting daemon session lifecycle', () => {
       senderUnionId: 'on_owner_not_seen',
     });
     expect(handled).toBe(true);
-    expect(sentMessages.at(-1)?.content).toContain('跨 bot 设置临时授权，需要会议监听 bot 先在本场见过你');
+    expect(sentMessages.at(-1)?.content).toContain('临时授权只能由本场会议监听 bot');
+    expect(sentMessages.at(-1)?.content).toContain('这条命令发给执行 agent 不会生效，也不会代转授权。');
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionUnionIds ?? []).toEqual([]);
+  });
+
+  it('explains when /vc-auth is sent to a bot unrelated to the active listener chat', async () => {
+    registerConsumerAgentBot(AGENT_APP_ID);
+    registerConsumerAgentBot(UNRELATED_AGENT_APP_ID, { name: 'Unrelated Agent' });
+    runtimeStoreRecords.push({
+      larkAppId: APP_ID,
+      meeting: { id: 'm_unrelated_auth', meetingNo: '555555565', topic: 'Unrelated auth' },
+      listenerChatId: 'oc_listener_1',
+      attentionTargetOpenId: TARGET_OPEN_ID,
+      consumerMode: 'agent',
+      selectedAgentAppId: AGENT_APP_ID,
+      selectedAgentLabel: 'Claude Loopy',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+
+    const handled = await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: UNRELATED_AGENT_APP_ID,
+      chatId: 'oc_listener_1',
+      commandContent: '/vc-auth @Alice',
+      mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_alice_unrelated_ns', unionId: 'on_alice' }],
+      senderOpenId: 'ou_owner_unrelated_ns',
+      senderUnionId: 'on_owner',
+    });
+    expect(handled).toBe(true);
+    expect(sentMessages.at(-1)?.content).toContain('本群有正在运行的会议监听');
+    expect(sentMessages.at(-1)?.content).toContain('这个 bot 不是本场会议监听 bot，也不是当前选择的执行 agent');
     expect(runtimeStoreRecords.at(-1)?.temporaryInstructionUnionIds ?? []).toEqual([]);
   });
 

@@ -2921,57 +2921,6 @@ ipcRoute('POST', '/api/vc-meetings/consumer-catch-up', async (req, res) => {
   }
 });
 
-ipcRoute('POST', '/api/vc-meetings/temporary-auth', async (req, res) => {
-  try {
-    const body = await readJsonBody<Record<string, unknown>>(req);
-    const larkAppId = typeof body.larkAppId === 'string' ? body.larkAppId.trim() : '';
-    const meetingId = typeof body.meetingId === 'string' ? body.meetingId.trim() : '';
-    const listenerChatId = typeof body.listenerChatId === 'string' ? body.listenerChatId.trim() : '';
-    const commandContent = typeof body.commandContent === 'string' ? body.commandContent : '';
-    const openIdNamespaceLarkAppId = typeof body.openIdNamespaceLarkAppId === 'string'
-      ? body.openIdNamespaceLarkAppId.trim()
-      : '';
-    const sourceBotOpenId = typeof body.sourceBotOpenId === 'string' ? body.sourceBotOpenId.trim() : undefined;
-    const senderOpenId = typeof body.senderOpenId === 'string' ? body.senderOpenId.trim() : undefined;
-    const senderUnionId = typeof body.senderUnionId === 'string' ? body.senderUnionId.trim() : undefined;
-    const mentions: LarkMessage['mentions'] = Array.isArray(body.mentions)
-      ? body.mentions
-        .filter((m): m is Record<string, unknown> => !!m && typeof m === 'object' && !Array.isArray(m))
-        .map(m => ({
-          key: typeof m.key === 'string' ? m.key : '',
-          name: typeof m.name === 'string' ? m.name : '',
-          ...(typeof m.openId === 'string' && m.openId.trim() ? { openId: m.openId.trim() } : {}),
-          ...(typeof m.unionId === 'string' && m.unionId.trim() ? { unionId: m.unionId.trim() } : {}),
-          ...(typeof m.idType === 'string' && m.idType.trim() ? { idType: m.idType.trim() } : {}),
-        }))
-      : undefined;
-    if (!larkAppId || !meetingId || !listenerChatId || !commandContent || !openIdNamespaceLarkAppId) {
-      return jsonRes(res, 400, { ok: false, error: 'bad_request' });
-    }
-    const active = findActiveVcMeetingSessionByRuntimeRecord({
-      larkAppId,
-      meeting: { id: meetingId },
-      listenerChatId,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      expiresAt: Date.now() + 60_000,
-    });
-    if (!active) return jsonRes(res, 404, { ok: false, error: 'meeting_session_not_found' });
-    const parsed = parseVcMeetingTemporaryAuthCommand(commandContent, mentions, sourceBotOpenId);
-    if (!parsed) return jsonRes(res, 400, { ok: false, error: 'bad_command' });
-    await applyVcMeetingTemporaryAuthCommand(active, parsed, {
-      commandContent,
-      mentions,
-      senderOpenId,
-      senderUnionId,
-      openIdNamespaceLarkAppId,
-    });
-    return jsonRes(res, 200, { ok: true });
-  } catch (err) {
-    return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
-  }
-});
-
 function parseTriggerChatBinding(
   raw: unknown,
 ): { chatId: string; larkAppId: string } | undefined {
@@ -3898,18 +3847,6 @@ function findActiveVcMeetingSessionByListenerChat(
   return best;
 }
 
-function findActiveVcMeetingSessionByRuntimeRecord(
-  record: VcMeetingRuntimeSessionRecord,
-): { key: string; session: VcMeetingDaemonSession; cfg: VcMeetingAgentConfig } | undefined {
-  const cfg = effectiveVcMeetingAgentConfig(record.larkAppId);
-  if (!cfg) return undefined;
-  const key = vcMeetingSessionKey(record.larkAppId, record.meeting.id);
-  const session = vcMeetingSessions.get(key);
-  if (!session || session.ended) return undefined;
-  if (session.listenerChatId !== record.listenerChatId) return undefined;
-  return { key, session, cfg };
-}
-
 function stripVcMeetingAuthMentionNames(text: string, mentions: LarkMessage['mentions']): string {
   let out = text;
   for (const mention of mentions ?? []) {
@@ -4071,7 +4008,6 @@ type VcMeetingTemporaryAuthApplyInput = {
   mentions?: LarkMessage['mentions'];
   senderOpenId?: string;
   senderUnionId?: string;
-  openIdNamespaceLarkAppId: string;
 };
 
 async function applyVcMeetingTemporaryAuthCommand(
@@ -4082,18 +4018,15 @@ async function applyVcMeetingTemporaryAuthCommand(
   const { session, cfg } = active;
   const listenerChatId = session.listenerChatId;
   if (!listenerChatId) return true;
-  const isCrossBotCommand = input.openIdNamespaceLarkAppId !== session.larkAppId;
-  const senderOpenId = isCrossBotCommand ? undefined : input.senderOpenId;
+  const openIdNamespaceLarkAppId = session.larkAppId;
   if (!isVcMeetingTemporaryAuthAllowedOperator(session, cfg, {
-    openId: senderOpenId,
+    openId: input.senderOpenId,
     unionId: input.senderUnionId,
   })) {
     await sendMessage(
       session.larkAppId,
       listenerChatId,
-      isCrossBotCommand
-        ? '跨 bot 设置临时授权，需要会议监听 bot 先在本场见过你（说过话/进过会/发过会中消息任一），或改为在监听群直接对监听 bot 发 /vc-auth。'
-        : '只有本场会议原授权人可以设置临时指令源。',
+      '只有本场会议原授权人可以设置临时指令源。',
       'text',
     );
     return true;
@@ -4110,19 +4043,19 @@ async function applyVcMeetingTemporaryAuthCommand(
   const changed: string[] = [];
   const unchanged: string[] = [];
   for (const target of parsed.targets) {
-    const openIdUsable = vcMeetingTemporaryAuthTargetOpenIdUsable(target, session, input.openIdNamespaceLarkAppId);
+    const openIdUsable = vcMeetingTemporaryAuthTargetOpenIdUsable(target, session, openIdNamespaceLarkAppId);
     if (!openIdUsable && !target.unionId) {
       unchanged.push(`${vcMeetingTemporaryAuthTargetLabel(session, target)} 缺少可跨 bot 对齐的 union_id`);
       continue;
     }
-    rememberVcMeetingTemporaryAuthTarget(session, target, input.openIdNamespaceLarkAppId);
+    rememberVcMeetingTemporaryAuthTarget(session, target, openIdNamespaceLarkAppId);
     const label = vcMeetingTemporaryAuthTargetLabel(session, target);
-    if (parsed.action === 'grant' && vcMeetingTemporaryAuthTargetIsApprover(session, cfg, target, input.openIdNamespaceLarkAppId)) {
+    if (parsed.action === 'grant' && vcMeetingTemporaryAuthTargetIsApprover(session, cfg, target, openIdNamespaceLarkAppId)) {
       unchanged.push(`${label} 已是原授权人`);
       continue;
     }
     if (parsed.action === 'grant') {
-      if (vcMeetingTemporaryAuthTargetIsTemporary(session, target, input.openIdNamespaceLarkAppId)) {
+      if (vcMeetingTemporaryAuthTargetIsTemporary(session, target, openIdNamespaceLarkAppId)) {
         unchanged.push(`${label} 已在临时授权列表`);
         continue;
       }
@@ -4131,7 +4064,7 @@ async function applyVcMeetingTemporaryAuthCommand(
       changed.push(label);
       continue;
     }
-    if (!vcMeetingTemporaryAuthTargetIsTemporary(session, target, input.openIdNamespaceLarkAppId)) {
+    if (!vcMeetingTemporaryAuthTargetIsTemporary(session, target, openIdNamespaceLarkAppId)) {
       unchanged.push(`${label} 不在临时授权列表`);
       continue;
     }
@@ -4157,63 +4090,60 @@ async function applyVcMeetingTemporaryAuthCommand(
   return true;
 }
 
-async function requestVcMeetingTemporaryAuthProxy(
-  record: VcMeetingRuntimeSessionRecord,
-  input: {
-    larkAppId: string;
-    commandContent: string;
-    mentions?: LarkMessage['mentions'];
-    senderOpenId?: string;
-    senderUnionId?: string;
-  },
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  const local = findActiveVcMeetingSessionByRuntimeRecord(record);
-  const sourceBotOpenId = getBot(input.larkAppId).botOpenId;
-  if (local) {
-    const parsed = parseVcMeetingTemporaryAuthCommand(input.commandContent, input.mentions, sourceBotOpenId);
-    if (!parsed) return { ok: false, error: 'bad command' };
-    await applyVcMeetingTemporaryAuthCommand(local, parsed, {
-      commandContent: input.commandContent,
-      mentions: input.mentions,
-      senderOpenId: input.senderOpenId,
-      senderUnionId: input.senderUnionId,
-      openIdNamespaceLarkAppId: input.larkAppId,
-    });
-    return { ok: true };
-  }
-  const { status, body } = await fetchVcMeetingDaemonJson(record.larkAppId, '/api/vc-meetings/temporary-auth', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      larkAppId: record.larkAppId,
-      meetingId: record.meeting.id,
-      listenerChatId: record.listenerChatId,
-      commandContent: input.commandContent,
-      mentions: input.mentions ?? [],
-      senderOpenId: input.senderOpenId,
-      senderUnionId: input.senderUnionId,
-      openIdNamespaceLarkAppId: input.larkAppId,
-      sourceBotOpenId,
-    }),
-  }, { timeoutMs: 8_000 });
-  if (body && typeof body === 'object' && (body as { ok?: unknown }).ok === true) return { ok: true };
-  const err = body && typeof body === 'object' && typeof (body as { error?: unknown }).error === 'string'
-    ? (body as { error: string }).error
-    : `listener daemon returned ${status}`;
-  return { ok: false, error: err };
+function resolveVcMeetingListenerBotLabel(larkAppId: string): { label: string; canMentionByName: boolean } {
+  try {
+    const bot = getBot(larkAppId);
+    if (bot.botName?.trim()) return { label: bot.botName.trim(), canMentionByName: true };
+    if (bot.config.displayName?.trim()) return { label: bot.config.displayName.trim(), canMentionByName: false };
+    if (bot.config.name?.trim()) return { label: bot.config.name.trim(), canMentionByName: false };
+  } catch { /* The listener bot may belong to a different daemon process. */ }
+
+  try {
+    const infoPath = join(config.session.dataDir, 'bots-info.json');
+    if (existsSync(infoPath)) {
+      const entries: Array<{ larkAppId?: unknown; botName?: unknown }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const hit = entries.find(entry => entry.larkAppId === larkAppId);
+      if (typeof hit?.botName === 'string' && hit.botName.trim()) {
+        return { label: hit.botName.trim(), canMentionByName: true };
+      }
+    }
+  } catch { /* fall back to static config */ }
+
+  try {
+    const cfg = loadBotConfigs().find(bot => bot.larkAppId === larkAppId);
+    if (cfg?.displayName?.trim()) return { label: cfg.displayName.trim(), canMentionByName: false };
+    if (cfg?.name?.trim()) return { label: cfg.name.trim(), canMentionByName: false };
+  } catch { /* fall back to app id */ }
+
+  return { label: larkAppId, canMentionByName: false };
 }
 
-async function proxyVcMeetingTemporaryAuthCommand(
+function findAnyVcMeetingRuntimeSessionByListenerChat(listenerChatId: string | undefined): VcMeetingRuntimeSessionRecord | undefined {
+  const chatId = listenerChatId?.trim();
+  if (!chatId) return undefined;
+  const appIds = new Set<string>();
+  for (const bot of getAllBots()) appIds.add(bot.config.larkAppId);
+  for (const daemon of listOnlineDaemons()) appIds.add(daemon.larkAppId);
+  try {
+    for (const bot of loadBotConfigs()) appIds.add(bot.larkAppId);
+  } catch { /* best effort */ }
+
+  let best: VcMeetingRuntimeSessionRecord | undefined;
+  for (const appId of appIds) {
+    for (const record of listVcMeetingRuntimeSessions(config.session.dataDir, appId)) {
+      if (record.listenerChatId !== chatId) continue;
+      if (!best || record.updatedAt > best.updatedAt) best = record;
+    }
+  }
+  return best;
+}
+
+async function replyVcMeetingTemporaryAuthListenerHint(
   input: {
     larkAppId: string;
     chatId: string | undefined;
     anchor: string;
-    commandContent: string;
-    mentions?: LarkMessage['mentions'];
-    senderOpenId?: string;
-    senderUnionId?: string;
-  },
-  _parsed: VcMeetingTemporaryAuthCommand,
+  }
 ): Promise<boolean> {
   if (!input.chatId) return false;
   const record = findVcMeetingRuntimeSessionByListenerAndAgent(config.session.dataDir, {
@@ -4221,15 +4151,19 @@ async function proxyVcMeetingTemporaryAuthCommand(
     selectedAgentAppId: input.larkAppId,
   });
   if (!record) return false;
-  const result = await requestVcMeetingTemporaryAuthProxy(record, input);
-  if (!result.ok) {
-    await sessionReply(
-      input.anchor,
-      `临时授权请求转发给会议监听 bot 失败：${result.error}`,
-      'text',
-      input.larkAppId,
-    );
-  }
+  const listenerBot = resolveVcMeetingListenerBotLabel(record.larkAppId);
+  await sessionReply(
+    input.anchor,
+    [
+      `临时授权只能由本场会议监听 bot（${listenerBot.label}）处理。`,
+      listenerBot.canMentionByName
+        ? `请在监听群里直接 @${listenerBot.label} 发送：\`/vc-auth @成员\`。`
+        : '请在监听群里直接 @会议监听 bot 发送：`/vc-auth @成员`。',
+      '这条命令发给执行 agent 不会生效，也不会代转授权。',
+    ].join('\n'),
+    'text',
+    input.larkAppId,
+  );
   return true;
 }
 
@@ -4250,9 +4184,13 @@ async function handleVcMeetingTemporaryAuthCommand(input: {
   if (!parsed) return false;
   const active = findActiveVcMeetingSessionByListenerChat(input.larkAppId, input.chatId);
   if (!active) {
-    const proxied = await proxyVcMeetingTemporaryAuthCommand(input, parsed);
-    if (proxied) return true;
-    await sessionReply(input.anchor, '当前群没有正在运行的会议监听，无法设置本场临时授权。', 'text', input.larkAppId);
+    const replied = await replyVcMeetingTemporaryAuthListenerHint(input);
+    if (replied) return true;
+    const activeInThisChat = findAnyVcMeetingRuntimeSessionByListenerChat(input.chatId);
+    const message = activeInThisChat
+      ? '本群有正在运行的会议监听，但这个 bot 不是本场会议监听 bot，也不是当前选择的执行 agent。请直接 @会议监听 bot 发送：`/vc-auth @成员`。'
+      : '当前群没有正在运行的会议监听，或这个 bot 不是本场的监听/处理 agent，无法设置本场临时授权。';
+    await sessionReply(input.anchor, message, 'text', input.larkAppId);
     return true;
   }
   return applyVcMeetingTemporaryAuthCommand(active, parsed, {
@@ -4260,7 +4198,6 @@ async function handleVcMeetingTemporaryAuthCommand(input: {
     mentions: input.mentions,
     senderOpenId: input.senderOpenId,
     senderUnionId: input.senderUnionId,
-    openIdNamespaceLarkAppId: input.larkAppId,
   });
 }
 
