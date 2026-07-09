@@ -101,6 +101,7 @@ import {
   getSessionWorkingDir,
   getProjectScanDir,
   getProjectScanDirs,
+  getBotProjectScanDirs,
   expandHome,
   downloadResources,
   formatAttachmentsHint,
@@ -176,7 +177,8 @@ import type { RawParamInput } from './workflows/params.js';
 import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
 import { emitGoalNarration } from './verified-delivery/narration.js';
 import { openLedger } from './verified-delivery/ledger.js';
-import { detectUnsupportedDeliveryEnvelope, parseDeliveryEnvelope, type EnvelopeEvidence } from './verified-delivery/envelope.js';
+import { detectUnsupportedDeliveryEnvelope, formatHelpEnvelope, parseDeliveryEnvelope, type EnvelopeEvidence } from './verified-delivery/envelope.js';
+import { formatDispatchRepoRequirement, inspectLocalRepo, parseDispatchRepoRequirement, resolveRepoRequirement } from './core/repo-requirement.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   injectGoalSupervisorTurn,
@@ -1379,6 +1381,10 @@ async function reassignDeadGoalWorker(task: TaskView, goalChatId: string, now: n
       workerNames: [candidate.workerName],
       workerLarkAppIds: [candidate.workerLarkAppId],
       workerCliIds: candidate.workerCliId ? [candidate.workerCliId] : undefined,
+      workerBotUnionIds: task.workerBotUnionIds?.[candidate.index]
+        ? [task.workerBotUnionIds[candidate.index]!]
+        : undefined,
+      requiredRepo: task.requiredRepo,
       brief,
       acceptanceHint: task.acceptanceHint,
       acceptanceCriteria: task.acceptanceCriteria,
@@ -1392,7 +1398,10 @@ async function reassignDeadGoalWorker(task: TaskView, goalChatId: string, now: n
       `<at user_id="${candidate.workerOpenId}"></at> [goal-reassign] ${task.taskId}`,
       `原会话已确认不可用（${candidate.deadReason}），请重新接手。`,
       '先查 goal charter / delivery ledger / 群历史，完成后用 botmux report 交证据。',
-    ].join('\n'),
+      task.requiredRepo
+        ? formatDispatchRepoRequirement({ taskId: task.taskId, repo: task.requiredRepo })
+        : undefined,
+    ].filter(Boolean).join('\n'),
     'text',
   );
   await emitGoalNarrationBestEffort({
@@ -7652,7 +7661,18 @@ async function resolvePinnedWorkingDir(ctx: {
   chatId: string;
   chatType: 'group' | 'p2p';
   larkAppId: string;
+  /** Receiver-local path resolved from a `[botmux-dispatch v1]` requirement. */
+  requiredWorkingDir?: string;
 }) {
+  if (ctx.requiredWorkingDir) {
+    return {
+      pinnedWorkingDir: ctx.requiredWorkingDir,
+      oncallEntry: undefined,
+      inheritedFrom: null,
+      pinnedFromBotDefault: false,
+      pinnedFromRequirement: true,
+    };
+  }
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
@@ -7678,7 +7698,7 @@ async function resolvePinnedWorkingDir(ctx: {
   // latter is set (it wins over inherit), so `!oncallEntry && botDefaultWorkingDir`
   // fully characterizes "came from the bot's own default".
   const pinnedFromBotDefault = !oncallEntry && !!botDefaultWorkingDir;
-  return { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault };
+  return { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault, pinnedFromRequirement: false };
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
@@ -8136,6 +8156,22 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     return;
   }
 
+  // A repo requirement can reveal whether a private checkout exists locally
+  // and may run git/scanner subprocesses. Only inspect it after the normal
+  // talk/team-trust gate has accepted the sender.
+  const dispatchRepo = await preflightDispatchRepo({
+    parsed,
+    larkAppId,
+    chatId,
+    scope,
+    anchor,
+  });
+  if (dispatchRepo.handled) return;
+  if (dispatchRepo.workingDir) {
+    content = parsed.content.trim();
+    cmdContent = stripLeadingMentions(content, parsed.mentions);
+  }
+
   // Download attachments
   const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources);
   if (attachments.length > 0) {
@@ -8193,7 +8229,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault, pinnedFromRequirement } = await resolvePinnedWorkingDir({
+    scope,
+    anchor,
+    chatId,
+    chatType,
+    larkAppId,
+    requiredWorkingDir: dispatchRepo.workingDir,
+  });
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -8245,7 +8288,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     rememberLastCliInput(ds, promptContent, prompt);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
-    const reason = oncallEntry
+    const reason = pinnedFromRequirement
+      ? 'dispatch repo requirement'
+      : oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
@@ -8530,6 +8575,127 @@ function envelopeEvidenceToLedgerEvidence(ev: EnvelopeEvidence, ledger: ReturnTy
   return { kind: 'url', url: ev.url };
 }
 
+interface DispatchRepoPreflightResult {
+  handled: boolean;
+  workingDir?: string;
+}
+
+interface DispatchRepoPreflightDeps {
+  scanDirs?: string[];
+  dataDir?: string;
+  sendAccessHelp?: typeof sendDispatchRepoAccessHelp;
+}
+
+async function sendDispatchRepoAccessHelp(input: {
+  larkAppId: string;
+  chatId: string;
+  scope: 'thread' | 'chat';
+  anchor: string;
+  supervisorOpenId?: string;
+  taskId: string;
+  repo: string;
+  detail?: string;
+}): Promise<void> {
+  const blocker = `缺少项目环境：${input.repo}${input.detail ? `（${input.detail}）` : ''}`;
+  const envelope = formatHelpEnvelope({
+    taskId: input.taskId,
+    helpKind: 'access',
+    blocker,
+  });
+  const text = input.supervisorOpenId
+    ? `<at user_id="${input.supervisorOpenId}"></at>\n${envelope}`
+    : envelope;
+  if (input.scope === 'thread') {
+    await replyMessage(input.larkAppId, input.anchor, text, 'text', true);
+  } else {
+    await sendMessage(input.larkAppId, input.chatId, text, 'text');
+  }
+}
+
+/**
+ * Resolve a dispatch's repo requirement before any session/card is created.
+ * A miss is converted into the existing `help(kind=access)` flow, so the
+ * supervisor decides whether to prepare the environment, switch workers, or
+ * fail the task. The daemon only reports the local fact.
+ */
+async function preflightDispatchRepo(input: {
+  parsed: LarkMessage;
+  larkAppId: string;
+  chatId: string;
+  scope: 'thread' | 'chat';
+  anchor: string;
+  existingSession?: DaemonSession;
+}, deps: DispatchRepoPreflightDeps = {}): Promise<DispatchRepoPreflightResult> {
+  const requirement = parseDispatchRepoRequirement(input.parsed.content);
+  if (!requirement) return { handled: false };
+
+  const senderIsBot = input.parsed.senderType === 'app' || input.parsed.senderType === 'bot';
+  if (!senderIsBot) {
+    logger.warn(`[dispatch-repo] ignored non-bot requirement task=${requirement.taskId} msg=${input.parsed.messageId}`);
+    return { handled: false };
+  }
+
+  const resolution = resolveRepoRequirement({
+    requirement: requirement.repo,
+    scanDirs: deps.scanDirs ?? getBotProjectScanDirs(input.larkAppId),
+    dataDir: deps.dataDir ?? config.session.dataDir,
+  });
+  if (!resolution.ok) {
+    try {
+      await (deps.sendAccessHelp ?? sendDispatchRepoAccessHelp)({
+        larkAppId: input.larkAppId,
+        chatId: input.chatId,
+        scope: input.scope,
+        anchor: input.anchor,
+        supervisorOpenId: input.parsed.senderId,
+        taskId: requirement.taskId,
+        repo: requirement.repo,
+      });
+    } catch (err) {
+      logger.error(`[dispatch-repo] failed to send access help task=${requirement.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    logger.warn(
+      `[dispatch-repo] blocked task=${requirement.taskId} repo=${requirement.repo} ` +
+      `reason=${resolution.reason} detail=${resolution.detail ?? ''} stalePath=${resolution.stalePath ?? ''}`,
+    );
+    return { handled: true };
+  }
+
+  if (input.existingSession) {
+    const current = inspectLocalRepo(getSessionWorkingDir(input.existingSession));
+    if (!current.ok || current.remoteIdentity !== resolution.remoteIdentity) {
+      try {
+        await (deps.sendAccessHelp ?? sendDispatchRepoAccessHelp)({
+          larkAppId: input.larkAppId,
+          chatId: input.chatId,
+          scope: input.scope,
+          anchor: input.anchor,
+          supervisorOpenId: input.parsed.senderId,
+          taskId: requirement.taskId,
+          repo: requirement.repo,
+          detail: '当前执行会话正在使用其他项目，不能安全切换',
+        });
+      } catch (err) {
+        logger.error(`[dispatch-repo] failed to report active-session mismatch task=${requirement.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      logger.warn(`[dispatch-repo] blocked active-session mismatch task=${requirement.taskId} current=${getSessionWorkingDir(input.existingSession)} wanted=${resolution.path}`);
+      return { handled: true };
+    }
+  }
+
+  input.parsed.content = requirement.content;
+  logger.info(
+    `[dispatch-repo] ready task=${requirement.taskId} repo=${requirement.repo} ` +
+    `path=${resolution.path} matchedBy=${resolution.matchedBy} source=${resolution.source}`,
+  );
+  return {
+    handled: false,
+    workingDir: input.existingSession ? undefined : resolution.path,
+  };
+}
+
+export const __testOnly_preflightDispatchRepo = preflightDispatchRepo;
+
 async function maybeIngestDeliveryEnvelope(input: {
   parsed: LarkMessage;
   larkAppId: string;
@@ -8644,6 +8810,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     return;
   }
 
+  const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
   // 不是用户直接发的——后续不需要按"对话用户"的方式处理。signal-file 路径
@@ -8673,7 +8840,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
   let promptContent = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix + parsed.content;
-  const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
   emitHookEvent('thread.reply', {
     larkAppId,
     chatId: ctxChatId,
@@ -9013,6 +9179,23 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     return;
   }
 
+  // Keep project discovery behind the same sender trust gate as normal CLI
+  // input. Otherwise an arbitrary bot could use requirement hits/misses as a
+  // local repository existence oracle or force synchronous scans.
+  const contentBeforeDispatchPreflight = parsed.content;
+  const dispatchRepo = await preflightDispatchRepo({
+    parsed,
+    larkAppId,
+    chatId: ctxChatId ?? data?.message?.chat_id ?? '',
+    scope,
+    anchor,
+    existingSession: ds,
+  });
+  if (dispatchRepo.handled) return;
+  if (parsed.content !== contentBeforeDispatchPreflight && !threadGrill) {
+    promptContent = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix + parsed.content;
+  }
+
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
   const { attachments, needLogin } = await downloadResources(effectiveAppId, parsed.messageId, resources);
@@ -9131,12 +9314,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault, pinnedFromRequirement } = await resolvePinnedWorkingDir({
       scope,
       anchor,
       chatId: autoCreateChatId,
       chatType: autoCreateChatType,
       larkAppId,
+      requiredWorkingDir: dispatchRepo.workingDir,
     });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     // Now we know the message will spawn or pend a real session — resolve
@@ -9191,7 +9375,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       rememberLastCliInput(newDs, promptContent, prompt);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
-      const reason = oncallEntry
+      const reason = pinnedFromRequirement
+        ? 'dispatch repo requirement'
+        : oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
         : inheritedFrom
         ? `inherited from peer session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
