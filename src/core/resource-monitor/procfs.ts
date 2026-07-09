@@ -49,6 +49,16 @@ export function parseMeminfo(raw: string): ProcfsSample['mem'] {
   };
 }
 
+// Proportional Set Size from /proc/<pid>/smaps_rollup — shared pages are divided
+// by the number of processes sharing them, so summing PSS across a process group
+// does NOT double-count the shared Node runtime / libs the way summing RSS does.
+// Returns null when unavailable (kernel < 4.14, no mm i.e. kernel threads,
+// permission denied, or the process exited) so the caller can fall back to RSS.
+export function parseSmapsRollupPss(raw: string): number | null {
+  const match = raw.match(/^Pss:\s+(\d+)\s+kB$/m);
+  return match ? Number(match[1]) * 1024 : null;
+}
+
 export function parseProcessStat(raw: string): { pid: number; ppid: number; cpuTicks: number; startTicks: number; rssPages: number } | null {
   const open = raw.indexOf('(');
   const close = raw.lastIndexOf(')');
@@ -88,10 +98,18 @@ export function sampleProcfs(nowMs = Date.now()): ProcfsSample {
         } catch {
           // Process may have exited or denied cmdline access after stat was read.
         }
+        // Prefer PSS (proportional) so per-group sums don't double-count shared
+        // pages; fall back to RSS when smaps_rollup is unavailable.
+        let pssBytes: number | null = null;
+        try {
+          pssBytes = parseSmapsRollupPss(readFileSync(`/proc/${entry}/smaps_rollup`, 'utf8'));
+        } catch {
+          // smaps_rollup absent (old kernel), unreadable, or process exited — use RSS.
+        }
         processes.push({
           pid: parsed.pid,
           ppid: parsed.ppid,
-          rssBytes: parsed.rssPages * PAGE_SIZE_BYTES,
+          rssBytes: pssBytes ?? parsed.rssPages * PAGE_SIZE_BYTES,
           cpuTicks: parsed.cpuTicks,
           startTicks: parsed.startTicks,
           cmd,

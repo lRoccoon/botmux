@@ -454,6 +454,7 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
       intervalMs,
       host,
       botmux: attribution.botmux,
+      botmuxBreakdown: attribution.botmuxBreakdown,
       bots: attribution.bots,
       sessions,
       runtime: buildRuntimeMonitorSummary({

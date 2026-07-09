@@ -64,6 +64,17 @@ export interface ResourceMetricCurrent {
   cpuPct: number;
 }
 
+// Breakdown of the aggregate `botmux` total into who actually holds the memory.
+// The `botmux` field is a single number that sums the daemon plus every session's
+// worker+CLI subtree, so it is dominated by the external CLIs — this splits it so
+// the UI can show that Botmux's own footprint (daemon + per-session workers) is a
+// small fraction next to the external CLI processes.
+export interface ResourceBotmuxBreakdown {
+  daemon: ResourceMetricCurrent; // botmux 守护进程自身
+  worker: ResourceMetricCurrent; // 每个会话的 botmux worker（Node 子进程，botmux 自有代码）
+  cli: ResourceMetricCurrent;    // 外部 CLI（Claude/Codex 等）及其工具子进程
+}
+
 export interface ResourceSessionCurrent {
   sessionId: string;
   larkAppId: string;
@@ -110,6 +121,7 @@ export interface ResourceCurrentSnapshot {
   reason?: 'procfs_unavailable';
   host?: HostResourceCurrent;
   botmux?: ResourceMetricCurrent;
+  botmuxBreakdown?: ResourceBotmuxBreakdown;
   bots: ResourceBotCurrent[];
   sessions: ResourceSessionCurrent[];
   runtime: RuntimeMonitorSummary;

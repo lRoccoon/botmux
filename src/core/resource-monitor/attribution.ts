@@ -52,6 +52,11 @@ export interface AttributionResult {
   sessions: ResourceSessionCurrent[];
   bots: ResourceBotCurrent[];
   botmux: { rssBytes: number; cpuPct: number };
+  botmuxBreakdown: {
+    daemon: { rssBytes: number; cpuPct: number };
+    worker: { rssBytes: number; cpuPct: number };
+    cli: { rssBytes: number; cpuPct: number };
+  };
   nextSessionStats: Map<string, PreviousSessionStat>;
 }
 
@@ -251,16 +256,41 @@ export function attributeResources(input: AttributionInput): AttributionResult {
     } satisfies ResourceBotCurrent;
   });
 
-  const botmuxPids = new Set<number>(input.botmuxPids ?? []);
-  for (const bot of bots) if (bot.daemonPid) botmuxPids.add(bot.daemonPid);
-  for (const pids of sessionPidsByBot.values()) {
-    for (const pid of pids) botmuxPids.add(pid);
+  // Split the aggregate into three disjoint buckets so the UI can show that
+  // botmux's own footprint is small next to the external CLIs:
+  //  - daemon: the botmux daemon process(es) themselves (dashboard pid + bot daemon pids)
+  //  - worker: the per-session botmux worker Node process (workerPid alone) — botmux code
+  //  - cli:    everything else attributed to sessions = the external CLI subtree + its tools
+  // The CLI runs as a descendant of its session's worker, so "worker minus the worker
+  // process itself" is the CLI tree; treating only workerPid as worker keeps this robust
+  // even when a session's CLI marker is missing (adopted sessions have no worker → all cli).
+  const daemonPids = new Set<number>(input.botmuxPids ?? []);
+  for (const bot of bots) if (bot.daemonPid) daemonPids.add(bot.daemonPid);
+
+  const workerPids = new Set<number>();
+  const cliPids = new Set<number>();
+  for (const candidate of candidates) {
+    for (const pid of candidate.pids) {
+      if (candidate.workerPid !== undefined && pid === candidate.workerPid) workerPids.add(pid);
+      else cliPids.add(pid);
+    }
   }
+
+  const daemon = metricFor(daemonPids, byPid, input.processCpuPct);
+  const worker = metricFor(workerPids, byPid, input.processCpuPct);
+  const cli = metricFor(cliPids, byPid, input.processCpuPct);
 
   return {
     sessions,
     bots,
-    botmux: metricFor(botmuxPids, byPid, input.processCpuPct),
+    // Keep `botmux` as the grand total. daemon/worker/cli pid sets are disjoint
+    // (session pids are worker-subtree descendants, never the daemon), so the sum
+    // equals the previous single-set metric — same number, now itemized.
+    botmux: {
+      rssBytes: daemon.rssBytes + worker.rssBytes + cli.rssBytes,
+      cpuPct: daemon.cpuPct + worker.cpuPct + cli.cpuPct,
+    },
+    botmuxBreakdown: { daemon, worker, cli },
     nextSessionStats,
   };
 }

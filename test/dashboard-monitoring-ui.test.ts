@@ -133,6 +133,44 @@ describe('dashboard monitoring session table', () => {
     expect(healthText).not.toContain('数据年龄 -');
   });
 
+  it('breaks the Botmux memory tile into self (daemon + worker) vs external CLI', () => {
+    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+      initialCurrent: {
+        supported: true,
+        cpuReady: true,
+        host: { cpuPct: 1, memUsedPct: 2, load1: 0.1 },
+        botmux: { cpuPct: 1, rssBytes: 768 * 1024 * 1024 },
+        botmuxBreakdown: {
+          daemon: { cpuPct: 0, rssBytes: 128 * 1024 * 1024 },
+          worker: { cpuPct: 0, rssBytes: 128 * 1024 * 1024 },
+          cli: { cpuPct: 0, rssBytes: 512 * 1024 * 1024 },
+        },
+        bots: [],
+        sessions: [],
+        rankings: { tracked: [] },
+        runtime: {
+          sampleHealth: { status: 'fresh', ageMs: 0 },
+          daemons: { total: 0, online: 0, offline: 0 },
+          sessions: { total: 0, working: 0, starting: 0, idle: 0, waiting: 0, unknown: 0, unattributed: 0 },
+        },
+      },
+      initialHistory: { supported: true, bots: [], sessions: [] },
+      poll: false,
+    }));
+
+    const botmuxCard = renderer.root
+      .findByProps({ className: 'panel resource-pressure' })
+      .findAllByProps({ className: 'metric-card' })[2];
+    const text = textContent(botmuxCard);
+    expect(text).toContain('768 MiB');   // total (strong)
+    expect(text).toContain('本体');       // self line label
+    expect(text).toContain('256 MiB');   // self = daemon 128 + worker 128
+    expect(text).toContain('外部 CLI');   // external CLI line label
+    expect(text).toContain('512 MiB');   // external CLI value
+    // CPU must NOT appear in the memory tile anymore.
+    expect(text).not.toContain('%');
+  });
+
   it('renders missing runtime counts as unknown without hiding resource fallback counts', () => {
     const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
       initialCurrent: {
@@ -220,7 +258,8 @@ describe('dashboard monitoring session table', () => {
       .findAllByProps({ className: 'metric-card' });
     expect(textContent(pressureCards[0].findByType('strong'))).toBe('-');
     expect(textContent(pressureCards[1].findByType('strong'))).toBe('40.0%');
-    expect(textContent(pressureCards[2].findByType('small'))).toBe('-');
+    // The Botmux memory tile is memory-only now — CPU was removed from it (CPU under
+    // a memory tile is misleading; the Botmux CPU trend still lives in the sparklines).
     expect(textContent(pressureCards[2].findByType('strong'))).toBe('128 MiB');
 
     const botTable = root.findByProps({ className: 'resource-table resource-bot-table' });

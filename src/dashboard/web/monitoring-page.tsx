@@ -10,6 +10,11 @@ type ResourceCurrent = {
   intervalMs?: number;
   host?: { cpuPct?: number; memUsedPct?: number; load1?: number };
   botmux?: { cpuPct?: number; rssBytes?: number };
+  botmuxBreakdown?: {
+    daemon: { cpuPct?: number; rssBytes?: number };
+    worker: { cpuPct?: number; rssBytes?: number };
+    cli: { cpuPct?: number; rssBytes?: number };
+  };
   bots?: ResourceBot[];
   sessions?: ResourceSession[];
   runtime?: RuntimeSummary;
@@ -451,7 +456,17 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
                   <HelpTip label={tr('monitoring.rssHelpLabel')} text={tr('monitoring.rssHelp')} />
                 </div>
                 <strong>{formatBytes(current?.botmux?.rssBytes)}</strong>
-                <small>{formatCpuPct(current?.botmux?.cpuPct, cpuReady)}</small>
+                {current?.botmuxBreakdown && (
+                  <>
+                    <small className="metric-breakdown">
+                      {tr('monitoring.botmuxSelf')} {formatBytes((current.botmuxBreakdown.daemon.rssBytes ?? 0) + (current.botmuxBreakdown.worker.rssBytes ?? 0))}
+                      <span className="metric-breakdown-detail"> ({tr('monitoring.botmuxDaemon')} {formatBytes(current.botmuxBreakdown.daemon.rssBytes)} · {tr('monitoring.botmuxWorker')} {formatBytes(current.botmuxBreakdown.worker.rssBytes)})</span>
+                    </small>
+                    <small className="metric-breakdown">
+                      {tr('monitoring.botmuxCli')} {formatBytes(current.botmuxBreakdown.cli.rssBytes)}
+                    </small>
+                  </>
+                )}
               </section>
               <section className="metric-card"><span>{tr('monitoring.trackedSessions')}</span><strong>{current?.rankings?.tracked?.length ?? 0}</strong><small>{tr('monitoring.currentSessions')} {(current?.sessions ?? []).length}</small></section>
             </div>

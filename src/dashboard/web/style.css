@@ -552,6 +552,21 @@ main {
   font-size: 12px;
 }
 
+/* Botmux total-RSS breakdown lines (self / external CLI) — tighter + quieter
+   than the primary CPU small, and the parenthetical daemon·worker detail stays
+   inline/normal-weight (overriding the bold block `.metric-card span` rule). */
+.metric-card small.metric-breakdown {
+  margin-top: 3px;
+  font-size: 11px;
+}
+
+.metric-card .metric-breakdown-detail {
+  display: inline;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
 .metric-label-with-help {
   display: flex;
   align-items: center;
