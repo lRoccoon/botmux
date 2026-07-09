@@ -22,6 +22,7 @@ import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
 import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, putDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { putPendingApproval, getPendingApproval, removePendingApproval, listPendingApprovals } from '../../services/doc-pending-approvals-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
@@ -1695,27 +1696,66 @@ async function processCommentEvent(
     return;
   }
 
-  // 1) 查订阅表；未订阅的文档自动创建一条（mention-only，@bot 才触发）
+  // 1) 查订阅表；未订阅的文档需要 owner 授权后才自动订阅
   let sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
   if (!sub) {
-    // 从 bot 配置的 docRepoMap 查该文档绑定的仓库目录
-    const botCfg = getBot(larkAppId).config;
-    const mappedDir = botCfg.docRepoMap?.[fileToken];
-    const autoSub: DocSubscription = {
-      fileToken,
-      fileType: parsed.fileType || 'docx',
-      sessionAnchor: `doc:${fileToken}`,
-      sessionId: undefined,
-      scope: 'chat',
-      chatId: `doc:${fileToken}`,
-      commentTriggerMode: 'mention-only',
-      ownerOpenId: parsed.operatorOpenId,
-      workingDir: mappedDir,
-      createdAt: Date.now(),
-    };
-    putDocSubscription(config.session.dataDir, larkAppId, autoSub);
-    sub = autoSub;
-    logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} type=${parsed.fileType || 'docx'} (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)})`);
+    const operatorOpenId = parsed.operatorOpenId;
+    const ownerOpenId = getOwnerOpenId(larkAppId);
+    const isOwner = operatorOpenId && (operatorOpenId === ownerOpenId);
+
+    if (isOwner) {
+      // Owner 直接 @ → 自动订阅（mention-only 模式）
+      const botCfg = getBot(larkAppId).config;
+      const mappedDir = botCfg.docRepoMap?.[fileToken];
+      const autoSub: DocSubscription = {
+        fileToken,
+        fileType: parsed.fileType || 'docx',
+        sessionAnchor: `doc:${fileToken}`,
+        sessionId: undefined,
+        scope: 'chat',
+        chatId: `doc:${fileToken}`,
+        commentTriggerMode: 'mention-only',
+        ownerOpenId: operatorOpenId,
+        workingDir: mappedDir,
+        createdAt: Date.now(),
+      };
+      putDocSubscription(config.session.dataDir, larkAppId, autoSub);
+      sub = autoSub;
+      logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} by owner (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)})`);
+    } else {
+      // 非 owner @ → 记录待授权，通知 owner 审批
+      const existingPending = getPendingApproval(config.session.dataDir, larkAppId, fileToken);
+      if (!existingPending) {
+        putPendingApproval(config.session.dataDir, larkAppId, {
+          fileToken,
+          fileType: parsed.fileType || 'docx',
+          requesterOpenId: operatorOpenId || 'unknown',
+          requestedAt: Date.now(),
+        });
+        // 通知 owner
+        if (ownerOpenId) {
+          const requesterName = operatorOpenId ? operatorOpenId.slice(0, 12) : '未知用户';
+          const approveCmd = `/doc-approve ${fileToken}`;
+          const denyCmd = `/doc-deny ${fileToken}`;
+          const notifyText = [
+            '📄 新文档评论授权请求',
+            '',
+            `用户 ${requesterName} 在文档中 @了机器人，该文档尚未被订阅。`,
+            `文档 token：${fileToken.slice(0, 12)}…`,
+            '',
+            `✅ 同意授权：${approveCmd}`,
+            `❌ 拒绝：${denyCmd}`,
+          ].join('\n');
+          sendUserMessage(larkAppId, ownerOpenId, notifyText).catch((e) => {
+            logger.warn(`[doc-comment] failed to notify owner about pending approval: ${e instanceof Error ? e.message : e}`);
+          });
+        }
+        logger.info(`[doc-comment] non-owner @ on unsubscribed doc=${fileToken.slice(0, 12)} requester=${operatorOpenId?.slice(0, 12)} → pending approval`);
+      } else {
+        logger.info(`[doc-comment] non-owner @ on unsubscribed doc=${fileToken.slice(0, 12)} → already pending approval`);
+      }
+      return; // 不处理这条评论，等 owner 授权
+    }
   }
 
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件

@@ -6,7 +6,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
 import { repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -34,9 +34,10 @@ import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/cod
 import { generateAuthUrl, getTokenStatus, resolveUserToken } from '../utils/user-token.js';
 import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import {
-  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession,
+  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, getDocSubscription,
   type CommentTriggerMode,
 } from '../services/doc-subs-store.js';
+import { getPendingApproval, removePendingApproval, listPendingApprovals } from '../services/doc-pending-approvals-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
@@ -1776,10 +1777,11 @@ export async function handleCommand(
 
         if (!arg) { await sessionReply(rootId, t('cmd.subdoc.usage', undefined, loc)); break; }
 
-        // 解析 --dir <path> 参数（指定该文档绑定的本地仓库/目录）
+        // 解析参数：--dir <path>（指定仓库目录）、--watch（所有评论都触发，不 @ 也回复）
         const dirMatch = arg.match(/--dir\s+(\S+)/);
         const docWorkingDir = dirMatch ? dirMatch[1] : undefined;
-        const docRef = arg.replace(/--dir\s+\S+/, '').trim();
+        const watchMode = /--watch\b/.test(arg);
+        const docRef = arg.replace(/--dir\s+\S+/, '').replace(/--watch\b/, '').trim();
         if (!docRef) { await sessionReply(rootId, t('cmd.subdoc.usage', undefined, loc)); break; }
 
         // 校验 --dir 路径
@@ -1809,7 +1811,7 @@ export async function handleCommand(
             });
           }
 
-          const mode: CommentTriggerMode = subCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
+          const mode: CommentTriggerMode = watchMode ? 'all' : (subCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
           const { previous } = putDocSubscription(dataDir, larkAppId, {
             fileToken: file.fileToken,
             fileType: file.fileType,
@@ -1832,6 +1834,9 @@ export async function handleCommand(
           if (validatedDir) {
             replyText += `\n📂 工作目录：${validatedDir}`;
           }
+          if (watchMode) {
+            replyText += `\n👀 Watch 模式：所有新评论都会触发回复（无需 @bot）`;
+          }
           if (!userTok) {
             replyText += `\n\n💡 提示：未检测到用户授权（/login），但文档评论事件通过 WebSocket 自动推送，不影响使用。如需更可靠的事件投递，可在话题中发送 /login 完成授权。`;
           }
@@ -1841,6 +1846,135 @@ export async function handleCommand(
           // resolveDocFile 失败（链接格式不对 / 文档不存在 / 无权限）
           await sessionReply(rootId, t('cmd.subdoc.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
         }
+        break;
+      }
+
+      case '/doc-approve':
+      case '/doc-deny': {
+        if (!larkAppId) break;
+        // 只有 owner 可以审批
+        const ownerOpenId = getOwnerOpenId(larkAppId);
+        if (!ownerOpenId || message.senderId !== ownerOpenId) {
+          await sessionReply(rootId, '只有 bot 所有者可以审批文档授权请求。');
+          break;
+        }
+        const token = message.content.replace(/^\/(doc-approve|doc-deny)\s*/i, '').trim();
+        if (!token) {
+          // 列所有待授权
+          const pending = listPendingApprovals(config.session.dataDir, larkAppId);
+          if (!pending.length) {
+            await sessionReply(rootId, '当前没有待审批的文档授权请求。');
+          } else {
+            const lines = pending.map(p =>
+              `• \`${p.fileToken.slice(0, 12)}…\`（请求者：${p.requesterOpenId.slice(0, 12)}，${new Date(p.requestedAt).toLocaleString('zh-CN')}）`
+            );
+            await sessionReply(rootId, ['📋 待审批的文档授权请求：', '', ...lines, '', '✅ 同意：`/doc-approve <token>`', '❌ 拒绝：`/doc-deny <token>`'].join('\n'));
+          }
+          break;
+        }
+        const isApprove = /approve/i.test(message.content);
+        const pending = getPendingApproval(config.session.dataDir, larkAppId, token);
+        if (!pending) {
+          await sessionReply(rootId, `未找到 token 为 ${token.slice(0, 12)}… 的待审批请求。`);
+          break;
+        }
+        if (isApprove) {
+          // 授权通过 → 创建订阅
+          const botCfg = getBot(larkAppId).config;
+          const mappedDir = botCfg.docRepoMap?.[pending.fileToken];
+          const newSub = {
+            fileToken: pending.fileToken,
+            fileType: pending.fileType,
+            sessionAnchor: `doc:${pending.fileToken}`,
+            sessionId: undefined,
+            scope: 'chat' as const,
+            chatId: `doc:${pending.fileToken}`,
+            commentTriggerMode: 'mention-only' as CommentTriggerMode,
+            ownerOpenId: pending.requesterOpenId,
+            workingDir: mappedDir,
+            createdAt: Date.now(),
+          };
+          putDocSubscription(config.session.dataDir, larkAppId, newSub);
+          removePendingApproval(config.session.dataDir, larkAppId, token);
+          const wdInfo = mappedDir ? `\n📂 工作目录：${mappedDir}` : '';
+          await sessionReply(rootId, `✅ 已授权文档 ${token.slice(0, 12)}…\n（请求者：${pending.requesterOpenId.slice(0, 12)}）${wdInfo}\n\n现在该文档的评论 @bot 会触发回复。`);
+          logger.info(`[doc-comment] owner approved doc=${token.slice(0, 12)} requester=${pending.requesterOpenId.slice(0, 12)}`);
+        } else {
+          // 拒绝
+          removePendingApproval(config.session.dataDir, larkAppId, token);
+          await sessionReply(rootId, `❌ 已拒绝文档 ${token.slice(0, 12)}… 的授权请求。`);
+          logger.info(`[doc-comment] owner denied doc=${token.slice(0, 12)} requester=${pending.requesterOpenId.slice(0, 12)}`);
+        }
+        break;
+      }
+
+      case '/doc-pending': {
+        if (!larkAppId) break;
+        // 列待审批（所有人可看，但只有 owner 能批）
+        const pending = listPendingApprovals(config.session.dataDir, larkAppId);
+        if (!pending.length) {
+          await sessionReply(rootId, '当前没有待审批的文档授权请求。');
+        } else {
+          const lines = pending.map(p =>
+            `• \`${p.fileToken.slice(0, 12)}…\`（请求者：${p.requesterOpenId.slice(0, 12)}，${new Date(p.requestedAt).toLocaleString('zh-CN')}）`
+          );
+          await sessionReply(rootId, ['📋 待审批的文档授权请求：', '', ...lines].join('\n'));
+        }
+        break;
+      }
+
+      case '/doc-watch':
+      case '/doc-unwatch': {
+        if (!larkAppId) break;
+        const watch = /watch$/.test(message.content.split(' ')[0]);
+        const arg = message.content.replace(/^\/(doc-watch|doc-unwatch)\s*/i, '').trim();
+        const docAnchor = ds ? sessionAnchorId(ds) : rootId;
+        if (!arg) {
+          // 列出当前会话订阅的文档
+          const subs = listDocSubscriptionsForSession(config.session.dataDir, larkAppId, docAnchor);
+          if (!subs.length) {
+            await sessionReply(rootId, '当前会话没有订阅的文档。用 `/subscribe-lark-doc <url> [--dir <path>] [--watch]` 订阅。');
+          } else {
+            const lines = subs.map(s => {
+              const wd = s.workingDir ? ` 📂${s.workingDir}` : '';
+              const mode = s.commentTriggerMode === 'all' ? '👀watch' : '@only';
+              return `• ${s.docTitle || s.fileToken.slice(0, 12)}（${mode}）${wd}`;
+            });
+            await sessionReply(rootId, ['📄 当前会话订阅的文档：', '', ...lines].join('\n'));
+          }
+          break;
+        }
+        // 切换指定文档的 watch 模式
+        const file = await resolveDocFile(larkAppId, arg).catch(() => null);
+        if (!file) {
+          await sessionReply(rootId, '无法解析文档链接或 token。');
+          break;
+        }
+        const existing = getDocSubscription(config.session.dataDir, larkAppId, file.fileToken);
+        if (!existing) {
+          // 还没订阅，直接创建
+          const botCfg = getBot(larkAppId).config;
+          const mappedDir = botCfg.docRepoMap?.[file.fileToken];
+          putDocSubscription(config.session.dataDir, larkAppId, {
+            fileToken: file.fileToken,
+            fileType: file.fileType,
+            sessionAnchor: docAnchor,
+            sessionId: ds?.session.sessionId,
+            scope: ds?.scope ?? 'chat',
+            chatId: ds?.chatId ?? '',
+            commentTriggerMode: watch ? 'all' : 'mention-only',
+            ownerOpenId: message.senderId,
+            workingDir: mappedDir,
+            createdAt: Date.now(),
+          });
+          await sessionReply(rootId, `✅ 已${watch ? '开启 Watch 模式' : '订阅'}文档 ${file.fileToken.slice(0, 12)}…${watch ? '\n（所有评论都会触发回复）' : ''}`);
+        } else {
+          // 更新模式
+          existing.commentTriggerMode = watch ? 'all' : 'mention-only';
+          putDocSubscription(config.session.dataDir, larkAppId, existing);
+          await sessionReply(rootId, `✅ 文档 ${file.fileToken.slice(0, 12)}… 已${watch ? '开启 Watch 模式（所有评论都触发回复）' : '关闭 Watch 模式（仅 @bot 触发）'}`);
+        }
+        logger.info(`[doc-comment] /doc-${watch ? 'watch' : 'unwatch'} → ${file.fileType}:${file.fileToken.slice(0, 12)}`);
         break;
       }
 
