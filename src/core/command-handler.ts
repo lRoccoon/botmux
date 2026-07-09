@@ -31,9 +31,8 @@ import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken } from '../utils/user-token.js';
 import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
-import { UserTokenMissingError } from '../im/lark/client.js';
 import {
   putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession,
   type CommentTriggerMode,
@@ -1794,28 +1793,22 @@ export async function handleCommand(
           validatedDir = v.resolvedPath;
         }
 
-        // 评论事件官方推荐用户身份订阅，tenant 订阅大概率收不到推送 → 需要带文档 scope
-        // 的 User Token。文档 scope 不在通用 /login 里（避免污染所有 bot 的登录），
-        // 这里按需生成带 DOC_COMMENT_OAUTH_SCOPES 的专用授权链接。
+        // 评论事件通过 WebSocket 自动推送（drive.notice.comment_add_v1），不需要显式
+        // 调飞书 subscribe API。subscribeDocFile 是 best-effort 的增强（有 user token
+        // 时更可靠），没有也不影响核心功能。因此这里不强制要求 user token。
         const subCfg = getBot(larkAppId).config;
-        const replyDocLogin = async () => {
-          const { authUrl } = generateAuthUrl(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), DOC_COMMENT_OAUTH_SCOPES);
-          await sessionReply(rootId, [
-            t('cmd.subdoc.need_login', undefined, loc),
-            '',
-            t('cmd.login.step1', undefined, loc),
-            authUrl,
-            '',
-            t('cmd.login.step2', undefined, loc),
-            t('cmd.login.step3', undefined, loc),
-          ].join('\n'));
-        };
-        const userTok = await resolveUserToken(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand));
-        if (!userTok) { await replyDocLogin(); break; }
 
         try {
           const file = await resolveDocFile(larkAppId, docRef);
-          await subscribeDocFile(larkAppId, file);
+
+          // Best-effort: 有 user token 就调飞书 subscribe API（增强可靠性）
+          const userTok = await resolveUserToken(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand)).catch(() => null);
+          if (userTok) {
+            await subscribeDocFile(larkAppId, file).catch((e) => {
+              logger.warn(`[${logTag}] /subscribe-lark-doc: subscribeDocFile best-effort failed: ${e instanceof Error ? e.message : e}`);
+            });
+          }
+
           const mode: CommentTriggerMode = subCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
           const { previous } = putDocSubscription(dataDir, larkAppId, {
             fileToken: file.fileToken,
@@ -1839,15 +1832,14 @@ export async function handleCommand(
           if (validatedDir) {
             replyText += `\n📂 工作目录：${validatedDir}`;
           }
-          await sessionReply(rootId, replyText);
-          logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${validatedDir ? ` wd=${validatedDir}` : ''}${rebound ? ' (rebound)' : ''}`);
-        } catch (err) {
-          // token 缺失 / 失效 / 缺文档 scope（403）→ 给带文档 scope 的重新授权链接。
-          if (err instanceof UserTokenMissingError) {
-            await replyDocLogin();
-          } else {
-            await sessionReply(rootId, t('cmd.subdoc.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
+          if (!userTok) {
+            replyText += `\n\n💡 提示：未检测到用户授权（/login），但文档评论事件通过 WebSocket 自动推送，不影响使用。如需更可靠的事件投递，可在话题中发送 /login 完成授权。`;
           }
+          await sessionReply(rootId, replyText);
+          logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${validatedDir ? ` wd=${validatedDir}` : ''}${rebound ? ' (rebound)' : ''}${userTok ? '' : ' (no user token)'}`);
+        } catch (err) {
+          // resolveDocFile 失败（链接格式不对 / 文档不存在 / 无权限）
+          await sessionReply(rootId, t('cmd.subdoc.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
         }
         break;
       }
