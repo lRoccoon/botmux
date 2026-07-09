@@ -207,6 +207,11 @@ function voiceSummaryInstruction(locale?: Locale): string {
   return t('card.voice.summary_instruction', undefined, locale);
 }
 
+function isLiveWorkerIdleOrLimited(ds: DaemonSession): boolean {
+  if (!ds.worker || ds.worker.killed) return true;
+  return ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited';
+}
+
 function isLegacySelfHealAction(actionType?: string): boolean {
   return !!actionType && LEGACY_SELF_HEAL_ACTIONS.has(actionType);
 }
@@ -1304,9 +1309,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] voice_summary blocked for unauthorized user: ${operatorOpenId ?? '?'}`);
         return { toast: { type: 'warning', content: t('card.voice.toast_need_auth', undefined, locDs) } };
       }
+      // Dedupe read BEFORE the busy guard: a card whose voice is already being
+      // generated will have its worker back in `working`, so the busy guard would
+      // otherwise shadow the "already on the way" hint with a misleading
+      // "wait for idle" toast. Read first (correct message), guard second, and
+      // only `add` after the guard so a genuinely-busy first click still doesn't
+      // burn the dedupe key.
       const dedupeKey = cardMessageId ?? `${sessionAnchorId(ds)}::voice`;
       if (voicedCardIds.has(dedupeKey)) {
         return { toast: { type: 'info', content: t('card.voice.toast_already', undefined, locDs) } };
+      }
+      if (!isLiveWorkerIdleOrLimited(ds)) {
+        logger.info(`[${tag(ds)}] voice_summary blocked because worker is busy: ${ds.lastScreenStatus ?? 'unknown'}`);
+        return { toast: { type: 'warning', content: t('card.voice.toast_worker_busy', undefined, locDs) } };
       }
       voicedCardIds.add(dedupeKey);
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
