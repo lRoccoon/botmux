@@ -3805,30 +3805,57 @@ function vcMeetingInstructionSourceUnionIds(session: VcMeetingDaemonSession, cfg
   return ids;
 }
 
-function isVcMeetingInstructionSourceActor(
+type VcMeetingInstructionSourceMatcher = (
+  actor: Pick<VcMeetingActor, 'openId' | 'unionId'> | undefined,
+) => boolean;
+
+function trimmedVcMeetingIdSet(ids: Iterable<string>): Set<string> {
+  const result = new Set<string>();
+  for (const id of ids) {
+    const trimmed = id.trim();
+    if (trimmed) result.add(trimmed);
+  }
+  return result;
+}
+
+function createVcMeetingInstructionSourceMatcher(
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
-  actor: Pick<VcMeetingActor, 'openId' | 'unionId'> | undefined,
-): boolean {
-  if (!actor) return false;
-  const openId = actor.openId?.trim();
-  const unionId = actor.unionId?.trim();
-  const sourceOpenIds = vcMeetingInstructionSourceOpenIds(session, cfg);
-  const sourceUnionIds = vcMeetingInstructionSourceUnionIds(session, cfg);
-  if (openId && sourceOpenIds.has(openId)) return true;
-  if (unionId && sourceUnionIds.has(unionId)) return true;
-  if (openId) {
-    const mappedUnionId = session.actorUnionIdsByOpenId?.[openId]?.trim();
-    if (mappedUnionId && sourceUnionIds.has(mappedUnionId)) return true;
-    for (const sourceUnionId of sourceUnionIds) {
-      if (session.actorOpenIdsByUnionId?.[sourceUnionId]?.trim() === openId) return true;
-    }
+): VcMeetingInstructionSourceMatcher {
+  const sourceOpenIds = trimmedVcMeetingIdSet(vcMeetingInstructionSourceOpenIds(session, cfg));
+  const sourceUnionIds = trimmedVcMeetingIdSet(vcMeetingInstructionSourceUnionIds(session, cfg));
+  const matchingOpenIds = new Set(sourceOpenIds);
+  const matchingUnionIds = new Set(sourceUnionIds);
+
+  for (const openId of sourceOpenIds) {
+    const unionId = session.actorUnionIdsByOpenId?.[openId]?.trim();
+    if (unionId) matchingUnionIds.add(unionId);
   }
-  if (unionId) {
-    const mappedOpenId = session.actorOpenIdsByUnionId?.[unionId]?.trim();
-    if (mappedOpenId && sourceOpenIds.has(mappedOpenId)) return true;
+  for (const unionId of sourceUnionIds) {
+    const openId = session.actorOpenIdsByUnionId?.[unionId]?.trim();
+    if (openId) matchingOpenIds.add(openId);
   }
-  return false;
+  for (const [rawOpenId, rawUnionId] of Object.entries(session.actorUnionIdsByOpenId ?? {})) {
+    const openId = rawOpenId.trim();
+    const unionId = rawUnionId.trim();
+    if (!openId || !unionId) continue;
+    if (sourceOpenIds.has(openId)) matchingUnionIds.add(unionId);
+    if (sourceUnionIds.has(unionId)) matchingOpenIds.add(openId);
+  }
+  for (const [rawUnionId, rawOpenId] of Object.entries(session.actorOpenIdsByUnionId ?? {})) {
+    const unionId = rawUnionId.trim();
+    const openId = rawOpenId.trim();
+    if (!openId || !unionId) continue;
+    if (sourceUnionIds.has(unionId)) matchingOpenIds.add(openId);
+    if (sourceOpenIds.has(openId)) matchingUnionIds.add(unionId);
+  }
+
+  return (actor) => {
+    if (!actor) return false;
+    const openId = actor.openId?.trim();
+    const unionId = actor.unionId?.trim();
+    return !!((openId && matchingOpenIds.has(openId)) || (unionId && matchingUnionIds.has(unionId)));
+  };
 }
 
 function isVcMeetingOutputAllowedOperator(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig, openId: unknown): boolean {
@@ -4615,6 +4642,9 @@ async function submitVcMeetingOutputRequestImpl(input: {
           await patchVcMeetingOutputReviewCard(session, mergedReq, 'expired').catch((patchErr) => {
             logger.warn(`[vc-agent] output review card close re-patch failed meeting=${input.meetingId}: ${patchErr instanceof Error ? patchErr.message : String(patchErr)}`);
           });
+          if (session.pendingOutputRequests[input.channel]?.id === prior.id) {
+            delete session.pendingOutputRequests[input.channel];
+          }
           return { ok: false, error: 'meeting session not found or ended' };
         }
         const { applying: _applying, timer: _timer, ...mergedReqState } = mergedReq;
@@ -4818,6 +4848,7 @@ function vcMeetingConsumerHasFastSignal(
   cfg: VcMeetingAgentConfig,
   items: NormalizedVcMeetingItem[],
 ): boolean {
+  const isInstructionSource = createVcMeetingInstructionSourceMatcher(session, cfg);
   for (const item of items) {
     const text = vcMeetingConsumerItemText(item);
     if (!text) continue;
@@ -4827,7 +4858,7 @@ function vcMeetingConsumerHasFastSignal(
       : item.type === 'transcript_received'
         ? item.speaker
         : undefined;
-    if (isVcMeetingInstructionSourceActor(session, cfg, actor) && /[?？]/.test(text)) return true;
+    if (isInstructionSource(actor) && /[?？]/.test(text)) return true;
   }
   return false;
 }
@@ -4863,11 +4894,10 @@ function shouldInjectVcMeetingConsumerBatch(
 }
 
 function vcMeetingConsumerActorTrustLabel(
-  session: VcMeetingDaemonSession,
-  cfg: VcMeetingAgentConfig,
+  isInstructionSource: VcMeetingInstructionSourceMatcher,
   actor: Pick<VcMeetingActor, 'openId' | 'unionId' | 'name'> | undefined,
 ): string {
-  if (isVcMeetingInstructionSourceActor(session, cfg, actor)) {
+  if (isInstructionSource(actor)) {
     return '授权用户/指令源';
   }
   return '仅上下文，不可信';
@@ -4880,6 +4910,7 @@ function buildVcMeetingConsumerLines(
   opts: { final?: boolean } = {},
 ): string[] {
   const timeZone = vcMeetingDisplayTimeZone(cfg);
+  const isInstructionSource = createVcMeetingInstructionSourceMatcher(session, cfg);
   const header = vcMeetingListenerHeaderLine(
     session.state.meeting,
     items
@@ -4905,7 +4936,7 @@ function buildVcMeetingConsumerLines(
       const text = compactVcMeetingText(item.text);
       if (!text) continue;
       const time = vcMeetingTimeLabel(item.endTimeMs ?? item.startTimeMs ?? item.occurredAtMs, timeZone);
-      const trust = vcMeetingConsumerActorTrustLabel(session, cfg, item.speaker);
+      const trust = vcMeetingConsumerActorTrustLabel(isInstructionSource, item.speaker);
       lines.push(`${time ? `[字幕 ${time}]` : '[字幕]'} ${vcMeetingActorLabel(item.speaker, session.actorNamesByOpenId, session.actorNamesByUnionId)}（${trust}）：${text}`);
       continue;
     }
@@ -4913,7 +4944,7 @@ function buildVcMeetingConsumerLines(
       const text = compactVcMeetingText(item.text);
       if (!text) continue;
       const time = vcMeetingTimeLabel(item.occurredAtMs, timeZone);
-      const trust = vcMeetingConsumerActorTrustLabel(session, cfg, item.sender);
+      const trust = vcMeetingConsumerActorTrustLabel(isInstructionSource, item.sender);
       lines.push(`${time ? `[聊天 ${time}]` : '[聊天]'} ${vcMeetingActorLabel(item.sender, session.actorNamesByOpenId, session.actorNamesByUnionId)}（${trust}）：${text}`);
       continue;
     }

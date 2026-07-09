@@ -3353,6 +3353,7 @@ describe('VC meeting daemon session lifecycle', () => {
     expect((merged as { ok: false; error: string }).error).toContain('ended');
     const patchedTitles = patchedMessages.map(msg => JSON.parse(msg.content).header.title.content);
     expect(patchedTitles.at(-1)).toBe('输出请求已过期');
+    expect(patchedTitles.filter(title => title === '输出请求已过期')).toHaveLength(1);
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_joined_181818182')).toBe(false);
   });
 
