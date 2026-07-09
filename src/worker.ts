@@ -5624,12 +5624,35 @@ window.addEventListener('resize',onViewportResize);
 // doesn't compound into a whole screen. px<0 = scroll up (toward history). The
 // per-call cap stops a single huge delta (page tick / fling) from over-firing.
 var _scrollAccum=0;var _SCROLL_STEP=33;
-function _fwdScroll(px){
+// Map a viewport pixel (clientX/Y) to a 1-based terminal cell "col;row", clamped to
+// the grid. The forwarded SGR wheel event MUST carry the cell UNDER THE POINTER, the
+// way a physical terminal reports it: zone-routed alt-screen TUIs — OpenCode (Bubble
+// Tea + bubblezone) — only scroll when the wheel lands inside the messages viewport's
+// mouse zone. A fixed (1,1) is the top-left border, outside that zone, so every
+// forwarded wheel was dropped and OpenCode wouldn't scroll at all. Coordinate-agnostic
+// CLIs (Claude Code etc.) scroll regardless of coords, which is why ONLY OpenCode broke.
+// Fall back to the grid CENTRE (never 1,1) when the screen geometry can't be read.
+function _cellAt(clientX,clientY){
+  var col=(term.cols>>1)+1,row=(term.rows>>1)+1;
+  try{
+    var sc=term.element&&term.element.querySelector('.xterm-screen');
+    var r=sc&&sc.getBoundingClientRect();
+    if(r&&r.width>0&&r.height>0){
+      col=Math.floor((clientX-r.left)/(r.width/term.cols))+1;
+      row=Math.floor((clientY-r.top)/(r.height/term.rows))+1;
+    }
+  }catch(_e){}
+  if(col<1)col=1;else if(col>term.cols)col=term.cols;
+  if(row<1)row=1;else if(row>term.rows)row=term.rows;
+  return col+';'+row;
+}
+function _fwdScroll(px,coord){
   if(!ws_||ws_.readyState!==1)return;
+  coord=coord||(((term.cols>>1)+1)+';'+((term.rows>>1)+1)); // never (1,1)
   _scrollAccum+=px;var data='',n=0;
   while(Math.abs(_scrollAccum)>=_SCROLL_STEP&&n<6){
     var up=_scrollAccum<0; // px<0 → wheel-up (history)
-    data+='\\x1b[<'+(up?64:65)+';1;1M';
+    data+='\\x1b[<'+(up?64:65)+';'+coord+'M';
     _scrollAccum+=up?_SCROLL_STEP:-_SCROLL_STEP;n++;
   }
   if(data)ws_.send(JSON.stringify({type:'input',data:data}));
@@ -5645,7 +5668,7 @@ if(!${isTmuxMode && !isPipeMode}){
     e.preventDefault();e.stopPropagation();
     // Normalise deltaMode to px: line→~16px, page→~one screen.
     var px=e.deltaMode===1?e.deltaY*16:e.deltaMode===2?e.deltaY*term.rows*16:e.deltaY;
-    _fwdScroll(px);
+    _fwdScroll(px,_cellAt(e.clientX,e.clientY)); // report the cell under the pointer
   },{capture:true,passive:false});
 }
 
@@ -5694,7 +5717,8 @@ if(!${isTmuxMode && !isPipeMode}){
     if(term.buffer.active.type!=='alternate'||_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
     var y=e.touches[0].clientY;
-    _fwdScroll(_tLastY-y); // finger drags down (y grows) → px<0 → scroll up (history)
+    // finger drags down (y grows) → px<0 → scroll up (history); report the touched cell
+    _fwdScroll(_tLastY-y,_cellAt(e.touches[0].clientX,y));
     _tLastY=y;
   },{capture:true,passive:false});
   _tTerm.addEventListener('touchend',function(){_tLastY=null;},{capture:true,passive:true});
