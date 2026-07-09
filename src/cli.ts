@@ -2322,7 +2322,7 @@ interface SessionData {
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   /** 文档评论入口当前轮回评论落点（见 Session.currentDocCommentTarget in types.ts）。 */
-  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
+  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string };
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   whiteboardId?: string;
@@ -4708,7 +4708,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-    const { replyToDocComment, chunkCommentText } = await import('./im/lark/doc-comment.js');
+    const { replyToDocComment, chunkCommentText, removeCommentReaction } = await import('./im/lark/doc-comment.js');
     const appId = s.larkAppId!;
     const loc = localeForBot(appId);
     try {
@@ -4725,6 +4725,12 @@ async function cmdSend(rest: string[]): Promise<void> {
       const chunks = chunkCommentText(content);
       for (let i = 0; i < chunks.length; i++) {
         await replyToDocComment(appId, { fileToken: docTarget.fileToken, fileType: docTarget.fileType }, docTarget.commentId, chunks[i], i === 0 ? docMentionOpenId : undefined);
+      }
+      // 清理 "Typing" reaction（bot 已回复完毕）。
+      if (docTarget.reactionId && docTarget.replyId) {
+        await removeCommentReaction(appId,
+          { fileToken: docTarget.fileToken, fileType: docTarget.fileType },
+          docTarget.commentId, docTarget.replyId, docTarget.reactionId);
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {

@@ -138,8 +138,8 @@ import {
 import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext } from './im/lark/event-dispatcher.js';
-import { listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription } from './services/doc-subs-store.js';
-import { subscribeDocFile, unsubscribeDocFile } from './im/lark/doc-comment.js';
+import { listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, type DocSubscription } from './services/doc-subs-store.js';
+import { subscribeDocFile, unsubscribeDocFile, addCommentReaction } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
@@ -7763,6 +7763,96 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 }
 
 /**
+ * 为文档评论自动创建 session（无活跃 IM session 时调用）。
+ *
+ * 用虚拟 anchor = `doc:{fileToken}` 作为 session key，workingDir 取自：
+ *   1) sub.workingDir（如果订阅时指定了）
+ *   2) bot 的 defaultWorkingDir / workingDir 配置
+ *   3) fallback 到 ~
+ *
+ * 创建后立即 fork worker 并把评论内容作为首轮输入。
+ * 返回创建好的 DaemonSession（已加入 activeSessions），失败返回 null。
+ */
+async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx: DocCommentContext): Promise<DaemonSession | null> {
+  const botCfg = getBot(larkAppId).config;
+  const loc = localeForBot(larkAppId);
+
+  // 解析 workingDir
+  const workingDir = (sub as any).workingDir
+    ?? effectiveDefaultWorkingDir(botCfg)
+    ?? botCfg.workingDir
+    ?? '~';
+
+  const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
+  const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
+
+  const promptContent = `${tr('daemon.doc_comment_prefix', { author: authorName }, loc)}\n${ctx.text}`;
+  const title = `[Doc] ${sub.fileToken.slice(0, 8)}: ${ctx.text.slice(0, 40)}`;
+
+  const virtualChatId = `doc:${sub.fileToken}`;
+  const virtualAnchor = sub.sessionAnchor;
+  const now = Date.now();
+
+  const session = sessionStore.createSession(virtualChatId, virtualAnchor, title, 'group');
+  session.larkAppId = larkAppId;
+  session.scope = 'chat';
+  session.lastMessageAt = new Date(now).toISOString();
+  session.workingDir = workingDir;
+  session.cliId = botCfg.cliId;
+  session.ownerOpenId = ctx.authorOpenId || sub.ownerOpenId;
+  sessionStore.updateSession(session);
+
+  const selfBot = getBot(larkAppId);
+  const ds: DaemonSession = {
+    session,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId,
+    chatId: virtualChatId,
+    chatType: 'group',
+    scope: 'chat',
+    spawnedAt: now,
+    cliVersion: getCurrentCliVersion(),
+    lastMessageAt: now,
+    hasHistory: false,
+    workingDir,
+    ownerOpenId: ctx.authorOpenId || sub.ownerOpenId,
+    currentTurnTitle: ctx.text.substring(0, 50),
+  };
+
+  // 记录本轮回评论落点
+  const turnId = ctx.replyId || ctx.commentId;
+  (ds.docCommentTurns ??= new Map()).set(turnId, {
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    commentId: ctx.commentId,
+    replyToOpenId: ctx.authorOpenId,
+    replyToName: sender?.name,
+    replyId: ctx.replyId,
+    reactionId: undefined, // 由调用方在加 reaction 后回填
+  });
+
+  const docTarget = {
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    commentId: ctx.commentId,
+    replyToName: sender?.name,
+    replyToOpenId: ctx.authorOpenId,
+    turnId,
+    replyId: ctx.replyId,
+  };
+  ds.session.currentDocCommentTarget = docTarget;
+
+  activeSessions.set(sessionKey(virtualAnchor, larkAppId), ds);
+
+  // 不在这里 forkWorker —— handleDocComment 会统一处理（它会检查 worker 状态、
+  // 加 reaction、设 docCommentTurns、然后 fork 或 send）。这里只建好 session 骨架。
+  logger.info(`[doc-comment] auto-created session for file=${sub.fileToken.slice(0, 12)} (wd=${workingDir}, cli=${botCfg.cliId})`);
+  return ds;
+}
+
+/**
  * 文档评论入口（/subscribe-lark-doc）：一条命中订阅的文档评论喂进其绑定会话。
  *
  * 与 handleThreadReply 同构但精简：会话由订阅锚点直接定位（无需路由决策），
@@ -7778,10 +7868,24 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
   const turnId = ctx.replyId || commentId;
   const loc = localeForBot(larkAppId);
 
-  const ds = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
+  let ds: DaemonSession | undefined | null = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
   if (!ds) {
-    logger.info(`[doc-comment] no active session at anchor=${sub.sessionAnchor.slice(0, 12)} (app=${larkAppId}); dropping comment ${commentId.slice(0, 12)}`);
-    return;
+    // 无活跃 session → 自动为该文档创建一个（用虚拟 anchor = doc:{fileToken}）
+    logger.info(`[doc-comment] no active session for anchor=${sub.sessionAnchor.slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
+    ds = await autoCreateDocSession(sub, larkAppId, ctx);
+    if (!ds) {
+      logger.info(`[doc-comment] auto-create session failed for file=${sub.fileToken.slice(0, 12)}; dropping comment ${commentId.slice(0, 12)}`);
+      return;
+    }
+  }
+
+  // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
+  const userReplyId = ctx.replyId;
+  let reactionId: string | undefined;
+  if (userReplyId) {
+    reactionId = await addCommentReaction(larkAppId,
+      { fileToken: sub.fileToken, fileType: sub.fileType },
+      commentId, userReplyId, 'Typing');
   }
 
   const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
@@ -7798,8 +7902,10 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     commentId,
     replyToOpenId: ctx.authorOpenId,
     replyToName: sender?.name,
+    replyId: userReplyId,
+    reactionId,
   });
-  const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId };
+  const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId };
 
   const dsBotCfg = getBot(ds.larkAppId).config;
   const selfBot = getBot(ds.larkAppId);

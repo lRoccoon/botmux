@@ -470,3 +470,74 @@ export function chunkCommentText(text: string, max = DOC_COMMENT_MAX_CHARS): str
   if (rest) chunks.push(rest);
   return chunks;
 }
+
+// ─── Reaction（"Typing" 指示器）────────────────────────────────────────────
+
+/**
+ * 给评论回复加 reaction（"Typing" 处理中指示器）。
+ *
+ * 用户在文档评论里 @bot 后，bot 立即给那条回复加一个 "Typing" emoji，让用户
+ * 知道 bot 收到了、正在处理。bot 回复发出后再删掉。
+ *
+ * 端点：`POST drive/v2/files/{token}/comments/reaction`（v2，评论 reaction 专用）。
+ * 优先应用身份（reaction 显示为 bot 加的）。
+ *
+ * @returns 新创建的 reaction_id（删除时要用）；失败返回 undefined（不阻塞主流程）。
+ */
+export async function addCommentReaction(
+  larkAppId: string,
+  file: ResolvedDocFile,
+  commentId: string,
+  replyId: string,
+  reactionType: string,
+): Promise<string | undefined> {
+  try {
+    const res = await driveApiCall(larkAppId, {
+      method: 'POST',
+      path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
+      params: { file_type: file.fileType },
+      data: { action: 'add', comment_id: commentId, reply_id: replyId, reaction_type: reactionType },
+      preferTenant: true,
+    });
+    const reactionId: string | undefined = res?.data?.reaction_id;
+    if (reactionId) {
+      logger.info(`[doc-comment] added reaction=${reactionId} type=${reactionType} on reply=${replyId.slice(0, 12)}`);
+    }
+    return reactionId;
+  } catch (err) {
+    logger.warn(`[doc-comment] addCommentReaction failed for reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return undefined;
+  }
+}
+
+/**
+ * 删除评论回复的 reaction（bot 回复发出后清理 "Typing" 指示器）。
+ *
+ * 端点：`DELETE drive/v2/files/{token}/comments/reaction`，参数全走 query string。
+ * best-effort：失败只告警不抛（bot 已经成功回复了，reaction 留着也不影响）。
+ */
+export async function removeCommentReaction(
+  larkAppId: string,
+  file: ResolvedDocFile,
+  commentId: string,
+  replyId: string,
+  reactionId: string,
+): Promise<void> {
+  if (!reactionId) return;
+  try {
+    await driveApiCall(larkAppId, {
+      method: 'DELETE',
+      path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
+      params: {
+        file_type: file.fileType,
+        comment_id: commentId,
+        reply_id: replyId,
+        reaction_id: reactionId,
+      },
+      preferTenant: true,
+    });
+    logger.info(`[doc-comment] removed reaction=${reactionId.slice(0, 12)} on reply=${replyId.slice(0, 12)}`);
+  } catch (err) {
+    logger.warn(`[doc-comment] removeCommentReaction failed for reaction=${reactionId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+  }
+}

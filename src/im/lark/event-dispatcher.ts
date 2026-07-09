@@ -21,7 +21,7 @@ import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
 import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
-import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { getDocSubscription, putDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
@@ -1695,11 +1695,23 @@ async function processCommentEvent(
     return;
   }
 
-  // 1) 必须是已订阅的文档（per-文档订阅 → 主键命中才处理）
-  const sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
+  // 1) 查订阅表；未订阅的文档自动创建一条（mention-only，@bot 才触发）
+  let sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
   if (!sub) {
-    logger.info(`[doc-comment] event dropped: file_token=${fileToken.slice(0, 12)} 不在订阅表（已订阅的可 /subscribe-lark-doc list 查；注意 wiki 链接会解析成底层 obj_token）`);
-    return;
+    const autoSub: DocSubscription = {
+      fileToken,
+      fileType: parsed.fileType || 'docx',
+      sessionAnchor: `doc:${fileToken}`,
+      sessionId: undefined,
+      scope: 'chat',
+      chatId: `doc:${fileToken}`,
+      commentTriggerMode: 'mention-only',
+      ownerOpenId: parsed.operatorOpenId,
+      createdAt: Date.now(),
+    };
+    putDocSubscription(config.session.dataDir, larkAppId, autoSub);
+    sub = autoSub;
+    logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} type=${parsed.fileType || 'docx'} (mention-only, anchor=doc:${fileToken.slice(0, 12)})`);
   }
 
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件

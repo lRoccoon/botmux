@@ -28,7 +28,7 @@ import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
-import { replyToDocComment, chunkCommentText, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
@@ -2675,6 +2675,12 @@ function deliverFinalOutput(
         const chunks = chunkCommentText(msg.content);
         for (let i = 0; i < chunks.length; i++) {
           await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
+        }
+        // 清理 "Typing" reaction（bot 已回复完毕）。
+        if (docTurn.reactionId && docTurn.replyId) {
+          await removeCommentReaction(ds.larkAppId,
+            { fileToken: docTurn.fileToken, fileType: docTurn.fileType },
+            docTurn.commentId, docTurn.replyId, docTurn.reactionId);
         }
         ds.docCommentTurns?.delete(msg.turnId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);

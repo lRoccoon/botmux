@@ -93,7 +93,7 @@ export interface Session {
    * send 跑在独立 CLI 子进程、只能从磁盘读会话态，故把当前轮的回评论落点持久化
    * 在这里。每开新轮重置（beginNewTurn 清空；handleDocComment 设值）。
    */
-  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
+  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string };
   /** open_id of the quote-target message's sender — used by --mention-back. */
   quoteTargetSenderOpenId?: string;
   /** Whether the quote-target sender is a bot (vs a human) — drives the
