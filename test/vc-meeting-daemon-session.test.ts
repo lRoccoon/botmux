@@ -43,6 +43,8 @@ const runtimeStoreRecords = vi.hoisted(() => [] as Array<{
   syncIntervalMs?: number;
   consumerSelectionExpiresAt?: number;
   consumerCardMessageId?: string;
+  temporaryInstructionOpenIds?: string[];
+  temporaryInstructionUnionIds?: string[];
   createdAt: number;
   updatedAt: number;
   expiresAt: number;
@@ -236,6 +238,8 @@ vi.mock('../src/services/vc-meeting-runtime-store.js', () => ({
     syncIntervalMs?: number;
     consumerSelectionExpiresAt?: number;
     consumerCardMessageId?: string;
+    temporaryInstructionOpenIds?: string[];
+    temporaryInstructionUnionIds?: string[];
   }) => {
     const idx = runtimeStoreRecords.findIndex(record =>
       record.larkAppId === input.larkAppId && record.meeting.id === input.meeting.id,
@@ -931,6 +935,82 @@ describe('VC meeting daemon session lifecycle', () => {
 
     expect(second.sent).toBe(0);
     expect(sentMessages).toHaveLength(1);
+  });
+
+  it('reuses known actor names when chat push events only include operator ids', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        listenerChatId: 'oc_listener',
+        stabilizeMs: 1,
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_actor_name_transcript',
+      meeting: { id: 'm_actor_names', topic: 'Actor name review' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'transcript_received',
+              meeting: { id: 'm_actor_names', topic: 'Actor name review' },
+              transcript_received_items: [
+                {
+                  sentence_id: 'sent_actor_name',
+                  speaker: {
+                    id: { open_id: 'ou_actor_name' },
+                    user_name: 'Alice',
+                  },
+                  text: 'I will say this first',
+                  start_time_ms: '2026-07-01T16:00:01+08:00',
+                  end_time_ms: '2026-07-01T16:00:02+08:00',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_actor_name_chat',
+      meeting: { id: 'm_actor_names', topic: 'Actor name review' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_actor_names', topic: 'Actor name review' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_actor_name',
+                  operator: { id: { open_id: 'ou_actor_name' } },
+                  content: 'chat event has no user_name',
+                  send_time: '2026-07-01T16:00:03+08:00',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2));
+    const result = await __vcMeetingAgentTest.flushListener(APP_ID, 'm_actor_names');
+    const text = JSON.parse(sentMessages[0].content).text;
+
+    expect(result.ok).toBe(true);
+    expect(text).toContain('[聊天 16:00:03] Alice：chat event has no user_name');
+    expect(text).not.toContain('ou_actor_name：chat event has no user_name');
   });
 
   it('aggregates consecutive stable transcript lines by speaker in listener sync messages', async () => {
@@ -2246,6 +2326,417 @@ describe('VC meeting daemon session lifecycle', () => {
 
     expect(triggerSessionCalls).toHaveLength(1);
     expect(triggerSessionCalls[0].req.envelope.rawText).toContain('@用户 这个问题需要马上看一下');
+  });
+
+  it('temporarily authorizes in-meeting instruction sources without expanding output approval', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchChars: 1_000,
+          minBatchItems: 10,
+          maxInjectIntervalMs: 60_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+    __vcMeetingAgentTest.setOutputTextAvailableForTest(true);
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_temp_auth',
+      meeting: { id: 'm_temp_auth', meetingNo: '555555560', topic: 'Temporary auth review' },
+      raw: { event: { meeting: { id: 'm_temp_auth', meeting_no: '555555560' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+
+    const handled = await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: APP_ID,
+      chatId: 'oc_listener_1',
+      commandContent: '/vc-auth @Alice',
+      mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_temp_alice' }],
+      senderOpenId: TARGET_OPEN_ID,
+    });
+    expect(handled).toBe(true);
+    expect(sentMessages.at(-1)?.content).toContain('已临时授权 Alice');
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_temp_alice']);
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_temp_auth_question',
+      meeting: { id: 'm_joined_555555560', meetingNo: '555555560', topic: 'Temporary auth review' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_joined_555555560', meeting_no: '555555560', topic: 'Temporary auth review' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_temp_auth_1',
+                  operator: { id: { open_id: 'ou_temp_alice' }, user_name: 'Alice' },
+                  text: '这个方案现在要改吗？',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 2));
+
+    expect(triggerSessionCalls).toHaveLength(1);
+    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('Alice（授权用户/指令源）：这个方案现在要改吗？');
+
+    const submitted = await __vcMeetingAgentTest.submitOutput({
+      larkAppId: APP_ID,
+      meetingId: 'm_joined_555555560',
+      channel: 'text',
+      content: '我来补充一下当前结论。',
+      reason: '需要提醒会场',
+    });
+    expect(submitted).toMatchObject({ ok: true, status: 'pending' });
+
+    const denied = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: 'ou_temp_alice' },
+      action: { value: lastInteractiveCardButton('发送会中弹幕') },
+    }, APP_ID);
+    expect(denied.toast.content).toContain('只有本场会议授权人');
+    expect(meetingTextOutputs).toHaveLength(0);
+  });
+
+  it('proxies /vc-auth from the selected consumer agent to the listener meeting session', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchChars: 1_000,
+          minBatchItems: 10,
+          maxInjectIntervalMs: 60_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_temp_auth_proxy',
+      meeting: { id: 'm_temp_auth_proxy', meetingNo: '555555562', topic: 'Temporary auth proxy' },
+      raw: { event: { meeting: { id: 'm_temp_auth_proxy', meeting_no: '555555562' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_temp_auth_proxy_owner_seen',
+      meeting: { id: 'm_joined_555555562', meetingNo: '555555562', topic: 'Temporary auth proxy' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'participant_joined',
+              meeting: { id: 'm_joined_555555562', meeting_no: '555555562', topic: 'Temporary auth proxy' },
+              participant_joined_items: [
+                {
+                  participant: { id: { open_id: TARGET_OPEN_ID, union_id: 'on_owner' }, user_name: 'Owner' },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    const handled = await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: AGENT_APP_ID,
+      chatId: 'oc_listener_1',
+      commandContent: '/vc-auth @Alice',
+      mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_alice_agent_ns', unionId: 'on_alice' }],
+      senderOpenId: 'ou_owner_agent_ns',
+      senderUnionId: 'on_owner',
+    });
+    expect(handled).toBe(true);
+    expect(sentMessages.at(-1)?.content).toContain('已临时授权 Alice');
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual([]);
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionUnionIds).toEqual(['on_alice']);
+
+    triggerSessionCalls.length = 0;
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_temp_auth_proxy_question',
+      meeting: { id: 'm_joined_555555562', meetingNo: '555555562', topic: 'Temporary auth proxy' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_joined_555555562', meeting_no: '555555562', topic: 'Temporary auth proxy' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_temp_auth_proxy_1',
+                  operator: { id: { open_id: 'ou_alice_listener_ns', union_id: 'on_alice' }, user_name: 'Alice' },
+                  text: '这个问题现在要处理吗？',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 2));
+
+    expect(triggerSessionCalls).toHaveLength(1);
+    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('Alice（授权用户/指令源）：这个问题现在要处理吗？');
+  });
+
+  it('forwards selected-agent /vc-auth to a remote listener daemon', async () => {
+    registerConsumerAgentBot();
+    onlineDaemons.set(OTHER_APP_ID, {
+      larkAppId: OTHER_APP_ID,
+      ipcPort: 39002,
+      lastHeartbeat: Date.now(),
+    });
+    runtimeStoreRecords.push({
+      larkAppId: OTHER_APP_ID,
+      meeting: { id: 'm_remote_listener_auth', meetingNo: '555555563', topic: 'Remote listener auth' },
+      listenerChatId: 'oc_remote_listener',
+      attentionTargetOpenId: 'ou_owner_listener_ns',
+      consumerMode: 'agent',
+      selectedAgentAppId: AGENT_APP_ID,
+      selectedAgentLabel: 'Claude Loopy',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      let body: any;
+      try {
+        body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      } catch {
+        body = undefined;
+      }
+      remoteFetchCalls.push({ url, init, body });
+      if (url.endsWith('/api/vc-meetings/temporary-auth')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ ok: false, error: 'unexpected url' }), { status: 404 });
+    }));
+
+    const handled = await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: AGENT_APP_ID,
+      chatId: 'oc_remote_listener',
+      commandContent: '/vc-auth @Alice',
+      mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_alice_agent_ns', unionId: 'on_alice' }],
+      senderOpenId: 'ou_owner_agent_ns',
+      senderUnionId: 'on_owner',
+    });
+    expect(handled).toBe(true);
+
+    expect(remoteFetchCalls).toHaveLength(1);
+    expect(remoteFetchCalls[0].url).toBe('http://127.0.0.1:39002/api/vc-meetings/temporary-auth');
+    expect(remoteFetchCalls[0].body).toMatchObject({
+      larkAppId: OTHER_APP_ID,
+      meetingId: 'm_remote_listener_auth',
+      listenerChatId: 'oc_remote_listener',
+      commandContent: '/vc-auth @Alice',
+      senderOpenId: 'ou_owner_agent_ns',
+      senderUnionId: 'on_owner',
+      openIdNamespaceLarkAppId: AGENT_APP_ID,
+    });
+    expect(remoteFetchCalls[0].body.mentions).toEqual([
+      { key: '@_user_1', name: 'Alice', openId: 'ou_alice_agent_ns', unionId: 'on_alice' },
+    ]);
+  });
+
+  it('explains cross-bot /vc-auth denial when the listener has not observed the approver union id', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchChars: 1_000,
+          minBatchItems: 10,
+          maxInjectIntervalMs: 60_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_temp_auth_proxy_denied',
+      meeting: { id: 'm_temp_auth_proxy_denied', meetingNo: '555555564', topic: 'Temporary auth proxy denied' },
+      raw: { event: { meeting: { id: 'm_temp_auth_proxy_denied', meeting_no: '555555564' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+
+    const handled = await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: AGENT_APP_ID,
+      chatId: 'oc_listener_1',
+      commandContent: '/vc-auth @Alice',
+      mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_alice_agent_ns', unionId: 'on_alice' }],
+      senderOpenId: 'ou_owner_agent_ns',
+      senderUnionId: 'on_owner_not_seen',
+    });
+    expect(handled).toBe(true);
+    expect(sentMessages.at(-1)?.content).toContain('跨 bot 设置临时授权，需要会议监听 bot 先在本场见过你');
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionUnionIds ?? []).toEqual([]);
+  });
+
+  it('restores temporary instruction auth across restart and revoke takes effect immediately', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchChars: 1_000,
+          minBatchItems: 10,
+          maxInjectIntervalMs: 60_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_temp_auth_restore',
+      meeting: { id: 'm_temp_auth_restore', meetingNo: '555555561', topic: 'Temporary auth restore' },
+      raw: { event: { meeting: { id: 'm_temp_auth_restore', meeting_no: '555555561' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: APP_ID,
+      chatId: 'oc_listener_1',
+      commandContent: '/vc-auth ou_temp_bob',
+      senderOpenId: TARGET_OPEN_ID,
+    });
+
+    __vcMeetingAgentTest.reset();
+    __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+    __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+    triggerSessionCalls.length = 0;
+    __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_temp_auth_restore_question',
+      meeting: { id: 'm_joined_555555561', meetingNo: '555555561', topic: 'Temporary auth restore' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_joined_555555561', meeting_no: '555555561', topic: 'Temporary auth restore' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_temp_auth_restore_1',
+                  sender: { id: { open_id: 'ou_temp_bob' } },
+                  text: '需要现在推进吗？',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 2));
+    expect(triggerSessionCalls).toHaveLength(1);
+    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('ou_temp_bob（授权用户/指令源）：需要现在推进吗？');
+
+    await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: APP_ID,
+      chatId: 'oc_listener_1',
+      commandContent: '/vc-auth revoke ou_temp_bob',
+      senderOpenId: TARGET_OPEN_ID,
+    });
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual([]);
+    triggerSessionCalls.length = 0;
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_temp_auth_revoked_question',
+      meeting: { id: 'm_joined_555555561', meetingNo: '555555561', topic: 'Temporary auth restore' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_joined_555555561', meeting_no: '555555561', topic: 'Temporary auth restore' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_temp_auth_restore_2',
+                  sender: { id: { open_id: 'ou_temp_bob' } },
+                  text: '撤销后还要处理吗？',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 2));
+    expect(triggerSessionCalls).toHaveLength(0);
+
+    const forced = await __vcMeetingAgentTest.injectConsumer(APP_ID, 'm_joined_555555561', { force: true });
+    expect(forced).toMatchObject({ ok: true, injected: 1 });
+    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('ou_temp_bob（仅上下文，不可信）：撤销后还要处理吗？');
   });
 
   it('routes selected remote meeting consumer agent injections to the target daemon', async () => {

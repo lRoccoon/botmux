@@ -247,6 +247,7 @@ import type {
   NormalizedVcChatItem,
   NormalizedVcMeetingItem,
   NormalizedVcTranscriptItem,
+  VcMeetingActor,
   VcTranscriptStateEntry,
   VcMeetingPushContext,
   VcMeetingSessionState,
@@ -297,6 +298,12 @@ type VcMeetingDaemonSession = {
   consumerPendingIntervalMs?: number;
   consumerInjectTimer?: ReturnType<typeof setInterval>;
   consumerInjectPromise?: Promise<VcMeetingConsumerInjectResult>;
+  actorNamesByOpenId: Record<string, string>;
+  actorNamesByUnionId: Record<string, string>;
+  actorUnionIdsByOpenId: Record<string, string>;
+  actorOpenIdsByUnionId: Record<string, string>;
+  temporaryInstructionOpenIds: Record<string, true>;
+  temporaryInstructionUnionIds: Record<string, true>;
 };
 
 type VcMeetingPendingInvite = {
@@ -4215,6 +4222,57 @@ ipcRoute('POST', '/api/vc-meetings/consumer-catch-up', async (req, res) => {
   }
 });
 
+ipcRoute('POST', '/api/vc-meetings/temporary-auth', async (req, res) => {
+  try {
+    const body = await readJsonBody<Record<string, unknown>>(req);
+    const larkAppId = typeof body.larkAppId === 'string' ? body.larkAppId.trim() : '';
+    const meetingId = typeof body.meetingId === 'string' ? body.meetingId.trim() : '';
+    const listenerChatId = typeof body.listenerChatId === 'string' ? body.listenerChatId.trim() : '';
+    const commandContent = typeof body.commandContent === 'string' ? body.commandContent : '';
+    const openIdNamespaceLarkAppId = typeof body.openIdNamespaceLarkAppId === 'string'
+      ? body.openIdNamespaceLarkAppId.trim()
+      : '';
+    const sourceBotOpenId = typeof body.sourceBotOpenId === 'string' ? body.sourceBotOpenId.trim() : undefined;
+    const senderOpenId = typeof body.senderOpenId === 'string' ? body.senderOpenId.trim() : undefined;
+    const senderUnionId = typeof body.senderUnionId === 'string' ? body.senderUnionId.trim() : undefined;
+    const mentions: LarkMessage['mentions'] = Array.isArray(body.mentions)
+      ? body.mentions
+        .filter((m): m is Record<string, unknown> => !!m && typeof m === 'object' && !Array.isArray(m))
+        .map(m => ({
+          key: typeof m.key === 'string' ? m.key : '',
+          name: typeof m.name === 'string' ? m.name : '',
+          ...(typeof m.openId === 'string' && m.openId.trim() ? { openId: m.openId.trim() } : {}),
+          ...(typeof m.unionId === 'string' && m.unionId.trim() ? { unionId: m.unionId.trim() } : {}),
+          ...(typeof m.idType === 'string' && m.idType.trim() ? { idType: m.idType.trim() } : {}),
+        }))
+      : undefined;
+    if (!larkAppId || !meetingId || !listenerChatId || !commandContent || !openIdNamespaceLarkAppId) {
+      return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+    }
+    const active = findActiveVcMeetingSessionByRuntimeRecord({
+      larkAppId,
+      meeting: { id: meetingId },
+      listenerChatId,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+    if (!active) return jsonRes(res, 404, { ok: false, error: 'meeting_session_not_found' });
+    const parsed = parseVcMeetingTemporaryAuthCommand(commandContent, mentions, sourceBotOpenId);
+    if (!parsed) return jsonRes(res, 400, { ok: false, error: 'bad_command' });
+    await applyVcMeetingTemporaryAuthCommand(active, parsed, {
+      commandContent,
+      mentions,
+      senderOpenId,
+      senderUnionId,
+      openIdNamespaceLarkAppId,
+    });
+    return jsonRes(res, 200, { ok: true });
+  } catch (err) {
+    return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 function parseTriggerChatBinding(
   raw: unknown,
 ): { chatId: string; larkAppId: string } | undefined {
@@ -4256,6 +4314,8 @@ function persistVcMeetingRuntimeSession(session: VcMeetingDaemonSession, cfg: Vc
     ...(session.syncIntervalMs !== undefined ? { syncIntervalMs: session.syncIntervalMs } : {}),
     ...(session.consumerSelectionExpiresAt !== undefined ? { consumerSelectionExpiresAt: session.consumerSelectionExpiresAt } : {}),
     ...(session.consumerCardMessageId ? { consumerCardMessageId: session.consumerCardMessageId } : {}),
+    temporaryInstructionOpenIds: Object.keys(session.temporaryInstructionOpenIds),
+    temporaryInstructionUnionIds: Object.keys(session.temporaryInstructionUnionIds),
   });
 }
 
@@ -4302,6 +4362,12 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.syncIntervalMs = record.syncIntervalMs;
     session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
     session.consumerCardMessageId = record.consumerCardMessageId;
+    session.temporaryInstructionOpenIds = Object.fromEntries(
+      (record.temporaryInstructionOpenIds ?? []).map(openId => [openId, true] as const),
+    );
+    session.temporaryInstructionUnionIds = Object.fromEntries(
+      (record.temporaryInstructionUnionIds ?? []).map(unionId => [unionId, true] as const),
+    );
     scheduleVcMeetingListenerFlush(key, cfg);
     if (session.consumerMode === 'agent') scheduleVcMeetingConsumerInjection(key, cfg);
     if (session.consumerMode === 'pending') {
@@ -4433,6 +4499,12 @@ function getOrCreateVcMeetingDaemonSession(
       pendingOutputRequests: {},
       consumerPendingItems: [],
       consumerTranscriptRevisions: {},
+      actorNamesByOpenId: {},
+      actorNamesByUnionId: {},
+      actorUnionIdsByOpenId: {},
+      actorOpenIdsByUnionId: {},
+      temporaryInstructionOpenIds: {},
+      temporaryInstructionUnionIds: {},
       flushing: false,
     };
     vcMeetingSessions.set(key, session);
@@ -4449,6 +4521,12 @@ function getOrCreateVcMeetingDaemonSession(
     session.textOutputPolicy ??= defaultVcMeetingTextOutputPolicy();
     session.voiceOutputPolicy ??= defaultVcMeetingVoiceOutputPolicy(cfg);
     session.pendingOutputRequests ??= {};
+    session.actorNamesByOpenId ??= {};
+    session.actorNamesByUnionId ??= {};
+    session.actorUnionIdsByOpenId ??= {};
+    session.actorOpenIdsByUnionId ??= {};
+    session.temporaryInstructionOpenIds ??= {};
+    session.temporaryInstructionUnionIds ??= {};
   }
   return session;
 }
@@ -4501,8 +4579,55 @@ function discardUnjoinedVcMeetingSession(key: string): void {
   logger.info(`[vc-agent] unjoined session discarded ${key}`);
 }
 
-function vcMeetingActorLabel(actor: { openId?: string; name?: string } | undefined): string {
-  return actor?.name?.trim() || actor?.openId || '未知成员';
+function vcMeetingKnownBotActorName(openId: string | undefined): string | undefined {
+  if (!openId) return undefined;
+  for (const bot of getAllBots()) {
+    if (bot.botOpenId !== openId) continue;
+    const name = effectiveBotDisplayName(bot)?.trim();
+    if (name) return name;
+  }
+  return undefined;
+}
+
+function vcMeetingActorLabel(
+  actor: { openId?: string; unionId?: string; name?: string } | undefined,
+  actorNamesByOpenId?: Record<string, string>,
+  actorNamesByUnionId?: Record<string, string>,
+): string {
+  const openId = actor?.openId;
+  const unionId = actor?.unionId;
+  return actor?.name?.trim()
+    || (openId ? actorNamesByOpenId?.[openId]?.trim() : undefined)
+    || (unionId ? actorNamesByUnionId?.[unionId]?.trim() : undefined)
+    || vcMeetingKnownBotActorName(openId)
+    || openId
+    || unionId
+    || '未知成员';
+}
+
+function rememberVcMeetingActorIdentity(session: VcMeetingDaemonSession, actor: { openId?: string; unionId?: string; name?: string } | undefined): void {
+  const openId = actor?.openId?.trim();
+  const unionId = actor?.unionId?.trim();
+  const name = actor?.name?.trim();
+  session.actorNamesByOpenId ??= {};
+  session.actorNamesByUnionId ??= {};
+  session.actorUnionIdsByOpenId ??= {};
+  session.actorOpenIdsByUnionId ??= {};
+  if (openId && name) session.actorNamesByOpenId[openId] = name;
+  if (unionId && name) session.actorNamesByUnionId[unionId] = name;
+  if (openId && unionId) {
+    session.actorUnionIdsByOpenId[openId] = unionId;
+    session.actorOpenIdsByUnionId[unionId] = openId;
+  }
+}
+
+function rememberVcMeetingActorNames(session: VcMeetingDaemonSession, items: NormalizedVcMeetingItem[]): void {
+  for (const item of items) {
+    if (item.type === 'transcript_received') rememberVcMeetingActorIdentity(session, item.speaker);
+    else if (item.type === 'chat_received') rememberVcMeetingActorIdentity(session, item.sender);
+    else if (item.type === 'participant_joined' || item.type === 'participant_left') rememberVcMeetingActorIdentity(session, item.participant);
+    else if (item.type === 'magic_share_started' || item.type === 'magic_share_ended') rememberVcMeetingActorIdentity(session, item.operator);
+  }
 }
 
 function vcMeetingTimeLabel(ms: number | undefined, timeZone: string): string {
@@ -4610,18 +4735,28 @@ type VcMeetingListenerEntry =
       line: string;
     };
 
-function formatVcMeetingTranscriptLine(item: NormalizedVcTranscriptItem, timeZone: string): string | undefined {
+function formatVcMeetingTranscriptLine(
+  item: NormalizedVcTranscriptItem,
+  timeZone: string,
+  actorNamesByOpenId?: Record<string, string>,
+  actorNamesByUnionId?: Record<string, string>,
+): string | undefined {
   const text = compactVcMeetingText(item.text);
   if (!text) return undefined;
   const time = vcMeetingTimeLabel(item.endTimeMs ?? item.startTimeMs, timeZone);
   const prefix = time ? `[字幕 ${time}]` : '[字幕]';
-  return `${prefix} ${vcMeetingActorLabel(item.speaker)}：${text}`;
+  return `${prefix} ${vcMeetingActorLabel(item.speaker, actorNamesByOpenId, actorNamesByUnionId)}：${text}`;
 }
 
-function vcMeetingTranscriptEntry(item: NormalizedVcTranscriptItem, index: number): VcMeetingListenerEntry | undefined {
+function vcMeetingTranscriptEntry(
+  item: NormalizedVcTranscriptItem,
+  index: number,
+  actorNamesByOpenId?: Record<string, string>,
+  actorNamesByUnionId?: Record<string, string>,
+): VcMeetingListenerEntry | undefined {
   const text = compactVcMeetingText(item.text);
   if (!text) return undefined;
-  const actorLabel = vcMeetingActorLabel(item.speaker);
+  const actorLabel = vcMeetingActorLabel(item.speaker, actorNamesByOpenId, actorNamesByUnionId);
   return {
     kind: 'transcript',
     sortTime: item.endTimeMs ?? item.startTimeMs,
@@ -4629,26 +4764,31 @@ function vcMeetingTranscriptEntry(item: NormalizedVcTranscriptItem, index: numbe
     ...(item.startTimeMs !== undefined ? { startTimeMs: item.startTimeMs } : {}),
     ...(item.endTimeMs !== undefined ? { endTimeMs: item.endTimeMs } : {}),
     actorLabel,
-    actorKey: item.speaker.openId || actorLabel,
+    actorKey: item.speaker.openId || item.speaker.unionId || actorLabel,
     text,
   };
 }
 
-function formatVcMeetingItemLine(item: NormalizedVcMeetingItem, timeZone: string): string | undefined {
-  if (item.type === 'transcript_received') return formatVcMeetingTranscriptLine(item, timeZone);
+function formatVcMeetingItemLine(
+  item: NormalizedVcMeetingItem,
+  timeZone: string,
+  actorNamesByOpenId?: Record<string, string>,
+  actorNamesByUnionId?: Record<string, string>,
+): string | undefined {
+  if (item.type === 'transcript_received') return formatVcMeetingTranscriptLine(item, timeZone, actorNamesByOpenId, actorNamesByUnionId);
   const time = vcMeetingTimeLabel(item.occurredAtMs, timeZone);
   const prefix = (label: string) => time ? `[${label} ${time}]` : `[${label}]`;
   if (item.type === 'chat_received') {
     const chat = item as NormalizedVcChatItem;
     const text = compactVcMeetingText(chat.text);
     if (!text) return undefined;
-    return `${prefix('聊天')} ${vcMeetingActorLabel(chat.sender)}：${text}`;
+    return `${prefix('聊天')} ${vcMeetingActorLabel(chat.sender, actorNamesByOpenId, actorNamesByUnionId)}：${text}`;
   }
   if (item.type === 'participant_joined') {
-    return `${prefix('入会')} ${vcMeetingActorLabel(item.participant)}`;
+    return `${prefix('入会')} ${vcMeetingActorLabel(item.participant, actorNamesByOpenId, actorNamesByUnionId)}`;
   }
   if (item.type === 'participant_left') {
-    return `${prefix('离会')} ${vcMeetingActorLabel(item.participant)}`;
+    return `${prefix('离会')} ${vcMeetingActorLabel(item.participant, actorNamesByOpenId, actorNamesByUnionId)}`;
   }
   if (item.type === 'magic_share_started') {
     const title = compactVcMeetingText(item.title) || '共享内容';
@@ -4661,9 +4801,15 @@ function formatVcMeetingItemLine(item: NormalizedVcMeetingItem, timeZone: string
   return undefined;
 }
 
-function vcMeetingEventEntry(item: NormalizedVcMeetingItem, index: number, timeZone: string): VcMeetingListenerEntry | undefined {
-  if (item.type === 'transcript_received') return vcMeetingTranscriptEntry(item, index);
-  const line = formatVcMeetingItemLine(item, timeZone);
+function vcMeetingEventEntry(
+  item: NormalizedVcMeetingItem,
+  index: number,
+  timeZone: string,
+  actorNamesByOpenId?: Record<string, string>,
+  actorNamesByUnionId?: Record<string, string>,
+): VcMeetingListenerEntry | undefined {
+  if (item.type === 'transcript_received') return vcMeetingTranscriptEntry(item, index, actorNamesByOpenId, actorNamesByUnionId);
+  const line = formatVcMeetingItemLine(item, timeZone, actorNamesByOpenId, actorNamesByUnionId);
   if (!line) return undefined;
   return {
     kind: 'event',
@@ -4702,11 +4848,15 @@ function buildVcMeetingListenerLines(
   meeting: VcMeetingPushContext['meeting'],
   items: NormalizedVcMeetingItem[],
   cfg: VcMeetingAgentConfig,
-  opts: { final?: boolean } = {},
+  opts: {
+    final?: boolean;
+    actorNamesByOpenId?: Record<string, string>;
+    actorNamesByUnionId?: Record<string, string>;
+  } = {},
 ): string[] {
   const timeZone = vcMeetingDisplayTimeZone(cfg);
   const entries = items
-    .map((item, index) => vcMeetingEventEntry(item, index, timeZone))
+    .map((item, index) => vcMeetingEventEntry(item, index, timeZone, opts.actorNamesByOpenId, opts.actorNamesByUnionId))
     .filter((entry): entry is VcMeetingListenerEntry => !!entry)
     .sort((a, b) => {
       const at = a.sortTime ?? Number.MAX_SAFE_INTEGER;
@@ -4951,7 +5101,7 @@ async function patchVcMeetingConsumerCard(
   );
 }
 
-function vcMeetingOutputAllowedOpenIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
+function vcMeetingApproverOpenIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
   const ids = new Set<string>();
   if (session.state.attentionTargetOpenId) ids.add(session.state.attentionTargetOpenId);
   const target = vcMeetingTargetOpenId(session.larkAppId, cfg);
@@ -4966,12 +5116,453 @@ function vcMeetingOutputAllowedOpenIds(session: VcMeetingDaemonSession, cfg: VcM
   return ids;
 }
 
+function vcMeetingInstructionSourceOpenIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
+  const ids = vcMeetingApproverOpenIds(session, cfg);
+  for (const openId of Object.keys(session.temporaryInstructionOpenIds ?? {})) ids.add(openId);
+  return ids;
+}
+
+function vcMeetingApproverUnionIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
+  const ids = new Set<string>();
+  for (const openId of vcMeetingApproverOpenIds(session, cfg)) {
+    const unionId = session.actorUnionIdsByOpenId?.[openId]?.trim();
+    if (unionId) ids.add(unionId);
+  }
+  return ids;
+}
+
+function vcMeetingInstructionSourceUnionIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
+  const ids = vcMeetingApproverUnionIds(session, cfg);
+  for (const unionId of Object.keys(session.temporaryInstructionUnionIds ?? {})) ids.add(unionId);
+  return ids;
+}
+
+function isVcMeetingInstructionSourceActor(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  actor: Pick<VcMeetingActor, 'openId' | 'unionId'> | undefined,
+): boolean {
+  if (!actor) return false;
+  if (actor.openId && vcMeetingInstructionSourceOpenIds(session, cfg).has(actor.openId)) return true;
+  if (actor.unionId && vcMeetingInstructionSourceUnionIds(session, cfg).has(actor.unionId)) return true;
+  return false;
+}
+
 function isVcMeetingOutputAllowedOperator(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig, openId: unknown): boolean {
-  return typeof openId === 'string' && vcMeetingOutputAllowedOpenIds(session, cfg).has(openId);
+  return typeof openId === 'string' && vcMeetingApproverOpenIds(session, cfg).has(openId);
+}
+
+function isVcMeetingTemporaryAuthAllowedOperator(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  operator: { openId?: unknown; unionId?: unknown },
+): boolean {
+  if (typeof operator.openId === 'string' && vcMeetingApproverOpenIds(session, cfg).has(operator.openId)) {
+    return true;
+  }
+  if (typeof operator.unionId === 'string' && vcMeetingApproverUnionIds(session, cfg).has(operator.unionId)) {
+    return true;
+  }
+  return false;
 }
 
 function isVcMeetingConsumerSelectionAllowedOperator(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig, openId: unknown): boolean {
   return isVcMeetingOutputAllowedOperator(session, cfg, openId);
+}
+
+type VcMeetingTemporaryAuthCommand =
+  | { action: 'list'; targets: [] }
+  | { action: 'grant' | 'revoke'; targets: VcMeetingTemporaryAuthTarget[] };
+
+type VcMeetingTemporaryAuthTarget = {
+  openId?: string;
+  unionId?: string;
+  name?: string;
+  source: 'mention' | 'literal-open-id' | 'literal-union-id';
+};
+
+function findActiveVcMeetingSessionByListenerChat(
+  larkAppId: string,
+  listenerChatId: string | undefined,
+): { key: string; session: VcMeetingDaemonSession; cfg: VcMeetingAgentConfig } | undefined {
+  if (!listenerChatId) return undefined;
+  const cfg = effectiveVcMeetingAgentConfig(larkAppId);
+  if (!cfg) return undefined;
+  let best: { key: string; session: VcMeetingDaemonSession; cfg: VcMeetingAgentConfig } | undefined;
+  for (const [key, session] of vcMeetingSessions.entries()) {
+    if (session.larkAppId !== larkAppId || session.ended) continue;
+    if (session.listenerChatId !== listenerChatId) continue;
+    if (!best || session.lastActivityAt > best.session.lastActivityAt) {
+      best = { key, session, cfg };
+    }
+  }
+  return best;
+}
+
+function findActiveVcMeetingSessionByRuntimeRecord(
+  record: VcMeetingRuntimeSessionRecord,
+): { key: string; session: VcMeetingDaemonSession; cfg: VcMeetingAgentConfig } | undefined {
+  const cfg = effectiveVcMeetingAgentConfig(record.larkAppId);
+  if (!cfg) return undefined;
+  const key = vcMeetingSessionKey(record.larkAppId, record.meeting.id);
+  const session = vcMeetingSessions.get(key);
+  if (!session || session.ended) return undefined;
+  if (session.listenerChatId !== record.listenerChatId) return undefined;
+  return { key, session, cfg };
+}
+
+function stripVcMeetingAuthMentionNames(text: string, mentions: LarkMessage['mentions']): string {
+  let out = text;
+  for (const mention of mentions ?? []) {
+    if (!mention.name) continue;
+    out = out.split(`@${mention.name}`).join(' ');
+  }
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+function parseVcMeetingTemporaryAuthCommand(
+  commandContent: string,
+  mentions: LarkMessage['mentions'],
+  botOpenId: string | undefined,
+): VcMeetingTemporaryAuthCommand | undefined {
+  const stripped = stripVcMeetingAuthMentionNames(commandContent, mentions);
+  const match = /^\/vc-auth(?:\s+([\s\S]*))?$/i.exec(stripped);
+  if (!match) return undefined;
+  const words = (match[1] ?? '').trim().split(/\s+/).filter(Boolean);
+  let action: VcMeetingTemporaryAuthCommand['action'] = 'grant';
+  if (words[0] === 'list') action = 'list';
+  else if (words[0] === 'revoke' || words[0] === 'rm' || words[0] === 'remove') action = 'revoke';
+  else if (words[0] === 'grant' || words[0] === 'add') action = 'grant';
+  if (action === 'list') return { action, targets: [] };
+
+  const targets = new Map<string, VcMeetingTemporaryAuthTarget>();
+  for (const mention of mentions ?? []) {
+    const openId = mention.openId?.trim();
+    const unionId = mention.unionId?.trim();
+    if ((!openId && !unionId) || openId === botOpenId) continue;
+    const key = unionId ? `union:${unionId}` : `open:${openId}`;
+    if (targets.has(key)) continue;
+    targets.set(key, {
+      ...(openId ? { openId } : {}),
+      ...(unionId ? { unionId } : {}),
+      ...(mention.name?.trim() ? { name: mention.name.trim() } : {}),
+      source: 'mention',
+    });
+  }
+  for (const openId of stripped.match(/\bou_[A-Za-z0-9_-]+\b/g) ?? []) {
+    if (!openId || openId === botOpenId) continue;
+    const key = `open:${openId}`;
+    if (targets.has(key)) continue;
+    targets.set(key, { openId, source: 'literal-open-id' });
+  }
+  for (const unionId of stripped.match(/\bon_[A-Za-z0-9_-]+\b/g) ?? []) {
+    if (!unionId) continue;
+    const key = `union:${unionId}`;
+    if (targets.has(key)) continue;
+    targets.set(key, { unionId, source: 'literal-union-id' });
+  }
+  return { action, targets: [...targets.values()] };
+}
+
+function vcMeetingTemporaryAuthTargetLabel(
+  session: VcMeetingDaemonSession,
+  target: Pick<VcMeetingTemporaryAuthTarget, 'openId' | 'unionId' | 'name'>,
+): string {
+  const openId = target.openId?.trim();
+  const unionId = target.unionId?.trim();
+  const mappedOpenId = unionId ? session.actorOpenIdsByUnionId?.[unionId] : undefined;
+  return target.name?.trim()
+    || (openId ? session.actorNamesByOpenId?.[openId]?.trim() : undefined)
+    || (unionId ? session.actorNamesByUnionId?.[unionId]?.trim() : undefined)
+    || (mappedOpenId ? session.actorNamesByOpenId?.[mappedOpenId]?.trim() : undefined)
+    || openId
+    || unionId
+    || '未知成员';
+}
+
+function vcMeetingTemporaryAuthUsage(): string {
+  return [
+    '用法：`/vc-auth @成员` 或 `/vc-auth ou_xxx` 临时授权本场会议指令源。',
+    '撤销：`/vc-auth revoke @成员`；查看：`/vc-auth list`。',
+    '临时授权只影响会中语音/聊天的指令源打标，不具备输出审批、再授权或配置会议 agent 的权限，会议结束自动失效。',
+  ].join('\n');
+}
+
+function vcMeetingTemporaryAuthTargetOpenIdUsable(
+  target: VcMeetingTemporaryAuthTarget,
+  session: VcMeetingDaemonSession,
+  openIdNamespaceLarkAppId: string,
+): boolean {
+  if (!target.openId) return false;
+  if (target.source !== 'mention') return true;
+  // Mention open_ids are scoped to the bot app that received the message.
+  // Cross-bot /vc-auth relies on union_id, which is stable only for apps under
+  // the same Lark developer account; cross-developer bot pairs fail closed.
+  return openIdNamespaceLarkAppId === session.larkAppId;
+}
+
+function vcMeetingTemporaryAuthTargetIsApprover(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  target: VcMeetingTemporaryAuthTarget,
+  openIdNamespaceLarkAppId: string,
+): boolean {
+  if (
+    vcMeetingTemporaryAuthTargetOpenIdUsable(target, session, openIdNamespaceLarkAppId)
+    && target.openId
+    && vcMeetingApproverOpenIds(session, cfg).has(target.openId)
+  ) {
+    return true;
+  }
+  return !!target.unionId && vcMeetingApproverUnionIds(session, cfg).has(target.unionId);
+}
+
+function vcMeetingTemporaryAuthTargetIsTemporary(
+  session: VcMeetingDaemonSession,
+  target: VcMeetingTemporaryAuthTarget,
+  openIdNamespaceLarkAppId: string,
+): boolean {
+  if (
+    vcMeetingTemporaryAuthTargetOpenIdUsable(target, session, openIdNamespaceLarkAppId)
+    && target.openId
+    && session.temporaryInstructionOpenIds?.[target.openId]
+  ) {
+    return true;
+  }
+  return !!target.unionId && !!session.temporaryInstructionUnionIds?.[target.unionId];
+}
+
+function rememberVcMeetingTemporaryAuthTarget(
+  session: VcMeetingDaemonSession,
+  target: VcMeetingTemporaryAuthTarget,
+  openIdNamespaceLarkAppId: string,
+): void {
+  const openId = vcMeetingTemporaryAuthTargetOpenIdUsable(target, session, openIdNamespaceLarkAppId)
+    ? target.openId?.trim()
+    : undefined;
+  const unionId = target.unionId?.trim();
+  const name = target.name?.trim();
+  rememberVcMeetingActorIdentity(session, {
+    ...(openId ? { openId } : {}),
+    ...(unionId ? { unionId } : {}),
+    ...(name ? { name } : {}),
+  });
+}
+
+function vcMeetingTemporaryAuthListBody(session: VcMeetingDaemonSession): string {
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const openId of Object.keys(session.temporaryInstructionOpenIds ?? {})) {
+    const unionId = session.actorUnionIdsByOpenId?.[openId];
+    if (unionId) seen.add(`union:${unionId}`);
+    seen.add(`open:${openId}`);
+    lines.push(`- ${vcMeetingTemporaryAuthTargetLabel(session, { openId, unionId })}（${openId}）`);
+  }
+  for (const unionId of Object.keys(session.temporaryInstructionUnionIds ?? {})) {
+    const key = `union:${unionId}`;
+    if (seen.has(key)) continue;
+    const openId = session.actorOpenIdsByUnionId?.[unionId];
+    lines.push(`- ${vcMeetingTemporaryAuthTargetLabel(session, { openId, unionId })}（${unionId}）`);
+  }
+  return lines.length > 0 ? lines.join('\n') : '本场暂无临时授权用户。';
+}
+
+type VcMeetingTemporaryAuthApplyInput = {
+  commandContent: string;
+  mentions?: LarkMessage['mentions'];
+  senderOpenId?: string;
+  senderUnionId?: string;
+  openIdNamespaceLarkAppId: string;
+};
+
+async function applyVcMeetingTemporaryAuthCommand(
+  active: { key: string; session: VcMeetingDaemonSession; cfg: VcMeetingAgentConfig },
+  parsed: VcMeetingTemporaryAuthCommand,
+  input: VcMeetingTemporaryAuthApplyInput,
+): Promise<boolean> {
+  const { session, cfg } = active;
+  const listenerChatId = session.listenerChatId;
+  if (!listenerChatId) return true;
+  const isCrossBotCommand = input.openIdNamespaceLarkAppId !== session.larkAppId;
+  const senderOpenId = isCrossBotCommand ? undefined : input.senderOpenId;
+  if (!isVcMeetingTemporaryAuthAllowedOperator(session, cfg, {
+    openId: senderOpenId,
+    unionId: input.senderUnionId,
+  })) {
+    await sendMessage(
+      session.larkAppId,
+      listenerChatId,
+      isCrossBotCommand
+        ? '跨 bot 设置临时授权，需要会议监听 bot 先在本场见过你（说过话/进过会/发过会中消息任一），或改为在监听群直接对监听 bot 发 /vc-auth。'
+        : '只有本场会议原授权人可以设置临时指令源。',
+      'text',
+    );
+    return true;
+  }
+  if (parsed.action === 'list') {
+    await sendMessage(session.larkAppId, listenerChatId, `本场临时授权：\n${vcMeetingTemporaryAuthListBody(session)}`, 'text');
+    return true;
+  }
+  if (parsed.targets.length === 0) {
+    await sendMessage(session.larkAppId, listenerChatId, vcMeetingTemporaryAuthUsage(), 'text');
+    return true;
+  }
+
+  const changed: string[] = [];
+  const unchanged: string[] = [];
+  for (const target of parsed.targets) {
+    const openIdUsable = vcMeetingTemporaryAuthTargetOpenIdUsable(target, session, input.openIdNamespaceLarkAppId);
+    if (!openIdUsable && !target.unionId) {
+      unchanged.push(`${vcMeetingTemporaryAuthTargetLabel(session, target)} 缺少可跨 bot 对齐的 union_id`);
+      continue;
+    }
+    rememberVcMeetingTemporaryAuthTarget(session, target, input.openIdNamespaceLarkAppId);
+    const label = vcMeetingTemporaryAuthTargetLabel(session, target);
+    if (parsed.action === 'grant' && vcMeetingTemporaryAuthTargetIsApprover(session, cfg, target, input.openIdNamespaceLarkAppId)) {
+      unchanged.push(`${label} 已是原授权人`);
+      continue;
+    }
+    if (parsed.action === 'grant') {
+      if (vcMeetingTemporaryAuthTargetIsTemporary(session, target, input.openIdNamespaceLarkAppId)) {
+        unchanged.push(`${label} 已在临时授权列表`);
+        continue;
+      }
+      if (openIdUsable && target.openId) session.temporaryInstructionOpenIds[target.openId] = true;
+      if (target.unionId) session.temporaryInstructionUnionIds[target.unionId] = true;
+      changed.push(label);
+      continue;
+    }
+    if (!vcMeetingTemporaryAuthTargetIsTemporary(session, target, input.openIdNamespaceLarkAppId)) {
+      unchanged.push(`${label} 不在临时授权列表`);
+      continue;
+    }
+    if (openIdUsable && target.openId) delete session.temporaryInstructionOpenIds[target.openId];
+    if (target.unionId) delete session.temporaryInstructionUnionIds[target.unionId];
+    changed.push(label);
+  }
+  persistVcMeetingRuntimeSession(session, cfg);
+  logger.info(
+    `[vc-agent] temporary instruction auth ${parsed.action} meeting=${session.state.meeting.id} ` +
+    `operator=${input.senderOpenId ?? input.senderUnionId ?? '?'} changed=${changed.join(',') || '-'} unchanged=${unchanged.join(',') || '-'}`,
+  );
+  const lines = changed.length > 0
+    ? [
+        parsed.action === 'grant'
+          ? `已临时授权 ${changed.join('、')} 为本场会议指令源。`
+          : `已撤销 ${changed.join('、')} 的本场临时指令源授权。`,
+        '临时授权仅本场有效，不具备输出审批、再授权或会议 agent 配置权限。',
+        ...(unchanged.length > 0 ? [`未变更：${unchanged.join('；')}`] : []),
+      ]
+    : [`未变更：${unchanged.join('；') || '没有可变更目标'}`];
+  await sendMessage(session.larkAppId, listenerChatId, lines.join('\n'), 'text');
+  return true;
+}
+
+async function requestVcMeetingTemporaryAuthProxy(
+  record: VcMeetingRuntimeSessionRecord,
+  input: {
+    larkAppId: string;
+    commandContent: string;
+    mentions?: LarkMessage['mentions'];
+    senderOpenId?: string;
+    senderUnionId?: string;
+  },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const local = findActiveVcMeetingSessionByRuntimeRecord(record);
+  const sourceBotOpenId = getBot(input.larkAppId).botOpenId;
+  if (local) {
+    const parsed = parseVcMeetingTemporaryAuthCommand(input.commandContent, input.mentions, sourceBotOpenId);
+    if (!parsed) return { ok: false, error: 'bad command' };
+    await applyVcMeetingTemporaryAuthCommand(local, parsed, {
+      commandContent: input.commandContent,
+      mentions: input.mentions,
+      senderOpenId: input.senderOpenId,
+      senderUnionId: input.senderUnionId,
+      openIdNamespaceLarkAppId: input.larkAppId,
+    });
+    return { ok: true };
+  }
+  const { status, body } = await fetchVcMeetingDaemonJson(record.larkAppId, '/api/vc-meetings/temporary-auth', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      larkAppId: record.larkAppId,
+      meetingId: record.meeting.id,
+      listenerChatId: record.listenerChatId,
+      commandContent: input.commandContent,
+      mentions: input.mentions ?? [],
+      senderOpenId: input.senderOpenId,
+      senderUnionId: input.senderUnionId,
+      openIdNamespaceLarkAppId: input.larkAppId,
+      sourceBotOpenId,
+    }),
+  }, { timeoutMs: 8_000 });
+  if (body && typeof body === 'object' && (body as { ok?: unknown }).ok === true) return { ok: true };
+  const err = body && typeof body === 'object' && typeof (body as { error?: unknown }).error === 'string'
+    ? (body as { error: string }).error
+    : `listener daemon returned ${status}`;
+  return { ok: false, error: err };
+}
+
+async function proxyVcMeetingTemporaryAuthCommand(
+  input: {
+    larkAppId: string;
+    chatId: string | undefined;
+    anchor: string;
+    commandContent: string;
+    mentions?: LarkMessage['mentions'];
+    senderOpenId?: string;
+    senderUnionId?: string;
+  },
+  _parsed: VcMeetingTemporaryAuthCommand,
+): Promise<boolean> {
+  if (!input.chatId) return false;
+  const record = findVcMeetingRuntimeSessionByListenerAndAgent(config.session.dataDir, {
+    listenerChatId: input.chatId,
+    selectedAgentAppId: input.larkAppId,
+  });
+  if (!record) return false;
+  const result = await requestVcMeetingTemporaryAuthProxy(record, input);
+  if (!result.ok) {
+    await sessionReply(
+      input.anchor,
+      `临时授权请求转发给会议监听 bot 失败：${result.error}`,
+      'text',
+      input.larkAppId,
+    );
+  }
+  return true;
+}
+
+async function handleVcMeetingTemporaryAuthCommand(input: {
+  larkAppId: string;
+  chatId: string | undefined;
+  anchor: string;
+  commandContent: string;
+  mentions?: LarkMessage['mentions'];
+  senderOpenId?: string;
+  senderUnionId?: string;
+}): Promise<boolean> {
+  const parsed = parseVcMeetingTemporaryAuthCommand(
+    input.commandContent,
+    input.mentions,
+    getBot(input.larkAppId).botOpenId,
+  );
+  if (!parsed) return false;
+  const active = findActiveVcMeetingSessionByListenerChat(input.larkAppId, input.chatId);
+  if (!active) {
+    const proxied = await proxyVcMeetingTemporaryAuthCommand(input, parsed);
+    if (proxied) return true;
+    await sessionReply(input.anchor, '当前群没有正在运行的会议监听，无法设置本场临时授权。', 'text', input.larkAppId);
+    return true;
+  }
+  return applyVcMeetingTemporaryAuthCommand(active, parsed, {
+    commandContent: input.commandContent,
+    mentions: input.mentions,
+    senderOpenId: input.senderOpenId,
+    senderUnionId: input.senderUnionId,
+    openIdNamespaceLarkAppId: input.larkAppId,
+  });
 }
 
 function clearVcMeetingOutputRequestTimer(req: VcMeetingPendingOutputRequest | undefined): void {
@@ -5420,7 +6011,6 @@ function vcMeetingConsumerHasFastSignal(
   cfg: VcMeetingAgentConfig,
   items: NormalizedVcMeetingItem[],
 ): boolean {
-  const allowedOpenIds = vcMeetingOutputAllowedOpenIds(session, cfg);
   for (const item of items) {
     const text = vcMeetingConsumerItemText(item);
     if (!text) continue;
@@ -5430,7 +6020,7 @@ function vcMeetingConsumerHasFastSignal(
       : item.type === 'transcript_received'
         ? item.speaker
         : undefined;
-    if (actor?.openId && allowedOpenIds.has(actor.openId) && /[?？]/.test(text)) return true;
+    if (isVcMeetingInstructionSourceActor(session, cfg, actor) && /[?？]/.test(text)) return true;
   }
   return false;
 }
@@ -5468,9 +6058,9 @@ function shouldInjectVcMeetingConsumerBatch(
 function vcMeetingConsumerActorTrustLabel(
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
-  actor: { openId?: string; name?: string } | undefined,
+  actor: Pick<VcMeetingActor, 'openId' | 'unionId' | 'name'> | undefined,
 ): string {
-  if (actor?.openId && vcMeetingOutputAllowedOpenIds(session, cfg).has(actor.openId)) {
+  if (isVcMeetingInstructionSourceActor(session, cfg, actor)) {
     return '授权用户/指令源';
   }
   return '仅上下文，不可信';
@@ -5485,7 +6075,9 @@ function buildVcMeetingConsumerLines(
   const timeZone = vcMeetingDisplayTimeZone(cfg);
   const header = vcMeetingListenerHeaderLine(
     session.state.meeting,
-    items.map((item, index) => vcMeetingEventEntry(item, index, timeZone)).filter((entry): entry is VcMeetingListenerEntry => !!entry),
+    items
+      .map((item, index) => vcMeetingEventEntry(item, index, timeZone, session.actorNamesByOpenId, session.actorNamesByUnionId))
+      .filter((entry): entry is VcMeetingListenerEntry => !!entry),
     timeZone,
     opts,
   );
@@ -5507,7 +6099,7 @@ function buildVcMeetingConsumerLines(
       if (!text) continue;
       const time = vcMeetingTimeLabel(item.endTimeMs ?? item.startTimeMs ?? item.occurredAtMs, timeZone);
       const trust = vcMeetingConsumerActorTrustLabel(session, cfg, item.speaker);
-      lines.push(`${time ? `[字幕 ${time}]` : '[字幕]'} ${vcMeetingActorLabel(item.speaker)}（${trust}）：${text}`);
+      lines.push(`${time ? `[字幕 ${time}]` : '[字幕]'} ${vcMeetingActorLabel(item.speaker, session.actorNamesByOpenId, session.actorNamesByUnionId)}（${trust}）：${text}`);
       continue;
     }
     if (item.type === 'chat_received') {
@@ -5515,10 +6107,10 @@ function buildVcMeetingConsumerLines(
       if (!text) continue;
       const time = vcMeetingTimeLabel(item.occurredAtMs, timeZone);
       const trust = vcMeetingConsumerActorTrustLabel(session, cfg, item.sender);
-      lines.push(`${time ? `[聊天 ${time}]` : '[聊天]'} ${vcMeetingActorLabel(item.sender)}（${trust}）：${text}`);
+      lines.push(`${time ? `[聊天 ${time}]` : '[聊天]'} ${vcMeetingActorLabel(item.sender, session.actorNamesByOpenId, session.actorNamesByUnionId)}（${trust}）：${text}`);
       continue;
     }
-    const line = formatVcMeetingItemLine(item, timeZone);
+    const line = formatVcMeetingItemLine(item, timeZone, session.actorNamesByOpenId, session.actorNamesByUnionId);
     if (line) lines.push(line);
   }
   return lines.length > 1 ? lines : [];
@@ -6043,7 +6635,11 @@ async function flushVcMeetingListenerSession(
       ...pendingSnapshot,
       ...stableTranscripts,
     ];
-    const lines = buildVcMeetingListenerLines(session.state.meeting, itemsToSend, cfg, { final: opts.final });
+    const lines = buildVcMeetingListenerLines(session.state.meeting, itemsToSend, cfg, {
+      final: opts.final,
+      actorNamesByOpenId: session.actorNamesByOpenId,
+      actorNamesByUnionId: session.actorNamesByUnionId,
+    });
     if (lines.length === 0) return { ok: true, sent: 0 };
     const chunks = chunkVcMeetingListenerLines(lines);
     let sent = 0;
@@ -6089,6 +6685,8 @@ async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfi
   if (!session) return;
   if (session.ended) return;
   session.ended = true;
+  session.temporaryInstructionOpenIds = {};
+  session.temporaryInstructionUnionIds = {};
   markVcMeetingEnded(key);
   removeVcMeetingRuntimeSession(config.session.dataDir, session.larkAppId, session.state.meeting.id);
   if (session.flushTimer) {
@@ -6545,6 +7143,7 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
     return;
   }
   session.state.meeting = { ...session.state.meeting, ...batch.meeting, ...ctx.meeting, id: ctx.meeting.id };
+  rememberVcMeetingActorNames(session, batch.items);
   const ingest = ingestNormalizedVcMeetingItems(session.state, batch.items);
   queueVcMeetingPendingItems(session, ingest.acceptedItems);
   queueVcMeetingConsumerPendingItems(session, cfg, ingest.acceptedItems);
@@ -6596,6 +7195,23 @@ export const __vcMeetingAgentTest = {
       scope: 'chat',
       anchor: listenerChatId,
     }),
+  handleTemporaryAuthCommand: (input: {
+    larkAppId: string;
+    chatId: string;
+    anchor?: string;
+    commandContent: string;
+    mentions?: LarkMessage['mentions'];
+    senderOpenId?: string;
+    senderUnionId?: string;
+  }) => handleVcMeetingTemporaryAuthCommand({
+    larkAppId: input.larkAppId,
+    chatId: input.chatId,
+    anchor: input.anchor ?? input.chatId,
+    commandContent: input.commandContent,
+    mentions: input.mentions,
+    senderOpenId: input.senderOpenId,
+    senderUnionId: input.senderUnionId,
+  }),
   submitOutput: (input: {
     larkAppId: string;
     meetingId: string;
@@ -7045,6 +7661,21 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const invocation = parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
+    if (cmd === '/vc-auth') {
+      // /vc-auth has its own meeting-scoped approver gate, so it runs before
+      // the generic slash-command grant restriction.
+      if (await handleVcMeetingTemporaryAuthCommand({
+        larkAppId,
+        chatId,
+        anchor,
+        commandContent,
+        mentions: parsed.mentions,
+        senderOpenId,
+        senderUnionId,
+      })) {
+        return;
+      }
+    }
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
     if (restrictedText) {
       await sessionReply(anchor, restrictedText, 'text', larkAppId);
@@ -7841,6 +8472,21 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const { cmd, content: commandContent } = invocation;
     const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
     const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
+    if (cmd === '/vc-auth') {
+      // /vc-auth has its own meeting-scoped approver gate, so it runs before
+      // the generic slash-command grant restriction.
+      if (await handleVcMeetingTemporaryAuthCommand({
+        larkAppId,
+        chatId: effectiveThreadChatId,
+        anchor,
+        commandContent,
+        mentions: parsed.mentions,
+        senderOpenId: threadSenderOpenId,
+        senderUnionId: threadSenderUnionId,
+      })) {
+        return;
+      }
+    }
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
     if (restrictedText) {
       await sessionReply(anchor, restrictedText, 'text', larkAppId);

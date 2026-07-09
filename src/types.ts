@@ -210,6 +210,7 @@ export interface LarkMention {
   key: string;        // e.g. "@_user_1"
   name: string;       // display name
   openId?: string;    // open_id of the mentioned user/bot
+  unionId?: string;   // stable user id across bot app namespaces when present
   idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
 }
 
@@ -361,6 +362,10 @@ export type WorkerToDaemon =
   | { type: 'user_notify'; message: string; turnId?: string }
   | {
       type: 'final_output';
+      /** Worker-side botmux session identity. Daemon validates this before
+       *  routing the reply so a stale/wrongly-bound worker cannot post into
+       *  another Lark thread. Optional for one release to accept older workers. */
+      sessionId?: string;
       content: string;
       lastUuid: string;
       turnId: string;
