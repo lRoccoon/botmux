@@ -3819,7 +3819,7 @@ function isVcMeetingConsumerSelectionAllowedOperator(session: VcMeetingDaemonSes
 }
 
 type VcMeetingTemporaryAuthCommand =
-  | { action: 'list'; targets: [] }
+  | { action: 'help' | 'list'; targets: [] }
   | { action: 'grant' | 'revoke'; targets: VcMeetingTemporaryAuthTarget[] };
 
 type VcMeetingTemporaryAuthTarget = {
@@ -3865,11 +3865,13 @@ function parseVcMeetingTemporaryAuthCommand(
   const match = /^\/vc-auth(?:\s+([\s\S]*))?$/i.exec(stripped);
   if (!match) return undefined;
   const words = (match[1] ?? '').trim().split(/\s+/).filter(Boolean);
+  const verb = words[0]?.toLowerCase();
   let action: VcMeetingTemporaryAuthCommand['action'] = 'grant';
-  if (words[0] === 'list') action = 'list';
-  else if (words[0] === 'revoke' || words[0] === 'rm' || words[0] === 'remove') action = 'revoke';
-  else if (words[0] === 'grant' || words[0] === 'add') action = 'grant';
-  if (action === 'list') return { action, targets: [] };
+  if (verb === 'help' || verb === 'h' || verb === '?' || verb === '-h' || verb === '--help') action = 'help';
+  else if (verb === 'list') action = 'list';
+  else if (verb === 'revoke' || verb === 'rm' || verb === 'remove') action = 'revoke';
+  else if (verb === 'grant' || verb === 'add') action = 'grant';
+  if (action === 'help' || action === 'list') return { action, targets: [] };
 
   const targets = new Map<string, VcMeetingTemporaryAuthTarget>();
   for (const mention of mentions ?? []) {
@@ -3918,8 +3920,9 @@ function vcMeetingTemporaryAuthTargetLabel(
 
 function vcMeetingTemporaryAuthUsage(): string {
   return [
+    '入口：在监听群里直接 @会议监听 bot 发送，发给执行 agent 不会生效。',
     '用法：`/vc-auth @成员` 或 `/vc-auth ou_xxx` 临时授权本场会议指令源。',
-    '撤销：`/vc-auth revoke @成员`；查看：`/vc-auth list`。',
+    '撤销：`/vc-auth revoke @成员`；查看：`/vc-auth list`；帮助：`/vc-auth help`。',
     '临时授权只影响会中语音/聊天的指令源打标，不具备输出审批、再授权或配置会议 agent 的权限，会议结束自动失效。',
   ].join('\n');
 }
@@ -4182,6 +4185,10 @@ async function handleVcMeetingTemporaryAuthCommand(input: {
     getBot(input.larkAppId).botOpenId,
   );
   if (!parsed) return false;
+  if (parsed.action === 'help') {
+    await sessionReply(input.anchor, vcMeetingTemporaryAuthUsage(), 'text', input.larkAppId);
+    return true;
+  }
   const active = findActiveVcMeetingSessionByListenerChat(input.larkAppId, input.chatId);
   if (!active) {
     const replied = await replyVcMeetingTemporaryAuthListenerHint(input);

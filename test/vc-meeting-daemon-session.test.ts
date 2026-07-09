@@ -2420,6 +2420,18 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(meetingTextOutputs).toHaveLength(0);
   });
 
+  it('shows /vc-auth help without requiring an active meeting listener', async () => {
+    const handled = await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: APP_ID,
+      chatId: 'oc_no_active_meeting',
+      commandContent: '/vc-auth HELP',
+      senderOpenId: TARGET_OPEN_ID,
+    });
+    expect(handled).toBe(true);
+    expect(sentMessages.at(-1)?.content).toContain('用法：`/vc-auth @成员`');
+    expect(sentMessages.at(-1)?.content).toContain('帮助：`/vc-auth help`');
+  });
+
   it('rejects /vc-auth sent to the selected consumer agent with listener-only guidance', async () => {
     registerConsumerAgentBot();
     registerBot({
