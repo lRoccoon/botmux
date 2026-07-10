@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { buildGrantCard, buildGrantResultCard, buildGrantNotifyCard } from '../src/im/lark/card-builder.js';
 
 describe('buildGrantCard', () => {
-  it('embeds @owner, requester name, and nonce-bearing actions', () => {
+  it('embeds @owner, @requester, and nonce-bearing actions', () => {
     const json = buildGrantCard(
       { ownerOpenId: 'ou_owner', targets: [{ openId: 'ou_g', name: '张三' }], chatId: 'oc_1', nonce: 'n1', mode: 'request' },
       'zh',
@@ -10,7 +10,7 @@ describe('buildGrantCard', () => {
     const card = JSON.parse(json);
     const flat = JSON.stringify(card);
     expect(flat).toContain('<at id=ou_owner></at>');
-    expect(flat).toContain('张三');
+    expect(flat).toContain('<at id=ou_g></at>');
     const actions = card.elements.find((e: any) => e.tag === 'action').actions;
     const byAction = Object.fromEntries(actions.map((a: any) => [a.value.action, a.value]));
     expect(byAction.grant_chat).toMatchObject({ target_open_ids: ['ou_g'], chat_id: 'oc_1', nonce: 'n1' });

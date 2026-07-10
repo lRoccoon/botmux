@@ -1233,8 +1233,12 @@ export interface GrantCardOpts {
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
   const single = o.targets[0];
+  // In request mode the requester can be an external bot, so it may not be
+  // present in message.mentions and its display name would otherwise fall
+  // back to a raw `ou_...` id. Mention the actual grantee in the card instead.
+  const requestName = single ? `<at id=${single.openId}></at>` : '';
   const body = o.mode === 'request'
-    ? t('card.grant.body_request', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale)
+    ? t('card.grant.body_request', { name: requestName, owner: o.ownerOpenId }, locale)
     : o.targets.length > 1
       ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
       : t('card.grant.body_owner', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale);
