@@ -1265,11 +1265,13 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
 
 /** 授权成功后给被授权人的通知卡（独立消息）。支持一次通知多个被授权人；带额度时追加"（额度 N 条）"。
  *
- *  **真人 grantee 用 `<at>` 点名，bot grantee 只用纯文本名字**：卡片里的 `<at id=botOpenId>` 会被
- *  对方 bot 的 daemon 当成一次「被 @」消息，从而凭新授权/同伴 peer 关系在本群误拉起一个空会话
- *  （实测 bug：手动 /grant 后面没有 prompt，不该触发自动会话）。纯文本名字不产生 mention 事件，
- *  既保留「谁被授权」的可读信息，又不会唤醒对方 bot。传 string/string[]（无 isBot 信息）时按真人
- *  处理（@ 全部），保持旧调用方/单测兼容。 */
+ *  **bot grantee 有名字就用纯文本名字、拿不到名字才 `<at>` 兜底；真人 grantee 一律 `<at>` 点名**：
+ *  卡片里的 `<at id=botOpenId>` 会被对方 bot 的 daemon 当成一次「被 @」消息，凭新授权/同伴 peer
+ *  关系在本群拉起一个空会话（实测：手动 /grant 后没有 prompt → 空会话「等待输入」）。所以能拿到
+ *  bot 名字时优先用纯文本（不产生 mention、不唤醒对方）；只有名字缺失时才退回 `<at>`——此时飞书
+ *  能据 open_id 展示对方身份（远比裸 open_id 可读），代价是可能偶尔触发一次空会话（产品上可接受，
+ *  且名字缺失是少数边角情况）。真人被 `<at>` 不会自动开会话。传 string/string[]（无 isBot 信息）
+ *  时按真人处理（@ 全部），保持旧调用方/单测兼容。 */
 export function buildGrantNotifyCard(
   kind: 'chat' | 'global',
   target: string | string[] | Array<{ openId: string; name?: string; isBot?: boolean }>,
@@ -1279,9 +1281,9 @@ export function buildGrantNotifyCard(
   const entries = (Array.isArray(target) ? target : [target]).map(tt =>
     typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
   const at = entries.map(e =>
-    e.isBot
-      ? (e.name && e.name.length > 0 ? e.name : e.openId)   // bot：纯文本名字，绝不 <at>（否则唤醒对方 bot）
-      : `<at id=${e.openId}></at>`,                          // 真人：@ 点名（真人被 @ 不会自动开会话）
+    e.isBot && e.name && e.name.length > 0
+      ? e.name                                              // bot 有名字：纯文本，不 <at>（不唤醒对方）
+      : `<at id=${e.openId}></at>`,                          // 真人 / bot 无名字：@ 点名（bot 无名字时靠飞书据 open_id 展示身份，代价=可能一次空会话）
   ).join(' ');
   let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
