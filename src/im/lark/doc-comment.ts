@@ -87,6 +87,10 @@ export interface DocComment {
   commentId: string;
   /** 评论是否已解决。 */
   isSolved: boolean;
+  /** 局部评论选中的文档原文；全文评论通常为空。 */
+  quote?: string;
+  /** 是否为整篇文档的全文评论。 */
+  isWhole?: boolean;
   /** 该评论 thread 下所有回复（飞书把评论建模成 reply_list）。 */
   replies: Array<{
     replyId: string;
@@ -344,17 +348,54 @@ export async function getDocComment(
 
 function normalizeComment(raw: any): DocComment {
   const replies = Array.isArray(raw?.reply_list?.replies) ? raw.reply_list.replies : [];
+  const quote = typeof raw?.quote === 'string'
+    ? raw.quote.trim()
+    : elementsToText(raw?.quote?.content?.elements ?? raw?.quote?.elements).trim();
   return {
     commentId: raw?.comment_id ?? '',
     isSolved: raw?.is_solved === true,
+    quote: quote || undefined,
+    isWhole: raw?.is_whole === true,
     replies: replies.map((r: any) => ({
       replyId: r?.reply_id ?? '',
       userId: r?.user_id,
       text: elementsToText(r?.content?.elements),
       mentions: elementsMentions(r?.content?.elements),
-      createdAt: typeof r?.create_time === 'number' ? r.create_time : undefined,
+      createdAt: Number.isFinite(Number(r?.create_time)) ? Number(r.create_time) : undefined,
     })),
   };
+}
+
+/**
+ * 列出文档当前可见的全部评论。`/watch-comment --all` 用它做增量轮询：
+ * 评论读取优先应用身份，因此不需要 User Token；只有应用身份无权访问文档时才
+ * 回退已有的用户授权。
+ */
+export async function listDocComments(
+  larkAppId: string,
+  file: ResolvedDocFile,
+): Promise<DocComment[]> {
+  const comments: DocComment[] = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await driveApiCall(larkAppId, {
+      method: 'GET',
+      path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments`,
+      params: {
+        file_type: file.fileType,
+        user_id_type: 'open_id',
+        page_size: 50,
+        page_token: pageToken,
+      },
+      preferTenant: true,
+    });
+    const data = ensureOk(res, '列出评论');
+    if (Array.isArray(data?.items)) comments.push(...data.items.map(normalizeComment));
+    pageToken = data?.has_more === true && typeof data?.page_token === 'string' && data.page_token
+      ? data.page_token
+      : undefined;
+  } while (pageToken);
+  return comments;
 }
 
 // ─── 回评论 ─────────────────────────────────────────────────────────────────────

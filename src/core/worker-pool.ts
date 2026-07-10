@@ -51,7 +51,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
 import { prepareSkillDelivery } from './skills/delivery.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
+import { sessionKey, sessionAnchorId, isDocNativeSession, type DaemonSession } from './types.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin } from './botmux-wrapper.js';
@@ -161,6 +161,7 @@ export function isRelayableRealSession(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession): boolean {
+  if (isDocNativeSession(ds)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -481,6 +482,7 @@ export async function postFreshStreamingCard(
   ds: DaemonSession,
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
 ): Promise<boolean> {
+  if (isDocNativeSession(ds)) return false;
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port) return false;
   const botCfg = getBot(ds.larkAppId).config;
@@ -1230,16 +1232,19 @@ export async function closeSession(
     // crash/limited turn may never have reached an idle edge).
     recordUsageForDaemonSession(ds);
     killWorker(ds);
-    // 文档订阅清理：会话关闭即退订其绑定的所有文档（飞书侧退订 + 删注册表），
-    // 否则该文档之后的评论会变成「命中订阅但无活跃会话」而被丢弃。
+    // 文档入口清理：会话关闭即删除其绑定。只有旧
+    // /subscribe-lark-doc 记录需要调飞书逐文件退订 API；
+    // /watch-comment 仅依赖应用级评论事件，删本地监听表即可。
     try {
       const anchor = sessionAnchorId(ds);
       const subs = listDocSubscriptionsForSession(config.session.dataDir, ds.larkAppId, anchor);
       for (const sub of subs) {
-        await unsubscribeDocFile(ds.larkAppId, { fileToken: sub.fileToken, fileType: sub.fileType });
+        if (sub.managedBy !== 'watch-comment') {
+          await unsubscribeDocFile(ds.larkAppId, { fileToken: sub.fileToken, fileType: sub.fileType });
+        }
         removeDocSubscription(config.session.dataDir, ds.larkAppId, sub.fileToken);
       }
-      if (subs.length) logger.info(`[doc-comment] session ${sessionId.slice(0, 8)} closed → unsubscribed ${subs.length} doc(s)`);
+      if (subs.length) logger.info(`[doc-comment] session ${sessionId.slice(0, 8)} closed → removed ${subs.length} doc binding(s)`);
     } catch (err: any) {
       logger.warn(`[doc-comment] cleanup on close failed for ${sessionId.slice(0, 8)}: ${err?.message ?? err}`);
     }
@@ -2666,7 +2671,7 @@ function deliverFinalOutput(
       return;
     }
     try {
-      // 文档评论入口分流：本轮若来自飞书文档评论（/subscribe-lark-doc），把正文
+      // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
       const docTurn = ds.docCommentTurns?.get(msg.turnId);
       if (docTurn) {

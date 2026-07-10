@@ -88,7 +88,7 @@ export interface Session {
    */
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   /**
-   * 文档评论入口（/subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
+   * 文档评论入口（/watch-comment / /subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
    * 触发时，`botmux send` 的用户可见回复要回到该文档评论（而非飞书）。因 botmux
    * send 跑在独立 CLI 子进程、只能从磁盘读会话态，故把当前轮的回评论落点持久化
    * 在这里。每开新轮重置（beginNewTurn 清空；handleDocComment 设值）。

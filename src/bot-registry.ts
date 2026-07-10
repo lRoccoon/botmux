@@ -835,7 +835,7 @@ export interface BotConfig {
    */
   substituteMode?: SubstituteModeConfig;
   /**
-   * 飞书文档订阅入口（/subscribe-lark-doc）新订阅的默认评论触发范围：
+   * 飞书文档评论监听（/watch-comment；/subscribe-lark-doc 也复用）新绑定的默认触发范围：
    *   • 'mention-only'（或 undefined）— 仅评论里 @bot 才触发（默认，防噪声）
    *   • 'all'                        — 该文档所有新评论都触发
    * 单条订阅的触发范围之后可在 dashboard 逐文档改（doc-subscriptions 表）。
@@ -846,7 +846,7 @@ export interface BotConfig {
    * session 会按 fileToken 查此表确定 agent 的 workingDir。
    * 键是飞书文档的 file_token（wiki 已解析为底层 obj_token），值是本地绝对路径。
    * 例：{ "KszRdLt6MoNtBFxNjBmm3jlhyWd": "/home/me/my-repo" }
-   * 也可以在 `/subscribe-lark-doc --dir /path` 时逐文档指定。
+   * 也可以在 `/watch-comment <doc> --dir /path` 时逐文档指定。
    */
   docRepoMap?: Record<string, string>;
   /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */

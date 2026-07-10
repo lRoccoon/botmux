@@ -4697,7 +4697,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
 
-  // ── 文档评论入口分流（/subscribe-lark-doc）──────────────────────────────────
+  // ── 文档评论入口分流（/watch-comment / /subscribe-lark-doc）─────────────────
   // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.currentDocCommentTarget），
   // 把用户可见回复发表为飞书文档评论，而非发回飞书会话。绕过 @ 硬门（评论不 @ 飞书
   // 用户）。显式改路由（--top-level / --chat-id / --into）时不分流，让模型仍能主动

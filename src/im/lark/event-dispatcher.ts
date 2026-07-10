@@ -22,11 +22,12 @@ import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
 import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, putDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
-import { putPendingApproval, getPendingApproval, removePendingApproval, listPendingApprovals } from '../../services/doc-pending-approvals-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
+import { putPendingApproval, getPendingApproval } from '../../services/doc-pending-approvals-store.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
+  DOC_WATCH_SCOPES,
   DOC_COMMENT_EVENT,
   VC_MEETING_BOT_EVENTS,
   VC_MEETING_FEATURE_SCOPES,
@@ -287,21 +288,33 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     try {
       const docSubs = listAllDocSubscriptions(config.session.dataDir, larkAppId);
       if (docSubs.length > 0) {
-        const missingDoc = DOC_FEATURE_SCOPES.filter(s => !grantedScopes.has(s.name));
+        const hasWatch = docSubs.some(s => s.managedBy === 'watch-comment');
+        // Historical records have no managedBy and belong to the legacy
+        // /subscribe-lark-doc flow, which still needs every OAuth/subscribe scope.
+        const hasApiSubscribe = docSubs.some(s => s.managedBy !== 'watch-comment');
+        const requiredDocScopes = [
+          ...(hasWatch ? DOC_WATCH_SCOPES : []),
+          ...(hasApiSubscribe ? DOC_FEATURE_SCOPES : []),
+        ].filter((scope, index, all) => all.findIndex(s => s.name === scope.name) === index);
+        const missingDoc = requiredDocScopes.filter(s => !grantedScopes.has(s.name));
+        const featureLabel = [
+          hasWatch ? '/watch-comment' : '',
+          hasApiSubscribe ? '/subscribe-lark-doc' : '',
+        ].filter(Boolean).join(' + ');
         if (missingDoc.length > 0) {
           const summary = missingDoc.map(s => `${s.name}(${s.desc})`).join('、');
-          logger.error(`[${larkAppId}] 文档评论入口已在用（${docSubs.length} 个订阅）但缺 ${missingDoc.length} 项文档权限：${summary}。评论将收不到/回不了，请到权限管理开通后 botmux restart。`);
+          logger.error(`[${larkAppId}] ${featureLabel} 已在用（${docSubs.length} 个绑定）但缺 ${missingDoc.length} 项文档权限：${summary}。评论将收不到/回不了，请到权限管理开通后 botmux restart。`);
           const adminDoc = getAdminOpenId(bot);
           if (adminDoc) {
             const lines = missingDoc.map((s, i) => `${i + 1}. **${s.desc}** (\`${s.name}\`)\n   ${buildScopeDeepLink(bot.config.larkAppId, s.name, brand)}`).join('\n\n');
             await dmAdmin(larkAppId, adminDoc,
-              `⚠️ 机器人 "${bot.botName ?? larkAppId}" 已订阅 ${docSubs.length} 个飞书文档（/subscribe-lark-doc），但缺少文档评论所需权限：\n\n${lines}\n\n` +
+              `⚠️ 机器人 "${bot.botName ?? larkAppId}" 已通过 ${featureLabel} 绑定 ${docSubs.length} 个飞书文档，但缺少对应权限：\n\n${lines}\n\n` +
               `另外请确认开发者后台「事件订阅」里已添加 **\`${DOC_COMMENT_EVENT}\`**（云文档新增评论）事件——该事件无法被自动检测，缺它则评论永远收不到。\n\n开通 + 订阅事件后执行 \`botmux restart\`。`,
               `missing doc-feature scopes: ${missingDoc.map(s => s.name).join(',')}`);
           }
         } else {
           // 权限齐了——事件订阅查不了，仅 info 记一条提醒（不 DM 免重启刷屏）。
-          logger.info(`[${larkAppId}] doc-comment 权限齐全（${docSubs.length} 订阅）；请确保后台已订阅事件 ${DOC_COMMENT_EVENT}（无法自动检测）`);
+          logger.info(`[${larkAppId}] ${featureLabel} 文档权限齐全（${docSubs.length} 绑定）；请确保后台已订阅事件 ${DOC_COMMENT_EVENT}（无法自动检测）`);
         }
       }
     } catch (err: any) {
@@ -1305,7 +1318,7 @@ export interface EventHandlers {
    *  — which in a 话题群 wraps each top-level message in a fresh topic.
    *  Best-effort fire-and-forget; the dispatcher proceeds either way. */
   onChatModeConverted?: (chatId: string, larkAppId: string) => void;
-  /** 文档评论入口（/subscribe-lark-doc）：一条命中订阅的文档评论被喂进其绑定
+  /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：一条命中文档绑定的评论被喂进
    *  会话。daemon 负责定位会话、投递给 worker、记录该轮回评论的落点。 */
   handleDocComment?: (ctx: DocCommentContext) => Promise<void>;
   /** VC bot meeting push events (`vc.bot.meeting_*_v1`). ACK-safe; daemon owns meeting session state. */
@@ -1331,6 +1344,12 @@ export interface DocCommentContext {
   replyId?: string;
   /** 评论纯文本（喂给模型的用户消息）。 */
   text: string;
+  /** 局部评论选中的文档原文。 */
+  selectedText?: string;
+  /** 触发回复之前，该评论串已有的讨论。 */
+  priorReplies?: Array<{ authorOpenId?: string; text: string }>;
+  /** 是否为整篇文档的全文评论。 */
+  isWhole?: boolean;
   /** 评论发表者 open_id。 */
   authorOpenId?: string;
 }
@@ -1715,6 +1734,7 @@ async function processCommentEvent(
         scope: 'chat',
         chatId: `doc:${fileToken}`,
         commentTriggerMode: 'mention-only',
+        managedBy: 'watch-comment',
         ownerOpenId: operatorOpenId,
         workingDir: mappedDir,
         createdAt: Date.now(),
@@ -1734,17 +1754,18 @@ async function processCommentEvent(
         });
         // 通知 owner
         if (ownerOpenId) {
-          const requesterName = operatorOpenId ? operatorOpenId.slice(0, 12) : '未知用户';
-          const approveCmd = `/doc-approve ${fileToken}`;
-          const denyCmd = `/doc-deny ${fileToken}`;
+          const loc = localeForBot(larkAppId);
+          const requesterName = operatorOpenId ? operatorOpenId.slice(0, 12) : '?';
+          const approveCmd = `/watch-comment approve ${fileToken}`;
+          const denyCmd = `/watch-comment deny ${fileToken}`;
           const notifyText = [
-            '📄 新文档评论授权请求',
+            t('daemon.doc_approval_request_title', undefined, loc),
             '',
-            `用户 ${requesterName} 在文档中 @了机器人，该文档尚未被订阅。`,
-            `文档 token：${fileToken.slice(0, 12)}…`,
+            t('daemon.doc_approval_request_body', { requester: requesterName }, loc),
+            t('daemon.doc_approval_request_token', { token: fileToken.slice(0, 12) }, loc),
             '',
-            `✅ 同意授权：${approveCmd}`,
-            `❌ 拒绝：${denyCmd}`,
+            `✅ ${t('daemon.doc_approval_approve', undefined, loc)}：${approveCmd}`,
+            `❌ ${t('daemon.doc_approval_deny', undefined, loc)}：${denyCmd}`,
           ].join('\n');
           sendUserMessage(larkAppId, ownerOpenId, notifyText).catch((e) => {
             logger.warn(`[doc-comment] failed to notify owner about pending approval: ${e instanceof Error ? e.message : e}`);
@@ -1774,6 +1795,7 @@ async function processCommentEvent(
   const trigger = parsed.replyId
     ? comment.replies.find(r => r.replyId === parsed.replyId) ?? comment.replies[comment.replies.length - 1]
     : comment.replies[comment.replies.length - 1];
+  const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
 
   // 3) 自触发过滤（防死循环）：bot 的回复可能以应用身份（作者=bot open_id）或回退
   //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
@@ -1800,6 +1822,12 @@ async function processCommentEvent(
     commentId,
     replyId: trigger.replyId || commentId,
     text,
+    selectedText: comment.quote,
+    priorReplies: comment.replies.slice(0, triggerIndex).map(reply => ({
+      authorOpenId: reply.userId,
+      text: reply.text.replaceAll(BOT_REPLY_SENTINEL, '').trim(),
+    })).filter(reply => reply.text.length > 0),
+    isWhole: comment.isWhole,
     authorOpenId: trigger.userId,
   });
 }
@@ -1829,9 +1857,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
       }, 'bot-added event');
     },
-    // 文档评论入口（/subscribe-lark-doc）。飞书评论事件命名在 v1/v2 间有差异，
-    // 两个候选名都注册（同一处理器）——真机一锤定音后可删冗余。需在开发者后台
-    // 订阅对应事件。注意：评论事件是 per-文档 推送（订阅时按 file_token 注册）。
+    // 文档评论入口（/watch-comment / /subscribe-lark-doc）。notice 事件主要覆盖 @Bot
+    // 通知；旧逐文件订阅还可能收到 file 事件。`/watch-comment --all` 的普通评论由
+    // daemon 应用身份轮询补齐，不依赖逐文件 subscribe API。
     'drive.file.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     'drive.notice.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     [VC_BOT_MEETING_INVITED_EVENT]: (data: any) =>
