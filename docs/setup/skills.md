@@ -87,7 +87,11 @@ botmux skills install agentbuddy:<group>/<skill>@<version>
 botmux skills install agentbuddy:collection/<uid>
 ```
 
-- 需要部署机装好 `agentbuddy` 并登录一次（`agentbuddy login`），凭证缓存后复用；未安装/未登录时返回 `agentbuddy_not_found` / `agentbuddy_command_failed`。
+也可直接粘贴制品仓库的网页链接（dashboard 尤其方便，贴上即装、跳过 discover）：
+- **skill 链接** `https://<host>/skill/skills:<group>/<name>` 自带 `skills:` identifier，**域名无关**即可识别，无需配置。
+- **collection 链接** `https://<host>/collection/<uid>` 只有一个 uid，必须靠域名识别，所以要把该 marketplace 域名加进 `BOTMUX_AGENTBUDDY_MARKETPLACE_HOSTS`（逗号分隔）后才认——这样内网域名只存在于部署机配置、不进源码。
+
+- 需要部署机装好 `agentbuddy` 并登录一次（`agentbuddy login`），凭证缓存后复用；未安装/未登录时返回 `agentbuddy_not_found` / `agentbuddy_command_failed`（dashboard 会提示去安装/登录）。
 - agentbuddy 自解析 skill 集合，安装/更新不走 discover-then-select；同一 identifier 的并发安装/更新会串行化，避免互相清空暂存目录。
 - botmux 在拷进 store 前用 agentbuddy 内置的 `clear-embedded-telemetry` 剥离制品内嵌的用量上报，并做 fail-closed 后置校验（残留即中断安装）；确需保留时设 `BOTMUX_AGENTBUDDY_KEEP_TELEMETRY=1`。
 
@@ -98,6 +102,7 @@ botmux skills install agentbuddy:collection/<uid>
 | `BOTMUX_AGENTBUDDY_CMD` | `agentbuddy` | 调用的命令（可设为 `npx -y agentbuddy@latest`）；私有 npm registry 由部署机 npmrc/env 提供 |
 | `BOTMUX_AGENTBUDDY_TIMEOUT_MS` | `180000` | 单次 agentbuddy 调用超时 |
 | `BOTMUX_AGENTBUDDY_KEEP_TELEMETRY` | 关 | 设 `1` 保留内嵌 telemetry（默认剥离） |
+| `BOTMUX_AGENTBUDDY_MARKETPLACE_HOSTS` | 空 | 逗号分隔的 marketplace 网页域名，用于识别粘贴的 collection 链接（skill 链接无需配置） |
 
 更新、查看和移除：
 

@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { MAX_LOCAL_LINK_SOURCES, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
+import { MAX_LOCAL_LINK_SOURCES, discoverDashboardSkills, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
 
 describe('dashboard skill install request parsing', () => {
   it('rejects lightweight install errors before starting a job', () => {
@@ -81,6 +81,18 @@ describe('dashboard skill install request parsing', () => {
       kind: 'agentbuddy',
       agentbuddy: { collection: 'col123abc' },
     });
+  });
+
+  it('routes an allow-listed marketplace URL to agentbuddy direct-install', async () => {
+    vi.stubEnv('BOTMUX_AGENTBUDDY_MARKETPLACE_HOSTS', 'mkt.example');
+    try {
+      const request = parseDashboardSkillInstallRequest({ source: 'https://mkt.example/collection/abc123' });
+      expect(request).toEqual({ kind: 'agentbuddy', agentbuddy: { collection: 'abc123' } });
+      // discover signals the UI to install directly (skip discover-then-select)
+      expect(await discoverDashboardSkills(request)).toEqual({ skills: [], directInstall: true });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('sanitizes batch local-link sources: trims, drops blanks/non-strings, dedups', () => {

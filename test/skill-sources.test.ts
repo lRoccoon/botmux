@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { assertSafeGitRef, assertSafeGitSkillPath, parseAgentbuddySource, parseSkillInstallSource, redactGitUrlCredentials } from '../src/core/skills/sources.js';
+import { assertSafeGitRef, assertSafeGitSkillPath, parseAgentbuddySource, parseMarketplaceUrl, parseSkillInstallSource, redactGitUrlCredentials } from '../src/core/skills/sources.js';
 
 describe('skill install sources', () => {
   it('rejects HTTPS git URLs with embedded credentials', () => {
@@ -118,6 +118,35 @@ describe('skill install sources', () => {
     expect(() => parseAgentbuddySource('agentbuddy:group/../escape/skill')).toThrow(/invalid_agentbuddy_group/);
     expect(() => parseAgentbuddySource('agentbuddy:group/skill;rm -rf')).toThrow(/invalid_agentbuddy_skill/);
     expect(() => parseAgentbuddySource('agentbuddy:collection/../etc')).toThrow(/invalid_agentbuddy_collection/);
+  });
+
+  describe('marketplace URLs', () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    it('recognizes a skill URL host-agnostically (self-contained skills: identifier)', () => {
+      // No BOTMUX_AGENTBUDDY_MARKETPLACE_HOSTS configured on purpose.
+      expect(parseSkillInstallSource('https://any-host.example/skill/skills:acme/team/mkt/deploy')).toMatchObject({
+        kind: 'agentbuddy',
+        agentbuddy: { group: 'acme/team/mkt', skill: 'deploy' },
+      });
+    });
+
+    it('requires an allow-listed host for collection URLs (uid alone is ambiguous)', () => {
+      expect(parseMarketplaceUrl('https://mkt.example/collection/abc123')).toBeNull();
+      expect(parseSkillInstallSource('https://mkt.example/collection/abc123').kind).not.toBe('agentbuddy');
+
+      vi.stubEnv('BOTMUX_AGENTBUDDY_MARKETPLACE_HOSTS', 'mkt.example, other.example');
+      expect(parseSkillInstallSource('https://mkt.example/collection/abc123')).toMatchObject({
+        kind: 'agentbuddy',
+        agentbuddy: { collection: 'abc123' },
+      });
+    });
+
+    it('ignores non-marketplace URLs', () => {
+      expect(parseMarketplaceUrl('https://example.com/some/page')).toBeNull();
+      expect(parseMarketplaceUrl('not a url')).toBeNull();
+      expect(parseMarketplaceUrl('ftp://example.com/collection/x')).toBeNull();
+    });
   });
 
   it('rejects git refs that could be parsed as checkout options', () => {

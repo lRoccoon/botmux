@@ -179,9 +179,54 @@ export function parseAgentbuddySource(raw: string): AgentbuddySource {
   return { group, skill, ...(version ? { version } : {}) };
 }
 
+/** Marketplace web hosts the operator opts into recognizing, so a pasted
+ *  collection URL auto-routes to agentbuddy. Empty by default — the internal
+ *  marketplace domain lives in deploy config (BOTMUX_AGENTBUDDY_MARKETPLACE_HOSTS,
+ *  comma-separated), never in this (publicly-published) source. */
+function marketplaceHosts(): Set<string> {
+  return new Set(
+    (process.env.BOTMUX_AGENTBUDDY_MARKETPLACE_HOSTS ?? '')
+      .split(',')
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+/** Turn a pasted marketplace web URL into an agentbuddy source.
+ *  - A skill URL (`…/skill/skills:<group>/<name>`) carries a self-contained
+ *    `skills:` identifier, so it's recognized host-agnostically.
+ *  - A collection URL (`…/collection/<uid>`) is just a uid — ambiguous on its
+ *    own — so it's only accepted for operator-allow-listed hosts.
+ *  Returns null for anything that isn't a recognizable marketplace URL. */
+export function parseMarketplaceUrl(raw: string): AgentbuddySource | null {
+  let url: URL;
+  try { url = new URL(raw); } catch { return null; }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+  const segments = url.pathname.split('/').filter(Boolean).map((s) => {
+    try { return decodeURIComponent(s); } catch { return s; }
+  });
+  const hostAllowed = marketplaceHosts().has(url.hostname.toLowerCase());
+  const skillIdx = segments.indexOf('skill');
+  if (skillIdx >= 0 && segments[skillIdx + 1]) {
+    const rest = segments.slice(skillIdx + 1).join('/');
+    if (rest.startsWith('skills:') || hostAllowed) {
+      try { return parseAgentbuddySource(`agentbuddy:${rest}`); } catch { return null; }
+    }
+  }
+  const collectionIdx = segments.indexOf('collection');
+  if (hostAllowed && collectionIdx >= 0 && segments[collectionIdx + 1]) {
+    try { return parseAgentbuddySource(`agentbuddy:collection/${segments[collectionIdx + 1]}`); } catch { return null; }
+  }
+  return null;
+}
+
 export function parseSkillInstallSource(raw: string): ParsedSkillInstallSource {
   if (raw.startsWith('agentbuddy:')) {
     return { kind: 'agentbuddy', value: raw, agentbuddy: parseAgentbuddySource(raw) };
+  }
+  const marketplace = parseMarketplaceUrl(raw);
+  if (marketplace) {
+    return { kind: 'agentbuddy', value: raw, agentbuddy: marketplace };
   }
   if (raw.startsWith('github:')) {
     const rest = raw.slice('github:'.length);

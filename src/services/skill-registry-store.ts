@@ -27,6 +27,9 @@ export interface DiscoveredSkillCandidate {
 export interface SkillSourceDiscovery {
   commit?: string;
   skills: DiscoveredSkillCandidate[];
+  /** True when the source resolves its own skill set (agentbuddy) — the dashboard
+   *  installs it directly, skipping the discover-then-select step. */
+  directInstall?: boolean;
 }
 
 export interface SkillInstallSelection {
