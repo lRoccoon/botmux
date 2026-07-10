@@ -594,6 +594,14 @@ function agentbuddyLockWaitMs(): number {
  *  staging dir mid-run (both agentbuddy children fail with uv_cwd/ENOENT). The
  *  cross-process file lock covers separate processes; wait budget ≥ a full run. */
 function withAgentbuddyLockSync<T>(identifier: string, fn: () => T): T {
+  // A blocking sync file-lock acquire cannot coexist with an in-process ASYNC
+  // holder of the same identifier: withFileLock is non-reentrant, and the sync
+  // acquire freezes the event loop so the async holder never reaches its release
+  // — a guaranteed deadlock until the (long) lock timeout. The sync API is the
+  // one-shot CLI path; if an async op is in flight in THIS process, fast-fail
+  // instead of dead-waiting. (Cross-process sync↔async is fine: the file lock
+  // serializes those, and blocking a one-shot CLI's own loop is harmless.)
+  if (agentbuddyLocks.has(sourceId(identifier))) throw new Error('agentbuddy_busy');
   return withFileLockSync(agentbuddyLockTarget(identifier), fn, { maxWaitMs: agentbuddyLockWaitMs() });
 }
 

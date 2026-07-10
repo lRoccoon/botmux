@@ -520,7 +520,7 @@ function SkillsPage() {
         ? tr('skills.agentbuddyNeedsLogin')
         : tr('skills.agentbuddyCommandFailed');
     }
-    if (msg.startsWith('agentbuddy_clear_telemetry_failed')) return tr('skills.agentbuddyTelemetryFailed');
+    if (msg.startsWith('agentbuddy_clear_telemetry_failed') || msg.startsWith('agentbuddy_telemetry_not_stripped')) return tr('skills.agentbuddyTelemetryFailed');
     if (msg.startsWith('agentbuddy_no_skill_produced')) return tr('skills.agentbuddyNoSkill');
     if (msg.startsWith('invalid_agentbuddy')) return tr('skills.agentbuddyInvalid');
     return msg;

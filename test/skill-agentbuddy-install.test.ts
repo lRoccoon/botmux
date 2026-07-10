@@ -193,6 +193,16 @@ describe('agentbuddy skill install', () => {
     expect(readSkillRegistry().skills.deploy).toBeTruthy();
   });
 
+  it('sync install fast-fails (no event-loop deadlock) while an async op for the same identifier is in-flight', async () => {
+    vi.stubEnv('FAKE_AB_DELAY_MS', '200');
+    const opts = { group: 'g/h', skill: 'deploy' };
+    const asyncP = installAgentbuddySkillAsync(opts); // takes the in-process lock entry synchronously
+    // A blocking sync acquire here would freeze the loop and deadlock the async
+    // holder; instead it must fast-fail rather than dead-wait to the timeout.
+    expect(() => installAgentbuddySkill(opts)).toThrow(/agentbuddy_busy/);
+    await expect(asyncP).resolves.toMatchObject([{ name: 'deploy' }]);
+  });
+
   it('updates an agentbuddy skill via the async (non-blocking) path', async () => {
     installAgentbuddySkill({ group: 'g/h', skill: 'deploy', version: '1.0.0' });
     const result = await updateInstalledSkillAsync('deploy');
