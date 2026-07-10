@@ -85,7 +85,7 @@ export async function runSkillsImCommand(larkAppId: string, content: string): Pr
 
   if (sub === 'attach') {
     const skill = readSkillRegistry().skills[name!];
-    if (!skill) return { ok: false, message: `未安装 skill：${name}\n先在部署机器上运行：botmux skills install <path|github>` };
+    if (!skill) return { ok: false, message: `未安装 skill：${name}\n先在部署机器上运行：botmux skills install <path|git|github|agentbuddy>` };
     const bot = getBot(larkAppId);
     const result = await writeSkillPolicy(larkAppId, attachSkillPolicy(bot.config.skills, skill.name));
     if (!result.ok) return result;

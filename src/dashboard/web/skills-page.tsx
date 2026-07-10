@@ -561,8 +561,11 @@ function SkillsPage() {
       setInstallStatus({ text: tr('skills.sourceRequired'), ok: false });
       return;
     }
+    // The 'agentbuddy:' source kind (see parseSkillInstallSource) resolves its
+    // own skill set, so skip the discover-then-select step and install directly.
+    // Prefix is matched inline here — the parser lives in a server-only module
+    // the browser bundle can't import.
     if (installSource.trim().startsWith('agentbuddy:')) {
-      // agentbuddy resolves its own skill set — skip discover, install directly.
       setInstallSelectionOpen(false);
       await submitSkillInstall();
       return;

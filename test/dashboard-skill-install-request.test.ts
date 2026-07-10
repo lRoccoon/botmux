@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { DIRECT_INSTALL_SOURCE_PREFIX, MAX_LOCAL_LINK_SOURCES, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
+import { MAX_LOCAL_LINK_SOURCES, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
 
 describe('dashboard skill install request parsing', () => {
   it('rejects lightweight install errors before starting a job', () => {
@@ -81,9 +81,6 @@ describe('dashboard skill install request parsing', () => {
       kind: 'agentbuddy',
       agentbuddy: { collection: 'col123abc' },
     });
-    // agentbuddy resolves its own skill set → dashboard skips /discover
-    expect('agentbuddy:example.com/team/mkt/deploy'.startsWith(DIRECT_INSTALL_SOURCE_PREFIX)).toBe(true);
-    expect('https://github.com/acme/skills'.startsWith(DIRECT_INSTALL_SOURCE_PREFIX)).toBe(false);
   });
 
   it('sanitizes batch local-link sources: trims, drops blanks/non-strings, dedups', () => {

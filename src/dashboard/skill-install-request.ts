@@ -31,12 +31,6 @@ export type DashboardSkillInstallRequest =
   | { kind: 'github'; owner: string; repo: string; path?: string; ref?: string; skillNames: string[]; all: boolean; fullDepth: boolean }
   | { kind: 'agentbuddy'; agentbuddy: AgentbuddySource };
 
-/** Prefix marking a source that resolves its own skill set (agentbuddy fetches
- *  the skill itself), so the dashboard install flow skips `/api/skills/discover`
- *  and installs directly. Kept as a shared constant so the client-side UI can
- *  branch on it without importing this server-only module. */
-export const DIRECT_INSTALL_SOURCE_PREFIX = 'agentbuddy:';
-
 export function shouldAutoLinkLocalSkillPath(rawPath: string): boolean {
   const normalized = rawPath.replace(/\\/g, '/');
   const parts = normalized.split('/').filter(Boolean);

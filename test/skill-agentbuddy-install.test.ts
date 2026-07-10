@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 
 import {
   installAgentbuddySkill,
+  installAgentbuddySkillAsync,
   readSkillRegistry,
   removeInstalledSkill,
   updateInstalledSkill,
+  updateInstalledSkillAsync,
 } from '../src/services/skill-registry-store.js';
 
 // A stand-in for the real `agentbuddy` CLI. It writes the SKILL.md tree that the
@@ -15,6 +17,13 @@ import {
 // implements `clear-embedded-telemetry` (strip @telemetry block + spans dir),
 // so the wrapper's capture + telemetry-scrub + register path is exercised
 // without any network/SSO. FAKE_AB_TELEMETRY=1 makes installs carry telemetry.
+// Env knobs used by individual tests:
+//   FAKE_AB_FAIL=1         → exit 1 with "needs login" (unauthenticated)
+//   FAKE_AB_EMPTY=1        → exit 0 producing nothing
+//   FAKE_AB_TELEMETRY=1    → produced skills carry a @telemetry block + spans/
+//   FAKE_AB_SCRUB_NOOP=1   → clear-embedded-telemetry exits 0 but strips nothing
+//   FAKE_AB_DELAY_MS=<n>   → sync-sleep before producing (force concurrency overlap)
+//   FAKE_AB_PRODUCE=a,b    → produce these skill names instead of the requested/default set
 const FAKE_AGENTBUDDY = `
 const { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } = require('node:fs');
 const { join } = require('node:path');
@@ -24,6 +33,7 @@ const argv = process.argv.slice(2);
 const TEL_START = '<!-- @telemetry:start -->';
 const TEL_END = '<!-- @telemetry:end -->';
 if (argv[0] === 'clear-embedded-telemetry') {
+  if (process.env.FAKE_AB_SCRUB_NOOP === '1') process.exit(0); // exit 0 but leave telemetry in place
   const base = argv[1] || process.cwd();
   const skillsDir = join(base, '.claude', 'skills');
   if (existsSync(skillsDir)) {
@@ -41,6 +51,8 @@ if (argv[0] === 'clear-embedded-telemetry') {
   }
   process.exit(0);
 }
+const delay = Number(process.env.FAKE_AB_DELAY_MS || 0);
+if (delay > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
 function writeSkill(name, desc) {
   const dir = join(process.cwd(), '.claude', 'skills', name);
   mkdirSync(dir, { recursive: true });
@@ -53,15 +65,16 @@ function writeSkill(name, desc) {
   writeFileSync(join(dir, 'SKILL.md'), body);
   writeFileSync(join(dir, 'helper.md'), 'resource for ' + name);
 }
+const override = process.env.FAKE_AB_PRODUCE ? process.env.FAKE_AB_PRODUCE.split(',') : null;
 if (argv[1] === 'collection') {
   const uid = argv[3];
-  writeSkill(uid + '-alpha', 'from collection ' + uid);
-  writeSkill(uid + '-beta', 'from collection ' + uid);
+  const names = override || [uid + '-alpha', uid + '-beta'];
+  for (const n of names) writeSkill(n, 'from collection ' + uid);
 } else {
   const i = argv.indexOf('--skill');
-  const name = i >= 0 ? argv[i + 1] : 'unnamed';
+  const requested = i >= 0 ? argv[i + 1] : 'unnamed';
   const v = argv.indexOf('--version');
-  writeSkill(name, v >= 0 ? ('v' + argv[v + 1]) : 'latest');
+  for (const n of (override || [requested])) writeSkill(n, v >= 0 ? ('v' + argv[v + 1]) : 'latest');
 }
 `;
 
@@ -78,7 +91,13 @@ describe('agentbuddy skill install', () => {
     vi.stubEnv('FAKE_AB_FAIL', '');
     vi.stubEnv('FAKE_AB_EMPTY', '');
     vi.stubEnv('FAKE_AB_TELEMETRY', '');
+    vi.stubEnv('FAKE_AB_SCRUB_NOOP', '');
+    vi.stubEnv('FAKE_AB_DELAY_MS', '');
+    vi.stubEnv('FAKE_AB_PRODUCE', '');
     vi.stubEnv('BOTMUX_AGENTBUDDY_KEEP_TELEMETRY', '');
+    // Long agentbuddy runs would make the per-identifier lock wait forever on a
+    // stuck holder; keep the lock's wait budget small + fast in tests.
+    vi.stubEnv('BOTMUX_AGENTBUDDY_TIMEOUT_MS', '10000');
   });
 
   afterEach(() => {
@@ -163,5 +182,46 @@ describe('agentbuddy skill install', () => {
   it('errors when the CLI produces no skill', () => {
     vi.stubEnv('FAKE_AB_EMPTY', '1');
     expect(() => installAgentbuddySkill({ group: 'g/h', skill: 'deploy' })).toThrow(/agentbuddy_no_skill_produced/);
+  });
+
+  it('serializes concurrent same-identifier installs (no staging clobber)', async () => {
+    vi.stubEnv('FAKE_AB_DELAY_MS', '150'); // hold the staging so the two would overlap unlocked
+    const opts = { group: 'g/h', skill: 'deploy' };
+    const [a, b] = await Promise.all([installAgentbuddySkillAsync(opts), installAgentbuddySkillAsync(opts)]);
+    expect(a.map((p) => p.name)).toEqual(['deploy']);
+    expect(b.map((p) => p.name)).toEqual(['deploy']);
+    expect(readSkillRegistry().skills.deploy).toBeTruthy();
+  });
+
+  it('updates an agentbuddy skill via the async (non-blocking) path', async () => {
+    installAgentbuddySkill({ group: 'g/h', skill: 'deploy', version: '1.0.0' });
+    const result = await updateInstalledSkillAsync('deploy');
+    expect(result).toMatchObject({ ok: true, skill: { name: 'deploy', source: { type: 'agentbuddy' } } });
+  });
+
+  it('update aborts with no side effects when the target skill was renamed upstream', () => {
+    installAgentbuddySkill({ group: 'g/h', skill: 'deploy' });
+    vi.stubEnv('FAKE_AB_PRODUCE', 'renamed'); // upstream renamed the skill
+    expect(updateInstalledSkill('deploy')).toEqual({ ok: false, reason: 'agentbuddy_update_failed' });
+    // aborted before any store/registry write: no 'renamed' entry, 'deploy' untouched
+    expect(readSkillRegistry().skills.renamed).toBeUndefined();
+    expect(readSkillRegistry().skills.deploy).toBeTruthy();
+  });
+
+  it('collection update aborts (no re-sync of others) when the member was removed', () => {
+    installAgentbuddySkill({ collection: 'col1' }); // → col1-alpha, col1-beta
+    const betaBefore = readSkillRegistry().skills['col1-beta'].updatedAt;
+    vi.stubEnv('FAKE_AB_PRODUCE', 'col1-beta'); // collection dropped col1-alpha
+    expect(updateInstalledSkill('col1-alpha')).toEqual({ ok: false, reason: 'agentbuddy_update_failed' });
+    // aborted before write: sibling col1-beta not re-synced, col1-alpha still present
+    expect(readSkillRegistry().skills['col1-beta'].updatedAt).toBe(betaBefore);
+    expect(readSkillRegistry().skills['col1-alpha']).toBeTruthy();
+  });
+
+  it('fails closed if telemetry survives a no-op scrub (stale/drifted agentbuddy)', () => {
+    vi.stubEnv('FAKE_AB_TELEMETRY', '1');
+    vi.stubEnv('FAKE_AB_SCRUB_NOOP', '1'); // scrub exits 0 but strips nothing
+    expect(() => installAgentbuddySkill({ group: 'g/h', skill: 'deploy' })).toThrow(/agentbuddy_telemetry_not_stripped/);
+    expect(readSkillRegistry().skills.deploy).toBeUndefined(); // nothing registered
   });
 });
