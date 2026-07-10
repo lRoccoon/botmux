@@ -31,7 +31,7 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { AskArgsError, parseAskOptions } from './core/ask-args.js';
-import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, buildReportText, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { normalizeRepoRemote } from './core/repo-requirement.js';
 import { normalizeDispatchBotsForSender, resolveDispatchWorkerBotUnionIds, resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
 import {
@@ -5836,17 +5836,31 @@ async function cmdReport(rest: string[]): Promise<void> {
     deliveryEnvelope,
   });
   const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });
+  const envelopeText = deliveryEnvelope
+    ? buildReportText({ orchOpenId: tgt.orchOpenId, content: deliveryEnvelope })
+    : undefined;
 
   try {
     let msgId: string;
     if (tgt.orchScope === 'chat' || !tgt.orchRoot) {
-      // Orchestrator at chat scope, or cross-machine fallback → post top-level
+      // Orchestrator at chat scope, or cross-machine fallback → send top-level
       // into the chat (the sub-topic's chat = the orchestrator's chat).
-      msgId = await sendMessage(appId, tgt.orchChatId, postJson, 'post');
+      msgId = await sendMessage(
+        appId,
+        tgt.orchChatId,
+        envelopeText ?? postJson,
+        envelopeText ? 'text' : 'post',
+      );
     } else {
       // Same-machine thread-scope orchestrator → reply into its thread so its
       // existing context-rich session (anchored on orchRoot) receives the report.
-      msgId = await replyMessage(appId, tgt.orchRoot, postJson, 'post', true);
+      msgId = await replyMessage(
+        appId,
+        tgt.orchRoot,
+        envelopeText ?? postJson,
+        envelopeText ? 'text' : 'post',
+        true,
+      );
     }
     console.log(JSON.stringify({
       success: true,
@@ -5954,9 +5968,9 @@ async function cmdHelp(rest: string[]): Promise<void> {
         s.larkAppId,
         goalChatId,
         supervisorOpenId
-          ? JSON.stringify({ zh_cn: { title: '', content: buildReportContent({ orchOpenId: supervisorOpenId, content: helpEnvelope }) } })
+          ? buildReportText({ orchOpenId: supervisorOpenId, content: helpEnvelope })
           : helpEnvelope,
-        supervisorOpenId ? 'post' : 'text',
+        'text',
       );
     } catch (err) {
       console.error(`⚠️ 已写入 help 账本，但 goal 群求助信封发送失败：${err instanceof Error ? err.message : String(err)}`);
