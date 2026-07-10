@@ -35,7 +35,7 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile, resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -1410,6 +1410,17 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
   } catch { /* default unlimited */ }
+  let logicalSessionCount = 0;
+  let residentSessionCount = 0;
+  let dormantSessionCount = 0;
+  const registry = getActiveSessionsRegistry();
+  if (registry) {
+    logicalSessionCount = registry.size;
+    for (const ds of registry.values()) {
+      if (ds.worker && !ds.worker.killed) residentSessionCount++;
+      else if (!ds.session.queued) dormantSessionCount++;
+    }
+  }
   // startupCommands → newline-joined for the dashboard textarea (one per line).
   let startupCommands = '';
   try {
@@ -1480,6 +1491,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    logicalSessionCount,
+    residentSessionCount,
+    dormantSessionCount,
     startupCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
@@ -1538,9 +1552,22 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
   let body: unknown;
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, body);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-  jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode });
+  const rec = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  // Resolve the submitted email / union_id entries into runtime-matchable
+  // open_ids (+ fresh display names) using this bot's own credentials before
+  // persisting; unresolvable entries are dropped but reported back for the UI.
+  const { targets, resolution } = await substituteModeStore.resolveSubstituteTargets(
+    cachedLarkAppId,
+    rec.targets,
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfile },
+  );
+  const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
+    enabled: rec.enabled === true,
+    targets,
+    disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
+  });
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, resolution });
+  jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution });
 });
 
 // Per-bot explicit `/summary` history range. Body `{ limit, sinceHours }`.

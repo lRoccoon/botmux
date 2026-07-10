@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseLoadavg, parseMeminfo, parseProcessStat, parseSystemCpuTimes, parseSystemStat } from '../src/core/resource-monitor/procfs.js';
+import { parseLoadavg, parseMeminfo, parseProcessStat, parseSmapsRollupPss, parseSystemCpuTimes, parseSystemStat } from '../src/core/resource-monitor/procfs.js';
 
 describe('resource procfs parsers', () => {
   it('parses host cpu ticks from /proc/stat', () => {
@@ -30,5 +30,13 @@ describe('resource procfs parsers', () => {
     const stat = '1234 (node (worker)) S 12 0 0 0 0 0 0 0 0 0 100 50 0 0 20 0 1 0 12345 999 42';
 
     expect(parseProcessStat(stat)).toEqual({ pid: 1234, ppid: 12, cpuTicks: 150, startTicks: 12345, rssPages: 42 });
+  });
+
+  it('parses Pss from smaps_rollup as bytes, and returns null when absent', () => {
+    const rollup = 'Rss:               20480 kB\nPss:               10240 kB\nShared_Clean:       8192 kB\nPrivate_Dirty:      6144 kB\n';
+    expect(parseSmapsRollupPss(rollup)).toBe(10_485_760); // 10240 kB * 1024
+    // Pss must not be confused with Pss_Anon/Pss_File lines, and missing → null.
+    expect(parseSmapsRollupPss('Rss:  20480 kB\nPss_Anon:  4096 kB\n')).toBeNull();
+    expect(parseSmapsRollupPss('')).toBeNull();
   });
 });

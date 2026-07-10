@@ -207,6 +207,11 @@ function voiceSummaryInstruction(locale?: Locale): string {
   return t('card.voice.summary_instruction', undefined, locale);
 }
 
+function isLiveWorkerIdleOrLimited(ds: DaemonSession): boolean {
+  if (!ds.worker || ds.worker.killed) return true;
+  return ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited';
+}
+
 function isLegacySelfHealAction(actionType?: string): boolean {
   return !!actionType && LEGACY_SELF_HEAL_ACTIONS.has(actionType);
 }
@@ -1304,9 +1309,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] voice_summary blocked for unauthorized user: ${operatorOpenId ?? '?'}`);
         return { toast: { type: 'warning', content: t('card.voice.toast_need_auth', undefined, locDs) } };
       }
+      // Dedupe read BEFORE the busy guard: a card whose voice is already being
+      // generated will have its worker back in `working`, so the busy guard would
+      // otherwise shadow the "already on the way" hint with a misleading
+      // "wait for idle" toast. Read first (correct message), guard second, and
+      // only `add` after the guard so a genuinely-busy first click still doesn't
+      // burn the dedupe key.
       const dedupeKey = cardMessageId ?? `${sessionAnchorId(ds)}::voice`;
       if (voicedCardIds.has(dedupeKey)) {
         return { toast: { type: 'info', content: t('card.voice.toast_already', undefined, locDs) } };
+      }
+      if (!isLiveWorkerIdleOrLimited(ds)) {
+        logger.info(`[${tag(ds)}] voice_summary blocked because worker is busy: ${ds.lastScreenStatus ?? 'unknown'}`);
+        return { toast: { type: 'warning', content: t('card.voice.toast_worker_busy', undefined, locDs) } };
       }
       voicedCardIds.add(dedupeKey);
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
@@ -2182,7 +2197,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   // Handle repo select card (option-based dropdowns: plain switch, or
   // `repo_worktree` = create a worktree from the picked repo and open that).
-  const isWorktreeOpen = action?.value?.key === 'repo_worktree';
+  // Require an explicit, recognized key: botmux's own dropdowns always set
+  // `repo_switch` / `repo_worktree` (card-builder.ts). Treating a keyless
+  // `option + root_id` as a plain switch let a hand-crafted card drive the
+  // session's working dir to an arbitrary path — reject anything unrecognized.
+  const repoKey = action?.value?.key;
+  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree') {
+    logger.warn(`Card action: unrecognized repo dropdown key ${repoKey ?? '(none)'} — ignoring`);
+    return;
+  }
+  const isWorktreeOpen = repoKey === 'repo_worktree';
   const selectedPath = option;
   const rootId = action?.value?.root_id;
   logger.info(`Card action: repo ${isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);

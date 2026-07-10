@@ -1,6 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import {
+  InfoTip,
+  LoadingState,
+  OverviewList,
+  OverviewListItem,
+  OverviewListMain,
+  OverviewListTail,
+  SectionHeader,
+} from './dashboard-components.js';
 
 type ResourceCurrent = {
   supported?: boolean;
@@ -10,6 +19,11 @@ type ResourceCurrent = {
   intervalMs?: number;
   host?: { cpuPct?: number; memUsedPct?: number; load1?: number };
   botmux?: { cpuPct?: number; rssBytes?: number };
+  botmuxBreakdown?: {
+    daemon: { cpuPct?: number; rssBytes?: number };
+    worker: { cpuPct?: number; rssBytes?: number };
+    cli: { cpuPct?: number; rssBytes?: number };
+  };
   bots?: ResourceBot[];
   sessions?: ResourceSession[];
   runtime?: RuntimeSummary;
@@ -102,6 +116,21 @@ type MonitoringPageProps = {
   poll?: boolean;
 };
 
+type ResourceDetail = {
+  title: string;
+  value: string;
+  detail: string;
+  chart?: {
+    values?: number[];
+    timestamps?: number[];
+    unit: 'pct' | 'bytes';
+    startLabel: string;
+    endLabel: string;
+    emptyLabel: string;
+  };
+  emptyText?: string;
+};
+
 function formatBytes(value: unknown): string {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return '-';
@@ -183,6 +212,11 @@ function historyStartLabel(timestamps: number[] | undefined, nowMs: number | und
   return tr('monitoring.chartDaysAgo', { value: Math.round(hours / 24) });
 }
 
+function lastFiniteValue(values: number[] | undefined): number | undefined {
+  const data = (values ?? []).filter(Number.isFinite);
+  return data.length ? data[data.length - 1] : undefined;
+}
+
 function Sparkline({
   values,
   timestamps,
@@ -190,6 +224,7 @@ function Sparkline({
   startLabel,
   endLabel,
   emptyLabel,
+  className,
 }: {
   values?: number[];
   timestamps?: number[];
@@ -197,6 +232,7 @@ function Sparkline({
   startLabel: string;
   endLabel: string;
   emptyLabel: string;
+  className?: string;
 }) {
   const data = (values ?? []).filter(Number.isFinite);
   const min = data.length ? Math.min(...data) : 0;
@@ -209,19 +245,32 @@ function Sparkline({
       return `${x},${y}`;
     }).join(' ')
     : '';
+  const areaPoints = points ? `0,100 ${points} 100,100` : '';
+  const pointParts = points ? points.split(' ') : [];
+  const lastPoint = pointParts.length ? pointParts[pointParts.length - 1].split(',').map(Number) : null;
   return (
-    <div className="resource-chart">
+    <div className={['resource-chart', className].filter(Boolean).join(' ')}>
       <div className="resource-chart-y" aria-hidden="true">
         <span>{data.length ? formatAxisValue(max, unit) : '-'}</span>
         <span>{data.length ? formatAxisValue(min, unit) : '-'}</span>
       </div>
       <div className="resource-chart-plot">
-        <svg className="resource-spark" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label={data.length > 1 ? undefined : emptyLabel}>
-          <line x1="0" y1="12" x2="100" y2="12" className="resource-grid-line" />
-          <line x1="0" y1="50" x2="100" y2="50" className="resource-grid-line" />
-          <line x1="0" y1="88" x2="100" y2="88" className="resource-grid-line" />
-          {points ? <polyline points={points} /> : null}
-        </svg>
+        <div className="resource-spark-wrap">
+          <svg className="resource-spark" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label={data.length > 1 ? undefined : emptyLabel}>
+            <line x1="0" y1="12" x2="100" y2="12" className="resource-grid-line" />
+            <line x1="0" y1="50" x2="100" y2="50" className="resource-grid-line" />
+            <line x1="0" y1="88" x2="100" y2="88" className="resource-grid-line" />
+            {areaPoints ? <polygon className="resource-spark-area" points={areaPoints} /> : null}
+            {points ? <polyline points={points} /> : null}
+          </svg>
+          {lastPoint && Number.isFinite(lastPoint[0]) && Number.isFinite(lastPoint[1]) ? (
+            <span
+              className="resource-spark-dot"
+              aria-hidden="true"
+              style={{ left: `${lastPoint[0]}%`, top: `${lastPoint[1]}%` }}
+            />
+          ) : null}
+        </div>
         <div className="resource-chart-x" aria-hidden="true">
           <span>{data.length > 1 ? startLabel : emptyLabel}</span>
           <span>{data.length > 1 ? endLabel : ''}</span>
@@ -231,40 +280,195 @@ function Sparkline({
   );
 }
 
+function ExpandableMetricCard(props: { label: string; onOpen(): void; children: ReactNode }) {
+  const shouldIgnore = (target: EventTarget | null): boolean => target instanceof Element && !!target.closest('.ui-info-tip');
+  return (
+    <section
+      className="metric-card"
+      data-resource-expandable=""
+      role="button"
+      tabIndex={0}
+      aria-label={props.label}
+      onClick={event => {
+        if (!shouldIgnore(event.target)) props.onOpen();
+      }}
+      onKeyDown={event => {
+        if (shouldIgnore(event.target) || (event.key !== 'Enter' && event.key !== ' ')) return;
+        event.preventDefault();
+        props.onOpen();
+      }}
+    >
+      {props.children}
+    </section>
+  );
+}
+
+function ExpandableTrendCell(props: { label: string; onOpen(): void; children: ReactNode }) {
+  return (
+    <article
+      className="resource-trend-cell"
+      data-resource-expandable=""
+      role="button"
+      tabIndex={0}
+      aria-label={props.label}
+      onClick={props.onOpen}
+      onKeyDown={event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        props.onOpen();
+      }}
+    >
+      {props.children}
+    </article>
+  );
+}
+
+function ResourceDetailModal(props: { detail: ResourceDetail | null; onClose(): void }) {
+  const tr = useT();
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (props.detail) {
+      if (!dialog.open) {
+        try { dialog.showModal(); } catch { /* dialog already opening */ }
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [props.detail]);
+
+  useEffect(() => () => {
+    const dialog = dialogRef.current;
+    if (dialog?.open) dialog.close();
+  }, []);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="resource-detail-modal"
+      onCancel={event => {
+        event.preventDefault();
+        props.onClose();
+      }}
+      onClose={props.onClose}
+      onClick={event => {
+        if (event.target === event.currentTarget) props.onClose();
+      }}
+    >
+      {props.detail ? (
+        <article className="resource-detail-modal-card">
+          <header className="resource-detail-modal-head">
+            <h3>{props.detail.title}</h3>
+            <button
+              type="button"
+              className="resource-detail-modal-close"
+              aria-label={tr('monitoring.modalClose')}
+              title={tr('monitoring.modalClose')}
+              onClick={props.onClose}
+            />
+          </header>
+          <div className="resource-detail-modal-body">
+            <section className="resource-detail-summary">
+              <strong>{props.detail.value}</strong>
+              <p>{props.detail.detail}</p>
+            </section>
+            {props.detail.chart ? (
+              <Sparkline
+                className="resource-detail-chart"
+                values={props.detail.chart.values}
+                timestamps={props.detail.chart.timestamps}
+                unit={props.detail.chart.unit}
+                startLabel={props.detail.chart.startLabel}
+                endLabel={props.detail.chart.endLabel}
+                emptyLabel={props.detail.chart.emptyLabel}
+              />
+            ) : <p className="resource-detail-empty">{props.detail.emptyText}</p>}
+          </div>
+        </article>
+      ) : null}
+    </dialog>
+  );
+}
+
 function RankReasons({ reasons }: { reasons?: string[] }) {
   return <span className="resource-reasons">{(reasons ?? []).join(', ') || '-'}</span>;
+}
+
+function ResourcePill({ label, value, tone }: { label: string; value: string; tone?: 'ok' | 'warn' | 'accent' | 'off' }) {
+  return (
+    <span className={`resource-pill${tone ? ` ${tone}` : ''}`}>
+      <span>{label}</span>
+      <b>{value}</b>
+    </span>
+  );
+}
+
+function BotRuntimeList({ bots, cpuReady = true }: { bots: ResourceBot[]; cpuReady?: boolean }) {
+  const tr = useT();
+  return (
+    <div className="resource-list-shell">
+      <OverviewList className="resource-runtime-list">
+        {bots.length ? bots.map(bot => {
+          const botRuntime = bot.runtime?.sessions;
+          const daemonStatus = bot.runtime?.daemonStatus ?? bot.daemonStatus ?? 'unknown';
+          const statusTone = daemonStatus === 'online' ? 'ok' : daemonStatus === 'offline' ? 'off' : 'warn';
+          return (
+            <OverviewListItem className="resource-list-item resource-bot-item" key={bot.larkAppId}>
+              <OverviewListMain>
+                <strong title={bot.botName}>{bot.botName}</strong>
+                <span>
+                  {tr('monitoring.sessionsCount')} {formatCount(botRuntime?.total ?? bot.sessions?.count)}
+                </span>
+              </OverviewListMain>
+              <OverviewListTail>
+                <div className="resource-pill-group">
+                  <ResourcePill label={tr('monitoring.daemon')} value={daemonStatus} tone={statusTone} />
+                  <ResourcePill label={tr('monitoring.working')} value={formatCount(botRuntime?.working)} tone="accent" />
+                  <ResourcePill label={tr('monitoring.starting')} value={formatCount(botRuntime?.starting)} />
+                  <ResourcePill label={tr('monitoring.cpu')} value={formatCpuPct(bot.total?.cpuPct, cpuReady)} />
+                  <ResourcePill label={tr('monitoring.rss')} value={formatBytes(bot.total?.rssBytes)} />
+                </div>
+              </OverviewListTail>
+            </OverviewListItem>
+          );
+        }) : <li className="empty">{tr('overview.noSessions')}</li>}
+      </OverviewList>
+    </div>
+  );
 }
 
 export function SessionResourceTable({ sessions, cpuReady = true }: { sessions: ResourceSession[]; cpuReady?: boolean }) {
   const tr = useT();
   return (
-    <div className="resource-table resource-session-table">
-      <div className="resource-row resource-row-head">
-        <span>{tr('monitoring.session')}</span><span>{tr('monitoring.bot')}</span><span>{tr('monitoring.cpu')}</span><span>{tr('monitoring.rss')}</span><span>{tr('monitoring.growth')}</span><span>{tr('monitoring.confidence')}</span><span>{tr('monitoring.rank')}</span>
-      </div>
-      <div className="resource-session-scroll" data-visible-rows={10}>
+    <div className="resource-list-shell resource-session-shell">
+      <OverviewList className="resource-runtime-list resource-session-list">
         {sessions.length ? sessions.map(session => (
-          <div className={`resource-row${session.tracked ? ' is-tracked' : ''}`} key={session.sessionId}>
-            <b>{session.title || session.sessionId}</b>
-            <span>{session.botName}</span>
-            <span>{formatCpuPct(session.current?.cpu1mPct ?? session.current?.cpuPct, cpuReady)}</span>
-            <span>{formatBytes(session.current?.rssBytes)}</span>
-            <span>{formatBytes(session.current?.rssGrowth5mBytes)}</span>
-            <span>{session.confidence ?? 'unknown'}</span>
-            <RankReasons reasons={session.rankReasons} />
-          </div>
-        )) : <div className="empty">{tr('overview.noSessions')}</div>}
-      </div>
+          <OverviewListItem
+            className={`resource-list-item resource-session-item${session.tracked ? ' is-tracked' : ''}`}
+            key={session.sessionId}
+          >
+            <OverviewListMain>
+              <strong title={session.title || session.sessionId}>{session.title || session.sessionId}</strong>
+              <span title={session.sessionId}>{session.botName} · {session.sessionId}</span>
+            </OverviewListMain>
+            <OverviewListTail>
+              <div className="resource-pill-group">
+                <ResourcePill label={tr('monitoring.cpu')} value={formatCpuPct(session.current?.cpu1mPct ?? session.current?.cpuPct, cpuReady)} tone="accent" />
+                <ResourcePill label={tr('monitoring.rss')} value={formatBytes(session.current?.rssBytes)} />
+                <ResourcePill label={tr('monitoring.growth')} value={formatBytes(session.current?.rssGrowth5mBytes)} />
+                <ResourcePill label={tr('monitoring.confidence')} value={session.confidence ?? 'unknown'} tone={session.tracked ? 'ok' : undefined} />
+                <span className="resource-pill resource-rank-pill">
+                  <span>{tr('monitoring.rank')}</span>
+                  <RankReasons reasons={session.rankReasons} />
+                </span>
+              </div>
+            </OverviewListTail>
+          </OverviewListItem>
+        )) : <li className="empty">{tr('overview.noSessions')}</li>}
+      </OverviewList>
     </div>
-  );
-}
-
-function HelpTip({ label, text }: { label: string; text: string }) {
-  return (
-    <span className="resource-help-tip">
-      <button type="button" className="help-icon-button resource-help-button" aria-label={label}>?</button>
-      <span className="resource-help-popover" role="tooltip">{text}</span>
-    </span>
   );
 }
 
@@ -285,35 +489,32 @@ function RuntimeHealth({ current }: { current: ResourceCurrent }) {
   const starting = runtime?.sessions?.starting;
 
   return (
-    <section className="panel runtime-health-panel">
-      <header className="panel-header">
-        <div>
-          <h2>{tr('monitoring.runtimeHealth')}</h2>
-          <p>{tr('monitoring.runtimeHealthHint')}</p>
+    <section className="overview-block resource-block">
+      <SectionHeader title={tr('monitoring.runtimeHealth')} />
+      <section className="panel runtime-health-panel">
+        <div className="runtime-health-grid">
+          <section className="metric-card runtime-health-card">
+            <span>{tr('monitoring.sampleHealth')}</span>
+            <strong><span className={`runtime-status-pill ${sampleStatus}`}>{tr(`monitoring.sample.${sampleStatus}`)}</span></strong>
+            <small>{tr('monitoring.sampleAge')} {formatDuration(runtime?.sampleHealth?.ageMs)}</small>
+          </section>
+          <section className="metric-card runtime-health-card">
+            <span>{tr('monitoring.daemonHealth')}</span>
+            <strong>{formatCount(daemonOnline)}/{formatCount(daemonTotal)}</strong>
+            <small>{formatCount(daemonOffline)} {tr('monitoring.offline')}</small>
+          </section>
+          <section className="metric-card runtime-health-card">
+            <span>{tr('monitoring.sessionHealth')}</span>
+            <strong>{formatCount(sessionTotal)}</strong>
+            <small>{tr('monitoring.working')} {formatCount(working)} · {tr('monitoring.starting')} {formatCount(starting)}</small>
+          </section>
+          <section className="metric-card runtime-health-card">
+            <span>{tr('monitoring.resourcePressure')}</span>
+            <strong>{formatCpuPct(current.host?.cpuPct, cpuReady)}</strong>
+            <small>{tr('monitoring.hostMemory')} {formatPct(current.host?.memUsedPct)} · RSS {formatBytes(current.botmux?.rssBytes)}</small>
+          </section>
         </div>
-      </header>
-      <div className="runtime-health-grid">
-        <section className="metric-card runtime-health-card">
-          <span>{tr('monitoring.sampleHealth')}</span>
-          <strong><span className={`runtime-status-pill ${sampleStatus}`}>{tr(`monitoring.sample.${sampleStatus}`)}</span></strong>
-          <small>{tr('monitoring.sampleAge')} {formatDuration(runtime?.sampleHealth?.ageMs)}</small>
-        </section>
-        <section className="metric-card runtime-health-card">
-          <span>{tr('monitoring.daemonHealth')}</span>
-          <strong>{formatCount(daemonOnline)}/{formatCount(daemonTotal)}</strong>
-          <small>{formatCount(daemonOffline)} {tr('monitoring.offline')}</small>
-        </section>
-        <section className="metric-card runtime-health-card">
-          <span>{tr('monitoring.sessionHealth')}</span>
-          <strong>{formatCount(sessionTotal)}</strong>
-          <small>{tr('monitoring.working')} {formatCount(working)} · {tr('monitoring.starting')} {formatCount(starting)}</small>
-        </section>
-        <section className="metric-card runtime-health-card">
-          <span>{tr('monitoring.resourcePressure')}</span>
-          <strong>{formatCpuPct(current.host?.cpuPct, cpuReady)}</strong>
-          <small>{tr('monitoring.hostMemory')} {formatPct(current.host?.memUsedPct)} · RSS {formatBytes(current.botmux?.rssBytes)}</small>
-        </section>
-      </div>
+      </section>
     </section>
   );
 }
@@ -325,37 +526,34 @@ function RuntimeSessionPressure({ runtime }: { runtime?: RuntimeSummary }) {
   const waiting = sessions?.longestWaiting;
 
   return (
-    <section className="panel runtime-session-pressure">
-      <header className="panel-header">
-        <div>
-          <h2>{tr('monitoring.sessionPressure')}</h2>
-          <p>{tr('monitoring.sessionPressureHint')}</p>
+    <section className="overview-block resource-block">
+      <SectionHeader title={tr('monitoring.sessionPressure')} />
+      <section className="panel runtime-session-pressure">
+        <div className="runtime-session-grid">
+          <section className="metric-card runtime-session-card">
+            <span>{tr('monitoring.statusDistribution')}</span>
+            <strong>{formatCount(sessions?.total)}</strong>
+            <small>
+              {tr('monitoring.working')} {formatCount(sessions?.working)} · {tr('monitoring.starting')} {formatCount(sessions?.starting)} · {tr('monitoring.waiting')} {formatCount(sessions?.waiting)} · {tr('monitoring.idle')} {formatCount(sessions?.idle)} · {tr('monitoring.unknown')} {formatCount(sessions?.unknown)}
+            </small>
+          </section>
+          <section className="metric-card runtime-session-card">
+            <span>{tr('monitoring.longestRunning')}</span>
+            <strong>{runtimeSessionLabel(running)}</strong>
+            <small>{formatDuration(running?.durationMs)}</small>
+          </section>
+          <section className="metric-card runtime-session-card">
+            <span>{tr('monitoring.longestWaiting')}</span>
+            <strong>{runtimeSessionLabel(waiting)}</strong>
+            <small>{formatDuration(waiting?.durationMs)}</small>
+          </section>
+          <section className="metric-card runtime-session-card">
+            <span>{tr('monitoring.unattributedSessions')}</span>
+            <strong>{formatCount(sessions?.unattributed)}</strong>
+            <small>{tr('monitoring.unattributedHint')}</small>
+          </section>
         </div>
-      </header>
-      <div className="runtime-session-grid">
-        <section className="metric-card runtime-session-card">
-          <span>{tr('monitoring.statusDistribution')}</span>
-          <strong>{formatCount(sessions?.total)}</strong>
-          <small>
-            {tr('monitoring.working')} {formatCount(sessions?.working)} · {tr('monitoring.starting')} {formatCount(sessions?.starting)} · {tr('monitoring.waiting')} {formatCount(sessions?.waiting)} · {tr('monitoring.idle')} {formatCount(sessions?.idle)} · {tr('monitoring.unknown')} {formatCount(sessions?.unknown)}
-          </small>
-        </section>
-        <section className="metric-card runtime-session-card">
-          <span>{tr('monitoring.longestRunning')}</span>
-          <strong>{runtimeSessionLabel(running)}</strong>
-          <small>{formatDuration(running?.durationMs)}</small>
-        </section>
-        <section className="metric-card runtime-session-card">
-          <span>{tr('monitoring.longestWaiting')}</span>
-          <strong>{runtimeSessionLabel(waiting)}</strong>
-          <small>{formatDuration(waiting?.durationMs)}</small>
-        </section>
-        <section className="metric-card runtime-session-card">
-          <span>{tr('monitoring.unattributedSessions')}</span>
-          <strong>{formatCount(sessions?.unattributed)}</strong>
-          <small>{tr('monitoring.unattributedHint')}</small>
-        </section>
-      </div>
+      </section>
     </section>
   );
 }
@@ -365,6 +563,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
   const [current, setCurrent] = useState<ResourceCurrent | null>(initialCurrent);
   const [history, setHistory] = useState<ResourceHistory | null>(initialHistory);
   const [sort, setSort] = useState<SortKey>('cpu');
+  const [resourceDetail, setResourceDetail] = useState<ResourceDetail | null>(null);
 
   useEffect(() => {
     if (!poll) return;
@@ -395,8 +594,8 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
     };
   }, [poll]);
 
+  const ready = current !== null && history !== null;
   const sessions = useMemo(() => sortedSessions(current?.sessions ?? [], sort), [current?.sessions, sort]);
-  const hottest = sessions[0];
   const supported = current?.supported !== false;
   const cpuReady = currentCpuReady(current);
   const chartLabels = {
@@ -412,10 +611,13 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
         <div>
           <p className="eyebrow">{tr('monitoring.eyebrow')}</p>
           <h1>{tr('monitoring.runtimeTitle')}</h1>
-          <p>{tr('monitoring.runtimeSubtitle')}</p>
         </div>
       </div>
 
+      {!ready ? <LoadingState label={tr('common.loading')} /> : null}
+
+      {ready ? (
+        <>
       {current ? <RuntimeHealth current={current} /> : null}
 
       {!supported ? (
@@ -435,53 +637,184 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
         </section>
       ) : (
         <>
-          <section className="panel resource-pressure">
-            <header className="panel-header">
-              <div>
-                <h2>{tr('monitoring.resourcePressure')}</h2>
-                <p>{tr('monitoring.resourcePressureHint')}</p>
+          <section className="overview-block resource-block resource-pressure-block">
+            <SectionHeader title={tr('monitoring.resourcePressure')} />
+            <section className="panel resource-pressure">
+              <div className="resource-metrics runtime-pressure-grid">
+                <ExpandableMetricCard
+                  label={tr('monitoring.hostCpu')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.hostCpu'),
+                    value: formatCpuPct(current?.host?.cpuPct, cpuReady),
+                    detail: `load ${Number(current?.host?.load1 ?? 0).toFixed(2)}`,
+                    chart: {
+                      values: history?.host?.cpuPct,
+                      timestamps: history?.host?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.hostStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <span>{tr('monitoring.hostCpu')}</span>
+                  <strong>{formatCpuPct(current?.host?.cpuPct, cpuReady)}</strong>
+                  <small>load {Number(current?.host?.load1 ?? 0).toFixed(2)}</small>
+                </ExpandableMetricCard>
+                <ExpandableMetricCard
+                  label={tr('monitoring.hostMemory')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.hostMemory'),
+                    value: formatPct(current?.host?.memUsedPct),
+                    detail: tr('monitoring.memoryOnly'),
+                    chart: {
+                      values: history?.host?.memUsedPct,
+                      timestamps: history?.host?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.hostStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <span>{tr('monitoring.hostMemory')}</span>
+                  <strong>{formatPct(current?.host?.memUsedPct)}</strong>
+                  <small>{tr('monitoring.memoryOnly')}</small>
+                </ExpandableMetricCard>
+                <ExpandableMetricCard
+                  label={tr('monitoring.botmuxRss')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.botmuxRss'),
+                    value: formatBytes(current?.botmux?.rssBytes),
+                    detail: current?.botmuxBreakdown
+                      ? `${tr('monitoring.botmuxSelf')} ${formatBytes((current.botmuxBreakdown.daemon.rssBytes ?? 0) + (current.botmuxBreakdown.worker.rssBytes ?? 0))}\n${tr('monitoring.botmuxCli')} ${formatBytes(current.botmuxBreakdown.cli.rssBytes)}`
+                      : formatCpuPct(current?.botmux?.cpuPct, cpuReady),
+                    chart: {
+                      values: history?.botmux?.rssBytes,
+                      timestamps: history?.botmux?.timestamps,
+                      unit: 'bytes',
+                      startLabel: chartLabels.botmuxStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <div className="metric-label-with-help">
+                    <span>{tr('monitoring.botmuxRss')}</span>
+                    <InfoTip label={tr('monitoring.rssHelpLabel')}>{tr('monitoring.rssHelp')}</InfoTip>
+                  </div>
+                  <strong>{formatBytes(current?.botmux?.rssBytes)}</strong>
+                  {current?.botmuxBreakdown && (
+                    <>
+                      <small className="metric-breakdown">
+                        {tr('monitoring.botmuxSelf')} {formatBytes((current.botmuxBreakdown.daemon.rssBytes ?? 0) + (current.botmuxBreakdown.worker.rssBytes ?? 0))}
+                        <span className="metric-breakdown-detail"> ({tr('monitoring.botmuxDaemon')} {formatBytes(current.botmuxBreakdown.daemon.rssBytes)} · {tr('monitoring.botmuxWorker')} {formatBytes(current.botmuxBreakdown.worker.rssBytes)})</span>
+                      </small>
+                      <small className="metric-breakdown">
+                        {tr('monitoring.botmuxCli')} {formatBytes(current.botmuxBreakdown.cli.rssBytes)}
+                      </small>
+                    </>
+                  )}
+                </ExpandableMetricCard>
+                <ExpandableMetricCard
+                  label={tr('monitoring.trackedSessions')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.trackedSessions'),
+                    value: formatCount(current?.rankings?.tracked?.length),
+                    detail: `${tr('monitoring.currentSessions')} ${(current?.sessions ?? []).length}`,
+                    emptyText: tr('monitoring.trackedSessionHint'),
+                  })}
+                >
+                  <span>{tr('monitoring.trackedSessions')}</span>
+                  <strong>{current?.rankings?.tracked?.length ?? 0}</strong>
+                  <small>{tr('monitoring.currentSessions')} {(current?.sessions ?? []).length}</small>
+                </ExpandableMetricCard>
               </div>
-            </header>
-            <div className="resource-metrics runtime-pressure-grid">
-              <section className="metric-card"><span>{tr('monitoring.hostCpu')}</span><strong>{formatCpuPct(current?.host?.cpuPct, cpuReady)}</strong><small>load {Number(current?.host?.load1 ?? 0).toFixed(2)}</small></section>
-              <section className="metric-card"><span>{tr('monitoring.hostMemory')}</span><strong>{formatPct(current?.host?.memUsedPct)}</strong><small>{tr('monitoring.memoryOnly')}</small></section>
-              <section className="metric-card">
-                <div className="metric-label-with-help">
-                  <span>{tr('monitoring.botmuxRss')}</span>
-                  <HelpTip label={tr('monitoring.rssHelpLabel')} text={tr('monitoring.rssHelp')} />
-                </div>
-                <strong>{formatBytes(current?.botmux?.rssBytes)}</strong>
-                <small>{formatCpuPct(current?.botmux?.cpuPct, cpuReady)}</small>
-              </section>
-              <section className="metric-card"><span>{tr('monitoring.trackedSessions')}</span><strong>{current?.rankings?.tracked?.length ?? 0}</strong><small>{tr('monitoring.currentSessions')} {(current?.sessions ?? []).length}</small></section>
-            </div>
+            </section>
           </section>
 
-          <section className="panel resource-trends">
-            <header className="panel-header">
-              <div>
-                <h2>{tr('monitoring.trends')}</h2>
-                <p>{tr('monitoring.trendsHint')}</p>
+          <section className="overview-block resource-block">
+            <SectionHeader title={tr('monitoring.trends')} />
+            <section className="panel resource-trends">
+              <div className="resource-trend-grid">
+                <ExpandableTrendCell
+                  label={tr('monitoring.trendHostCpu')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.trendHostCpu'),
+                    value: formatPct(lastFiniteValue(history?.host?.cpuPct)),
+                    detail: `load ${Number(current?.host?.load1 ?? 0).toFixed(2)}`,
+                    chart: {
+                      values: history?.host?.cpuPct,
+                      timestamps: history?.host?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.hostStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <b>{tr('monitoring.trendHostCpu')}</b>
+                  <Sparkline values={history?.host?.cpuPct} timestamps={history?.host?.timestamps} unit="pct" startLabel={chartLabels.hostStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
+                </ExpandableTrendCell>
+                <ExpandableTrendCell
+                  label={tr('monitoring.trendHostMemory')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.trendHostMemory'),
+                    value: formatPct(lastFiniteValue(history?.host?.memUsedPct)),
+                    detail: tr('monitoring.memoryOnly'),
+                    chart: {
+                      values: history?.host?.memUsedPct,
+                      timestamps: history?.host?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.hostStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <b>{tr('monitoring.trendHostMemory')}</b>
+                  <Sparkline values={history?.host?.memUsedPct} timestamps={history?.host?.timestamps} unit="pct" startLabel={chartLabels.hostStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
+                </ExpandableTrendCell>
+                <ExpandableTrendCell
+                  label={tr('monitoring.trendBotmuxCpu')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.trendBotmuxCpu'),
+                    value: formatPct(lastFiniteValue(history?.botmux?.cpuPct)),
+                    detail: tr('monitoring.botRuntime'),
+                    chart: {
+                      values: history?.botmux?.cpuPct,
+                      timestamps: history?.botmux?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.botmuxStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <b>{tr('monitoring.trendBotmuxCpu')}</b>
+                  <Sparkline values={history?.botmux?.cpuPct} timestamps={history?.botmux?.timestamps} unit="pct" startLabel={chartLabels.botmuxStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
+                </ExpandableTrendCell>
+                <ExpandableTrendCell
+                  label={tr('monitoring.botmuxRss')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.botmuxRss'),
+                    value: formatBytes(lastFiniteValue(history?.botmux?.rssBytes)),
+                    detail: tr('monitoring.memoryOnly'),
+                    chart: {
+                      values: history?.botmux?.rssBytes,
+                      timestamps: history?.botmux?.timestamps,
+                      unit: 'bytes',
+                      startLabel: chartLabels.botmuxStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <b>{tr('monitoring.botmuxRss')}</b>
+                  <Sparkline values={history?.botmux?.rssBytes} timestamps={history?.botmux?.timestamps} unit="bytes" startLabel={chartLabels.botmuxStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
+                </ExpandableTrendCell>
               </div>
-            </header>
-            <div className="resource-trend-grid">
-              <article className="resource-trend-cell">
-                <b>{tr('monitoring.trendHostCpu')}</b>
-                <Sparkline values={history?.host?.cpuPct} timestamps={history?.host?.timestamps} unit="pct" startLabel={chartLabels.hostStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
-              </article>
-              <article className="resource-trend-cell">
-                <b>{tr('monitoring.trendHostMemory')}</b>
-                <Sparkline values={history?.host?.memUsedPct} timestamps={history?.host?.timestamps} unit="pct" startLabel={chartLabels.hostStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
-              </article>
-              <article className="resource-trend-cell">
-                <b>{tr('monitoring.trendBotmuxCpu')}</b>
-                <Sparkline values={history?.botmux?.cpuPct} timestamps={history?.botmux?.timestamps} unit="pct" startLabel={chartLabels.botmuxStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
-              </article>
-              <article className="resource-trend-cell">
-                <b>{tr('monitoring.botmuxRss')}</b>
-                <Sparkline values={history?.botmux?.rssBytes} timestamps={history?.botmux?.timestamps} unit="bytes" startLabel={chartLabels.botmuxStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
-              </article>
-            </div>
+            </section>
           </section>
         </>
       )}
@@ -490,78 +823,82 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
 
       {supported ? (
         <>
-          <section className="panel">
-            <header className="panel-header">
-              <div>
-                <h2>{tr('monitoring.botRuntime')}</h2>
-                <p>{tr('monitoring.botRuntimeHint')}</p>
-              </div>
-            </header>
-            <div className="resource-table resource-bot-table">
-              <div className="resource-row resource-row-head">
-                <span>{tr('monitoring.bot')}</span><span>{tr('monitoring.daemon')}</span><span>{tr('monitoring.sessionsCount')}</span><span>{tr('monitoring.working')}</span><span>{tr('monitoring.starting')}</span><span>{tr('monitoring.cpu')}</span><span>{tr('monitoring.rss')}</span>
-              </div>
-              {(current?.bots ?? []).map(bot => {
-                const botRuntime = bot.runtime?.sessions;
-                return (
-                  <div className="resource-row" key={bot.larkAppId}>
-                    <b>{bot.botName}</b>
-                    <span>{bot.runtime?.daemonStatus ?? bot.daemonStatus ?? 'unknown'}</span>
-                    <span>{formatCount(botRuntime?.total ?? bot.sessions?.count)}</span>
-                    <span>{formatCount(botRuntime?.working)}</span>
-                    <span>{formatCount(botRuntime?.starting)}</span>
-                    <span>{formatCpuPct(bot.total?.cpuPct, cpuReady)}</span>
-                    <span>{formatBytes(bot.total?.rssBytes)}</span>
-                  </div>
-                );
-              })}
-            </div>
+          <section className="overview-block resource-block">
+            <SectionHeader title={tr('monitoring.botRuntime')} />
+            <section className="panel">
+              <BotRuntimeList bots={current?.bots ?? []} cpuReady={cpuReady} />
+            </section>
           </section>
 
-          <section className="panel">
-            <header className="panel-header">
-              <div>
-                <h2>{tr('monitoring.sessions')}</h2>
-                <p>{tr('monitoring.sessionsHint')}</p>
+          <section className="overview-block resource-block">
+            <SectionHeader title={tr('monitoring.sessions')}>
+              <div className="resource-sortbar resource-sortbar-inline dashboard-toolbar" role="group" aria-label={tr('monitoring.sort')}>
+                <div className="segmented resource-sort-switch">
+                  {(['cpu', 'rss', 'growth', 'bot', 'status'] as const).map(key => (
+                    <button
+                      type="button"
+                      className={sort === key ? 'active' : undefined}
+                      aria-pressed={sort === key}
+                      key={key}
+                      onClick={() => setSort(key)}
+                    >
+                      {tr(`monitoring.sort.${key}`)}
+                    </button>
+                  ))}
+                </div>
               </div>
-              {hottest ? <span className="resource-hot">{tr('monitoring.hottest')}: {hottest.botName} · {hottest.title || hottest.sessionId}</span> : null}
-            </header>
-            <div className="resource-sortbar" role="group" aria-label={tr('monitoring.sort')}>
-              {(['cpu', 'rss', 'growth', 'bot', 'status'] as const).map(key => (
-                <button type="button" className={sort === key ? 'on' : ''} key={key} onClick={() => setSort(key)}>
-                  {tr(`monitoring.sort.${key}`)}
-                </button>
-              ))}
-            </div>
-            <SessionResourceTable sessions={sessions} cpuReady={cpuReady} />
+            </SectionHeader>
+            <section className="panel">
+              <SessionResourceTable sessions={sessions} cpuReady={cpuReady} />
+            </section>
           </section>
 
-          <section className="panel">
-            <header className="panel-header">
-              <div>
-                <h2>{tr('monitoring.trackedSessionTrends')}</h2>
-                <p>{tr('monitoring.trackedSessionHint')}</p>
+          <section className="overview-block resource-block">
+            <SectionHeader title={tr('monitoring.trackedSessionTrends')} />
+            <section className="panel">
+              <div className="resource-trend-grid">
+                {(history?.sessions ?? []).map(session => {
+                  const title = `${session.botName} · ${session.title || session.sessionId}`;
+                  const startLabel = historyStartLabel(session.series?.timestamps, current?.sampledAt, tr);
+                  return (
+                    <ExpandableTrendCell
+                      key={session.sessionId}
+                      label={title}
+                      onOpen={() => setResourceDetail({
+                        title,
+                        value: formatBytes(lastFiniteValue(session.series?.rssBytes)),
+                        detail: session.sessionId,
+                        chart: {
+                          values: session.series?.rssBytes,
+                          timestamps: session.series?.timestamps,
+                          unit: 'bytes',
+                          startLabel,
+                          endLabel: chartLabels.endLabel,
+                          emptyLabel: chartLabels.emptyLabel,
+                        },
+                      })}
+                    >
+                      <b title={title}>{title}</b>
+                      <Sparkline
+                        values={session.series?.rssBytes}
+                        timestamps={session.series?.timestamps}
+                        unit="bytes"
+                        startLabel={startLabel}
+                        endLabel={chartLabels.endLabel}
+                        emptyLabel={chartLabels.emptyLabel}
+                      />
+                    </ExpandableTrendCell>
+                  );
+                })}
+                {!(history?.sessions ?? []).length ? <div className="empty">{tr('monitoring.noTrackedHistory')}</div> : null}
               </div>
-            </header>
-            <div className="resource-trend-grid">
-              {(history?.sessions ?? []).map(session => (
-                <article className="resource-trend-cell" key={session.sessionId}>
-                  <b>{session.botName} · {session.title || session.sessionId}</b>
-                  <Sparkline
-                    values={session.series?.rssBytes}
-                    timestamps={session.series?.timestamps}
-                    unit="bytes"
-                    startLabel={historyStartLabel(session.series?.timestamps, current?.sampledAt, tr)}
-                    endLabel={chartLabels.endLabel}
-                    emptyLabel={chartLabels.emptyLabel}
-                  />
-                </article>
-              ))}
-              {!(history?.sessions ?? []).length ? <div className="empty">{tr('monitoring.noTrackedHistory')}</div> : null}
-            </div>
+            </section>
           </section>
         </>
       ) : null}
+        </>
+      ) : null}
+      <ResourceDetailModal detail={resourceDetail} onClose={() => setResourceDetail(null)} />
     </section>
   );
 }

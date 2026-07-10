@@ -39,6 +39,19 @@ describe('attributeResources', () => {
     expect(result.bots.find(b => b.larkAppId === 'app-a')?.sessions.rssBytes).toBe(500);
     expect(result.bots.find(b => b.larkAppId === 'app-a')?.daemon.rssBytes).toBe(100);
     expect(result.bots.find(b => b.larkAppId === 'app-b')?.total.rssBytes).toBe(1100);
+
+    // botmux total = daemon(10,40) + worker(20) + cli(21,50), and the breakdown
+    // splits it: the per-session worker Node process (pid 20) is `worker`, while
+    // its CLI child (pid 21) and the adopted CLI (pid 50) are `cli` — proving
+    // botmux's own footprint is separable from the external CLIs. Sum == total.
+    expect(result.botmux).toEqual({ rssBytes: 1700, cpuPct: 17 });
+    expect(result.botmuxBreakdown).toEqual({
+      daemon: { rssBytes: 600, cpuPct: 6 },
+      worker: { rssBytes: 200, cpuPct: 2 },
+      cli: { rssBytes: 900, cpuPct: 9 },
+    });
+    const parts = result.botmuxBreakdown;
+    expect(parts.daemon.rssBytes + parts.worker.rssBytes + parts.cli.rssBytes).toBe(result.botmux.rssBytes);
   });
 
   it('does not force ambiguous marker processes into a session', () => {
@@ -116,6 +129,11 @@ describe('attributeResources', () => {
     });
 
     expect(result.botmux).toEqual({ rssBytes: 400, cpuPct: 4 });
+    expect(result.botmuxBreakdown).toEqual({
+      daemon: { rssBytes: 400, cpuPct: 4 },
+      worker: { rssBytes: 0, cpuPct: 0 },
+      cli: { rssBytes: 0, cpuPct: 0 },
+    });
     expect(result.bots).toEqual([]);
   });
 
