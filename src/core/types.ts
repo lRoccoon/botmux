@@ -149,6 +149,12 @@ export interface DaemonSession {
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */
   lastBridgeEmittedUuid?: string;
+  /** Native Hermes messages.session_id values bound by this worker after
+   *  seeing botmux-injected `<session_id>...` markers in Hermes state.db.
+   *  Hermes `/clear` can rebind to a new native session while a completed
+   *  turn from the previous source is still queued for emission, so the
+   *  daemon keeps every source announced by the current worker. */
+  hermesBridgeSourceSessionIds?: Set<string>;
   /** Flag flipped once this process lifecycle has already been reflected on the
    *  dashboard. A real close publishes `session.exited`; a deliberate suspend
    *  publishes `status=dormant`. The later child-process exit must not emit a

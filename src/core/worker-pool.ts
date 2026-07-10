@@ -1887,6 +1887,12 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
 function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  // Source authorization belongs to one worker lifetime. A replacement worker
+  // must announce its own Hermes sources before any stamped final_output is
+  // trusted; `/clear` rebinds within the same lifetime accumulate afterwards.
+  if (ds.session.cliId === 'hermes' && ds.worker !== worker) {
+    ds.hermesBridgeSourceSessionIds = undefined;
+  }
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
@@ -2491,6 +2497,23 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         break;
       }
 
+      case 'bridge_source_session': {
+        if (msg.bridge !== 'hermes') break;
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored Hermes source binding from stale worker: ${msg.sourceSessionId}`);
+          break;
+        }
+        const sourceSessionIds = ds.hermesBridgeSourceSessionIds ??= new Set<string>();
+        if (sourceSessionIds.has(msg.sourceSessionId)) break;
+        if (sourceSessionIds.size === 0) {
+          logger.info(`[${t}] Hermes bridge sourceSessionId bound: ${msg.sourceSessionId}`);
+        } else {
+          logger.info(`[${t}] Hermes bridge sourceSessionId added after rebind: ${msg.sourceSessionId}`);
+        }
+        sourceSessionIds.add(msg.sourceSessionId);
+        break;
+      }
+
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -2512,6 +2535,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // another session.
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
+        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
         if (!msg.sessionId) {
           logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
         }
@@ -2603,6 +2627,31 @@ function shouldDropMismatchedFinalOutput(
   logger.error(
     `[${t}] Dropped final_output with mismatched sessionId ` +
     `(msg=${msg.sessionId}, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+  );
+  return true;
+}
+
+function shouldDropMismatchedHermesFinalOutput(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+): boolean {
+  if (ds.session.cliId !== 'hermes') return false;
+  const sourceSessionIds = ds.hermesBridgeSourceSessionIds;
+  const hasBoundSource = !!sourceSessionIds && sourceSessionIds.size > 0;
+  if (!msg.sourceHermesSessionId) {
+    if (!hasBoundSource) return false;
+    logger.error(
+      `[${t}] Dropped Hermes final_output without sourceHermesSessionId ` +
+      `(expected one of ${sourceSessionIds!.size} bound sources, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+    );
+    return true;
+  }
+  if (sourceSessionIds?.has(msg.sourceHermesSessionId)) return false;
+  logger.error(
+    `[${t}] Dropped Hermes final_output with mismatched sourceHermesSessionId ` +
+    `(msg=${msg.sourceHermesSessionId}, expected one of ${sourceSessionIds?.size ?? 0} bound sources, ` +
+    `session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
   );
   return true;
 }
