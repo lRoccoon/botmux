@@ -263,7 +263,7 @@ describe('dashboard workflow API routes', () => {
     const body = await res.json() as { ok: boolean; error: string; hint: string };
     expect(body.ok).toBe(false);
     expect(body.error).toBe('needs_cli_cancel');
-    expect(body.hint).toContain('botmux workflow cancel api-cli-only-01');
+    expect(body.hint).toContain('botmux template cancel api-cli-only-01');
     expect(proxyToDaemon).not.toHaveBeenCalled();
   });
 

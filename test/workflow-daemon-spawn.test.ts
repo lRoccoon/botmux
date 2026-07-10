@@ -1,16 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   createWorkflowDaemonSpawn,
-  syntheticSessionUuid,
   type WorkerHandle,
   type WorkerProcessFactory,
 } from '../src/workflows/daemon-spawn.js';
+import { forkWorkerJsFactory, syntheticSessionUuid } from '../src/workflows/shared/worker-process.js';
 import {
   WORKFLOW_OUTPUT_BEGIN,
   WORKFLOW_OUTPUT_END,
@@ -407,6 +407,43 @@ describe('createWorkflowDaemonSpawn', () => {
       });
     } finally {
       rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('shared workflow worker process', () => {
+  it('allows SIGINT → SIGTERM → SIGKILL escalation until the child actually closes', async () => {
+    if (process.platform === 'win32') return;
+    const root = mkdtempSync(join(tmpdir(), 'workflow-worker-escalation-'));
+    let pid: number | undefined;
+    try {
+      const workerPath = join(root, 'worker.js');
+      writeFileSync(workerPath, [
+        "process.on('SIGINT', () => {});",
+        "process.on('SIGTERM', () => {});",
+        "process.send?.({ type: 'ready', port: 1, token: 'test' });",
+        'setInterval(() => {}, 1000);',
+      ].join('\n'));
+      const worker = forkWorkerJsFactory.spawn({ workerPath, cwd: root, env: process.env });
+      pid = worker.pid;
+      await new Promise<void>((resolve) => worker.on('message', () => resolve()));
+      const closed = new Promise<void>((resolve) => worker.on('close', () => resolve()));
+
+      worker.kill('SIGINT');
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      worker.kill('SIGTERM');
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      worker.kill('SIGKILL');
+
+      await expect(Promise.race([
+        closed.then(() => 'closed'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timeout'), 2_000)),
+      ])).resolves.toBe('closed');
+    } finally {
+      if (pid) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already closed */ }
+      }
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

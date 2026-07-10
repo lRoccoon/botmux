@@ -46,13 +46,22 @@ describe('Saved Workflow IM policy', () => {
     { kind: 'show', ref: 'Weekly Report' } as const,
     { kind: 'save', source: 'last', global: false, acknowledgeUnsafeLiterals: false } as const,
     { kind: 'run', ref: 'Weekly Report', rawParams: {} } as const,
-  ])('charges every accepted verb exactly once: $kind', async (command) => {
+  ])('charges every billable accepted verb exactly once: $kind', async (command) => {
     const quota = vi.fn().mockResolvedValue(true);
     await expect(authorizeV3SavedWorkflowInvocation(command, {
       canPublishGlobal: () => true,
       consumeMessageQuotaOnce: quota,
     })).resolves.toEqual({ ok: true });
     expect(quota).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps cancellation available without quota because immutable run ownership is checked later', async () => {
+    const quota = vi.fn().mockResolvedValue(false);
+    await expect(authorizeV3SavedWorkflowInvocation(
+      { kind: 'cancel', runId: 'run-1' },
+      { canPublishGlobal: () => false, consumeMessageQuotaOnce: quota },
+    )).resolves.toEqual({ ok: true });
+    expect(quota).not.toHaveBeenCalled();
   });
 
   it('requires operate permission before publishing global scope', async () => {
@@ -83,6 +92,9 @@ function executionDeps(overrides: Partial<V3SavedWorkflowExecutionDeps> = {}): V
     loadBots: vi.fn(() => []),
     persistStartIntent: vi.fn(),
     driveDetached: vi.fn(),
+    readRunBinding: vi.fn(),
+    requestCancel: vi.fn(),
+    cancelAndDrive: vi.fn(),
     ...overrides,
   } as unknown as V3SavedWorkflowExecutionDeps;
 }
@@ -142,6 +154,89 @@ describe('Saved Workflow execution seam', () => {
     expect(result.effect).toBe('run_started');
     expect(deps.persistStartIntent).toHaveBeenCalledTimes(1);
     expect(deps.driveDetached).toHaveBeenCalledTimes(1);
+  });
+
+  it('durably requests v3 cancellation for the exact owner/chat/app binding, then wakes the runner', async () => {
+    const deps = executionDeps({
+      readRunBinding: vi.fn().mockReturnValue({
+        ownerOpenId: 'ou_owner',
+        larkAppId: 'cli_bot',
+        chatId: 'oc_chat',
+        rootMessageId: 'om_original',
+      }),
+      requestCancel: vi.fn().mockReturnValue({ kind: 'requested', cancelRequestId: 'cancel-1' }),
+    });
+    const result = await executeV3SavedWorkflowCommand({
+      ...EXECUTION_BASE,
+      command: { kind: 'cancel', runId: 'run-1' },
+      operatorCanOperate: false,
+    }, deps);
+
+    expect(result).toMatchObject({ effect: 'cancel_requested' });
+    expect(result.message).toContain('status: cancelling');
+    expect(deps.requestCancel).toHaveBeenCalledWith(
+      '/tmp/botmux-data/v3-runs',
+      'run-1',
+      { by: 'ou_owner', reason: 'cancelled via /workflow cancel' },
+    );
+    expect(deps.cancelAndDrive).toHaveBeenCalledWith('run-1', 'cancel-1');
+  });
+
+  it('allows a verified chat operator, but never a stranger or cross-binding caller', async () => {
+    const binding = {
+      ownerOpenId: 'ou_someone_else',
+      larkAppId: 'cli_bot',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_original',
+    };
+    const allowed = executionDeps({
+      readRunBinding: vi.fn().mockReturnValue(binding),
+      requestCancel: vi.fn().mockReturnValue({ kind: 'already-requested', cancelRequestId: 'cancel-1' }),
+    });
+    await expect(executeV3SavedWorkflowCommand({
+      ...EXECUTION_BASE,
+      command: { kind: 'cancel', runId: 'run-1' },
+      operatorCanOperate: true,
+    }, allowed)).resolves.toMatchObject({ effect: 'cancel_requested' });
+    expect(allowed.cancelAndDrive).toHaveBeenCalledWith('run-1', 'cancel-1');
+
+    const stranger = executionDeps({ readRunBinding: vi.fn().mockReturnValue(binding) });
+    const denied = await executeV3SavedWorkflowCommand({
+      ...EXECUTION_BASE,
+      command: { kind: 'cancel', runId: 'run-1' },
+      operatorCanOperate: false,
+    }, stranger);
+    expect(denied).toMatchObject({ effect: 'failed' });
+    expect(denied.message).toContain('run owner');
+    expect(stranger.requestCancel).not.toHaveBeenCalled();
+
+    const crossChat = executionDeps({
+      readRunBinding: vi.fn().mockReturnValue({ ...binding, chatId: 'oc_other' }),
+    });
+    const crossDenied = await executeV3SavedWorkflowCommand({
+      ...EXECUTION_BASE,
+      command: { kind: 'cancel', runId: 'run-1' },
+      operatorCanOperate: true,
+    }, crossChat);
+    expect(crossDenied).toMatchObject({ effect: 'failed' });
+    expect(crossDenied.message).toContain('不属于当前群或当前机器人');
+    expect(crossChat.requestCancel).not.toHaveBeenCalled();
+  });
+
+  it('reports an existing terminal honestly without waking the runner', async () => {
+    const deps = executionDeps({
+      readRunBinding: vi.fn().mockReturnValue({
+        ownerOpenId: 'ou_owner', larkAppId: 'cli_bot', chatId: 'oc_chat', rootMessageId: 'om_root',
+      }),
+      requestCancel: vi.fn().mockReturnValue({ kind: 'already-terminal', status: 'succeeded' }),
+    });
+    const result = await executeV3SavedWorkflowCommand({
+      ...EXECUTION_BASE,
+      command: { kind: 'cancel', runId: 'run-1' },
+    }, deps);
+    expect(result).toMatchObject({ effect: 'cancel_terminal' });
+    expect(result.message).toContain('succeeded');
+    expect(deps.cancelAndDrive).not.toHaveBeenCalled();
   });
 
   it('swallows notification transport failure after a committed effect', async () => {

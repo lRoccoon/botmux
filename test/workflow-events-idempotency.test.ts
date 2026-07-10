@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { createHash } from 'node:crypto';
 import {
-  canonicalJson,
-  computeInputHash,
   deriveIdempotencyKey,
   type IdempotencyKeyTuple,
 } from '../src/workflows/events/idempotency.js';
+import {
+  canonicalJson,
+  computeInputHash,
+} from '../src/utils/canonical-input-hash.js';
 
 const baseTuple: IdempotencyKeyTuple = {
   workflowId: 'wf-demo',
@@ -156,6 +158,12 @@ describe('computeInputHash', () => {
     const canonical = '{"a":1,"b":2}';
     const expected = 'sha256:' + createHash('sha256').update(canonical, 'utf-8').digest('hex');
     expect(computeInputHash({ a: 1, b: 2 })).toBe(expected);
+  });
+
+  it('keeps the stable golden digest used by schedule idempotency', () => {
+    expect(computeInputHash({ b: 2, a: 1 })).toBe(
+      'sha256:43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777',
+    );
   });
 });
 

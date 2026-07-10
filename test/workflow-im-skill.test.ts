@@ -96,8 +96,9 @@ describe('/workflow legacy compatibility boundary', () => {
     expect(parseWorkflowCommand('/workflow run hello name=SF')).toBeNull();
   });
 
-  it('legacy /workflow cancel still parses as v2 cancel', () => {
-    expect(parseWorkflowCommand('/workflow cancel hello-20260520-abcd1234')).toEqual({
+  it('/workflow cancel belongs to v3 while /template cancel remains the v2 command', () => {
+    expect(parseWorkflowCommand('/workflow cancel hello-20260520-abcd1234')).toBeNull();
+    expect(parseWorkflowCommand('/template cancel hello-20260520-abcd1234')).toEqual({
       kind: 'cancel',
       runId: 'hello-20260520-abcd1234',
     });
@@ -126,7 +127,7 @@ describe('parseWorkflowGrillTrigger（/workflow 即兴 grill 入口）', () => {
     expect(parseWorkflowGrillTrigger('/workflow new   ')).toEqual({ kind: 'usage' });
   });
 
-  it('does NOT swallow legacy run/cancel (那是 v2，返回 null)', () => {
+  it('does NOT swallow reserved v3 run/cancel verbs', () => {
     expect(parseWorkflowGrillTrigger('/workflow run hello name=SF')).toBeNull();
     expect(parseWorkflowGrillTrigger('/workflow cancel hello-x')).toBeNull();
   });
@@ -232,7 +233,7 @@ describe('executeWorkflowCommand', () => {
 
     const result = await executeWorkflowCommand(
       {
-        content: '/workflow cancel hello-20260520-abcd1234',
+        content: '/template cancel hello-20260520-abcd1234',
         chatId: 'oc_chat',
         larkAppId: 'cli_codex',
         initiator: 'ou_user',
@@ -261,7 +262,7 @@ describe('executeWorkflowCommand', () => {
   it('returns a user-facing error when cancel runtime hook rejects the run', async () => {
     const result = await executeWorkflowCommand(
       {
-        content: '/workflow cancel missing-run',
+        content: '/template cancel missing-run',
         chatId: 'oc_chat',
         larkAppId: 'cli_codex',
         initiator: 'ou_user',
@@ -285,7 +286,7 @@ describe('executeWorkflowCommand', () => {
   it('returns a cross-chat error when cancel runtime hook rejects chat ownership', async () => {
     const result = await executeWorkflowCommand(
       {
-        content: '/workflow cancel other-chat-run',
+        content: '/template cancel other-chat-run',
         chatId: 'oc_chat_a',
         larkAppId: 'cli_codex',
         initiator: 'ou_user',
@@ -322,7 +323,7 @@ describe('executeWorkflowCommand', () => {
 
     const result = await executeWorkflowCommand(
       {
-        content: `/workflow cancel ${runId}`,
+        content: `/template cancel ${runId}`,
         chatId: 'oc_chat_b',
         larkAppId: 'cli_codex',
         initiator: 'ou_user',

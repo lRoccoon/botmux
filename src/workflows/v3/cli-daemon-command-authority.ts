@@ -1,6 +1,6 @@
 /**
  * Caller/target authorization for agent-facing daemon mutations:
- * `botmux workflow start|retry|grant`.
+ * `botmux workflow start|cancel|retry|grant`.
  *
  * These commands run as child processes of a long-lived CLI.  The inherited
  * BOTMUX_OWNER_OPEN_ID / BOTMUX_LARK_APP_ID values describe the session at
@@ -42,6 +42,10 @@ export interface AuthorizeV3DaemonCommandOptions {
   startPid?: number;
   /** Explicit `--bot`; inherited BOTMUX_LARK_APP_ID is intentionally ignored. */
   requestedLarkAppId?: string;
+  /** Cancel-only escape hatch: an unbound manual run is mutated on local disk
+   * and therefore does not need a daemon selector. Other daemon commands keep
+   * requiring --bot for standalone routing. */
+  allowStandaloneLocal?: boolean;
   /** Test seam. Production always uses the fresh marker/session resolver. */
   resolveProvenance?: (options: {
     dataDir: string;
@@ -211,14 +215,14 @@ export function authorizeV3DaemonCommand(
       `run ${options.runId} 绑定了 chat caller，standalone 命令不能修改`,
     );
   }
-  if (!requested) {
+  if (!requested && !options.allowStandaloneLocal) {
     throw new V3DaemonCommandAuthorityError(
       `standalone 操作未绑定 run ${options.runId} 时必须显式提供 --bot <larkAppId>`,
     );
   }
   return {
     runDir,
-    larkAppId: requested,
+    larkAppId: requested ?? '',
     mode: 'standalone',
     bindingSource: target.source,
   };

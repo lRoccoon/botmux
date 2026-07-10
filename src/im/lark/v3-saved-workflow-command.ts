@@ -16,6 +16,7 @@ export type V3SavedWorkflowCommand =
       acknowledgeUnsafeLiterals: boolean;
     }
   | { kind: 'run'; ref: string; rawParams: Record<string, string> }
+  | { kind: 'cancel'; runId: string }
   | { kind: 'list' }
   | { kind: 'show'; ref: string }
   | { kind: 'invalid'; error: string };
@@ -32,7 +33,18 @@ export function parseV3SavedWorkflowCommand(content: string): V3SavedWorkflowCom
   if (!tail) return null;
   const tokens = tail.split(/\s+/);
   const sub = tokens[0]!.toLowerCase();
-  if (!['save', 'run', 'list', 'show'].includes(sub)) return null;
+  if (!['save', 'run', 'cancel', 'list', 'show'].includes(sub)) return null;
+
+  if (sub === 'cancel') {
+    if (tokens.length !== 2) {
+      return { kind: 'invalid', error: '用法：/workflow cancel <runId>' };
+    }
+    const runId = tokens[1]!;
+    if (!SAFE_RUN_ID.test(runId)) {
+      return { kind: 'invalid', error: 'cancel 的 runId 非法' };
+    }
+    return { kind: 'cancel', runId };
+  }
 
   if (sub === 'list') {
     return tokens.length === 1 ? { kind: 'list' } : { kind: 'invalid', error: '/workflow list 不接受其它参数' };
@@ -101,6 +113,7 @@ export function v3SavedWorkflowUsage(): string {
     'Saved Workflow：',
     '/workflow save [last|runId] [名称] [--global] [--ack-unsafe]',
     '/workflow run <名称或 workflowId> [key=value ...]',
+    '/workflow cancel <runId>',
     '/workflow list',
     '/workflow show <名称或 workflowId>',
     '若即兴目标本身以 run 开头，请使用 /workflow new run ...',

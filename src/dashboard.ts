@@ -1391,7 +1391,16 @@ async function proxyToDaemon(
       headers: { 'content-type': 'application/json' },
     });
   }
-  return fetch(`http://127.0.0.1:${d.ipcPort}${daemonPath}`, init);
+  // Sign every daemon proxy request. Routes that do not require HMAC ignore
+  // the headers; high-impact routes (v3 cancel, terminal write-link) verify
+  // them, preventing a process that only knows ipcPort from replaying a
+  // dashboard action directly (same-UID secret readers remain in the existing
+  // host trust boundary).
+  const headers = new Headers(init.headers);
+  for (const [key, value] of Object.entries(signDaemonTokenHeaders())) {
+    headers.set(key, value);
+  }
+  return fetch(`http://127.0.0.1:${d.ipcPort}${daemonPath}`, { ...init, headers });
 }
 
 /** Create a Feishu group from the team UI: pick a creator daemon among the
@@ -2901,9 +2910,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // v3 workflow runs (read-only DAG + per-node terminal projection).  Reads
-    // the v3 run dirs directly; no daemon proxy (v3 runs are plain files).
-    if (await handleV3RunsApi(req, res, url, { runsDir: v3RunsDir() }, authed)) {
+    // v3 workflow runs. Reads project directly from disk; cancel resolves the
+    // immutable run owner and proxies to that daemon (the dashboard never
+    // writes the v3 journal itself).
+    if (await handleV3RunsApi(req, res, url, {
+      runsDir: v3RunsDir(),
+      proxyToDaemon,
+    }, authed)) {
       return;
     }
 

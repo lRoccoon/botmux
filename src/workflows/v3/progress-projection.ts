@@ -25,6 +25,8 @@ import { materialize } from './state.js';
 export type V3ProgressStatus =
   | 'starting'
   | 'running'
+  | 'cancelling'
+  | 'cancelled'
   | 'waiting'
   | 'blocked'
   | 'succeeded'
@@ -145,6 +147,8 @@ function progressStatus(
   counts: V3ProgressCounts,
   hasExecutionActivity: boolean,
 ): V3ProgressStatus {
+  if (runStatus === 'cancelled') return 'cancelled';
+  if (runStatus === 'cancelling') return 'cancelling';
   if (runStatus === 'succeeded') return 'succeeded';
   if (runStatus === 'failed' || counts.failed > 0) return 'failed';
   if (runStatus === 'blocked' || counts.blocked > 0) return 'blocked';

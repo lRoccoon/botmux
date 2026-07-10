@@ -18,8 +18,8 @@ import {
   syntheticSessionUuid,
   type WorkerHandle,
   type WorkerProcessFactory,
-} from './daemon-spawn.js';
-import { workflowSandboxInitFields } from './spawn-policy.js';
+} from './shared/worker-process.js';
+import { workflowSandboxInitFields } from './shared/sandbox-policy.js';
 import {
   isPathInsideDir,
   isValidPathSegment,

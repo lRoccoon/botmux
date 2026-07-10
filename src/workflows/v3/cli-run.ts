@@ -372,6 +372,9 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
   if (outcome.runStatus === 'succeeded') {
     console.log(`\n✅ run 成功 — 产物在 ${outcome.runDir}`);
     process.exit(0);
+  } else if (outcome.runStatus === 'cancelled') {
+    console.error(`\n⏹ run 已取消 — 详见 ${join(outcome.runDir, 'journal.ndjson')}`);
+    process.exit(1);
   } else if (outcome.runStatus === 'blocked') {
     // Blocked ≠ failed: a contract/semantic failure that a retry can fix —
     // or an exhausted loop that a grant (+1 iteration) can re-open.

@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/file-lock.test.ts
  */
-import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -64,6 +64,36 @@ describe('withFileLock', () => {
 
     expect(result).toBe('recovered');
     expect(existsSync(target + '.lock')).toBe(false);
+  });
+
+  it('recovers an old empty lock left by a crash before the holder PID write', async () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, '', 'utf-8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+
+    await expect(withFileLock(target, async () => 'recovered-empty')).resolves.toBe('recovered-empty');
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it('recovers an old invalid sync lock left before a valid holder PID write', () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, 'not-a-pid', 'utf-8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+
+    expect(withFileLockSync(target, () => 'recovered-invalid')).toBe('recovered-invalid');
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it('breaks a stale identity-bound lock after its PID was reused', async () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, procStart: 'stale-process-birth' }), 'utf-8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+
+    await expect(withFileLock(target, async () => 'recovered-reused-pid')).resolves.toBe('recovered-reused-pid');
+    expect(existsSync(lockPath)).toBe(false);
   });
 
   it('does not break a lock held by a live PID', async () => {

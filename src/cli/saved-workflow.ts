@@ -5,7 +5,7 @@ import { dirname, resolve } from 'node:path';
 import { loadBotConfigs } from '../bot-registry.js';
 import { resolveCurrentTurnProvenance } from '../core/current-turn-provenance.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
-import type { RawParamInput } from '../workflows/params.js';
+import type { RawParamInput } from '../workflows/shared/params.js';
 import { defaultBaseDir } from '../workflows/v3/grill-state.js';
 import {
   instantiatePublishedSavedWorkflow,

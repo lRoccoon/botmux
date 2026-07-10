@@ -16,14 +16,11 @@
  *
  * The `WorkerProcessFactory` indirection keeps the module unit-testable:
  * tests inject a scripted process that emits canned IPC frames, real
- * code injects `forkWorkerJs` (defined below).
+ * code uses the shared `forkWorkerJsFactory` implementation.
  */
 
-import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -42,83 +39,23 @@ import {
   type AttemptTerminalStatus,
 } from './attempt-terminal.js';
 import { logger } from '../utils/logger.js';
+import {
+  expandWorkflowWorkingDir,
+  forkWorkerJsFactory,
+  syntheticSessionUuid,
+  type WorkerHandle,
+  type WorkerProcessFactory,
+} from './shared/worker-process.js';
 
-type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
-
-// ─── IPC payloads (subset of WorkerToDaemon we care about) ────────────────
-
-type WorkerEvent =
-  | { type: 'ready'; port: number; token: string }
-  | { type: 'cli_session_id'; cliSessionId: string }
-  | {
-      type: 'final_output';
-      content: string;
-      lastUuid: string;
-      turnId: string;
-      kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
-      userText?: string;
-    }
-  | {
-      type: 'screen_update';
-      content: string;
-      status: 'working' | 'idle' | 'analyzing';
-    }
-  | { type: 'prompt_ready' }
-  | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean }
-  | { type: 'error'; message: string };
-
-// ─── Worker process abstraction (factory + handle) ────────────────────────
-
-export interface WorkerHandle {
-  send(msg: unknown): void;
-  on(event: 'message', cb: (msg: WorkerEvent) => void): void;
-  on(event: 'exit', cb: (code: number | null) => void): void;
-  on(event: 'error', cb: (err: Error) => void): void;
-  kill(signal?: NodeJS.Signals): void;
-  readonly pid?: number;
-  readonly stdout?: NodeJS.ReadableStream | null;
-  readonly stderr?: NodeJS.ReadableStream | null;
-}
-
-export interface WorkerProcessFactory {
-  spawn(opts: WorkerSpawnOptions): WorkerHandle;
-}
-
-export type WorkerSpawnOptions = {
-  workerPath: string;
-  cwd: string;
-  env: NodeJS.ProcessEnv;
-};
-
-/** Default factory: real `node:child_process.fork` against `worker.js`. */
-export const forkWorkerJsFactory: WorkerProcessFactory = {
-  spawn(opts) {
-    const child: ChildProcess = fork(opts.workerPath, [], {
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-      cwd: opts.cwd,
-      env: opts.env,
-    } as WindowsForkOptions);
-    return {
-      send: (m) => child.send(m as never),
-      on: (event: string, cb: (...args: unknown[]) => void) => {
-        child.on(event as never, cb);
-      },
-      kill: (sig) => {
-        if (!child.killed) child.kill(sig);
-      },
-      get pid() {
-        return child.pid;
-      },
-      get stdout() {
-        return child.stdout;
-      },
-      get stderr() {
-        return child.stderr;
-      },
-    } as WorkerHandle;
-  },
-};
+// Compatibility exports for the one-release v2 retirement window.
+export {
+  expandWorkflowWorkingDir,
+  forkWorkerJsFactory,
+  syntheticSessionUuid,
+  type WorkerHandle,
+  type WorkerProcessFactory,
+  type WorkerSpawnOptions,
+} from './shared/worker-process.js';
 
 // ─── Deps for the factory ────────────────────────────────────────────────
 
@@ -623,13 +560,6 @@ function logOneShotMemory(input: DaemonRunOneShotInput, phase: string): void {
   );
 }
 
-export function expandWorkflowWorkingDir(workingDir: string | undefined): string | undefined {
-  if (!workingDir) return undefined;
-  if (workingDir === '~') return homedir();
-  if (workingDir.startsWith('~/')) return join(homedir(), workingDir.slice(2));
-  return workingDir;
-}
-
 function formatMiB(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)}MiB`;
 }
@@ -694,14 +624,6 @@ function truncateLogLine(line: string): string {
  * jsonl bridge path & resume both work) by hashing through SHA-256 and
  * rewriting the version + variant nibbles to satisfy the v4 shape.
  */
-export function syntheticSessionUuid(rawId: string): string {
-  const h = createHash('sha256').update(rawId).digest('hex');
-  const version = `4${h.slice(13, 16)}`;
-  const variantNibble = ((parseInt(h[16]!, 16) & 0x3) | 0x8).toString(16);
-  const variant = `${variantNibble}${h.slice(17, 20)}`;
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${version}-${variant}-${h.slice(20, 32)}`;
-}
-
 function syntheticIds(input: DaemonRunOneShotInput): {
   sessionId: string;
   chatId: string;

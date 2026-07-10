@@ -24,7 +24,7 @@ import {
   coerceWorkflowParams,
   validateWorkflowParamSchema,
   type RawParamInput,
-} from '../params.js';
+} from '../shared/params.js';
 import { isLoopNode, validateDag, type V3Dag, type V3Node } from './dag.js';
 import {
   freezeDagBotSnapshots,

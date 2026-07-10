@@ -7,7 +7,8 @@
  */
 
 import type { BotConfig } from '../../bot-registry.js';
-import type { RawParamInput } from '../../workflows/params.js';
+import type { RawParamInput } from '../../workflows/shared/params.js';
+import type { RunChatBinding } from '../../workflows/v3/grill-state.js';
 import {
   instantiatePublishedSavedWorkflow,
   listVisibleSavedWorkflows,
@@ -17,6 +18,11 @@ import {
   type SavedWorkflowActorContext,
 } from '../../workflows/v3/library-service.js';
 import { loadCurrentSavedWorkflow } from '../../workflows/v3/library-store.js';
+import {
+  readV3RunChatBinding,
+  requestV3RunCancel,
+  safeRunDir,
+} from '../../workflows/v3/daemon-run.js';
 import type { V3SavedWorkflowCommand } from './v3-saved-workflow-command.js';
 import { v3SavedWorkflowAdHocRunEscapeHint } from './v3-saved-workflow-command.js';
 
@@ -64,7 +70,9 @@ export type V3SavedWorkflowPolicyResult =
 /**
  * One authorization seam shared by all Saved Workflow verbs. Read commands
  * consume quota too, so a command can never accidentally become a free CLI
- * path merely by moving code between read/write branches.
+ * path merely by moving code between read/write branches. Cancellation is the
+ * deliberate exception: it only reduces already-authorized work and must stay
+ * available after the run-launching message exhausts a user's last quota.
  */
 export async function authorizeV3SavedWorkflowInvocation(
   command: ExecutableV3SavedWorkflowCommand,
@@ -76,6 +84,7 @@ export async function authorizeV3SavedWorkflowInvocation(
   if (command.kind === 'save' && command.global && !deps.canPublishGlobal()) {
     return { ok: false, reason: 'global_requires_operate' };
   }
+  if (command.kind === 'cancel') return { ok: true };
   if (!await deps.consumeMessageQuotaOnce()) return { ok: false, reason: 'quota_denied' };
   return { ok: true };
 }
@@ -85,6 +94,9 @@ export interface V3SavedWorkflowExecutionInput {
   dataDir: string;
   baseDir: string;
   context: SavedWorkflowActorContext;
+  /** Host-authorized operate permission for run-level mutations. Ownership is
+   * checked independently against the immutable run binding. */
+  operatorCanOperate?: boolean;
 }
 
 export interface V3SavedWorkflowExecutionDeps {
@@ -97,6 +109,9 @@ export interface V3SavedWorkflowExecutionDeps {
   loadBots(): BotConfig[];
   persistStartIntent(runId: string, runDir: string): void;
   driveDetached(runId: string): void;
+  readRunBinding(runDir: string): RunChatBinding | undefined;
+  requestCancel: typeof requestV3RunCancel;
+  cancelAndDrive(runId: string, cancelRequestId: string): void;
 }
 
 export type V3SavedWorkflowExecutionEffect =
@@ -104,6 +119,8 @@ export type V3SavedWorkflowExecutionEffect =
   | 'save_committed'
   | 'run_started'
   | 'run_materialized_not_started'
+  | 'cancel_requested'
+  | 'cancel_terminal'
   | 'failed';
 
 export interface V3SavedWorkflowExecutionResult {
@@ -177,6 +194,61 @@ export async function executeV3SavedWorkflowCommand(
       };
     }
 
+    if (command.kind === 'cancel') {
+      const runDir = safeRunDir(baseDir, command.runId);
+      const binding = deps.readRunBinding(runDir);
+      if (!binding) {
+        throw new Error(
+          '该 v3 run 不存在、完整性校验失败，或没有可验证的聊天绑定。' +
+          `若 \`${command.runId}\` 是 v2 run，请改用 \`/template cancel ${command.runId}\`。`,
+        );
+      }
+      if (binding.larkAppId !== context.actor.larkAppId || binding.chatId !== context.chatId) {
+        throw new Error('该 v3 run 不属于当前群或当前机器人');
+      }
+      const isOwner = binding.ownerOpenId === context.actor.openId;
+      if (!isOwner && !input.operatorCanOperate) {
+        throw new Error('只有 run owner 或本群可操作成员才能取消该 v3 run');
+      }
+
+      const outcome = deps.requestCancel(baseDir, command.runId, {
+        by: context.actor.openId,
+        reason: 'cancelled via /workflow cancel',
+      });
+      if (outcome.kind === 'stale-run') {
+        throw new Error('该 v3 run 不存在或已清理');
+      }
+      if (outcome.kind === 'already-terminal') {
+        return {
+          effect: 'cancel_terminal',
+          message: `ℹ️ v3 workflow \`${command.runId}\` 已是终态（${outcome.status}），未写入取消请求。`,
+        };
+      }
+      if (outcome.kind === 'already-cancelled') {
+        return {
+          effect: 'cancel_terminal',
+          message: `⏹️ v3 workflow \`${command.runId}\` 已取消。`,
+        };
+      }
+
+      let wakeWarning = '';
+      try {
+        // Both first and repeated requests wake the runner: this repairs the
+        // durable-intent -> process-crash window without creating a new intent.
+        deps.cancelAndDrive(command.runId, outcome.cancelRequestId);
+      } catch {
+        // The journal intent is already durable. Never report a false failure
+        // that would encourage repeated mutation; cold attach will converge it.
+        wakeWarning = '\n⚠️ 即时中断信号未送达；取消意图已落盘，daemon 恢复后会继续收敛。';
+      }
+      return {
+        effect: 'cancel_requested',
+        message:
+          `${outcome.kind === 'already-requested' ? '⏳ 取消请求已存在' : '⏹️ 已提交取消请求'}：` +
+          `\`${command.runId}\`\nstatus: cancelling${wakeWarning}`,
+      };
+    }
+
     if (command.kind === 'save') {
       const runDir = await deps.resolveOwnedRun({ baseDir, source: command.source, context });
       const result = await deps.saveRun({
@@ -241,7 +313,16 @@ export const defaultV3SavedWorkflowExecutionServices = {
   resolveOwnedRun: resolveOwnedTerminalRunDir,
   saveRun: saveTerminalRunAsWorkflow,
   instantiate: instantiatePublishedSavedWorkflow,
+  readRunBinding: readV3RunChatBinding,
+  requestCancel: requestV3RunCancel,
 } satisfies Pick<
   V3SavedWorkflowExecutionDeps,
-  'listVisible' | 'resolveVisible' | 'loadCurrent' | 'resolveOwnedRun' | 'saveRun' | 'instantiate'
+  | 'listVisible'
+  | 'resolveVisible'
+  | 'loadCurrent'
+  | 'resolveOwnedRun'
+  | 'saveRun'
+  | 'instantiate'
+  | 'readRunBinding'
+  | 'requestCancel'
 >;

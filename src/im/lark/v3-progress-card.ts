@@ -110,6 +110,15 @@ export function buildV3ProgressCard(
 
   appendTerminalHint(elements, view);
 
+  if (
+    view.status === 'starting' ||
+    view.status === 'running' ||
+    view.status === 'waiting' ||
+    view.status === 'blocked'
+  ) {
+    appendSection(elements, '停止运行', `\`/workflow cancel ${escapeMd(view.runId)}\``);
+  }
+
   if (view.status === 'succeeded' && view.source.kind === 'ad_hoc' && options.saveActions) {
     elements.push({
       tag: 'action',
@@ -218,6 +227,8 @@ function statusChrome(status: V3ProgressView['status']): {
   switch (status) {
     case 'starting': return { emoji: '⏳', label: '准备中', template: 'blue' };
     case 'running': return { emoji: '🔄', label: '运行中', template: 'blue' };
+    case 'cancelling': return { emoji: '⏹', label: '取消中', template: 'orange' };
+    case 'cancelled': return { emoji: '⏹', label: '已取消', template: 'grey' };
     case 'waiting': return { emoji: '⏸', label: '等待中', template: 'orange' };
     case 'blocked': return { emoji: '🚧', label: '已阻塞', template: 'orange' };
     case 'succeeded': return { emoji: '✅', label: '已完成', template: 'green' };

@@ -25,10 +25,20 @@ import type {
   V3RunState,
 } from './orchestrator.js';
 
-export type V3RunStatus = 'running' | 'succeeded' | 'failed' | 'blocked';
+export type V3RunStatus =
+  | 'running'
+  | 'cancelling'
+  | 'cancelled'
+  | 'succeeded'
+  | 'failed'
+  | 'blocked';
 
 export interface V3RunSnapshot {
   runStatus: V3RunStatus;
+  /** First-wins durable cancellation boundary. Once present, later ordinary
+   *  dispatch/settle events are audit-only and cannot revive the run. */
+  cancelRequestId?: string;
+  cancelRequestedBy?: string;
   /** Set once `runFailed` is observed — the node that triggered fail-fast. */
   failedNodeId?: string;
   /** Workflow-level failure reason; ordinary node failures keep using
@@ -81,6 +91,8 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const loops: V3LoopRunState = new Map();
   const edges: V3EdgeRunState = new Map();
   let runStatus: V3RunStatus = 'running';
+  let cancelRequestId: string | undefined;
+  let cancelRequestedBy: string | undefined;
   let failedNodeId: string | undefined;
   let failureReason: V3RunFailureReason | undefined;
   let failureDetail: string | undefined;
@@ -146,6 +158,17 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
   };
 
   for (const e of events) {
+    // A durable cancel request is a journal cut: work already committed before
+    // it stays committed, while every later ordinary worker/gate/control event
+    // is stale audit data. Only cancellation convergence records may mutate the
+    // folded state after the cut. This makes request-vs-settle races linear by
+    // journal order, including two-daemon overlap windows.
+    if (
+      cancelRequestId !== undefined &&
+      e.type !== 'runCancelRequested' &&
+      e.type !== 'nodeCancelled' &&
+      e.type !== 'runCancelled'
+    ) continue;
     switch (e.type) {
       case 'runStarted':
         runStatus = 'running';
@@ -265,6 +288,28 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         if (e.instanceId) recordInstance(e.nodeId, e.instanceId, 'cancelled', false);
         else set(e.nodeId, 'cancelled');
         break;
+      case 'runCancelRequested':
+        // First request wins. A true terminal event committed before it wins
+        // instead; requestV3RunCancel normally prevents that combination, but
+        // replay stays fail-safe for legacy/corrupt histories too.
+        if (
+          cancelRequestId === undefined &&
+          runStatus !== 'succeeded' &&
+          runStatus !== 'failed' &&
+          runStatus !== 'cancelled'
+        ) {
+          cancelRequestId = e.cancelRequestId;
+          cancelRequestedBy = e.by;
+          runStatus = 'cancelling';
+          blockedNodeId = undefined;
+        }
+        break;
+      case 'runCancelled':
+        if (cancelRequestId !== undefined && e.cancelRequestId === cancelRequestId) {
+          runStatus = 'cancelled';
+          blockedNodeId = undefined;
+        }
+        break;
       case 'runSucceeded':
         runStatus = 'succeeded';
         break;
@@ -318,7 +363,20 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     }
   }
 
-  return { runStatus, failedNodeId, failureReason, failureDetail, blockedNodeId, nodes, instances, attempts, loops, edges };
+  return {
+    runStatus,
+    cancelRequestId,
+    cancelRequestedBy,
+    failedNodeId,
+    failureReason,
+    failureDetail,
+    blockedNodeId,
+    nodes,
+    instances,
+    attempts,
+    loops,
+    edges,
+  };
 }
 
 // ─── STATE checkpoint (atomic write / read) ────────────────────────────────
@@ -327,6 +385,8 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
  *  human-readable and `jq`-able. */
 interface StateFile {
   runStatus: V3RunStatus;
+  cancelRequestId?: string;
+  cancelRequestedBy?: string;
   failedNodeId?: string;
   failureReason?: V3RunFailureReason;
   failureDetail?: string;
@@ -350,6 +410,8 @@ export function writeState(statePath: string, snap: V3RunSnapshot): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const file: StateFile = {
     runStatus: snap.runStatus,
+    cancelRequestId: snap.cancelRequestId,
+    cancelRequestedBy: snap.cancelRequestedBy,
     failedNodeId: snap.failedNodeId,
     failureReason: snap.failureReason,
     failureDetail: snap.failureDetail,
@@ -374,6 +436,8 @@ export function readState(statePath: string): V3RunSnapshot | undefined {
   const file = JSON.parse(readFileSync(statePath, 'utf-8')) as StateFile;
   return {
     runStatus: file.runStatus,
+    cancelRequestId: file.cancelRequestId,
+    cancelRequestedBy: file.cancelRequestedBy,
     failedNodeId: file.failedNodeId,
     failureReason: file.failureReason,
     failureDetail: file.failureDetail,

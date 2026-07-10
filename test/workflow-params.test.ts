@@ -14,7 +14,7 @@ import {
   ParamCoerceFailure,
   validateWorkflowParamSchema,
   type WorkflowParamSchemaOwner,
-} from '../src/workflows/params.js';
+} from '../src/workflows/shared/params.js';
 
 const DEF = parseWorkflowDefinition({
   workflowId: 'wf-params',

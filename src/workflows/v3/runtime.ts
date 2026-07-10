@@ -17,8 +17,10 @@
  * `docs/design/2026-06-01-v3-mvp-engine-split.md`.
  */
 
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { join, dirname, relative, isAbsolute } from 'node:path';
+import { join, dirname, relative, isAbsolute, resolve, sep } from 'node:path';
+import { readProcessStartIdentity } from '../../core/session-marker.js';
 
 import {
   DEFAULT_NODE_TIMEOUT_SEC,
@@ -35,8 +37,29 @@ import {
   type V3ResultSchema,
 } from './dag.js';
 import { decideNext, type V3Action } from './orchestrator.js';
-import { appendEvent, readJournal, type StoredEvent, type V3ErrorClass, type V3LoopRef } from './journal.js';
+import {
+  appendEvent,
+  readJournal,
+  withJournalMutationSync,
+  type StoredEvent,
+  type V3ErrorClass,
+  type V3Event,
+  type V3LoopRef,
+} from './journal.js';
 import { materialize, writeState } from './state.js';
+import {
+  activateV3AttemptWorkerFence,
+  armV3AttemptWorkerFence,
+  closeV3ArmedFenceWithoutSpawn,
+  discoverV3AttemptWorker,
+  probeV3AttemptWorkerFence,
+  readV3AttemptWorkerFence,
+  recoverV3ArmedFenceWorker,
+  removeV3AttemptWorkerFence,
+  signalV3AttemptWorker,
+  type V3ActiveAttemptWorkerFence,
+  type V3ArmedAttemptWorkerFence,
+} from './worker-fence.js';
 import { normalizeGateWaitInput, writePendingWait } from './human-gate.js';
 import {
   ASK_HUMAN_ERROR_CODE,
@@ -501,7 +524,7 @@ export type V3RunOutcome =
       reason: 'terminal';
       // `blocked` is its OWN status — never collapse it into failed (it is the
       // retryable half of the blocked/failed split).
-      runStatus: 'succeeded' | 'failed' | 'blocked';
+      runStatus: 'succeeded' | 'failed' | 'blocked' | 'cancelled';
       failedNodeId?: string;
       blockedNodeId?: string;
       failureReason?: 'allSinksSkipped';
@@ -594,11 +617,82 @@ export async function runWorkflow(
   const cliInFlight = new Map<string, number>();
   const nodeControllers = new Map<string, AbortController>();
   const nodeAbortCleanups = new Map<string, () => void>();
+  const externalCancelSignals = new Map<string, { sigintAt: number; sigkillAt?: number }>();
+  const missingFenceNoneSince = new Map<string, number>();
+  // These values must be initialized before the main loop starts: recovery
+  // helpers are function declarations (hoisted), but a later lexical const
+  // would still be in its TDZ while the loop is already draining cancellation.
+  const EXTERNAL_CANCEL_KILL_GRACE_MS = 5_000;
+  const MISSING_FENCE_DOUBLE_SCAN_MS = 500;
 
   while (true) {
     const events = readJournal(journalPath);
     const snap = materialize(events);
     writeState(statePath, snap);
+
+    if (
+      snap.runStatus === 'succeeded' ||
+      snap.runStatus === 'failed' ||
+      snap.runStatus === 'cancelled'
+    ) break;
+
+    // An AbortSignal is only the low-latency delivery channel. Turn a bare
+    // signal into the same durable journal intent so a direct/dev caller also
+    // gets replay-correct cancellation instead of the old "running → failed"
+    // fallback. Production daemon paths persist this intent before aborting.
+    if (opts.cancelSignal?.aborted && snap.runStatus !== 'cancelling') {
+      requestRuntimeCancellation();
+      continue;
+    }
+
+    if (snap.runStatus === 'cancelling' && snap.cancelRequestId) {
+      // Stop active workers first. Pending/gated nodes can be neutral-cancelled
+      // immediately; running nodes become cancelled only after their runNode
+      // Promise resolves (the real pool now fences cancellation on worker exit).
+      for (const controller of nodeControllers.values()) {
+        if (!controller.signal.aborted) {
+          controller.abort({ kind: 'run', cancelRequestId: snap.cancelRequestId });
+        }
+      }
+      cancelUnfinishedNodes(snap.cancelRequestId, { includeRunning: false });
+
+      // Blocking/dev gates have no process to kill and their late resolution is
+      // ignored by the cancellation journal cut. Suspend-mode daemon gates are
+      // not retained in memory, but clearing both shapes keeps the runtime total.
+      for (const key of [...inFlight.keys()]) {
+        if (key.endsWith('::gate')) inFlight.delete(key);
+      }
+
+      if (inFlight.size > 0) {
+        await Promise.race(inFlight.values());
+        continue;
+      }
+
+      // After daemon handoff there may be journal-running attempts without a
+      // Promise/controller in this process. Do not publish runCancelled until
+      // the durable attempt fence (or conservative Linux legacy discovery)
+      // proves every outer worker closed. Unknown stays cancelling.
+      let externalDrained = false;
+      try {
+        externalDrained = drainExternallyOwnedAttempts(snap.cancelRequestId);
+      } catch {
+        // Integrity/probe uncertainty is deliberately fail-safe: keep the
+        // durable cancelling state and retry rather than report a false close.
+      }
+      if (!externalDrained) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
+
+      // Every worker fence has now resolved. Re-fold under the journal lock,
+      // cancel any attempts that were running at request time, and commit the
+      // run terminal exactly once.
+      finalizeRuntimeCancellation(snap.cancelRequestId);
+      continue;
+    }
+
+    // blocked is terminal-for-now and returns to the caller; only a later
+    // retry/grant or cancellation intent re-opens it.
     if (snap.runStatus !== 'running') break;
 
     const actions = decideNext(dag, snap.nodes, snap.loops, snap.edges, snap.instances);
@@ -612,18 +706,17 @@ export async function runWorkflow(
         a.kind === 'completeRunBlocked',
     );
     if (terminal) {
-      if (terminal.kind === 'completeRunSucceeded') {
-        appendEvent(journalPath, { type: 'runSucceeded' });
-      } else if (terminal.kind === 'completeRunFailed') {
-        appendEvent(journalPath, {
-          type: 'runFailed',
-          failedNodeId: terminal.failedNodeId,
-          reason: terminal.reason,
-          detail: terminal.detail,
-        });
-      } else {
-        appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: terminal.blockedNodeId });
-      }
+      const event: V3Event = terminal.kind === 'completeRunSucceeded'
+        ? { type: 'runSucceeded' }
+        : terminal.kind === 'completeRunFailed'
+          ? {
+              type: 'runFailed',
+              failedNodeId: terminal.failedNodeId,
+              reason: terminal.reason,
+              detail: terminal.detail,
+            }
+          : { type: 'runBlocked', blockedNodeId: terminal.blockedNodeId };
+      appendRunTerminalUnlessCancelling(event);
       continue;
     }
 
@@ -662,11 +755,9 @@ export async function runWorkflow(
     // Dispatch the ready set under the three-layer cap.  Anything not started
     // this tick (cap hit) is retried next tick.
     let startedThisTick = 0;
-    const aborted = opts.cancelSignal?.aborted === true;
-    if (!aborted) {
-      for (const a of actions) {
-        if (inFlight.size >= globalCap) break;
-        if (a.kind === 'dispatchWork') {
+    for (const a of actions) {
+      if (inFlight.size >= globalCap) break;
+      if (a.kind === 'dispatchWork') {
           // Loop body instances are synthesized from the body definition; the
           // instance id is theirs alone (attempt dirs, journal events, retry).
           const node = a.loop ? instanceNodeFor(a.loop) : nodesById.get(a.nodeId)!;
@@ -674,12 +765,11 @@ export async function runWorkflow(
           const botSnap = botSnapshots.get(botKey)!;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
           if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
-          startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId);
-          startedThisTick++;
-        } else if (a.kind === 'dispatchGate') {
-          startGate(nodesById.get(a.nodeId)!, a.instanceId);
+        if (startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId)) {
           startedThisTick++;
         }
+      } else if (a.kind === 'dispatchGate') {
+        if (startGate(nodesById.get(a.nodeId)!, a.instanceId)) startedThisTick++;
       }
     }
 
@@ -692,7 +782,6 @@ export async function runWorkflow(
     if (cancelledThisTick) continue;
 
     if (inFlight.size === 0) {
-      if (aborted) break; // cancelled with nothing running → stop
       if (startedThisTick === 0) {
         const pendingWaits = gateMode === 'suspend' ? pendingGateWaits(snap.nodes) : [];
         if (pendingWaits.length > 0) {
@@ -704,19 +793,21 @@ export async function runWorkflow(
       }
     }
 
-    // Wait for at least one in-flight unit to settle before re-evaluating.
-    if (inFlight.size > 0) await Promise.race(inFlight.values());
+    // Wait for a unit to settle OR for another daemon/process to append the
+    // durable cancellation boundary. AbortSignal is the fast path, but the
+    // journal poll is what makes cancellation delivery survive daemon handoff.
+    if (inFlight.size > 0) await waitForInFlightOrDurableCancellation();
   }
 
   const finalSnap = materialize(readJournal(journalPath));
   return {
     reason: 'terminal',
-    // Map 1:1 — blocked must NOT collapse into failed.  A 'running' snapshot
-    // here means the loop exited via cancel-abort with nothing in flight;
-    // report that as failed (the run did not complete).
+    // Map terminal states 1:1 — blocked and cancelled are first-class, never
+    // collapse either into failed.
     runStatus:
       finalSnap.runStatus === 'succeeded' ? 'succeeded'
       : finalSnap.runStatus === 'blocked' ? 'blocked'
+      : finalSnap.runStatus === 'cancelled' ? 'cancelled'
       : 'failed',
     failedNodeId: finalSnap.failedNodeId,
     failureReason: finalSnap.failureReason,
@@ -727,6 +818,478 @@ export async function runWorkflow(
 
   // ─── closures over runDir / journalPath / caps ──────────────────────────
 
+  function isTrueRunTerminal(status: ReturnType<typeof materialize>['runStatus']): boolean {
+    return status === 'succeeded' || status === 'failed' || status === 'cancelled';
+  }
+
+  /** Atomically turn a direct AbortSignal into the durable cancel protocol. */
+  function requestRuntimeCancellation(): void {
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      const snap = materialize([...events]);
+      if (isTrueRunTerminal(snap.runStatus) || snap.runStatus === 'cancelling') return;
+      append({
+        type: 'runCancelRequested',
+        cancelRequestId: `cancel-${randomUUID()}`,
+        by: 'runtime-signal',
+      }, { durable: true });
+    });
+  }
+
+  /** Run completion and cancellation share the journal lock. Whichever event
+   *  linearizes first wins; a terminal action computed from a stale snapshot
+   *  can never land after runCancelRequested. */
+  function appendRunTerminalUnlessCancelling(event: Extract<
+    V3Event,
+    { type: 'runSucceeded' | 'runFailed' | 'runBlocked' }
+  >): boolean {
+    return withJournalMutationSync(journalPath, ({ events, append }) => {
+      const snap = materialize([...events]);
+      if (snap.runStatus !== 'running') return false;
+      append(event, { durable: true });
+      return true;
+    });
+  }
+
+  /** Claim a pending node/gate immediately before spawning or writing a wait.
+   *  This closes the request→dispatch race: once cancellation owns the journal
+   *  boundary, no new worker can be created from an older decideNext result. */
+  function claimDispatch(event: Extract<
+    V3Event,
+    { type: 'nodeDispatched' | 'gateDispatched' }
+  >): boolean {
+    return withJournalMutationSync(journalPath, ({ events, append }) => {
+      const snap = materialize([...events]);
+      if (snap.runStatus !== 'running') return false;
+      const status = snap.nodes.get(event.nodeId)?.status ?? 'pending';
+      if (status !== 'pending') return false;
+      append(event, { durable: true });
+      return true;
+    });
+  }
+
+  function isRunCancelling(): boolean {
+    return materialize(readJournal(journalPath)).runStatus === 'cancelling';
+  }
+
+  /**
+   * A cancellation may be persisted by a different daemon than the one that
+   * owns these in-memory worker promises. Polling the journal while work is
+   * active lets that owner observe the durable cut and abort its own children;
+   * without this, Promise.race(inFlight) could sleep until a 30-minute node
+   * timeout even though cancellation was already fsynced.
+   */
+  async function waitForInFlightOrDurableCancellation(): Promise<void> {
+    const active = [...inFlight.values()];
+    if (active.length === 0) return;
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      let timer: NodeJS.Timeout | undefined;
+      const signal = opts.cancelSignal;
+      const finish = (): void => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', finish);
+        resolve();
+      };
+      for (const promise of active) promise.then(finish, finish);
+      const poll = (): void => {
+        if (done) return;
+        try {
+          if (signal?.aborted || isRunCancelling()) {
+            finish();
+            return;
+          }
+          timer = setTimeout(poll, 250);
+        } catch (err) {
+          if (done) return;
+          done = true;
+          if (timer) clearTimeout(timer);
+          signal?.removeEventListener('abort', finish);
+          reject(err);
+        }
+      };
+      signal?.addEventListener('abort', finish, { once: true });
+      poll();
+    });
+  }
+
+  /** Record a worker-fenced attempt cancellation once. */
+  function appendCancelledAttempt(
+    nodeId: string,
+    instanceId: string | undefined,
+    attemptId: string,
+  ): void {
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      const snap = materialize([...events]);
+      if (snap.runStatus !== 'cancelling' || !snap.cancelRequestId) return;
+      const state = instanceId ? snap.instances.get(instanceId) : snap.nodes.get(nodeId);
+      if (state?.status === 'cancelled') return;
+      append({
+        type: 'nodeCancelled',
+        nodeId,
+        ...(instanceId ? { instanceId } : {}),
+        attemptId,
+        reason: 'runCancelled',
+        cancelRequestId: snap.cancelRequestId,
+      });
+    });
+  }
+
+  /**
+   * Drain attempts owned by a previous daemon. The drive lease guarantees no
+   * second current-version runtime is spawning concurrently; attempt fences
+   * prove close across crashes. Pre-fence runs use exact Linux `/proc` binding
+   * plus two separated empty scans (startup's global orphan reaper runs first).
+   * Unsupported/ambiguous discovery never guesses: the run stays cancelling.
+   */
+  function drainExternallyOwnedAttempts(cancelRequestId: string): boolean {
+    const events = readJournal(journalPath);
+    const snap = materialize(events);
+    if (snap.runStatus !== 'cancelling' || snap.cancelRequestId !== cancelRequestId) return false;
+
+    type RecoverableAttempt = {
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+    };
+    const attempts = new Map<string, RecoverableAttempt>();
+    const workerSettledAttempts = new Set<string>();
+    for (const event of events) {
+      if (
+        event.type === 'nodeSucceeded' ||
+        event.type === 'nodeFailed' ||
+        event.type === 'nodeBlocked' ||
+        (event.type === 'nodeCancelled' && event.reason === 'runCancelled')
+      ) {
+        if (event.attemptId) workerSettledAttempts.add(event.attemptId);
+        continue;
+      }
+      if (event.type !== 'nodeDispatched' && event.type !== 'nodeWorkerFenceArmed') continue;
+      const prior = attempts.get(event.attemptId);
+      if (
+        prior &&
+        (prior.nodeId !== event.nodeId || prior.instanceId !== event.instanceId)
+      ) {
+        throw new Error(`v3 runtime: attempt identity changed in journal (${event.attemptId})`);
+      }
+      attempts.set(event.attemptId, {
+        nodeId: event.nodeId,
+        ...(event.instanceId ? { instanceId: event.instanceId } : {}),
+        attemptId: event.attemptId,
+      });
+    }
+
+    // Every currently-running worker must have a dispatch record. Keep this
+    // explicit so a malformed/legacy journal never turns "unknown" into a
+    // false proof of closure. Structured-loop composites were neutral-cancelled
+    // before this function and therefore are no longer running here.
+    let allDrained = true;
+    for (const [nodeId, nodeState] of snap.nodes) {
+      if (nodeState.status !== 'running') continue;
+      const instanceId = nodeState.effectiveInstanceId;
+      const attemptId = latestAttemptIdFor(events, instanceId ?? nodeId);
+      if (!attemptId) {
+        allDrained = false;
+        continue;
+      }
+      if (!attempts.has(attemptId)) {
+        attempts.set(attemptId, {
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          attemptId,
+        });
+      }
+    }
+
+    // Do not limit recovery to the materialized "running" node view. An
+    // early-release loser is journalled nodeCancelled before its process
+    // closes, and a revisit can supersede an old instance while that worker is
+    // still unwinding. Their armed/active fences remain resource truth and must
+    // be drained before the run-level terminal is published.
+    for (const attempt of attempts.values()) {
+      const { nodeId, instanceId, attemptId } = attempt;
+      const state = instanceId ? snap.instances.get(instanceId) : snap.nodes.get(nodeId);
+      const currentRunning = state?.status === 'running' &&
+        latestAttemptIdFor(events, instanceId ?? nodeId) === attemptId;
+      let attemptDir: string;
+      try {
+        attemptDir = safeAttemptDirFromId(attemptId);
+      } catch {
+        allDrained = false;
+        continue;
+      }
+
+      let fence;
+      try {
+        fence = readV3AttemptWorkerFence(attemptDir, { runId: dag.runId, attemptId });
+      } catch {
+        allDrained = false;
+        continue;
+      }
+
+      if (fence?.phase === 'armed') {
+        const ownedByThisRuntime = fence.ownerPid === process.pid &&
+          fence.ownerProcStart === readProcessStartIdentity(process.pid);
+        if (ownedByThisRuntime) {
+          // This happens when missing-fence discovery found a worker but it
+          // vanished before activate(), leaving the recovery daemon's own
+          // armed record. Re-run exact discovery instead of asking the generic
+          // recovery helper (which correctly refuses to steal a live owner's
+          // fence and would therefore deadlock this self-owned repair).
+          const discovery = discoverV3AttemptWorker(attemptDir);
+          if (discovery.status === 'one') {
+            try {
+              fence = activateV3AttemptWorkerFence({
+                attemptDir,
+                armed: fence,
+                workerPid: discovery.worker.pid,
+              });
+              missingFenceNoneSince.delete(attemptId);
+            } catch {
+              allDrained = false;
+              continue;
+            }
+          } else if (discovery.status === 'none') {
+            if (!emptyDiscoveryIsStable(attemptId)) {
+              allDrained = false;
+              continue;
+            }
+            try {
+              const closed = closeV3ArmedFenceWithoutSpawn(attemptDir, fence, 'setup_failed');
+              if (currentRunning) appendCancelledAttempt(nodeId, instanceId, attemptId);
+              removeV3AttemptWorkerFence(attemptDir, closed);
+              externalCancelSignals.delete(attemptId);
+              missingFenceNoneSince.delete(attemptId);
+              continue;
+            } catch {
+              allDrained = false;
+              continue;
+            }
+          } else {
+            missingFenceNoneSince.delete(attemptId);
+            allDrained = false;
+            continue;
+          }
+        } else {
+          const recovered = recoverV3ArmedFenceWorker({ attemptDir, armed: fence });
+          if (recovered.status === 'recovered' || recovered.status === 'already_active') {
+            fence = recovered.fence;
+            missingFenceNoneSince.delete(attemptId);
+          } else if (
+            recovered.status === 'already_closed' ||
+            recovered.status === 'already_closed_no_spawn'
+          ) {
+            fence = recovered.fence;
+          } else if (recovered.status === 'none') {
+            if (!emptyDiscoveryIsStable(attemptId)) {
+              allDrained = false;
+              continue;
+            }
+            if (currentRunning) appendCancelledAttempt(nodeId, instanceId, attemptId);
+            removeV3AttemptWorkerFence(attemptDir, fence);
+            externalCancelSignals.delete(attemptId);
+            missingFenceNoneSince.delete(attemptId);
+            continue;
+          } else {
+            missingFenceNoneSince.delete(attemptId);
+            allDrained = false;
+            continue;
+          }
+        }
+      }
+
+      if (!fence) {
+        // A worker outcome is appended only after the outer process closes, so
+        // a settled attempt whose fence was subsequently cleaned needs no
+        // legacy scan. Early-release and supersede events are deliberately not
+        // in workerSettledAttempts: they can precede process close. A current
+        // running attempt or an unsettled current-version fence marker still
+        // requires conservative /proc proof when its sidecar is missing.
+        // Pre-fence one-release runs have no marker, but an early-release or
+        // superseded attempt can still be unwinding. Any dispatched attempt
+        // without a post-close worker outcome therefore needs exact discovery;
+        // ordinary historical success/failure/block attempts skip it.
+        const missingNeedsDiscovery = !workerSettledAttempts.has(attemptId);
+        if (!missingNeedsDiscovery) {
+          externalCancelSignals.delete(attemptId);
+          missingFenceNoneSince.delete(attemptId);
+          continue;
+        }
+        const discovery = discoverV3AttemptWorker(attemptDir);
+        if (discovery.status === 'one') {
+          try {
+            const armed = armV3AttemptWorkerFence({
+              attemptDir,
+              runId: dag.runId,
+              attemptId,
+            });
+            fence = activateV3AttemptWorkerFence({
+              attemptDir,
+              armed,
+              workerPid: discovery.worker.pid,
+            });
+            missingFenceNoneSince.delete(attemptId);
+          } catch {
+            allDrained = false;
+            continue;
+          }
+        } else if (discovery.status === 'none') {
+          if (!emptyDiscoveryIsStable(attemptId)) {
+            allDrained = false;
+            continue;
+          }
+          if (currentRunning) appendCancelledAttempt(nodeId, instanceId, attemptId);
+          externalCancelSignals.delete(attemptId);
+          missingFenceNoneSince.delete(attemptId);
+          continue;
+        } else {
+          missingFenceNoneSince.delete(attemptId);
+          allDrained = false;
+          continue;
+        }
+      }
+
+      const probe = probeV3AttemptWorkerFence(attemptDir, {
+        runId: dag.runId,
+        attemptId,
+      });
+      if (probe.status === 'dead') {
+        if (currentRunning) appendCancelledAttempt(nodeId, instanceId, attemptId);
+        removeV3AttemptWorkerFence(attemptDir, probe.fence);
+        externalCancelSignals.delete(attemptId);
+        missingFenceNoneSince.delete(attemptId);
+        continue;
+      }
+      if (probe.status !== 'alive') {
+        allDrained = false;
+        continue;
+      }
+
+      if (!signalExternallyOwnedWorker(attemptDir, attemptId, probe.fence)) {
+        allDrained = false;
+        continue;
+      }
+      // A signal is only a request. Re-probe on the next tick and append the
+      // node cancellation only after the process identity is gone/closed.
+      allDrained = false;
+    }
+    return allDrained;
+  }
+
+  function safeAttemptDirFromId(attemptId: string): string {
+    const root = resolve(runDir);
+    const candidate = resolve(root, attemptId);
+    const rel = relative(root, candidate);
+    if (!rel || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+      throw new Error(`v3 runtime: attempt path escapes run dir (${attemptId})`);
+    }
+    return candidate;
+  }
+
+  function emptyDiscoveryIsStable(attemptId: string): boolean {
+    const now = Date.now();
+    const first = missingFenceNoneSince.get(attemptId);
+    if (first === undefined) {
+      missingFenceNoneSince.set(attemptId, now);
+      return false;
+    }
+    return now - first >= MISSING_FENCE_DOUBLE_SCAN_MS;
+  }
+
+  function signalExternallyOwnedWorker(
+    attemptDir: string,
+    attemptId: string,
+    fence: V3ActiveAttemptWorkerFence,
+  ): boolean {
+    const now = Date.now();
+    const prior = externalCancelSignals.get(attemptId);
+    const signal = !prior
+      ? 'SIGINT'
+      : prior.sigkillAt === undefined && now - prior.sigintAt >= EXTERNAL_CANCEL_KILL_GRACE_MS
+        ? 'SIGKILL'
+        : undefined;
+    if (!signal) return false;
+    const result = signalV3AttemptWorker(attemptDir, fence, signal);
+    if (result.status === 'dead') return true;
+    if (result.status !== 'signalled') return false;
+    if (!prior) externalCancelSignals.set(attemptId, { sigintAt: now });
+    else externalCancelSignals.set(attemptId, { ...prior, sigkillAt: now });
+    return false;
+  }
+
+  /** Neutral-cancel nodes that have no live worker fence to await. */
+  function cancelUnfinishedNodes(
+    cancelRequestId: string,
+    options: { includeRunning: boolean },
+  ): void {
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      const snap = materialize([...events]);
+      if (snap.runStatus !== 'cancelling' || snap.cancelRequestId !== cancelRequestId) return;
+      const ids = new Set<string>([
+        ...dag.nodes.map((node) => node.id),
+        ...snap.nodes.keys(),
+      ]);
+      for (const nodeId of ids) {
+        const nodeState = snap.nodes.get(nodeId);
+        const status = nodeState?.status ?? 'pending';
+        // A structured loop composite is control state, not an outer worker.
+        // `loopStarted` materializes it as running even between body attempts;
+        // cancelling it here prevents recovery from waiting for a nonexistent
+        // attempt fence while real loop-body workers remain fenced normally.
+        const controlOnlyLoop = status === 'running' && snap.loops.has(nodeId);
+        const cancellable = status === 'pending' || status === 'gateWaiting' || controlOnlyLoop ||
+          (options.includeRunning && status === 'running');
+        if (!cancellable) continue;
+        const instanceId = nodeState?.effectiveInstanceId;
+        const attemptId = latestAttemptIdFor([...events], instanceId ?? nodeId);
+        append({
+          type: 'nodeCancelled',
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          ...(attemptId ? { attemptId } : {}),
+          reason: 'runCancelled',
+          cancelRequestId,
+        });
+      }
+    });
+  }
+
+  function finalizeRuntimeCancellation(cancelRequestId: string): void {
+    // Worker promises are drained before this call. Mark the exact attempts
+    // still materialized as running, then publish the run terminal in the same
+    // journal critical section so two finalizers remain idempotent.
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      const snap = materialize([...events]);
+      if (snap.runStatus === 'cancelled') return;
+      if (snap.runStatus !== 'cancelling' || snap.cancelRequestId !== cancelRequestId) return;
+      const ids = new Set<string>([
+        ...dag.nodes.map((node) => node.id),
+        ...snap.nodes.keys(),
+      ]);
+      for (const nodeId of ids) {
+        const nodeState = snap.nodes.get(nodeId);
+        const status = nodeState?.status ?? 'pending';
+        if (status !== 'pending' && status !== 'gateWaiting' && status !== 'running') continue;
+        const instanceId = nodeState?.effectiveInstanceId;
+        const attemptId = latestAttemptIdFor([...events], instanceId ?? nodeId);
+        append({
+          type: 'nodeCancelled',
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          ...(attemptId ? { attemptId } : {}),
+          reason: 'runCancelled',
+          cancelRequestId,
+        });
+      }
+      append({
+        type: 'runCancelled',
+        cancelRequestId,
+        by: snap.cancelRequestedBy ?? 'unknown',
+      }, { durable: true });
+    });
+  }
+
   function startWork(
     node: V3Node,
     botSnap: BotSnapshot,
@@ -735,7 +1298,7 @@ export async function runWorkflow(
     loopRef?: V3LoopRef,
     omitted?: GoalInputs['omitted'],
     instanceId?: string,
-  ): void {
+  ): boolean {
     // The dispatch key namespaces the attempt dir + journal events.  For a
     // plain node it's the runtime instance (`A#001`); for a loop body it's the
     // expanded node.id (`loopId.i001.code`); legacy/no-instance falls back to
@@ -815,23 +1378,74 @@ export async function runWorkflow(
       [GOAL_ENV.V3_MARKER]: '1',
     };
 
-    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, loop: loopRef });
+    if (!claimDispatch({
+      type: 'nodeDispatched',
+      nodeId: node.id,
+      ...(instanceId ? { instanceId } : {}),
+      attemptId,
+      loop: loopRef,
+    })) return false;
+
+    let workerFence: V3ArmedAttemptWorkerFence | undefined;
+    try {
+      // Pre-fork ownership is durable before the pool can resolve credentials
+      // or call factory.spawn(). The following journal marker makes the order
+      // explicit for recovery and one-release legacy handling.
+      workerFence = armV3AttemptWorkerFence({ attemptDir, runId: dag.runId, attemptId });
+      const maySpawn = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+        const current = materialize([...latest]);
+        append({
+          type: 'nodeWorkerFenceArmed',
+          nodeId: node.id,
+          ...(instanceId ? { instanceId } : {}),
+          attemptId,
+        }, { durable: true });
+        return current.runStatus === 'running';
+      });
+      if (!maySpawn) {
+        closeV3ArmedFenceWithoutSpawn(attemptDir, workerFence, 'pre_aborted');
+        return true;
+      }
+    } catch (err) {
+      // No worker has been forked yet. A concurrent cancellation cut ignores
+      // this ordinary settle and its recovery path keeps missing/corrupt fences
+      // fail-safe; otherwise surface a precise infrastructure failure.
+      if (workerFence) {
+        try {
+          closeV3ArmedFenceWithoutSpawn(attemptDir, workerFence, 'setup_failed');
+        } catch {
+          // Preserve the armed unknown on integrity/I/O failure. Recovery must
+          // fail closed rather than claim that a worker was never spawned.
+        }
+      }
+      appendEvent(journalPath, {
+        type: 'nodeFailed',
+        nodeId: node.id,
+        ...(instanceId ? { instanceId } : {}),
+        attemptId,
+        errorClass: 'workerError',
+        errorCode: 'WORKER_FENCE_ARM_FAILED',
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return true;
+    }
     botInFlight.set(botKey, (botInFlight.get(botKey) ?? 0) + 1);
     cliInFlight.set(botSnap.cliId, (cliInFlight.get(botSnap.cliId) ?? 0) + 1);
 
     // `isGoalNode` is guaranteed by validateDag (host is rejected), but the
     // contract types `runNode` to V3GoalNode, so narrow explicitly.
     if (!isGoalNode(node)) {
+      closeV3ArmedFenceWithoutSpawn(attemptDir, workerFence, 'setup_failed');
       appendEvent(journalPath, {
         type: 'nodeFailed', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
         errorClass: 'workerError', message: `node "${node.id}" is not a goal node`,
       });
       releaseSlots(botKey, botSnap.cliId);
-      return;
+      return true;
     }
 
     const controller = new AbortController();
-    const relayAbort = (): void => controller.abort();
+    const relayAbort = (): void => controller.abort(opts.cancelSignal?.reason);
     if (opts.cancelSignal?.aborted) relayAbort();
     else opts.cancelSignal?.addEventListener('abort', relayAbort, { once: true });
     nodeControllers.set(dispatchKey, controller);
@@ -847,6 +1461,7 @@ export async function runWorkflow(
       inputsPath,
       outputDir,
       env,
+      workerFence,
       timeoutMs: (node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC) * 1000,
       cancelSignal: controller.signal,
       // Worker terminal is ready mid-run → stamp nodeSessionReady so the
@@ -866,9 +1481,13 @@ export async function runWorkflow(
       },
     };
 
-    const p = deps
-      .runNode(req)
+    const p = Promise.resolve()
+      .then(() => deps.runNode(req))
       .then(async (result) => {
+        if (result.status === 'cancelled' || isRunCancelling()) {
+          appendCancelledAttempt(node.id, instanceId, attemptId);
+          return;
+        }
         // Final verdict = process outcome AND manifest validation (codex
         // point 4 — NOT v0.2 final_output semantics).  Always validate the
         // manifest so a clean `status:'fail'` manifest yields a precise
@@ -999,12 +1618,17 @@ export async function runWorkflow(
         }
       })
       .catch((err: unknown) => {
+        if (isRunCancelling()) {
+          appendCancelledAttempt(node.id, instanceId, attemptId);
+          return;
+        }
         appendEvent(journalPath, {
           type: 'nodeFailed', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
           errorClass: 'workerError', message: err instanceof Error ? err.message : String(err),
         });
       })
       .finally(() => {
+        cleanupSettledWorkerFence(attemptDir, dag.runId, attemptId);
         // Key by dispatchKey (instance-scoped), NOT node.id: after a cross-node
         // revisit, D#001 and D#002 can be in-flight at once under the same
         // node.id. An unguarded inFlight.delete(node.id) here would let the stale
@@ -1020,6 +1644,26 @@ export async function runWorkflow(
         releaseSlots(botKey, botSnap.cliId);
       });
     inFlight.set(dispatchKey, p);
+    return true;
+  }
+
+  /** Remove a fence only after the node settle has been journaled and the outer
+   * worker is absent. Unexpected live/unknown records remain as a fail-safe. */
+  function cleanupSettledWorkerFence(attemptDir: string, runId: string, attemptId: string): void {
+    try {
+      const fence = readV3AttemptWorkerFence(attemptDir, { runId, attemptId });
+      if (!fence) return;
+      if (fence.phase === 'armed') {
+        // Test/remote runNode implementations may not fork an outer worker.
+        removeV3AttemptWorkerFence(attemptDir, fence);
+        return;
+      }
+      const probe = probeV3AttemptWorkerFence(attemptDir, { runId, attemptId });
+      if (probe.status === 'dead') removeV3AttemptWorkerFence(attemptDir, probe.fence);
+    } catch {
+      // Never overwrite a durable node verdict with cleanup noise. Leaving the
+      // sidecar intact is the safe failure direction for later recovery/audit.
+    }
   }
 
   /** A node's transitive downstream cone (the node itself + every node reachable
@@ -1090,17 +1734,22 @@ export async function runWorkflow(
     }
   }
 
-  function startGate(node: V3Node, instanceId?: string): void {
+  function startGate(node: V3Node, instanceId?: string): boolean {
     // Instance-level waitId so a revisit's fresh gate (`A#002-gate`) gets its own
     // wait file + card nonce, never overwriting the superseded `A#001-gate`
     // (stale-card protection).  Legacy/no-instance → `<nodeId>-gate`.
     const waitId = `${instanceId ?? node.id}-gate`;
     const gate = normalizeGateWaitInput(node.humanGate!);
-    appendEvent(journalPath, { type: 'gateDispatched', nodeId: node.id, ...(instanceId ? { instanceId } : {}), waitId });
+    if (!claimDispatch({
+      type: 'gateDispatched',
+      nodeId: node.id,
+      ...(instanceId ? { instanceId } : {}),
+      waitId,
+    })) return false;
 
     if (gateMode === 'suspend') {
       writePendingWait(runDir, { waitId, nodeId: node.id, ...(instanceId ? { instanceId } : {}), ...gate });
-      return;
+      return true;
     }
 
     if (!deps.resolveGate) {
@@ -1131,6 +1780,7 @@ export async function runWorkflow(
         if (inFlight.get(key) === p) inFlight.delete(key);
       });
     inFlight.set(key, p);
+    return true;
   }
 
   /** Synthesize the effective node a body instance runs as: the body

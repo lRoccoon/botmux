@@ -81,7 +81,7 @@ import {
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
 } from './core/worker-pool.js';
-import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
+import { ipcHmacAuthorized, ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -125,7 +125,6 @@ import {
   buildWorkflowGrillPrompt,
   resolveBotSnapshot,
   WORKFLOW_USAGE,
-  WORKFLOW_V2_RENAME_NOTICE,
   type WorkflowCommandResult,
 } from './im/lark/workflow-slash-command.js';
 import {
@@ -145,6 +144,7 @@ import {
   createV3GateRunner,
   preflightV3RunStart,
   readV3RunChatBinding,
+  requestV3RunCancel,
   requestV3Retry,
   requestV3LoopGrant,
 } from './workflows/v3/daemon-run.js';
@@ -2144,13 +2144,6 @@ async function handleWorkflowCommandIfAny(
   larkAppId: string,
   initiator: string | undefined,
 ): Promise<boolean> {
-  // 旧 `/workflow cancel` 软降级：在执行前**先**发改名提示，让迁移指引第一时间
-  // 到达用户（codex review：先发优于后发）。从原始 content 判定而非 parse 结果，
-  // 这样连缺 runId 的 invalid legacy 也能收到提示。`/workflow run`
-  // 已被 v3 Saved Workflow 回收，v2 run 只保留 `/template run`。
-  if (/^\/workflow\s+cancel\b/.test(content.trim())) {
-    await sessionReply(anchor, WORKFLOW_V2_RENAME_NOTICE, 'text', larkAppId);
-  }
   // Captured by the `onRunCreated` closure so the trailing text reply can be
   // suppressed when the run-level progress card already landed.  Codex
   // round 1 medium: "single self-updating tile" promise breaks if we also
@@ -2296,14 +2289,18 @@ async function handleV3SavedWorkflowCommandIfAny(
     return true;
   }
   if (
+    // Cancellation is decrease-only and is still protected below by the
+    // immutable owner/chat/app binding (or explicit canOperate). Keep it
+    // available even when a run launch consumed the caller's final grant.
     (command.kind === 'save' || command.kind === 'run') &&
     await replyGrantRestrictionIfNeeded(larkAppId, chatId, initiatorOpenId, targets.replyAnchor, '/workflow')
   ) {
     return true;
   }
 
+  const operatorCanOperate = canOperate(larkAppId, chatId, initiatorOpenId, teamTrustUnionId);
   const policy = await authorizeV3SavedWorkflowInvocation(command, {
-    canPublishGlobal: () => canOperate(larkAppId, chatId, initiatorOpenId, teamTrustUnionId),
+    canPublishGlobal: () => operatorCanOperate,
     consumeMessageQuotaOnce: () => enforceMessageQuotaForCliInput(
       larkAppId,
       chatId,
@@ -2331,12 +2328,14 @@ async function handleV3SavedWorkflowCommandIfAny(
   const dataDir = dirname(v3DefaultBaseDir());
   const baseDir = v3DefaultBaseDir();
   const result = await executeV3SavedWorkflowCommand(
-    { command, dataDir, baseDir, context },
+    { command, dataDir, baseDir, context, operatorCanOperate },
     {
       ...defaultV3SavedWorkflowExecutionServices,
       loadBots: loadBotConfigs,
       persistStartIntent: persistV3StartIntent,
       driveDetached: (runId) => v3GateRunner.driveDetached(runId),
+      cancelAndDrive: (runId, cancelRequestId) =>
+        v3GateRunner.cancelAndDrive(runId, cancelRequestId),
     },
   );
   await deliverV3SavedWorkflowNotification(
@@ -2650,6 +2649,8 @@ const v3GateRunner = createV3GateRunner({
     if (!binding) return;
     const msg = outcome.runStatus === 'succeeded'
       ? `✅ v3 workflow \`${runId}\` 跑完了`
+      : outcome.runStatus === 'cancelled'
+        ? `⏹️ v3 workflow \`${runId}\` 已取消`
       : outcome.runStatus === 'blocked'
         // Fallback only — the blocked path normally posts a retry/grant card instead.
         ? `⏸️ v3 workflow \`${runId}\` 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''}，可 \`botmux workflow retry ${runId}\` 重试（loop 耗尽则 \`botmux workflow grant ${runId}\` 追加一轮）`
@@ -2786,6 +2787,92 @@ ipcRoute('POST', '/api/v3/runs/:runId/start', async (_req, res, params) => {
   }
   v3GateRunner.driveDetached(runId);
   return jsonRes(res, 202, { ok: true, runId });
+});
+
+// v3 durable cancel: journal intent first, then low-latency AbortController
+// delivery + replay. HTTP 202 is returned only after runCancelRequested has
+// been fsynced; an immediate daemon crash is therefore recovered by coldAttach.
+ipcRoute('POST', '/api/v3/runs/:runId/cancel', async (req, res, params) => {
+  // Unlike older loopback-trusted mutations, cancel is irreversible, so require
+  // the repository's machine-local replay-protected HMAC in addition to the
+  // immutable run binding. This blocks callers that only discover ipcPort. As
+  // elsewhere in daemon IPC, a same-UID process able to read the shared secret
+  // remains inside the host trust boundary; process-bound IPC auth is separate
+  // hardening, not something this file-secret scheme claims to provide.
+  if (!ipcHmacAuthorized(req)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  const runId = params.runId;
+  if (!isValidV3RunId(runId)) return jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
+  const runDir = join(v3DefaultBaseDir(), runId);
+  if (!existsSync(runDir)) return jsonRes(res, 404, { ok: false, error: 'unknown_run' });
+  const binding = readV3RunChatBinding(runDir);
+  if (!binding) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'run_not_daemon_owned',
+      hint: 'unbound/manual v3 runs must be interrupted by their local runner',
+    });
+  }
+  if (selfV3LarkAppId && binding.larkAppId !== selfV3LarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+  }
+
+  let body: { reason?: unknown } = {};
+  try {
+    body = await readJsonBody<{ reason?: unknown }>(req);
+  } catch {
+    // Empty body is valid. Malformed non-empty JSON is rejected by the shared
+    // reader; callers normally send `{}`.
+    const contentLength = Number(req.headers['content-length'] ?? 0);
+    if (contentLength > 0) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (body.reason !== undefined && typeof body.reason !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_reason' });
+  }
+
+  let outcome;
+  try {
+    outcome = requestV3RunCancel(v3DefaultBaseDir(), runId, {
+      by: 'daemon-ipc',
+      ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
+    });
+  } catch (err) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'run_integrity_or_cancel_invalid',
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+  if (outcome.kind === 'stale-run') {
+    return jsonRes(res, 404, { ok: false, error: 'unknown_run' });
+  }
+  if (outcome.kind === 'already-terminal') {
+    return jsonRes(res, 200, {
+      ok: true,
+      runId,
+      status: outcome.status,
+      alreadyTerminal: true,
+    });
+  }
+  if (outcome.kind === 'already-cancelled') {
+    return jsonRes(res, 200, {
+      ok: true,
+      runId,
+      status: 'cancelled',
+      alreadyTerminal: true,
+      ...(outcome.cancelRequestId ? { cancelRequestId: outcome.cancelRequestId } : {}),
+    });
+  }
+
+  v3GateRunner.cancelAndDrive(runId, outcome.cancelRequestId);
+  return jsonRes(res, 202, {
+    ok: true,
+    runId,
+    status: 'cancelling',
+    cancelRequestId: outcome.cancelRequestId,
+    alreadyRequested: outcome.kind === 'already-requested',
+  });
 });
 
 // v3 blocked retry: append the retry intent + re-drive.  Same owner posture as
@@ -6830,7 +6917,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     content,
   });
 
-  // Saved Workflow 保留动词必须先于即兴 grill，避免 `run/save/list/show`
+  // Workflow 保留动词必须先于即兴 grill，避免 `run/save/cancel/list/show`
   // 被当成自由文本目标或落回 v2 runtime。
   if (await handleV3SavedWorkflowCommandIfAny({
     content: cmdContent,
@@ -6849,7 +6936,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // v3 即兴 grill：`/workflow [new] <目标>`。daemon 不拷问——把目标包成触发
   // botmux-workflow skill 的 prompt（改写 content，promptContent 随后从 content
   // 构造），fall-through 到正常 session 创建，让本话题 agent 接管整条链路。
-  // Saved Workflow 动词已在上方处理；只有 cancel 保留 v2 legacy。
+  // v3 Workflow 动词已在上方处理；v2 只保留 `/template ...`。
   const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
   if (newTopicGrill) {
     if (await replyGrantRestrictionIfNeeded(larkAppId, chatId, senderOpenId, anchor, '/workflow')) {
@@ -7576,7 +7663,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     }
   }
 
-  // Saved Workflow 命令在 thread 内同样由 host 直接处理，不转发给 CLI。
+  // v3 Workflow 命令在 thread 内同样由 host 直接处理，不转发给 CLI。
   if (await handleV3SavedWorkflowCommandIfAny({
     content: cmdContent,
     anchor,
@@ -7593,8 +7680,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
   // v3 即兴 grill（thread 内）：`/workflow [new] <目标>` → 把目标包成触发
   // botmux-workflow skill 的 prompt 覆盖 promptContent，fall-through 到下面正常
-  // 转发逻辑，让现有/新建的 agent 接管。Saved Workflow 动词已在上方处理，
-  // 只有 cancel 保留 v2 legacy 兼容入口。
+  // 转发逻辑，让现有/新建的 agent 接管。v3 Workflow 动词已在上方处理，
+  // v2 只保留 `/template ...`。
   const threadGrill = parseWorkflowGrillTrigger(cmdContent);
   if (threadGrill) {
     if (await replyGrantRestrictionIfNeeded(larkAppId, threadChatId, threadSenderOpenId, anchor, '/workflow')) {

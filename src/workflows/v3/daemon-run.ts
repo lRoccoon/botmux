@@ -16,12 +16,13 @@
  * concurrent clicks / start can't double-spawn.
  */
 
+import { randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { withFileLockSync } from '../../utils/file-lock.js';
+import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { isLoopNode, loadDag, type V3Dag } from './dag.js';
 import {
   runWorkflow,
@@ -67,7 +68,13 @@ import {
   writePendingWait,
   type GateWaitStatus,
 } from './human-gate.js';
-import { readJournal, appendEvent, type StoredEvent, type V3ErrorClass } from './journal.js';
+import {
+  readJournal,
+  appendEvent,
+  withJournalMutationSync,
+  type StoredEvent,
+  type V3ErrorClass,
+} from './journal.js';
 import { materialize } from './state.js';
 import { isValidRunId } from './ops-projection.js';
 import { GOAL_ANSWER_FILE, type GoalAnswer, type GoalAsk, type ValidateManifest } from './contract.js';
@@ -629,6 +636,8 @@ export interface V3DaemonRunDeps {
   /** Report a terminal run (final card / message).  Optional. */
   onTerminal?: (runId: string, outcome: V3TerminalOutcome, binding?: RunChatBinding) => Promise<void>;
   maxParallel?: number;
+  /** Low-latency interrupt delivery. Durable intent always lives in journal. */
+  cancelSignal?: AbortSignal;
 }
 
 /**
@@ -665,7 +674,7 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   const journalPath = join(runDir, 'journal.ndjson');
   const wasAlreadyTerminal =
     existsSync(journalPath) &&
-    ['succeeded', 'failed'].includes(materialize(readJournal(journalPath)).runStatus);
+    ['succeeded', 'failed', 'cancelled'].includes(materialize(readJournal(journalPath)).runStatus);
 
   const bots = (deps.loadBots ?? loadBotConfigs)();
   if (!context.authorizedArtifacts) {
@@ -703,6 +712,7 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     ...(context.authorizedArtifacts ? { authorizedArtifacts: true } : {}),
     ...(context.resolvedWorkflowData ? { resolvedWorkflowData: context.resolvedWorkflowData } : {}),
     ...(deps.maxParallel ? { globalConcurrency: deps.maxParallel } : {}),
+    ...(deps.cancelSignal ? { cancelSignal: deps.cancelSignal } : {}),
   };
 
   const outcome = await runWorkflow(dag, runtimeDeps, opts);
@@ -824,6 +834,63 @@ export function resolveV3GateClick(
     selected: input.selected,
   });
   return { kind: 'resolved', resolution };
+}
+
+export type V3RunCancelOutcome =
+  | { kind: 'requested'; cancelRequestId: string }
+  | { kind: 'already-requested'; cancelRequestId: string }
+  | { kind: 'already-cancelled'; cancelRequestId?: string }
+  | { kind: 'already-terminal'; status: 'succeeded' | 'failed' }
+  | { kind: 'stale-run'; reason: 'missing' };
+
+const CANCEL_ACTOR_MAX = 128;
+const CANCEL_REASON_MAX = 500;
+
+/**
+ * Durable, idempotent run-cancel mutation shared by CLI, IM, cards and the
+ * dashboard daemon endpoint. The journal lock is the linearization boundary:
+ * a true terminal committed first wins; otherwise the first cancel request
+ * wins and every repeat reuses its id.
+ */
+export function requestV3RunCancel(
+  baseDir: string,
+  runId: string,
+  input: { by: string; reason?: string },
+): V3RunCancelOutcome {
+  const runDir = safeRunDir(baseDir, runId);
+  if (!existsSync(runDir)) return { kind: 'stale-run', reason: 'missing' };
+  assertV3RunIntegrityForMutation(runDir);
+
+  const by = input.by.trim();
+  if (!by || by.length > CANCEL_ACTOR_MAX || /[\r\n\0]/.test(by)) {
+    throw new Error(`v3 cancel actor must be 1-${CANCEL_ACTOR_MAX} safe characters`);
+  }
+  const reason = input.reason?.trim();
+  if (reason !== undefined && (reason.length === 0 || reason.length > CANCEL_REASON_MAX || /[\0]/.test(reason))) {
+    throw new Error(`v3 cancel reason must be 1-${CANCEL_REASON_MAX} characters`);
+  }
+
+  const journalPath = join(runDir, 'journal.ndjson');
+  return withJournalMutationSync(journalPath, ({ events, append }) => {
+    const snap = materialize([...events]);
+    if (snap.runStatus === 'cancelled') {
+      return { kind: 'already-cancelled', cancelRequestId: snap.cancelRequestId };
+    }
+    if (snap.runStatus === 'succeeded' || snap.runStatus === 'failed') {
+      return { kind: 'already-terminal', status: snap.runStatus };
+    }
+    if (snap.runStatus === 'cancelling' && snap.cancelRequestId) {
+      return { kind: 'already-requested', cancelRequestId: snap.cancelRequestId };
+    }
+    const cancelRequestId = `cancel-${randomUUID()}`;
+    append({
+      type: 'runCancelRequested',
+      cancelRequestId,
+      by,
+      ...(reason ? { reason } : {}),
+    }, { durable: true });
+    return { kind: 'requested', cancelRequestId };
+  });
 }
 
 export type V3RetryOutcome =
@@ -1170,8 +1237,10 @@ export interface V3GateRunnerDeps {
  * source is always the runDir.
  */
 export function createV3GateRunner(deps: V3GateRunnerDeps) {
+  const baseDir = deps.baseDir ?? defaultBaseDir();
   const inFlight = new Set<string>();
   const rerunRequested = new Set<string>();
+  const activeControllers = new Map<string, AbortController>();
 
   const invokeLifecycleHook = (
     hook: ((runId: string) => void | Promise<void>) | undefined,
@@ -1201,21 +1270,54 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
       do {
         rerunRequested.delete(runId); // clear before the run; a request DURING re-sets it
         invokeLifecycleHook(deps.onDriveBegin, runId, 'begin');
+        const controller = new AbortController();
+        activeControllers.set(runId, controller);
         try {
-          await driveV3Run(runId, {
-            baseDir: deps.baseDir,
-            loadBots: deps.loadBots,
-            makeRunNode: deps.makeRunNode,
-            validateManifest: deps.validateManifest,
-            maxParallel: deps.maxParallel,
-            postGateCard: (binding, gate, rid) => deps.postCard(binding, gate, rid),
-            postBlockedCard: deps.postBlockedCard,
-            postLoopGrantCard: deps.postLoopGrantCard,
-            postRevisitGrantCard: deps.postRevisitGrantCard,
-            onTerminal: (rid, outcome, binding) =>
-              deps.notifyTerminal ? deps.notifyTerminal(binding, rid, outcome) : Promise.resolve(),
-          });
+          // The in-memory guard above prevents duplicate drives inside one
+          // daemon.  This lease extends the same invariant across rolling
+          // restarts / an accidental second daemon: only the process that owns
+          // the live worker promises may fold a cancellation to `runCancelled`.
+          // A cancel request itself uses the independent journal lock, so it
+          // can still wake the lease holder while a second daemon waits here.
+          const leaseTarget = join(baseDir, `.v3-drive-${runId}`);
+          let leaseSettled = false;
+          while (!leaseSettled) {
+            try {
+              await withFileLock(leaseTarget, async () => {
+                // A durable cancel can land while driveV3Run is no longer in
+                // runtime (for example it is awaiting a slow gate-card POST).
+                // Re-fold under the SAME lease before releasing ownership so
+                // the request cannot be stranded between runtime and transport.
+                do {
+                  await driveV3Run(runId, {
+                    baseDir,
+                    loadBots: deps.loadBots,
+                    makeRunNode: deps.makeRunNode,
+                    validateManifest: deps.validateManifest,
+                    maxParallel: deps.maxParallel,
+                    cancelSignal: controller.signal,
+                    postGateCard: (binding, gate, rid) => deps.postCard(binding, gate, rid),
+                    postBlockedCard: deps.postBlockedCard,
+                    postLoopGrantCard: deps.postLoopGrantCard,
+                    postRevisitGrantCard: deps.postRevisitGrantCard,
+                    onTerminal: (rid, outcome, binding) =>
+                      deps.notifyTerminal ? deps.notifyTerminal(binding, rid, outcome) : Promise.resolve(),
+                  });
+                } while (currentRunStatus(baseDir, runId) === 'cancelling');
+              }, { maxWaitMs: 15_000 });
+              leaseSettled = true;
+            } catch (err) {
+              // A second daemon may legitimately wait longer than one lock
+              // window while the owner drains a wedged CLI or a Lark request.
+              // Durable cancellation must keep a waiter alive until the lease
+              // is released; ordinary duplicate drives may still fail fast.
+              const lockTimedOut = err instanceof Error && err.message.includes('file-lock timeout waiting for');
+              if (lockTimedOut && currentRunStatus(baseDir, runId) === 'cancelling') continue;
+              throw err;
+            }
+          }
         } finally {
+          if (activeControllers.get(runId) === controller) activeControllers.delete(runId);
           invokeLifecycleHook(deps.onDriveEnd, runId, 'end');
         }
       } while (rerunRequested.has(runId));
@@ -1224,6 +1326,7 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
     } finally {
       inFlight.delete(runId);
       rerunRequested.delete(runId);
+      activeControllers.delete(runId);
     }
   }
 
@@ -1232,10 +1335,20 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
     void drive(runId);
   }
 
+  /** Deliver an already-durable cancel request to the active runtime and make
+   *  sure a fresh replay runs even when the request raced post-card/teardown. */
+  function cancelAndDrive(runId: string, cancelRequestId: string): void {
+    const controller = activeControllers.get(runId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort({ kind: 'run', cancelRequestId });
+    }
+    driveDetached(runId);
+  }
+
   async function coldAttach(ownerLarkAppId?: string): Promise<void> {
     let recs: V3GateRecovery[] = [];
     try {
-      recs = reconcileV3PendingGates(deps.baseDir, ownerLarkAppId);
+      recs = reconcileV3PendingGates(baseDir, ownerLarkAppId);
     } catch (err) {
       deps.onError?.('(cold-attach)', err);
       return;
@@ -1283,7 +1396,19 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
     }
   }
 
-  return { drive, driveDetached, coldAttach };
+  return { drive, driveDetached, cancelAndDrive, coldAttach };
+}
+
+function currentRunStatus(baseDir: string, runId: string): ReturnType<typeof materialize>['runStatus'] | undefined {
+  try {
+    const journalPath = join(safeRunDir(baseDir, runId), 'journal.ndjson');
+    if (!existsSync(journalPath)) return undefined;
+    return materialize(readJournal(journalPath)).runStatus;
+  } catch {
+    // The actual drive path reports integrity/journal errors. This helper is
+    // only a retry predicate and must never convert corruption into a spin.
+    return undefined;
+  }
 }
 
 /**
@@ -1316,7 +1441,21 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
 
       const events = readJournal(journalPath);
       const snap = materialize(events);
-      if (snap.runStatus === 'succeeded' || snap.runStatus === 'failed') continue;
+      if (
+        snap.runStatus === 'succeeded' ||
+        snap.runStatus === 'failed' ||
+        snap.runStatus === 'cancelled'
+      ) continue;
+
+      if (snap.runStatus === 'cancelling') {
+        const binding = readV3RunChatBinding(runDir);
+        if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
+        // Never repost stale gate/retry cards while cancellation is in
+        // progress. A cold drive converges pending/gated nodes immediately;
+        // workers from the dead daemon exit on IPC disconnect.
+        out.push({ runId, runDir, binding, repost: [], resume: true });
+        continue;
+      }
 
       if (snap.runStatus === 'blocked') {
         // Blocked run: repost the recovery card (covers the crash window

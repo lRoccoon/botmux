@@ -14,7 +14,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, promises as fs, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
-import type { RawParamInput } from '../params.js';
+import type { RawParamInput } from '../shared/params.js';
 import {
   compileSavedWorkflowFromRun,
   materializeSavedWorkflowRun,

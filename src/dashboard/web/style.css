@@ -18583,6 +18583,8 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-node.st-skipped .v3r-box, .v3r-node.st-cancelled .v3r-box { stroke-dasharray: 4 3; }
 .rs-running   { --ns: var(--v3r-running); }
 .rs-succeeded { --ns: var(--v3r-done); }
+.rs-cancelling { --ns: var(--v3r-blocked); }
+.rs-cancelled { --ns: var(--v3r-skipped); }
 .rs-blocked   { --ns: var(--v3r-blocked); }
 .rs-failed    { --ns: var(--v3r-failed); }
 
@@ -18837,6 +18839,33 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 
 .v3r-run-status-pill {
   flex: none;
+}
+
+.page-heading-actions > button.v3r-cancel-button {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 5%, transparent);
+  color: var(--danger);
+}
+
+.page-heading-actions > button.v3r-cancel-button:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 11%, transparent);
+  color: var(--danger);
+}
+
+.v3r-cancel-notice {
+  padding: .62rem .82rem;
+  border: 1px solid color-mix(in srgb, var(--warning) 34%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.v3r-cancel-notice.done {
+  border-color: color-mix(in srgb, var(--muted) 28%, var(--border-soft));
+  background: color-mix(in srgb, var(--muted) 6%, var(--surface));
+  color: var(--muted);
 }
 
 .legacy-workflow-status-menu {

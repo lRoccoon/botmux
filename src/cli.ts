@@ -77,7 +77,7 @@ import {
   resolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
-import { loadDashboardSecret } from './dashboard/auth.js';
+import { loadDashboardSecret, signCliAuth } from './dashboard/auth.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
@@ -3684,6 +3684,102 @@ function authorizeWorkflowDaemonCommand(runId: string, rest: string[]): string {
   }).larkAppId;
 }
 
+/** `botmux workflow cancel <runId>` — authenticate the exact current caller
+ * against the immutable run binding, then ask the owning daemon to durably
+ * record cancellation before interrupting workers. */
+async function cmdWorkflowCancelV3(runId: string | undefined, rest: string[]): Promise<void> {
+  if (!runId) {
+    console.error('用法: botmux workflow cancel <runId> [--reason <text>] [--bot <larkAppId>]');
+    process.exit(1);
+  }
+  const {
+    formatV3RunCancelCliSuccess,
+    parseV3RunCancelCliOptions,
+  } = await import('./cli/v3-run-cancel.js');
+  const parsed = parseV3RunCancelCliOptions(rest);
+  if (!parsed.ok) {
+    console.error(`❌ ${parsed.error}`);
+    console.error('用法: botmux workflow cancel <runId> [--reason <text>] [--bot <larkAppId>]');
+    process.exit(1);
+  }
+  const reason = parsed.reason;
+  const authority = authorizeV3DaemonCommand({
+    runId,
+    dataDir: resolveDataDir(),
+    envSessionId: process.env.BOTMUX_SESSION_ID,
+    requestedLarkAppId: parsed.larkAppId,
+    allowStandaloneLocal: true,
+  });
+  if (authority.mode === 'standalone') {
+    // A manual_cli run is owned by its foreground/local runtime, not a daemon.
+    // Persisting the shared journal intent is sufficient: runWorkflow polls the
+    // durable cut while a worker is active and aborts it within one tick.
+    const { requestV3RunCancel } = await import('./workflows/v3/daemon-run.js');
+    let outcome;
+    try {
+      outcome = requestV3RunCancel(dirname(authority.runDir), runId, {
+        by: 'standalone-cli',
+        ...(reason ? { reason } : {}),
+      });
+    } catch (err) {
+      console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    if (outcome.kind === 'stale-run') throw new Error(`找不到 v3 run ${runId}`);
+    if (outcome.kind === 'already-terminal') {
+      console.log(formatV3RunCancelCliSuccess({
+        ok: true, runId, status: outcome.status, alreadyTerminal: true,
+      }));
+      return;
+    }
+    if (outcome.kind === 'already-cancelled') {
+      console.log(formatV3RunCancelCliSuccess({
+        ok: true, runId, status: 'cancelled', alreadyTerminal: true,
+        ...(outcome.cancelRequestId ? { cancelRequestId: outcome.cancelRequestId } : {}),
+      }));
+      return;
+    }
+    console.log(formatV3RunCancelCliSuccess({
+      ok: true,
+      runId,
+      status: 'cancelling',
+      cancelRequestId: outcome.cancelRequestId,
+      alreadyRequested: outcome.kind === 'already-requested',
+    }));
+    return;
+  }
+
+  const daemon = findDaemon(authority.larkAppId);
+  if (!daemon) {
+    console.error('❌ 没有在线的目标 daemon；v3 run 取消需要由所属 daemon 持久化并中断节点。');
+    process.exit(1);
+  }
+  let secret: string | null = null;
+  try {
+    secret = loadDashboardSecret(join(CONFIG_DIR, '.dashboard-secret'));
+  } catch (err) {
+    console.error(`❌ 无法读取 .dashboard-secret：${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  if (!secret) {
+    console.error('❌ 缺少 .dashboard-secret，无法认证 v3 cancel daemon 请求；请先重启 botmux 初始化。');
+    process.exit(1);
+  }
+  try {
+    const { postV3RunCancel } = await import('./cli/v3-run-cancel.js');
+    const result = await postV3RunCancel({
+      ipcPort: daemon.ipcPort,
+      runId,
+      auth: signCliAuth(secret),
+      ...(reason ? { reason } : {}),
+    });
+    console.log(formatV3RunCancelCliSuccess(result));
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
 /** `botmux workflow start <runId>` — POST the daemon's v3 start IPC so the run
  *  is daemon-driven (humanGate → 飞书审批卡).  The grill skill calls this after
  *  approve-dag instead of the standalone `botmux v3 run` (which has no card
@@ -4114,6 +4210,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        运行 / 查看 Saved Workflow
   workflow new|spec-finalize|approve-spec|revise-spec|architect|revise-dag [...]
   workflow approve-dag|start [...]     创建、修订并运行一次性即兴 Workflow
+  workflow cancel <runId> [--reason <text>] [--bot <larkAppId>]
+                                       持久化取消 v3 run 并中断活动节点
   workflow retry|grant [...]           处理受阻节点 / loop
   template <run|resume|cancel|ls|tail|validate|show> [...]
                                        v2 模板迁移命名空间（仅兼容一个版本）
@@ -7948,6 +8046,12 @@ switch (command) {
   }
   case 'workflow': {
     const wfSub = process.argv[3] ?? '';
+    if (wfSub === 'cancel') {
+      // Durable v3 run cancellation. v2 cancellation is available only under
+      // `botmux template cancel` during the retirement window.
+      await cmdWorkflowCancelV3(process.argv[4], process.argv.slice(5));
+      break;
+    }
     if (wfSub === 'start') {
       // `botmux workflow start <runId>` — kick a daemon-driven v3 run (so
       // humanGate posts approval cards).  Needs a live daemon; findDaemon is

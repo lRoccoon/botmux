@@ -2,7 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { SectionHeader } from './dashboard-components.js';
 import { legacyWorkflowDetailHash } from './legacy-workflow-link.js';
 import { useT } from './react-hooks.js';
-import { fetchV3RunDetail, fetchV3Runs, probeLegacyV2RunSnapshot, shouldProbeLegacyV2Fallback } from './v3-api.js';
+import { ui } from './ui.js';
+import { cancelV3Run, fetchV3RunDetail, fetchV3Runs, probeLegacyV2RunSnapshot, shouldProbeLegacyV2Fallback } from './v3-api.js';
 import { WorkflowVersionSwitch } from './workflow-version-switch.js';
 import {
   V3_DECISION_LABEL,
@@ -170,12 +171,30 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [instanceId, setInstanceId] = useState<string | null>(null);
   const [instancePinned, setInstancePinned] = useState(false);
+  const [cancelBusy, setCancelBusy] = useState(false);
+  const [cancelSubmitted, setCancelSubmitted] = useState(false);
+  const [cancelNotice, setCancelNotice] = useState<string | null>(null);
 
   useEffect(() => {
     setSelectedId(null);
     setInstanceId(null);
     setInstancePinned(false);
+    setCancelBusy(false);
+    setCancelSubmitted(false);
+    setCancelNotice(null);
   }, [props.runId]);
+
+  useEffect(() => {
+    if (view?.runStatus === 'cancelling') {
+      setCancelSubmitted(true);
+      setCancelNotice(tr('workflow.v3.cancelPending'));
+    } else if (view?.runStatus === 'cancelled') {
+      setCancelSubmitted(false);
+      setCancelNotice(tr('workflow.v3.cancelled'));
+    } else if (isTerminalRunStatus(view?.runStatus)) {
+      setCancelSubmitted(false);
+    }
+  }, [tr, view?.runStatus]);
 
   useEffect(() => {
     if (!view) return;
@@ -198,6 +217,36 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
 
   const selectedNode = view?.nodes.find((node) => node.id === selectedId) ?? null;
   const statusClass = view ? `v3r-pill rs-${view.runStatus}` : 'v3r-pill';
+  const terminal = isTerminalRunStatus(view?.runStatus);
+  const cancelling = cancelBusy || cancelSubmitted || view?.runStatus === 'cancelling';
+
+  const cancelRun = useCallback(async () => {
+    if (!view || terminal || cancelling) return;
+    if (!window.confirm(tr('workflow.v3.cancelConfirm', { runId: props.runId }))) return;
+    setCancelBusy(true);
+    setCancelNotice(null);
+    try {
+      const result = await cancelV3Run(props.runId);
+      if (!result.ok) {
+        setCancelNotice(result.status === 401
+          ? tr('workflow.v3.cancelAuthRequired')
+          : tr('workflow.v3.cancelFailed', { error: result.error }));
+        return;
+      }
+      setCancelNotice(
+        result.runStatus === 'cancelled'
+          ? tr('workflow.v3.cancelled')
+          : result.alreadyTerminal
+            ? tr('workflow.v3.cancelAlreadyTerminal')
+            : tr('workflow.v3.cancelPending'),
+      );
+      setCancelSubmitted(result.runStatus !== 'cancelled' && result.alreadyTerminal !== true);
+    } catch {
+      setCancelNotice(tr('workflow.v3.cancelFailed', { error: 'network_error' }));
+    } finally {
+      setCancelBusy(false);
+    }
+  }, [cancelling, props.runId, terminal, tr, view]);
 
   return (
     <>
@@ -209,9 +258,19 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
           <span className={`${statusClass} v3r-run-status-pill`}>{statusText}</span>
         </div>
         <div className="page-heading-actions">
+          <V3CancelButton
+            runStatus={view?.runStatus}
+            busy={cancelBusy || cancelSubmitted}
+            onCancel={() => { void cancelRun(); }}
+          />
           <WorkflowVersionSwitch active="v3" />
         </div>
       </div>
+      {cancelNotice ? (
+        <div className={`v3r-cancel-notice${view?.runStatus === 'cancelled' ? ' done' : ''}`} role="status">
+          {cancelNotice}
+        </div>
+      ) : null}
       <div className="v3r-wrap">
         <section className="overview-block v3r-graph-section">
           <SectionHeader
@@ -244,6 +303,32 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
         </section>
       </div>
     </>
+  );
+}
+
+export function V3CancelButton(props: {
+  runStatus: RunView['runStatus'] | undefined;
+  busy: boolean;
+  onCancel: () => void;
+}): JSX.Element | null {
+  const tr = useT();
+  if (!ui.authed) return null;
+  const terminal = isTerminalRunStatus(props.runStatus);
+  const cancelling = props.busy || props.runStatus === 'cancelling';
+  return (
+    <button
+      type="button"
+      className="danger v3r-cancel-button"
+      disabled={!props.runStatus || terminal || cancelling}
+      title={terminal ? tr('workflow.v3.cancelTerminal') : tr('workflow.v3.cancelTitle')}
+      onClick={props.onCancel}
+    >
+      {cancelling
+        ? tr('workflow.v3.cancelling')
+        : terminal
+          ? tr('workflow.v3.cancelTerminal')
+          : tr('workflow.v3.cancel')}
+    </button>
   );
 }
 

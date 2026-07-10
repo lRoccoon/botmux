@@ -90,7 +90,7 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
   }
   // One-version CLI compatibility for non-conflicting legacy ops. The v2
   // engine's canonical namespace is now `botmux template ...`.
-  if (['resume', 'cancel', 'ls', 'tail', 'validate'].includes(sub)) {
+  if (['resume', 'ls', 'tail', 'validate'].includes(sub)) {
     console.warn(`⚠️  v2 命令已迁到 \`botmux template ${sub}\`；本次兼容执行。`);
     await cmdTemplate(sub, rest);
     return;
@@ -142,7 +142,7 @@ export async function cmdTemplate(sub: string, rest: string[]): Promise<void> {
 }
 
 function printWorkflowHelp(): void {
-  console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|retry|grant> [...]
+  console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|cancel|retry|grant> [...]
 
 Saved Workflow:
   save [last|runId] [名称] [--workflow-id <chat-scope-id>]
@@ -153,6 +153,8 @@ Saved Workflow:
 
 即兴 Workflow:
   new / spec-finalize / approve-spec / architect / approve-dag / start
+  cancel <runId> [--reason <text>] [--bot <larkAppId>]
+      持久化 v3 run 取消意图并由所属 daemon 中断活动节点
 
 v2 模板迁移期入口: botmux template <run|resume|cancel|ls|tail|validate|show>
 `);
@@ -442,10 +444,10 @@ async function cmdWorkflowResume(rest: string[]): Promise<void> {
 async function cmdWorkflowCancel(rest: string[]): Promise<void> {
   const runId = positionals(rest)[0];
   if (!runId) {
-    console.error('用法: botmux workflow cancel <runId> [--reason <text>]');
+    console.error('用法: botmux template cancel <runId> [--reason <text>]');
     process.exit(1);
   }
-  const reason = argValue(rest, '--reason') ?? 'cancelled via botmux workflow cancel';
+  const reason = argValue(rest, '--reason') ?? 'cancelled via botmux template cancel';
   const runsDir = getRunsDir();
   const log = new EventLog(runId, runsDir);
 

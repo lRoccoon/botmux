@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import React from 'react';
+import TestRenderer, { act } from 'react-test-renderer';
 import {
   buildGraphLayout,
   buildRoundMiniDagLayout,
@@ -8,6 +10,7 @@ import {
   v3RunIdFromHash,
 } from '../src/dashboard/web/v3-model.js';
 import {
+  cancelV3Run,
   fetchV3RunDetail,
   fetchV3Runs,
   probeLegacyV2RunSnapshot,
@@ -21,6 +24,10 @@ import {
   nodeTerminalSignature,
 } from '../src/dashboard/web/v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../src/workflows/v3/ops-projection.js';
+import { V3CancelButton } from '../src/dashboard/web/v3-components.js';
+import { ui } from '../src/dashboard/web/ui.js';
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 function node(overrides: Partial<RunNodeView> = {}): RunNodeView {
   return {
@@ -54,9 +61,11 @@ function response(ok: boolean, status: number, body: unknown = {}): Response {
 }
 
 describe('v3 dashboard model', () => {
-  it('stops detail polling only for succeeded/failed, not blocked', () => {
+  it('stops detail polling for terminal states, but keeps polling through cancelling/blocked', () => {
     expect(isTerminalRunStatus('succeeded')).toBe(true);
     expect(isTerminalRunStatus('failed')).toBe(true);
+    expect(isTerminalRunStatus('cancelled')).toBe(true);
+    expect(isTerminalRunStatus('cancelling')).toBe(false);
     expect(isTerminalRunStatus('blocked')).toBe(false);
     expect(isTerminalRunStatus('running')).toBe(false);
   });
@@ -172,6 +181,105 @@ describe('v3 dashboard api helpers', () => {
     });
     expect(exists).toBe(true);
     expect(calls).toEqual(['/api/workflows/runs/old%2Frun/snapshot']);
+  });
+
+  it('posts v3 cancel with an encoded run id and preserves cancelling/cancelled outcomes', async () => {
+    const fetcher = vi.fn<V3Fetch>(async () => response(true, 202, {
+      ok: true,
+      runId: 'run/id',
+      status: 'cancelling',
+    }));
+    await expect(cancelV3Run('run/id', fetcher)).resolves.toEqual({
+      ok: true,
+      runId: 'run/id',
+      runStatus: 'cancelling',
+    });
+    expect(fetcher).toHaveBeenCalledWith('/api/v3/runs/run%2Fid/cancel', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+
+    await expect(cancelV3Run('done', async () => response(true, 200, {
+      ok: true,
+      status: 'cancelled',
+      alreadyTerminal: true,
+    }))).resolves.toEqual({
+      ok: true,
+      runStatus: 'cancelled',
+      alreadyTerminal: true,
+    });
+  });
+
+  it('returns a safe v3 cancel error for JSON and non-JSON failures', async () => {
+    await expect(cancelV3Run('r-1', async () => response(false, 409, {
+      ok: false,
+      error: 'needs_cli_cancel',
+    }))).resolves.toEqual({ ok: false, status: 409, error: 'needs_cli_cancel' });
+
+    await expect(cancelV3Run('r-1', async () => ({
+      ok: false,
+      status: 401,
+      json: async () => { throw new Error('HTML auth wall'); },
+    }) as Response)).resolves.toEqual({ ok: false, status: 401, error: 'http_401' });
+  });
+});
+
+describe('v3 dashboard cancel control', () => {
+  it('enables only non-terminal runs and disables throughout cancelling/cancelled', () => {
+    const onCancel = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(V3CancelButton, {
+        runStatus: 'running',
+        busy: false,
+        onCancel,
+      }));
+    });
+    let button = renderer.root.findByType('button');
+    expect(button.props.disabled).toBe(false);
+    act(() => { button.props.onClick(); });
+    expect(onCancel).toHaveBeenCalledOnce();
+
+    act(() => {
+      renderer.update(React.createElement(V3CancelButton, {
+        runStatus: 'cancelling',
+        busy: false,
+        onCancel,
+      }));
+    });
+    button = renderer.root.findByType('button');
+    expect(button.props.disabled).toBe(true);
+
+    act(() => {
+      renderer.update(React.createElement(V3CancelButton, {
+        runStatus: 'cancelled',
+        busy: false,
+        onCancel,
+      }));
+    });
+    button = renderer.root.findByType('button');
+    expect(button.props.disabled).toBe(true);
+    act(() => { renderer.unmount(); });
+  });
+
+  it('does not render a mutation affordance for public read-only visitors', () => {
+    const previous = ui.authed;
+    let renderer!: TestRenderer.ReactTestRenderer;
+    try {
+      ui.authed = false;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(V3CancelButton, {
+          runStatus: 'running',
+          busy: false,
+          onCancel: vi.fn(),
+        }));
+      });
+      expect(renderer.toJSON()).toBeNull();
+    } finally {
+      if (renderer) act(() => { renderer.unmount(); });
+      ui.authed = previous;
+    }
   });
 });
 

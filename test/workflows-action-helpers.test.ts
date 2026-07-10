@@ -248,6 +248,6 @@ describe('runCancel', () => {
     const body = r.body as any;
     expect(body.ok).toBe(false);
     expect(body.error).toBe('needs_cli_cancel');
-    expect(body.hint).toContain("botmux workflow cancel r1");
+    expect(body.hint).toContain("botmux template cancel r1");
   });
 });

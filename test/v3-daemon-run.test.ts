@@ -9,6 +9,7 @@ import {
   preflightV3RunStart,
   reconcileV3PendingGates,
   requestRevisitGrant,
+  requestV3RunCancel,
   requestV3LoopGrant,
   requestV3Retry,
   resolveV3GateClick,
@@ -455,6 +456,113 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
   });
 });
 
+describe('requestV3RunCancel — durable idempotent mutation', () => {
+  it('appends exactly one first-wins request and reuses its id on replay', () => {
+    const base = freshBase();
+    try {
+      const runId = 'cancel-idempotent';
+      const runDir = seedSavedDefinitionRun(base, runId);
+      const journalPath = join(runDir, 'journal.ndjson');
+      appendEvent(journalPath, { type: 'runStarted', runId });
+
+      const first = requestV3RunCancel(base, runId, {
+        by: 'ou_first',
+        reason: 'user stopped the run',
+      });
+      expect(first.kind).toBe('requested');
+      if (first.kind !== 'requested') throw new Error('expected requested');
+
+      const replay = requestV3RunCancel(base, runId, {
+        by: 'ou_second',
+        reason: 'must not replace the original request',
+      });
+      expect(replay).toEqual({
+        kind: 'already-requested',
+        cancelRequestId: first.cancelRequestId,
+      });
+
+      const requests = readJournal(journalPath).filter((event) => event.type === 'runCancelRequested');
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({
+        cancelRequestId: first.cancelRequestId,
+        by: 'ou_first',
+        reason: 'user stopped the run',
+      });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['succeeded', 'failed'] as const)('does not append after a %s terminal', (status) => {
+    const base = freshBase();
+    try {
+      const runId = `cancel-after-${status}`;
+      const runDir = seedSavedDefinitionRun(base, runId);
+      const journalPath = join(runDir, 'journal.ndjson');
+      appendEvent(journalPath, { type: 'runStarted', runId });
+      appendEvent(
+        journalPath,
+        status === 'succeeded'
+          ? { type: 'runSucceeded' }
+          : { type: 'runFailed', failedNodeId: 'deploy' },
+      );
+
+      expect(requestV3RunCancel(base, runId, { by: 'ou_user' })).toEqual({
+        kind: 'already-terminal',
+        status,
+      });
+      expect(readJournal(journalPath).some((event) => event.type === 'runCancelRequested')).toBe(false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('reports an already-cancelled run without appending another request', () => {
+    const base = freshBase();
+    try {
+      const runId = 'cancel-already-terminal';
+      const runDir = seedSavedDefinitionRun(base, runId);
+      const journalPath = join(runDir, 'journal.ndjson');
+      appendEvent(journalPath, { type: 'runStarted', runId });
+      appendEvent(journalPath, {
+        type: 'runCancelRequested',
+        cancelRequestId: 'cancel-original',
+        by: 'ou_first',
+      });
+      appendEvent(journalPath, {
+        type: 'runCancelled',
+        cancelRequestId: 'cancel-original',
+        by: 'ou_first',
+      });
+
+      expect(requestV3RunCancel(base, runId, { by: 'ou_second' })).toEqual({
+        kind: 'already-cancelled',
+        cancelRequestId: 'cancel-original',
+      });
+      expect(readJournal(journalPath).filter((event) => event.type === 'runCancelRequested')).toHaveLength(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('allows cancellation from blocked because blocked is recoverable, not a true terminal', () => {
+    const base = freshBase();
+    try {
+      const runId = 'cancel-from-blocked';
+      const runDir = seedSavedDefinitionRun(base, runId);
+      const journalPath = join(runDir, 'journal.ndjson');
+      appendEvent(journalPath, { type: 'runStarted', runId });
+      appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: 'deploy' });
+
+      const outcome = requestV3RunCancel(base, runId, { by: 'ou_user' });
+      expect(outcome.kind).toBe('requested');
+      expect(readJournal(journalPath).filter((event) => event.type === 'runCancelRequested')).toHaveLength(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('v3 mutation integrity — tamper fail-closed before side effects', () => {
   function tamperAuthorizedDag(runDir: string): void {
     const dagPath = join(runDir, 'dag.json');
@@ -754,6 +862,95 @@ describe('reconcileV3PendingGates — 重启恢复 + 原子窗口（codex #2/#3�
 });
 
 describe('createV3GateRunner — in-flight 锁 + coldAttach 顺序', () => {
+  it('two runners share a drive lease: durable cancel reaches the worker owner and commits once', async () => {
+    const base = freshBase();
+    try {
+      const runDir = seedApprovedRun(base, 'lease-cancel', { binding: BINDING });
+      const journalPath = join(runDir, 'journal.ndjson');
+      appendEvent(journalPath, { type: 'runStarted', runId: 'lease-cancel' });
+      appendEvent(journalPath, {
+        type: 'gateDispatched', nodeId: 'deploy', instanceId: 'deploy#001', waitId: 'deploy#001-gate',
+      });
+      appendEvent(journalPath, {
+        type: 'gateResolved', nodeId: 'deploy', instanceId: 'deploy#001', waitId: 'deploy#001-gate',
+        resolution: 'approved', by: 'ou_user',
+      });
+
+      let workerStarted = false;
+      let workerAborted = false;
+      const runNode: RunNode = async (req) => {
+        workerStarted = true;
+        return await new Promise((resolve) => {
+          const stop = (): void => {
+            workerAborted = true;
+            resolve({ status: 'cancelled', manifestPath: join(req.attemptDir, 'manifest.json') });
+          };
+          if (req.cancelSignal?.aborted) stop();
+          else req.cancelSignal?.addEventListener('abort', stop, { once: true });
+        });
+      };
+      const common = {
+        baseDir: base,
+        loadBots: () => [{ larkAppId: 'cli_test', larkAppSecret: 's', cliId: 'claude-code' } as any],
+        makeRunNode: () => runNode,
+        validateManifest: async () => ({ ok: false as const, problems: ['cancelled'] }),
+        postCard: async () => {},
+      };
+      const runnerA = createV3GateRunner(common);
+      const runnerB = createV3GateRunner(common);
+      const a = runnerA.drive('lease-cancel');
+      await vi.waitFor(() => expect(workerStarted).toBe(true));
+
+      const request = requestV3RunCancel(base, 'lease-cancel', { by: 'ou_user' });
+      if (request.kind !== 'requested') throw new Error(`unexpected cancel outcome ${request.kind}`);
+      runnerB.cancelAndDrive('lease-cancel', request.cancelRequestId);
+      await a;
+      await vi.waitFor(() => {
+        expect(readJournal(journalPath).filter((event) => event.type === 'runCancelled')).toHaveLength(1);
+      });
+
+      expect(workerAborted).toBe(true);
+      expect(readJournal(journalPath).filter((event) => event.type === 'runCancelRequested')).toHaveLength(1);
+      expect(readJournal(journalPath).filter((event) => event.type === 'runCancelled')).toHaveLength(1);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('cancel during a slow postCard is re-folded by the lease holder before handoff', async () => {
+    const base = freshBase();
+    try {
+      const runDir = seedApprovedRun(base, 'lease-card-cancel', { binding: BINDING });
+      let cardStarted = false;
+      let releaseCard: () => void = () => {};
+      const card = new Promise<void>((resolve) => { releaseCard = resolve; });
+      const common = {
+        baseDir: base,
+        loadBots: () => [{ larkAppId: 'cli_test', larkAppSecret: 's', cliId: 'claude-code' } as any],
+        makeRunNode: () => (async () => ({ status: 'ok' as const, manifestPath: 'unused' })),
+        validateManifest: async () => ({ ok: false as const, problems: ['unexpected'] }),
+      };
+      const runnerA = createV3GateRunner({
+        ...common,
+        postCard: async () => { cardStarted = true; await card; },
+      });
+      const runnerB = createV3GateRunner({ ...common, postCard: async () => {} });
+      const a = runnerA.drive('lease-card-cancel');
+      await vi.waitFor(() => expect(cardStarted).toBe(true));
+      const request = requestV3RunCancel(base, 'lease-card-cancel', { by: 'ou_user' });
+      if (request.kind !== 'requested') throw new Error(`unexpected cancel outcome ${request.kind}`);
+      const b = runnerB.drive('lease-card-cancel');
+
+      releaseCard();
+      await Promise.all([a, b]);
+      const events = readJournal(join(runDir, 'journal.ndjson'));
+      expect(events.filter((event) => event.type === 'runCancelled')).toHaveLength(1);
+      expect(events.some((event) => event.type === 'nodeCancelled' && event.nodeId === 'deploy')).toBe(true);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('progress lifecycle hook 失败只上报，不改变 workflow 结果', async () => {
     const base = freshBase();
     try {
@@ -800,6 +997,7 @@ describe('createV3GateRunner — in-flight 锁 + coldAttach 顺序', () => {
       const p1 = runner.drive('gate-run'); // 进入、awaitingGate、postCard 阻塞
       const p2 = runner.drive('gate-run'); // inFlight.has('gate-run') → 立即 no-op
       await p2; // 快速返回（被去重）
+      await vi.waitFor(() => expect(postCalls).toBe(1));
       expect(postCalls).toBe(1); // 只有第一次 drive 发了卡
       release();
       await p1;

@@ -175,8 +175,8 @@ export async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T
 // terminal-control credential (the worker write token: GET /write-link returns
 // the URL, POST /write-link-card delivers it as a private Lark card), so they
 // additionally require the caller to prove it can read ~/.botmux/.dashboard-secret.
-// That keeps a sandboxed worker, or a random local process that merely discovered
-// the ipcPort, from minting write tokens for sessions it doesn't own. The legit
+// That keeps a caller that merely discovered the ipcPort from minting write
+// tokens for sessions it doesn't own. The legit
 // callers — the dashboard proxy and `botmux term-link` — sign with the same secret
 // + scheme as `botmux dashboard` → /__cli/rotate. (A same-user process that can
 // read the secret is out of scope: it's already trusted.)
@@ -188,7 +188,10 @@ function ipcAuthSecret(): string | null {
   try { return readFileSync(join(homedir(), '.botmux', '.dashboard-secret'), 'utf8').trim() || null; }
   catch { return null; }
 }
-function tokenRouteAuthorized(req: IncomingMessage): boolean {
+/** Authenticate a high-impact loopback daemon mutation with the machine-local
+ * dashboard secret. Exported so feature routes registered by daemon.ts can use
+ * the same replay-protected HMAC boundary as terminal write-link routes. */
+export function ipcHmacAuthorized(req: IncomingMessage): boolean {
   const secret = ipcAuthSecret();
   if (!secret) return false; // fail-closed: no secret on disk → nobody can sign
   const ts = req.headers['x-botmux-cli-ts'];
@@ -714,7 +717,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lock', async (req, res, params) => {
  * can't pull a write token.
  */
 ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
-  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   // Riff backend: the sandbox URL is the writable link — no local worker needed.
@@ -737,7 +740,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
  * credential, just into Lark rather than into the HTTP response.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, params) => {
-  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   const r = await deliverWriteLinkCardToOwners(ds);

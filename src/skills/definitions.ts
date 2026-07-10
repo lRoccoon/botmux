@@ -1213,14 +1213,14 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 
 const WORKFLOW_V3_SKILL = `---
 name: botmux-workflow
-description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排成 DAG 并跑完，也负责 Saved Workflow 的保存、运行、列表和详情。自然语言触发包括“调研后出报告”“把 A/B/C 串起来”“把刚才的流程存下来”“运行已保存的周报流程”“有哪些流程”；自然语言多步目标先做一次轻确认，只有显式 \`/workflow ...\` 可跳过，明确的 Saved Workflow 操作可直接执行。单步请求、普通问答、普通改代码不要触发。边界：workflow 是有界 DAG、跑完即散、一个交付物；需要多 bot 分工 + 持续 goal 群/多话题协调 + 主 bot 验收时用 botmux-orchestrate。
+description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排成 DAG 并跑完，也负责 Saved Workflow 的保存、运行、列表、详情和 run 取消。自然语言触发包括“调研后出报告”“把 A/B/C 串起来”“把刚才的流程存下来”“运行已保存的周报流程”“取消刚才的流程”“有哪些流程”；自然语言多步目标先做一次轻确认，只有显式 \`/workflow ...\` 可跳过，明确的 Saved Workflow/run 操作可直接执行。单步请求、普通问答、普通改代码不要触发。边界：workflow 是有界 DAG、跑完即散、一个交付物；需要多 bot 分工 + 持续 goal 群/多话题协调 + 主 bot 验收时用 botmux-orchestrate。
 ---
 
 # botmux-workflow — v3 即兴 + Saved Workflow
 
-统一处理两类能力：① 把一句模糊的复合目标通过「拷问澄清 → 自动编排 DAG → 人确认 → 自动执行」做完；② 把成功 run 保存成 Saved Workflow，并负责后续运行、列出和查看。整个过程在当前飞书话题里进行（用 botmux send 跟用户对话）。
+统一处理两类能力：① 把一句模糊的复合目标通过「拷问澄清 → 自动编排 DAG → 人确认 → 自动执行」做完；② 管理 v3 run 与 Saved Workflow，包括保存、复用、查看和取消。整个过程在当前飞书话题里进行（用 botmux send 跟用户对话）。
 
-用户可以用大白话表达，也可以显式发 \`/workflow <目标>\`、\`/workflow save|run|list|show ...\`。不要再把新流程分流到 \`/template run\` 或 botmux-workflow-create；那套仅用于 v2 存量迁移。
+用户可以用大白话表达，也可以显式发 \`/workflow <目标>\`、\`/workflow save|run|cancel|list|show ...\`。不要再把新流程分流到 \`/template run\` 或 botmux-workflow-create；那套仅用于 v2 存量迁移（v2 run 取消仍用 \`/template cancel\`）。
 
 ## 何时用 / 不用
 - ✅ 一个**有界、需要拆成多步、最终汇成一个交付物**的目标（“调研三家竞品出对比报告”“拉日志分析后生成图表”）。Workflow 跑完即散。
@@ -1241,6 +1241,7 @@ description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排
 
 - “把刚才那个流程存下来（叫周报）” → \`botmux workflow save last 周报\`（IM 等价：\`/workflow save last 周报\`）。只保存已成功结束且属于当前用户/话题的 run；agent-facing CLI 固定为 chat scope。用户明确要求跨话题复用时，不得替用户执行 \`--global\`，请让用户本人在飞书显式发送 \`/workflow save last 周报 --global\`，由 daemon 校验 canOperate。
 - “运行已保存的周报流程，region=sg” → \`botmux workflow run 周报 --param region=sg\`（IM 等价：\`/workflow run 周报 region=sg\`）。缺必填参数时只补问缺的项；名称有歧义时展示候选，不要猜。
+- “取消刚才正在跑的流程” → \`botmux workflow cancel <runId>\`（IM 等价：\`/workflow cancel <runId>\`）。只使用真实 runId；CLI 会校验当前 turn 与 run 的 owner/chat/app 绑定，IM 中本群可操作成员也可取消。若是 v2 run，明确改用 \`/template cancel <runId>\`，不要跨引擎猜测。
 - “我有哪些流程” → \`botmux workflow list\`（IM：\`/workflow list\`）。
 - “看看周报流程” → \`botmux workflow show 周报\`（IM：\`/workflow show 周报\`）。
 

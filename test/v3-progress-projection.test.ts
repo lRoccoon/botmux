@@ -239,6 +239,42 @@ describe('projectV3Progress', () => {
     });
     expect(succeeded.status).toBe('succeeded');
     expect(succeeded.counts).toMatchObject({ total: 2, done: 1, skipped: 1 });
+
+    const cancellingEvents: StoredEvent[] = [
+      at(1, { type: 'runStarted', runId: 'progress-run' }),
+      at(2, { type: 'nodeDispatched', nodeId: 'research', attemptId: '001' }),
+      at(3, {
+        type: 'runCancelRequested',
+        cancelRequestId: 'cancel-progress',
+        by: 'ou_user',
+      }),
+    ];
+    const cancelling = projectV3Progress({ envelope: envelope(), dag: dag(), events: cancellingEvents });
+    expect(cancelling.status).toBe('cancelling');
+
+    const cancelled = projectV3Progress({
+      envelope: envelope(),
+      dag: dag(),
+      events: [
+        ...cancellingEvents,
+        at(4, {
+          type: 'nodeCancelled',
+          nodeId: 'research',
+          attemptId: '001',
+          reason: 'runCancelled',
+          cancelRequestId: 'cancel-progress',
+        }),
+        at(5, {
+          type: 'nodeCancelled',
+          nodeId: 'publish',
+          reason: 'runCancelled',
+          cancelRequestId: 'cancel-progress',
+        }),
+        at(6, { type: 'runCancelled', cancelRequestId: 'cancel-progress', by: 'ou_user' }),
+      ],
+    });
+    expect(cancelled.status).toBe('cancelled');
+    expect(cancelled.counts.cancelled).toBe(2);
   });
 
   it('keeps loop body instances outside the outer total while exposing bounded loop metadata', () => {

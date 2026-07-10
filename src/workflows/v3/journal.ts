@@ -75,6 +75,10 @@ export type V3Event =
   // carry their own expanded nodeId) omit it, and consumers fall back to
   // nodeId-keyed behavior (instance restoration design 2026-06-08).
   | { type: 'nodeDispatched'; nodeId: string; instanceId?: string; attemptId: string; loop?: V3LoopRef }
+  // Durable proof that the attempt's pre-fork worker fence was published
+  // before factory.spawn(). Recovery treats a missing/corrupt fence after this
+  // marker as unknown until process discovery proves no outer worker remains.
+  | { type: 'nodeWorkerFenceArmed'; nodeId: string; instanceId?: string; attemptId: string }
   // Written when the node's worker web terminal is ready (mid-run) so the
   // dashboard can attach to an in-flight node's LIVE terminal instead of waiting
   // for completion.  Kept even if the node later fails (terminal info survives).
@@ -151,18 +155,21 @@ export type V3Event =
   // It is not a failure and does not trigger fail-fast; its outgoing edges
   // become inactive by pure derivation from node state + static DAG.
   | { type: 'nodeSkipped'; nodeId: string; reason: 'triggerRuleUnsatisfied'; detail?: string }
-  // A neutral terminal for early-release losers.  This is deliberately NOT
-  // nodeFailed(errorClass:'cancelled'): cancellation means "no longer needed",
-  // not "requires intervention", and must not trip the fail-fast sweep.
-  | {
+  // A neutral terminal for early-release losers and run-level cancellation.
+  // This is deliberately NOT nodeFailed(errorClass:'cancelled'): cancellation
+  // means "no longer needed", not "requires intervention", and must not trip
+  // the fail-fast sweep.  `byNodeId` is mandatory only for an early-release
+  // winner; user cancellation carries the durable run-level actor instead.
+  | ({
       type: 'nodeCancelled';
       nodeId: string;
       instanceId?: string;
       attemptId?: string;
-      reason: 'earlyReleaseLoser';
-      byNodeId: string;
       detail?: string;
-    }
+    } & (
+      | { reason: 'earlyReleaseLoser'; byNodeId: string }
+      | { reason: 'runCancelled'; cancelRequestId: string }
+    ))
   // ── cross-node revisit / instance lifecycle (instance restoration 2026-06-08) ──
   // A node's worker emitted result.json `status:"revisit"` requesting a jump
   // back to ancestor `toNodeId` (must be in the node's `revisitTo`).  Audit +
@@ -237,6 +244,12 @@ export type V3Event =
   // loop analogue of nodeRetryRequested — journal event, never an in-memory
   // patch).  Consumed by the next loopIterationStarted.
   | { type: 'loopIterationGranted'; loopId: string; fromIteration: number; by?: string }
+  // Durable user intent is its own boundary.  Runtime treats every later
+  // non-cancellation settle as stale, aborts live workers, neutral-cancels all
+  // unfinished nodes, then appends runCancelled.  A crash between these two
+  // records is recoverable by replay + cold re-drive.
+  | { type: 'runCancelRequested'; cancelRequestId: string; by: string; reason?: string }
+  | { type: 'runCancelled'; cancelRequestId: string; by: string }
   | { type: 'runSucceeded' }
   | { type: 'runFailed'; failedNodeId?: string; reason?: V3RunFailureReason; detail?: string }
   // Terminal-for-now: every non-done path is blocked (recoverable).  A retry

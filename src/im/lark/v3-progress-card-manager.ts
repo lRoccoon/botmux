@@ -148,7 +148,9 @@ export class V3ProgressCardManager {
         const events = readJournal(join(runDir, 'journal.ndjson'));
         if (events.length === 0) continue; // approved/materialized but never started
         const snapshot = materialize(events);
-        const terminal = snapshot.runStatus === 'succeeded' || snapshot.runStatus === 'failed';
+        const terminal = snapshot.runStatus === 'succeeded' ||
+          snapshot.runStatus === 'failed' ||
+          snapshot.runStatus === 'cancelled';
         const suspended = snapshot.runStatus === 'blocked' ||
           [...snapshot.nodes.values()].some((node) => node.status === 'gateWaiting');
         const hasSidecar = existsSync(join(runDir, V3_PROGRESS_SIDECAR));
@@ -256,7 +258,13 @@ export class V3ProgressCardManager {
         ...(loaded.spec ? { spec: loaded.spec } : {}),
         events,
       });
-      if (view.status === 'waiting' || view.status === 'blocked' || view.status === 'succeeded' || view.status === 'failed') {
+      if (
+        view.status === 'waiting' ||
+        view.status === 'blocked' ||
+        view.status === 'succeeded' ||
+        view.status === 'failed' ||
+        view.status === 'cancelled'
+      ) {
         this.stop(runId);
       }
       const cardJson = this.deps.buildCard(view, loaded);

@@ -1,65 +1,7 @@
 import { createHash } from 'node:crypto';
+import { canonicalJson } from '../../utils/canonical-input-hash.js';
 
-// ─── canonical JSON ─────────────────────────────────────────────────────────
-
-/**
- * Serialize `value` to canonical JSON (deterministic across object key order
- * and identical-content equality).  Used by:
- *   - `computeInputHash` to derive inputHash for attempt input immutability
- *     checks (events doc §4.2 + §3.6).
- *   - any code path that needs hash-stable serialization of structured data.
- *
- * Rules:
- *   - Object keys are sorted ascending (lexicographic on UTF-16 code units,
- *     matching JS's default Array.sort).
- *   - `undefined` properties are dropped (matches `JSON.stringify` behaviour
- *     for plain objects).
- *   - `null` is preserved as `"null"`.
- *   - Arrays preserve order — they're ordered data, not bags.
- *   - Strings, numbers, booleans use `JSON.stringify` (handles escapes).
- *   - Non-finite numbers (`NaN`, `±Infinity`), BigInt, Function, Symbol,
- *     Date, and class instances throw.  Dates would need a project-wide
- *     decision on epoch-ms vs ISO string; v0 throws so the caller is forced
- *     to normalize upstream.
- */
-export function canonicalJson(value: unknown): string {
-  return serialize(value);
-}
-
-function serialize(v: unknown): string {
-  if (v === null) return 'null';
-  if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (typeof v === 'number') {
-    if (!Number.isFinite(v)) {
-      throw new Error(`canonicalJson: non-finite number (${String(v)}) not serializable`);
-    }
-    return JSON.stringify(v);
-  }
-  if (typeof v === 'string') return JSON.stringify(v);
-  if (Array.isArray(v)) {
-    return '[' + v.map((x) => serialize(x)).join(',') + ']';
-  }
-  if (typeof v === 'object') {
-    // Reject anything that's not a plain object.  This guards against Date,
-    // Map, Set, Buffer, class instances etc. that would otherwise leak
-    // internal state into the hash.
-    if (Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null) {
-      throw new Error(
-        `canonicalJson: non-plain-object (${v?.constructor?.name ?? 'unknown'}) not serializable — normalize upstream`,
-      );
-    }
-    const obj = v as Record<string, unknown>;
-    const keys = Object.keys(obj)
-      .filter((k) => obj[k] !== undefined)
-      .sort();
-    return '{' + keys.map((k) => JSON.stringify(k) + ':' + serialize(obj[k])).join(',') + '}';
-  }
-  if (typeof v === 'bigint') {
-    throw new Error('canonicalJson: bigint not serializable — convert to string upstream');
-  }
-  // function, symbol, undefined at the root
-  throw new Error(`canonicalJson: cannot serialize ${typeof v}`);
-}
+export { canonicalJson, computeInputHash } from '../../utils/canonical-input-hash.js';
 
 // ─── idempotency key derivation (5-tuple → ≤ 50-char uuid) ──────────────────
 
@@ -127,29 +69,4 @@ export function deriveIdempotencyKey(
   const seed = canonicalJson(tuple);
   const hash = createHash('sha256').update(seed, 'utf-8').digest('hex');
   return namespace + hash.substring(0, maxLength - namespace.length);
-}
-
-// ─── input hash (canonical full-field sha256) ───────────────────────────────
-
-/**
- * Hash an attempt's canonical input.  Returned in `sha256:<hex>` form so
- * it slots directly into event payloads (`effectAttempted.inputHash` and
- * resume reconcile evidence).
- *
- * The hash is over the **full canonical input** — for send/reply that
- * includes `receive_id`, `root_message_id?`, `msg_type`, `content`; for
- * schedule it includes the entire create-task input.  Spike report §1.3
- * + reply test 3c proved partial hashes leak silent state drift.
- *
- * inputHash is **separate** from idempotencyKey by design (codex v0.1.1
- * round 2): mixing content into the key would convert "input changed" into
- * "new effect", bypassing attempt-immutability.  inputHash lives as a
- * post-fact validator: same attemptId must always produce the same
- * inputHash; mismatches trigger `IdempotencyInputMismatch` (events doc
- * §4.2).
- */
-export function computeInputHash(input: unknown): string {
-  const canonical = canonicalJson(input);
-  const hex = createHash('sha256').update(canonical, 'utf-8').digest('hex');
-  return `sha256:${hex}`;
 }

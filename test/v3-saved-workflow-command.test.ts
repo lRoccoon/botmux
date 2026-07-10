@@ -40,6 +40,15 @@ describe('parseV3SavedWorkflowCommand', () => {
     expect(parseV3SavedWorkflowCommand('/workflow list extra')).toMatchObject({ kind: 'invalid' });
   });
 
+  it('reserves cancel for v3 and requires exactly one safe runId', () => {
+    expect(parseV3SavedWorkflowCommand('/workflow cancel report-260711-120000-123-deadbeef')).toEqual({
+      kind: 'cancel', runId: 'report-260711-120000-123-deadbeef',
+    });
+    expect(parseV3SavedWorkflowCommand('/workflow cancel')).toMatchObject({ kind: 'invalid' });
+    expect(parseV3SavedWorkflowCommand('/workflow cancel ../other')).toMatchObject({ kind: 'invalid' });
+    expect(parseV3SavedWorkflowCommand('/workflow cancel r extra')).toMatchObject({ kind: 'invalid' });
+  });
+
   it('treats words before the first key=value as the saved name', () => {
     expect(parseV3SavedWorkflowCommand('/workflow run run the tests and report')).toMatchObject({
       kind: 'run', ref: 'run the tests and report', rawParams: {},

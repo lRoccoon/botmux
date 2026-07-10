@@ -513,7 +513,7 @@ export const messages: Record<string, string> = {
   'help.pair': '/pair <code>        - Bind a team-platform web login pairing code',
   'help.heading_workflow': '🧭 Workflow:',
   'help.workflow_run': '/workflow <goal>; /workflow run <name> [key=value ...] - Start ad-hoc or run a Saved Workflow',
-  'help.workflow_cancel': '/workflow save last [name]; /workflow list|show; /template run|cancel - Save/discover, plus v2 migration aliases',
+  'help.workflow_cancel': '/workflow save last [name]; /workflow list|show; /workflow cancel <runId>; /template run|cancel - Save/discover/cancel, plus v2 migration aliases',
   'help.heading_role': '🎭 Roles and capabilities:',
   'help.role_show': '/role              - Show the effective role',
   'help.role_set': '/role set <Markdown> - Set this chat role (overrides team)',

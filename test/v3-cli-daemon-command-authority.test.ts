@@ -153,6 +153,10 @@ describe('agent-facing v3 daemon command authority', () => {
     });
     expect(() => authorize('unbound-standalone', { envSessionId: undefined }))
       .toThrow(/standalone.*必须显式提供 --bot/);
+    expect(authorize('unbound-standalone', {
+      envSessionId: undefined,
+      allowStandaloneLocal: true,
+    })).toMatchObject({ larkAppId: '', mode: 'standalone' });
   });
 
   it('does not let a standalone caller mutate a chat-bound run', () => {

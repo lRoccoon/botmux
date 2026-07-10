@@ -66,6 +66,7 @@ describe('buildV3ProgressCard', () => {
     expect(text).toContain('刷新 draft');
     expect(text).toContain('即兴编排');
     expect(text).toContain('weekly-report-260711-120000-ab12cd34');
+    expect(text).toContain('/workflow cancel weekly-report-260711-120000-ab12cd34');
     expect(text).toContain('更新时间：2026-07-11 12:34:56Z');
 
     const detail = card.elements.find(
@@ -82,6 +83,8 @@ describe('buildV3ProgressCard', () => {
 
   it.each([
     ['starting', 'blue', '⏳ Workflow v3 · 准备中'],
+    ['cancelling', 'orange', '⏹ Workflow v3 · 取消中'],
+    ['cancelled', 'grey', '⏹ Workflow v3 · 已取消'],
     ['waiting', 'orange', '⏸ Workflow v3 · 等待中'],
     ['blocked', 'orange', '🚧 Workflow v3 · 已阻塞'],
     ['succeeded', 'green', '✅ Workflow v3 · 已完成'],

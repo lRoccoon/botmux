@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from '../core/dashboard-events.js';
-import { computeInputHash } from '../workflows/events/idempotency.js';
+import { computeInputHash } from '../utils/canonical-input-hash.js';
 import type { ScheduledTask, ParsedSchedule } from '../types.js';
 
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────

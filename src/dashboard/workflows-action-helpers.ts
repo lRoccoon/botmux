@@ -259,7 +259,7 @@ export async function runCancel(
       body: {
         ok: false,
         error: 'needs_cli_cancel',
-        hint: `This run has no chat-binding owner; use 'botmux workflow cancel ${runId}' instead.`,
+        hint: `This v2 run has no chat-binding owner; use 'botmux template cancel ${runId}' instead.`,
       },
     };
   }
