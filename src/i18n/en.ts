@@ -513,7 +513,7 @@ export const messages: Record<string, string> = {
   'help.pair': '/pair <code>        - Bind a team-platform web login pairing code',
   'help.heading_workflow': '🧭 Workflow:',
   'help.workflow_run': '/workflow <goal>; /workflow run <name> [key=value ...] - Start ad-hoc or run a Saved Workflow',
-  'help.workflow_cancel': '/workflow save last [name]; /workflow list|show|cancel; use /template cancel only for legacy v2 runs and botmux template migrate-v3 for definitions',
+  'help.workflow_cancel': '/workflow save last [name]; /workflow list|show|cancel; legacy v2 assets only support offline migrate-v3 / archive-runs operations',
   'help.heading_role': '🎭 Roles and capabilities:',
   'help.role_show': '/role              - Show the effective role',
   'help.role_set': '/role set <Markdown> - Set this chat role (overrides team)',
@@ -771,7 +771,6 @@ export const messages: Record<string, string> = {
   'card.dashboard.owner_only': '🔒 The `/dashboard` command group is restricted to bot admins (allowedUsers).',
   'card.dashboard.overview.not_implemented_yet': '🚧 `/dashboard overview` is not implemented yet; coming in a follow-up PR.',
   'card.dashboard.sessions.not_implemented_yet': '🚧 `/dashboard sessions` is not implemented yet; coming in a follow-up PR.',
-  'card.dashboard.workflows.not_implemented_yet': '🚧 `/dashboard workflows` is not implemented yet; coming in a follow-up PR.',
   'card.dashboard.groups.not_implemented_yet': '🚧 `/dashboard groups` is not implemented yet; coming in a follow-up PR.',
   'card.dashboard.schedules.not_implemented_yet': '🚧 `/dashboard schedules` is not implemented yet; coming in a follow-up PR.',
   'card.dashboard.settings.not_implemented_yet': '🚧 `/dashboard settings` is not implemented yet; coming in a follow-up PR.',
@@ -780,7 +779,6 @@ export const messages: Record<string, string> = {
     'Modules:\n' +
     '• `overview`   — cross-bot overview\n' +
     '• `sessions`   — session list / detail\n' +
-    '• `workflows`  — workflow runs (beta)\n' +
     '• `groups`     — group matrix\n' +
     '• `schedules`  — scheduled tasks\n' +
     '• `settings`   — global settings (admins only)\n' +
@@ -926,41 +924,6 @@ export const messages: Record<string, string> = {
   'card.dashboard.groups.working_dir_required': '⚠️ Working directory is required to enable Oncall.',
   'card.dashboard.groups.role_required': '⚠️ Role description is required.',
 
-  // workflows card (PR3 slice 1)
-  'card.dashboard.workflows.title': '🧩 Dashboard Workflows',
-  'card.dashboard.workflows.count_summary': 'Running {running} · Done {done} · Failed {failed} · Page {page}/{totalPages}',
-  'card.dashboard.workflows.empty': '_No workflow runs yet_',
-  'card.dashboard.workflows.refresh': '🔄',
-  'card.dashboard.workflows.prev': '← Prev',
-  'card.dashboard.workflows.next': 'Next →',
-  'card.dashboard.workflows.jump_page': '{n}/{total}',
-  'card.dashboard.workflows.progress_label': 'step {done}/{total}',
-  'card.dashboard.workflows.started_label': 'started {rel}',
-  'card.dashboard.workflows.updated_label': 'updated {rel}',
-  'card.dashboard.workflows.dm_sent': '📬 The dashboard workflows list was DMed to you.',
-  'card.dashboard.workflows.dm_failed': '⚠️ Failed to DM you the workflows list: {reason}',
-  'card.dashboard.workflows.list_failed': '⚠️ Failed to fetch workflows list: {reason}',
-  // workflows card (PR3 slice 2a) — detail card + cancel action
-  'card.dashboard.workflows.row_detail': '📂 Detail',
-  'card.dashboard.workflows.detail.title': '🧩 Workflow Run Detail',
-  'card.dashboard.workflows.detail.workflow_label': 'workflow: {workflowId}',
-  'card.dashboard.workflows.detail.run_label': 'run: {runId}',
-  'card.dashboard.workflows.detail.status_label': 'status: {status}',
-  'card.dashboard.workflows.detail.started_label': 'started: {rel}',
-  'card.dashboard.workflows.detail.updated_label': 'updated: {rel}',
-  'card.dashboard.workflows.detail.finished_label': 'finished: {rel}',
-  'card.dashboard.workflows.detail.elapsed_label': 'elapsed: {elapsed}',
-  'card.dashboard.workflows.detail.progress_label': 'progress: {progress}',
-  'card.dashboard.workflows.detail.chat_label': 'owner: {chat}',
-  'card.dashboard.workflows.detail.nodes_header': 'Node progress:',
-  'card.dashboard.workflows.btn.cancel': '⏏ Cancel',
-  'card.dashboard.workflows.btn.back': '🔙 Back',
-  'card.dashboard.workflows.confirm.cancel.title': 'Cancel this run?',
-  'card.dashboard.workflows.confirm.cancel.text': 'Once cancelled the run is terminated and any in-flight progress may be lost. Run: {runId}',
-  'card.dashboard.workflows.cancel.disabled.alreadyTerminal': 'Run is already in a terminal state and cannot be cancelled',
-  'card.dashboard.workflows.cancel.disabled.noOwner': 'Run has no chatBinding and cannot be cancelled from the dashboard',
-  'card.dashboard.workflows.cancel_failed': '⚠️ Cancel failed: {reason}',
-  'card.dashboard.workflows.workflow_not_found': '⚠️ Run not found or already cleaned up.',
 
   'card.dashboard.settings.dm_sent': '📬 The dashboard settings card was DMed to you.',
   'card.dashboard.settings.dm_failed': '⚠️ Failed to DM you the settings card: {reason}',
@@ -974,13 +937,11 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.settings_section': '⚙️ Settings',
   'card.dashboard.overview.settings_summary': '{publicReadOnlyLabel} · {openTerminalLabel} · {autoUpdateLabel}',
   'card.dashboard.overview.groups_section': '🧑‍🤝‍🧑 Groups',
-  'card.dashboard.overview.workflows_section': '🌀 Workflows',
   'card.dashboard.overview.refresh': '🔄 Refresh',
   'card.dashboard.overview.goto_sessions': '📂 Sessions',
   'card.dashboard.overview.goto_schedules': '📂 Schedules',
   'card.dashboard.overview.goto_settings': '📂 Settings',
   'card.dashboard.overview.goto_groups': '📂 Groups',
-  'card.dashboard.overview.goto_workflows': '📂 Workflows',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.
@@ -1052,49 +1013,6 @@ export const messages: Record<string, string> = {
   'common.operator': 'By: {by}',
   'common.empty_paren': '(empty)',
   'common.truncated_short': '…(truncated)',
-
-  // Workflow approval card
-  'card.wf.none': 'None',
-  'card.wf.title_pending': 'Approval needed: {node}',
-  'card.wf.title_resolved': '{prefix}: {node}',
-  'card.wf.review_content': 'Review content',
-  'card.wf.review_preview_suffix': ' (preview; full text in Web details below)',
-  'card.wf.comment_placeholder': 'Optional: add a review comment',
-  'card.wf.btn_approve': '✅ Approve',
-  'card.wf.btn_reject': '❌ Reject',
-  'card.wf.btn_cancel_run': 'Cancel run',
-  'card.wf.btn_web_detail': 'Web details',
-  'card.wf.resolved.approved': 'Approved',
-  'card.wf.resolved.rejected': 'Rejected',
-  'card.wf.resolved.cancelled': 'Cancelled',
-  'card.wf.banner.approved': '✅ Approved',
-  'card.wf.banner.rejected': '❌ Rejected',
-  'card.wf.banner.cancelled': '🛑 Cancelled',
-  'card.wf.comment_label': 'Note: {comment}',
-  'card.wf.truncated': '…(truncated; view the full text on the Web)',
-
-  // Workflow progress card
-  'card.wf.field.status': 'Status',
-  'card.wf.field.progress': 'Progress',
-  'card.wf.field.failed': 'Failed',
-  'card.wf.progress_value': '{done} / {total} nodes done',
-  'card.wf.section.running': 'Running',
-  'card.wf.section.waiting': 'Awaiting approval',
-  'card.wf.section.loop': 'Loop nodes',
-  'card.wf.failure_summary': 'Failure summary',
-  'card.wf.terminal.live': 'View live terminal',
-  'card.wf.terminal.log': 'View execution log',
-  'card.wf.usage': 'Usage: /template run <id> [key=value ...]\nor: /template cancel <runId>',
-  'wf.err.missing_run_id': 'Missing runId',
-  'wf.err.cancel_only_run_id': '/template cancel only accepts a runId',
-  'wf.err.run_id_charset': 'runId may only contain letters, digits, underscore, dot and hyphen',
-  'wf.err.unknown_subcommand': 'Only /template run / cancel subcommands are supported',
-  'wf.err.missing_workflow_id': 'Missing workflow id',
-  'wf.err.workflow_id_charset': 'workflow id may only contain letters, digits, underscore, dot and hyphen',
-  'wf.err.param_format': 'Parameters must be key=value: {token}',
-  'wf.err.param_name_charset': 'Parameter names may only contain letters, digits, underscore, dot and hyphen: {key}',
-  'wf.err.duplicate_param': 'Duplicate parameter: {key}',
-  'wf.cmd_failed': 'Workflow command failed: {error}',
 
   // Ask card
   'card.ask.field.deadline': 'Deadline',

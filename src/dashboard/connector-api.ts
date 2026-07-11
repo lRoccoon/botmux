@@ -25,7 +25,7 @@ import {
   type TriggerLogStats,
 } from '../services/trigger-log-store.js';
 import type { TriggerAction, TriggerErrorCode } from '../services/trigger-types.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 
 const DEFAULT_VERIFY_HEADERS = {
   signatureHeader: 'x-botmux-signature',

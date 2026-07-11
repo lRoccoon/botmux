@@ -1,11 +1,13 @@
 /** `botmux template archive-runs`: private, content-addressed v2 run archive. */
 
+import { lstatSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import {
   commitV2RunArchive,
   planV2RunArchive,
+  retireV2RunSource,
   verifyV2RunArchive,
   type V2RunArchivePlan,
   type V2RunArchiveVerification,
@@ -16,16 +18,17 @@ import {
 } from '../workflows/migration/v2-run-archive-schema.js';
 
 export interface WorkflowRunArchiveCliOptions {
-  mode: 'plan' | 'commit' | 'verify';
+  mode: 'plan' | 'commit' | 'verify' | 'retire';
   json: boolean;
   runsDir: string;
   archiveBaseDir: string;
   archiveRef?: string;
+  daemonStoppedAcknowledged: boolean;
 }
 
 export interface WorkflowRunArchiveCliReport {
   mode: WorkflowRunArchiveCliOptions['mode'];
-  archiveId: string;
+  archiveId?: string;
   runCount: number;
   residualCount: number;
   fileCount: number;
@@ -35,10 +38,13 @@ export interface WorkflowRunArchiveCliReport {
   reused?: boolean;
   staticVerified?: boolean;
   sourceVerified?: boolean;
+  retirementStatus?: 'retired' | 'already_retired' | 'nothing_to_retire';
+  quarantineDir?: string;
+  receiptPath?: string;
 }
 
-const VALUE_FLAGS = new Set(['--verify', '--runs-dir', '--archive-dir']);
-const BOOLEAN_FLAGS = new Set(['--commit', '--json']);
+const VALUE_FLAGS = new Set(['--verify', '--retire', '--runs-dir', '--archive-dir']);
+const BOOLEAN_FLAGS = new Set(['--commit', '--json', '--ack-daemon-stopped']);
 
 export function parseWorkflowRunArchiveCliOptions(
   args: string[],
@@ -65,8 +71,15 @@ export function parseWorkflowRunArchiveCliOptions(
     values.set(flag, value);
   }
   const commit = booleans.has('--commit');
-  const archiveRef = values.get('--verify');
-  if (commit && archiveRef) throw new Error('--commit and --verify are mutually exclusive');
+  const verifyRef = values.get('--verify');
+  const retireRef = values.get('--retire');
+  const selectedModes = Number(commit) + Number(verifyRef !== undefined) + Number(retireRef !== undefined);
+  if (selectedModes > 1) throw new Error('--commit, --verify, and --retire are mutually exclusive');
+  const archiveRef = verifyRef ?? retireRef;
+  const daemonStoppedAcknowledged = booleans.has('--ack-daemon-stopped');
+  if (daemonStoppedAcknowledged && !retireRef) {
+    throw new Error('--ack-daemon-stopped is only valid with --retire');
+  }
   const runsDir = resolve(
     values.get('--runs-dir') ??
     env.BOTMUX_WORKFLOW_RUNS_DIR ??
@@ -76,10 +89,11 @@ export function parseWorkflowRunArchiveCliOptions(
     values.get('--archive-dir') ?? join(dataDir, 'workflow-archives', 'v2-runs'),
   );
   return {
-    mode: archiveRef ? 'verify' : commit ? 'commit' : 'plan',
+    mode: retireRef ? 'retire' : verifyRef ? 'verify' : commit ? 'commit' : 'plan',
     json: booleans.has('--json'),
     runsDir,
     archiveBaseDir,
+    daemonStoppedAcknowledged,
     ...(archiveRef ? { archiveRef } : {}),
   };
 }
@@ -88,7 +102,7 @@ function resolveArchiveRef(baseDir: string, ref: string): string {
   if (isAbsolute(ref) || ref.includes('/') || ref.includes('\\')) return resolve(ref);
   if (/^sha256:[0-9a-f]{64}$/.test(ref)) return join(baseDir, archiveDirectoryName(ref));
   if (/^sha256-[0-9a-f]{64}$/.test(ref)) return join(baseDir, ref);
-  throw new Error('--verify expects an absolute/relative archive path or sha256 archive id');
+  throw new Error('--verify/--retire expects an absolute/relative archive path or sha256 archive id');
 }
 
 function warningCodes(plan: V2RunArchivePlan): string[] {
@@ -132,10 +146,46 @@ export async function runWorkflowRunArchiveCli(
   options: WorkflowRunArchiveCliOptions,
 ): Promise<WorkflowRunArchiveCliReport> {
   if (options.mode === 'verify') {
+    let sourceRunsDir: string | undefined;
+    try {
+      // ENOENT after a successful retirement is the one legitimate reason to
+      // perform static-only verification. Existing but unreadable/unsafe or
+      // changed sources must still fail loudly in the source-aware verifier.
+      lstatSync(options.runsDir);
+      sourceRunsDir = options.runsDir;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
     return reportFromVerification(await verifyV2RunArchive({
       archiveDir: resolveArchiveRef(options.archiveBaseDir, options.archiveRef!),
-      sourceRunsDir: options.runsDir,
+      ...(sourceRunsDir ? { sourceRunsDir } : {}),
     }));
+  }
+  if (options.mode === 'retire') {
+    const retired = await retireV2RunSource({
+      runsDir: options.runsDir,
+      archiveBaseDir: options.archiveBaseDir,
+      archiveDir: resolveArchiveRef(options.archiveBaseDir, options.archiveRef!),
+      daemonStoppedAcknowledged: options.daemonStoppedAcknowledged,
+    });
+    if (retired.status === 'nothing_to_retire') {
+      return {
+        mode: 'retire',
+        runCount: 0,
+        residualCount: 0,
+        fileCount: 0,
+        totalBytes: 0,
+        warningCodes: [],
+        retirementStatus: retired.status,
+      };
+    }
+    return {
+      ...reportFromVerification(retired.verification),
+      mode: 'retire',
+      retirementStatus: retired.status,
+      quarantineDir: retired.quarantineDir,
+      receiptPath: retired.receiptPath,
+    };
   }
   const plan = await planV2RunArchive({ runsDir: options.runsDir });
   if (options.mode === 'plan') return reportFromPlan('plan', plan);
@@ -153,7 +203,7 @@ export async function runWorkflowRunArchiveCli(
 function printHuman(report: WorkflowRunArchiveCliReport): void {
   const mib = (report.totalBytes / (1024 * 1024)).toFixed(2);
   console.log(
-    `[${report.mode}] archive=${report.archiveId} runs=${report.runCount} ` +
+    `[${report.mode}] archive=${report.archiveId ?? 'none'} runs=${report.runCount} ` +
     `residuals=${report.residualCount} files=${report.fileCount} bytes=${report.totalBytes} (${mib} MiB)`,
   );
   if (report.warningCodes.length > 0) {
@@ -161,6 +211,12 @@ function printHuman(report: WorkflowRunArchiveCliReport): void {
   }
   if (report.mode === 'plan') {
     console.log('dry-run only; add --commit to publish the private archive');
+  } else if (report.mode === 'retire') {
+    console.log(
+      `retirementStatus=${report.retirementStatus}` +
+      (report.quarantineDir ? ` quarantineDir=${report.quarantineDir}` : '') +
+      (report.receiptPath ? ` receiptPath=${report.receiptPath}` : ''),
+    );
   } else {
     console.log(
       `staticVerified=${report.staticVerified === true} sourceVerified=${report.sourceVerified === true}` +

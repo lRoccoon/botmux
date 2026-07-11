@@ -103,7 +103,7 @@ import {
   resolveV3HostInputTemplate,
 } from './host-bindings.js';
 import type { HostExecutorRegistry, RegisteredHostExecutor } from '../hostExecutors/registry.js';
-import type { ProviderReconciler } from '../resume.js';
+import type { ProviderReconciler } from '../shared/provider-reconciler.js';
 
 // ─── goal.txt rendering ─────────────────────────────────────────────────────
 

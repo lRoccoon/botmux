@@ -164,12 +164,6 @@ function isActiveNav(item: NavItem, hash: string): boolean {
     return false;
   }
   if (
-    item.id === 'workflows' &&
-    (current === '#/legacy-workflow' || current.startsWith('#/legacy-workflow?') || current.startsWith('#/legacy-workflow/'))
-  ) {
-    return true;
-  }
-  if (
     item.id === 'sessions' &&
     (current === '#/monitor-room' || current.startsWith('#/monitor-room?') || current.startsWith('#/monitor-room/'))
   ) {
@@ -730,6 +724,9 @@ async function route(): Promise<void> {
   }
   if (hash.startsWith('#/v3')) {
     window.location.replace(`#/workflows${hash.slice('#/v3'.length)}`);
+    return;
+  } else if (hash.startsWith('#/legacy-workflow')) {
+    window.location.replace('#/workflows');
     return;
   } else if (/^#\/workflows(?:\/|-)catalog(?:[/?].*)?$/.test(hash)) {
     window.location.replace('#/workflows');

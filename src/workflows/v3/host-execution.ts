@@ -21,7 +21,7 @@ import {
   fsyncDirectorySyncPortable,
   fsyncRegularFileSync,
 } from '../../utils/fs-durability.js';
-import { deriveIdempotencyKey } from '../events/idempotency.js';
+import { deriveIdempotencyKey } from '../shared/idempotency-key.js';
 import type { RegisteredHostExecutor } from '../hostExecutors/registry.js';
 import type { Manifest } from './contract.js';
 

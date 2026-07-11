@@ -30,9 +30,9 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 
+import { canonicalJsonStringify } from '../../utils/canonical-json.js';
 import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
 import { withFileLock } from '../../utils/file-lock.js';
-import { canonicalJsonStringify } from '../definition.js';
 import { parseEvent, type WorkflowEvent } from '../events/schema.js';
 import {
   isValidRunId,
@@ -43,9 +43,12 @@ import {
   V2_RUN_ARCHIVE_COMMIT_SCHEMA_VERSION,
   V2_RUN_ARCHIVE_KIND,
   V2_RUN_ARCHIVE_SCHEMA_VERSION,
+  V2_RUN_RETIREMENT_KIND,
+  V2_RUN_RETIREMENT_SCHEMA_VERSION,
   archiveDirectoryName,
   parseV2RunArchiveCommitMarker,
   parseV2RunArchiveManifest,
+  parseV2RunRetirementReceipt,
   sha256Ref,
   v2RunArchiveId,
   type V2RunArchiveCommitMarker,
@@ -55,6 +58,7 @@ import {
   type V2RunArchiveResidual,
   type V2RunArchiveRun,
   type V2RunArchiveWarning,
+  type V2RunRetirementReceipt,
 } from './v2-run-archive-schema.js';
 
 const READ_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
@@ -69,6 +73,8 @@ const MANIFEST_FILE = 'manifest.json';
 const COMMIT_FILE = 'COMMITTED';
 const STAGING_PREFIX = '.staging-v2-run-archive-';
 const STAGE_MARKER = 'stage.json';
+const PUBLICATION_LOCK_BASENAME = '.v2-run-archive-publication';
+const RETIREMENT_RECEIPT_PREFIX = 'v2-run-retirement-';
 
 export type V2RunArchiveCommitPhase =
   | 'after-first-capture'
@@ -77,6 +83,13 @@ export type V2RunArchiveCommitPhase =
   | 'after-manifest'
   | 'after-publish'
   | 'after-commit-marker';
+
+export type V2RunRetirementPhase =
+  | 'after-first-source-verification'
+  | 'before-source-rename'
+  | 'after-source-rename'
+  | 'after-quarantine-verification'
+  | 'after-retirement-receipt';
 
 export class V2RunArchiveError extends Error {
   constructor(public readonly code: string, message: string) {
@@ -137,6 +150,30 @@ export interface VerifyV2RunArchiveInput {
   /** Publication recovery uses static verification before COMMITTED exists. */
   allowMissingCommitMarker?: boolean;
 }
+
+export interface RetireV2RunSourceInput {
+  runsDir: string;
+  archiveBaseDir: string;
+  archiveDir: string;
+  daemonStoppedAcknowledged: boolean;
+  now?: Date;
+  /** Crash/race-injection seam. Production callers omit it. */
+  onPhase?: (phase: V2RunRetirementPhase) => void | Promise<void>;
+}
+
+export type RetireV2RunSourceResult =
+  | {
+      status: 'nothing_to_retire';
+      sourceRunsDir: string;
+    }
+  | {
+      status: 'retired' | 'already_retired';
+      archiveDir: string;
+      quarantineDir: string;
+      receiptPath: string;
+      receipt: V2RunRetirementReceipt;
+      verification: V2RunArchiveVerification;
+    };
 
 interface CapturedTree {
   directories: string[];
@@ -203,6 +240,18 @@ function ensurePrivateArchiveBase(path: string): void {
   assertPlainDirectory(path, 'archive base directory');
   if (created !== undefined) chmodSync(path, 0o700);
   else assertPrivateMode(path, 0o700, 'archive base directory');
+}
+
+/**
+ * Publication and retirement deliberately share one non-reentrant lock.
+ * Keep all callers on this helper so a basename change cannot split the
+ * serialization domain and never call it from inside another invocation.
+ */
+export function withV2RunArchivePublicationLock<T>(
+  archiveBaseDir: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withFileLock(join(resolve(archiveBaseDir), PUBLICATION_LOCK_BASENAME), fn);
 }
 
 function assertPrivateMode(path: string, wanted: number, label: string): void {
@@ -607,7 +656,9 @@ async function captureSource(runsDirInput: string): Promise<SourceCapture> {
     });
   }
 
-  if (runs.length === 0) fail('NO_WORKFLOW_RUNS', `${sourceRunsDir} has no terminal v2 workflow runs to archive`);
+  if (runs.length === 0 && residuals.length === 0) {
+    fail('NO_WORKFLOW_RUNS', `${sourceRunsDir} has no v2 workflow-run bytes to archive`);
+  }
   runs.sort((a, b) => a.runId.localeCompare(b.runId));
   residuals.sort((a, b) => a.name.localeCompare(b.name));
   const payloadDirectories = [...directories].sort();
@@ -780,7 +831,7 @@ export async function commitV2RunArchive(input: CommitV2RunArchiveInput): Promis
   ensureDisjoint(sourceInput, archiveBaseDir);
   ensureDisjoint(sourceReal, realpathProspective(archiveBaseDir));
   ensurePrivateArchiveBase(archiveBaseDir);
-  return withFileLock(join(archiveBaseDir, '.v2-run-archive-publication'), async () => {
+  return withV2RunArchivePublicationLock(archiveBaseDir, async () => {
     cleanOwnedStaging(archiveBaseDir);
     const first = await captureSource(input.runsDir);
     ensureDisjoint(first.sourceRunsDir, archiveBaseDir);
@@ -904,6 +955,373 @@ function assertProjectionMatchesVerdict(archiveDir: string, run: V2RunArchiveRun
     (projection.run.workflowId ?? 'unknown') !== run.verdict.workflowId ||
     projection.lastSeq !== run.verdict.lastSeq || projection.updatedAt !== run.verdict.updatedAt
   ) fail('ARCHIVE_VERDICT_MISMATCH', `projection and manifest verdict disagree for ${run.runId}`);
+}
+
+function optionalLstat(path: string): ReturnType<typeof lstatSync> | undefined {
+  try { return lstatSync(path); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw err;
+  }
+}
+
+function archiveHex(archiveId: string): string {
+  const match = /^sha256:([0-9a-f]{64})$/.exec(archiveId);
+  if (!match) fail('ARCHIVE_ID_INVALID', `invalid archive id ${archiveId}`);
+  return match[1]!;
+}
+
+function quarantinePathFor(sourceRunsDir: string, archiveId: string): string {
+  return join(
+    dirname(sourceRunsDir),
+    `.${basename(sourceRunsDir)}.retired-${archiveHex(archiveId)}`,
+  );
+}
+
+function retirementReceiptPathFor(archiveBaseDir: string, archiveId: string): string {
+  return join(resolve(archiveBaseDir), `${RETIREMENT_RECEIPT_PREFIX}${archiveHex(archiveId)}.json`);
+}
+
+function hasRetirementArtifacts(sourcePath: string, archiveBaseDir: string): boolean {
+  const quarantinePrefix = `.${basename(sourcePath)}.retired-`;
+  const sourceParent = dirname(sourcePath);
+  const checks: Array<{ directory: string; prefix: string; label: string }> = [
+    { directory: sourceParent, prefix: quarantinePrefix, label: 'quarantine' },
+    { directory: archiveBaseDir, prefix: RETIREMENT_RECEIPT_PREFIX, label: 'receipt' },
+  ];
+  let found = false;
+  for (const check of checks) {
+    const stat = optionalLstat(check.directory);
+    if (!stat) continue;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      fail('RETIREMENT_PARENT_UNSAFE', `${check.label} parent must be a real directory: ${check.directory}`);
+    }
+    for (const entry of readdirSync(check.directory, { withFileTypes: true })) {
+      if (!entry.name.startsWith(check.prefix)) continue;
+      const path = join(check.directory, entry.name);
+      const artifact = lstatSync(path);
+      if (artifact.isSymbolicLink() || (!artifact.isDirectory() && !artifact.isFile())) {
+        fail('RETIREMENT_ARTIFACT_UNSAFE', `unsafe ${check.label} artifact: ${path}`);
+      }
+      found = true;
+    }
+  }
+  return found;
+}
+
+function expectedRawTree(
+  manifest: V2RunArchiveManifest,
+  rawRoot: string,
+): { directories: string[]; files: Array<{ relativePath: string; bytes: number; sha256: string }> } {
+  if (!manifest.content.payloadDirectories.includes(rawRoot)) {
+    fail('ARCHIVE_RAW_ROOT_MISSING', `manifest does not contain raw root ${rawRoot}`);
+  }
+  const prefix = `${rawRoot}/`;
+  return {
+    directories: manifest.content.payloadDirectories
+      .filter((path) => path.startsWith(prefix))
+      .map((path) => path.slice(prefix.length))
+      .sort(),
+    files: manifest.content.payloadFiles
+      .filter((file) => file.path.startsWith(prefix))
+      .map((file) => ({
+        relativePath: file.path.slice(prefix.length),
+        bytes: file.bytes,
+        sha256: file.sha256,
+      }))
+      .sort((a, b) => a.relativePath.localeCompare(b.relativePath)),
+  };
+}
+
+function comparableRawTree(tree: CapturedTree): string {
+  return canonicalJsonStringify({
+    directories: tree.directories,
+    files: tree.files.map(({ relativePath, bytes, sha256 }) => ({ relativePath, bytes, sha256 })),
+  });
+}
+
+/**
+ * Verify relocated bytes without replaying projections.
+ *
+ * Historical OutputRef.outputPath values are absolute and intentionally
+ * remain byte-exact inside the quarantine. Replaying them after rename would
+ * reinterpret those paths relative to the new root and create false drift.
+ * The two pre-rename source-aware passes already prove projection parity;
+ * post-rename recovery must instead prove the complete raw topology/hashes.
+ */
+function verifyRelocatedRawSourceAgainstManifest(
+  sourceDir: string,
+  manifest: V2RunArchiveManifest,
+): void {
+  assertPlainDirectory(sourceDir, 'retired workflow runs root');
+  const expected = new Map<string, { sourceType: 'directory' | 'file'; rawRoot: string }>();
+  for (const run of manifest.content.runs) {
+    if (expected.has(run.runId)) fail('ARCHIVE_SOURCE_TOPOLOGY_MISMATCH', `duplicate source entry ${run.runId}`);
+    expected.set(run.runId, { sourceType: 'directory', rawRoot: run.rawRoot });
+  }
+  for (const residual of manifest.content.residuals) {
+    if (expected.has(residual.name)) fail('ARCHIVE_SOURCE_TOPOLOGY_MISMATCH', `duplicate source entry ${residual.name}`);
+    expected.set(residual.name, { sourceType: residual.sourceType, rawRoot: residual.rawRoot });
+  }
+
+  const actualNames = readdirSync(sourceDir, { withFileTypes: true })
+    .map((entry) => entry.name)
+    .sort();
+  const expectedNames = [...expected.keys()].sort();
+  if (canonicalJsonStringify(actualNames) !== canonicalJsonStringify(expectedNames)) {
+    fail('ARCHIVE_SOURCE_TOPOLOGY_MISMATCH', 'retired source top-level entries differ from manifest');
+  }
+
+  for (const name of expectedNames) {
+    const spec = expected.get(name)!;
+    const path = join(sourceDir, name);
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) fail('SOURCE_SYMLINK', `retired source contains symlink: ${path}`);
+    let captured: CapturedTree;
+    if (spec.sourceType === 'directory') {
+      if (!stat.isDirectory()) fail('ARCHIVE_SOURCE_TOPOLOGY_MISMATCH', `${name} must remain a directory`);
+      captured = captureDirectoryTree(path);
+    } else {
+      if (!stat.isFile()) fail('ARCHIVE_SOURCE_TOPOLOGY_MISMATCH', `${name} must remain a regular file`);
+      captured = captureTopFile(path, name);
+    }
+    const expectedTree = expectedRawTree(manifest, spec.rawRoot);
+    if (comparableRawTree(captured) !== canonicalJsonStringify(expectedTree)) {
+      fail('ARCHIVE_SOURCE_CHANGED', `retired source bytes/topology differ for ${name}`);
+    }
+  }
+}
+
+function readRetirementReceipt(path: string): V2RunRetirementReceipt {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+    fail('RETIREMENT_RECEIPT_UNSAFE', `receipt must be a single-link regular file: ${path}`);
+  }
+  assertPrivateMode(path, 0o600, 'retirement receipt');
+  try {
+    return parseV2RunRetirementReceipt(JSON.parse(readSecureFile(path).toString('utf-8')));
+  } catch (err) {
+    if (err instanceof V2RunArchiveError) throw err;
+    fail('RETIREMENT_RECEIPT_INVALID', `${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function assertReceiptMatches(
+  receipt: V2RunRetirementReceipt,
+  expected: Omit<V2RunRetirementReceipt, 'retiredAt'>,
+): void {
+  for (const key of [
+    'schemaVersion',
+    'kind',
+    'archiveId',
+    'manifestSha256',
+    'sourceRunsDir',
+    'quarantineDir',
+  ] as const) {
+    if (receipt[key] !== expected[key]) {
+      fail('RETIREMENT_RECEIPT_CONFLICT', `receipt ${key} does not match the verified retirement`);
+    }
+  }
+}
+
+function publishRetirementReceipt(
+  receiptPath: string,
+  expected: Omit<V2RunRetirementReceipt, 'retiredAt'>,
+  now: Date,
+): { receipt: V2RunRetirementReceipt; reused: boolean } {
+  const existing = optionalLstat(receiptPath);
+  if (existing) {
+    const receipt = readRetirementReceipt(receiptPath);
+    assertReceiptMatches(receipt, expected);
+    return { receipt, reused: true };
+  }
+  const receipt: V2RunRetirementReceipt = {
+    ...expected,
+    retiredAt: now.toISOString(),
+  };
+  parseV2RunRetirementReceipt(receipt);
+  const bytes = canonicalFile(receipt);
+  const tmp = join(
+    dirname(receiptPath),
+    `.${basename(receiptPath)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`,
+  );
+  try {
+    writeNewPrivateFile(tmp, bytes);
+    try {
+      linkSync(tmp, receiptPath);
+      unlinkSync(tmp);
+      fsyncDirectorySyncPortable(dirname(receiptPath));
+      return { receipt, reused: false };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      unlinkSync(tmp);
+      const raced = readRetirementReceipt(receiptPath);
+      assertReceiptMatches(raced, expected);
+      return { receipt: raced, reused: true };
+    }
+  } finally {
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+  }
+}
+
+/**
+ * Linearize v2 run-source retirement without deleting bytes.
+ *
+ * The advisory publication lock coordinates Botmux archive/retire commands,
+ * but it cannot stop an old daemon from appending to an already-open journal.
+ * Therefore non-empty retirement additionally requires an explicit operator
+ * acknowledgement that all v2 writers are stopped, verifies source parity
+ * twice immediately before rename, and verifies the relocated tree once more.
+ */
+export async function retireV2RunSource(
+  input: RetireV2RunSourceInput,
+): Promise<RetireV2RunSourceResult> {
+  const archiveBaseDir = resolve(input.archiveBaseDir);
+  const sourceInput = resolve(input.runsDir);
+  const archiveDir = resolve(input.archiveDir);
+  const initialSourceStat = optionalLstat(sourceInput);
+  if (initialSourceStat && (initialSourceStat.isSymbolicLink() || !initialSourceStat.isDirectory())) {
+    fail('UNSAFE_DIRECTORY', `workflow runs root must be a real directory: ${sourceInput}`);
+  }
+  const initiallyEmpty = !initialSourceStat || readdirSync(sourceInput).length === 0;
+  // A fresh install has no archive contract to verify and retirement should
+  // be a genuine zero-write no-op. Only enter the publication transaction
+  // when live bytes or a prior quarantine/receipt prove there is work.
+  if (initiallyEmpty && !hasRetirementArtifacts(sourceInput, archiveBaseDir)) {
+    return { status: 'nothing_to_retire', sourceRunsDir: realpathProspective(sourceInput) };
+  }
+  ensureDisjoint(sourceInput, archiveBaseDir);
+  ensureDisjoint(realpathProspective(sourceInput), realpathProspective(archiveBaseDir));
+  ensurePrivateArchiveBase(archiveBaseDir);
+
+  return withV2RunArchivePublicationLock(archiveBaseDir, async () => {
+    const archiveStat = optionalLstat(archiveDir);
+    const sourceStat = optionalLstat(sourceInput);
+    if (sourceStat && (sourceStat.isSymbolicLink() || !sourceStat.isDirectory())) {
+      fail('UNSAFE_DIRECTORY', `workflow runs root must be a real directory: ${sourceInput}`);
+    }
+
+    if (!archiveStat) {
+      if (!sourceStat || readdirSync(sourceInput).length === 0) {
+        fail(
+          'RETIREMENT_STATE_REQUIRES_ARCHIVE',
+          'found a retirement quarantine/receipt but the referenced committed archive is missing',
+        );
+      }
+      fail('RETIREMENT_ARCHIVE_REQUIRED', `non-empty v2 source requires a committed archive: ${archiveDir}`);
+    }
+    if (archiveStat.isSymbolicLink() || !archiveStat.isDirectory()) {
+      fail('ARCHIVE_TARGET_UNSAFE', `retirement archive must be a real directory: ${archiveDir}`);
+    }
+    if (dirname(archiveDir) !== archiveBaseDir) {
+      fail('RETIREMENT_ARCHIVE_OUTSIDE_BASE', `retirement archive must be a direct child of ${archiveBaseDir}`);
+    }
+
+    const staticVerification = await verifyV2RunArchive({ archiveDir });
+    const manifest = staticVerification.manifest;
+    const expectedSourcePath = realpathProspective(sourceInput);
+    if (expectedSourcePath !== manifest.sourceRunsDir) {
+      fail(
+        'ARCHIVE_SOURCE_MISMATCH',
+        `manifest source ${manifest.sourceRunsDir} != requested source ${expectedSourcePath}`,
+      );
+    }
+    const quarantineDir = quarantinePathFor(manifest.sourceRunsDir, manifest.archiveId);
+    const receiptPath = retirementReceiptPathFor(archiveBaseDir, manifest.archiveId);
+    const quarantineStat = optionalLstat(quarantineDir);
+    const receiptStat = optionalLstat(receiptPath);
+    if (quarantineStat && (quarantineStat.isSymbolicLink() || !quarantineStat.isDirectory())) {
+      fail('RETIREMENT_QUARANTINE_UNSAFE', `quarantine must be a real directory: ${quarantineDir}`);
+    }
+    if (receiptStat && (receiptStat.isSymbolicLink() || !receiptStat.isFile() || receiptStat.nlink !== 1)) {
+      fail('RETIREMENT_RECEIPT_UNSAFE', `receipt must be a single-link regular file: ${receiptPath}`);
+    }
+    if (sourceStat && quarantineStat) {
+      fail('RETIREMENT_SOURCE_RESURRECTED', `source and quarantine both exist; an old writer may still be active`);
+    }
+    if (
+      (!sourceStat || readdirSync(sourceInput).length === 0) &&
+      !quarantineStat && !receiptStat &&
+      hasRetirementArtifacts(sourceInput, archiveBaseDir)
+    ) {
+      fail(
+        'RETIREMENT_STATE_REQUIRES_ARCHIVE',
+        'existing retirement artifacts do not belong to the selected committed archive',
+      );
+    }
+
+    if (sourceStat && readdirSync(sourceInput).length === 0) {
+      if (receiptStat) fail('RETIREMENT_RECEIPT_WITH_LIVE_SOURCE', `receipt exists while source directory is present`);
+      return { status: 'nothing_to_retire', sourceRunsDir: realpathSync(sourceInput) };
+    }
+    if (!sourceStat && !quarantineStat) {
+      if (receiptStat) fail('RETIREMENT_QUARANTINE_MISSING', `receipt exists but quarantine is missing`);
+      return { status: 'nothing_to_retire', sourceRunsDir: expectedSourcePath };
+    }
+    if (!input.daemonStoppedAcknowledged) {
+      fail(
+        'DAEMON_STOP_ACK_REQUIRED',
+        'non-empty v2 retirement requires --ack-daemon-stopped; the archive lock does not exclude old daemon writers',
+      );
+    }
+
+    const manifestSha256 = sha256Ref(readSecureFile(join(archiveDir, MANIFEST_FILE)));
+    const expectedReceipt = {
+      schemaVersion: V2_RUN_RETIREMENT_SCHEMA_VERSION,
+      kind: V2_RUN_RETIREMENT_KIND,
+      archiveId: manifest.archiveId,
+      manifestSha256,
+      sourceRunsDir: manifest.sourceRunsDir,
+      quarantineDir,
+    } as const;
+
+    if (!sourceStat) {
+      verifyRelocatedRawSourceAgainstManifest(quarantineDir, manifest);
+      chmodSync(quarantineDir, 0o700);
+      fsyncDirectorySyncPortable(dirname(quarantineDir));
+      const published = publishRetirementReceipt(receiptPath, expectedReceipt, input.now ?? new Date());
+      await input.onPhase?.('after-retirement-receipt');
+      return {
+        status: published.reused ? 'already_retired' : 'retired',
+        archiveDir,
+        quarantineDir,
+        receiptPath,
+        receipt: published.receipt,
+        verification: { ...staticVerification, sourceVerified: true },
+      };
+    }
+
+    if (receiptStat) {
+      fail('RETIREMENT_RECEIPT_WITH_LIVE_SOURCE', `receipt exists while source directory is present`);
+    }
+    await verifyV2RunArchive({
+      archiveDir,
+      sourceRunsDir: sourceInput,
+    });
+    await input.onPhase?.('after-first-source-verification');
+    const secondVerification = await verifyV2RunArchive({
+      archiveDir,
+      sourceRunsDir: sourceInput,
+    });
+    await input.onPhase?.('before-source-rename');
+    renameSync(sourceInput, quarantineDir);
+    fsyncDirectorySyncPortable(dirname(sourceInput));
+    await input.onPhase?.('after-source-rename');
+    chmodSync(quarantineDir, 0o700);
+    verifyRelocatedRawSourceAgainstManifest(quarantineDir, manifest);
+    fsyncDirectorySyncPortable(dirname(quarantineDir));
+    await input.onPhase?.('after-quarantine-verification');
+    const published = publishRetirementReceipt(receiptPath, expectedReceipt, input.now ?? new Date());
+    await input.onPhase?.('after-retirement-receipt');
+    return {
+      status: 'retired',
+      archiveDir,
+      quarantineDir,
+      receiptPath,
+      receipt: published.receipt,
+      verification: secondVerification,
+    };
+  });
 }
 
 export async function verifyV2RunArchive(input: VerifyV2RunArchiveInput): Promise<V2RunArchiveVerification> {

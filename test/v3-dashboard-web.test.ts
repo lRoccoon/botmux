@@ -13,8 +13,6 @@ import {
   cancelV3Run,
   fetchV3RunDetail,
   fetchV3Runs,
-  probeLegacyV2RunSnapshot,
-  shouldProbeLegacyV2Fallback,
   type V3Fetch,
 } from '../src/dashboard/web/v3-api.js';
 import {
@@ -167,20 +165,9 @@ describe('v3 dashboard api helpers', () => {
     expect(calls).toEqual(['/api/v3/runs', '/api/v3/runs/run%2Fid%20with%20space']);
   });
 
-  it('returns empty/non-ok results and probes legacy v2 fallback only once per 404 path', async () => {
+  it('returns empty/non-ok results without probing a retired v2 surface', async () => {
     await expect(fetchV3Runs(async () => response(false, 500))).resolves.toEqual([]);
     await expect(fetchV3RunDetail('missing', async () => response(false, 404))).resolves.toEqual({ ok: false, status: 404 });
-    expect(shouldProbeLegacyV2Fallback(404, false)).toBe(true);
-    expect(shouldProbeLegacyV2Fallback(404, true)).toBe(false);
-    expect(shouldProbeLegacyV2Fallback(500, false)).toBe(false);
-
-    const calls: string[] = [];
-    const exists = await probeLegacyV2RunSnapshot('old/run', async (input) => {
-      calls.push(input);
-      return response(true, 200);
-    });
-    expect(exists).toBe(true);
-    expect(calls).toEqual(['/api/workflows/runs/old%2Frun/snapshot']);
   });
 
   it('posts v3 cancel with an encoded run id and preserves cancelling/cancelled outcomes', async () => {

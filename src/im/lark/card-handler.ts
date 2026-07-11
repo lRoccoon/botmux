@@ -18,11 +18,6 @@ import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import { checkNonce, clearPending, markDenied, getPendingQuota } from './grant-pending.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import {
-  handleWorkflowApprovalAction,
-  isWorkflowApprovalAction,
-  type WorkflowApprovalHandlerDeps,
-} from './workflow-card-handler.js';
-import {
   handleV3GateAction,
   isV3GateAction,
   type V3GateCardHandlerDeps,
@@ -89,8 +84,6 @@ export interface CardHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   lastRepoScan: Map<string, ProjectInfo[]>;
-  workflowApprovalDeps?: WorkflowApprovalHandlerDeps;
-  workflowApprovalResolved?: (runId: string) => void | Promise<void>;
   /** v3 humanGate 审批卡点击处理（driveRun 由 daemon 接的 v3 gate runner 提供）. */
   v3GateDeps?: V3GateCardHandlerDeps;
   /** v3 blocked 重试卡点击处理（同一个 runner 的 driveRun）. */
@@ -839,21 +832,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
-  // ─── `/dashboard workflows` callbacks ────────────────────────────────
-  if (
-    typeof value?.action === 'string' &&
-    value.action.startsWith('dash_workflows_') &&
-    larkAppId
-  ) {
-    const { handleWorkflowsCardAction } = await import('./workflows-card.js');
-    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
-    const workflowsLocale = localeForBot(larkAppId);
-    return handleWorkflowsCardAction(data, larkAppId, {
-      createClient: (appId: string) => createDaemonClientFor(appId),
-      locale: workflowsLocale,
-    });
-  }
-
   // ─── `/dashboard groups` callbacks ───────────────────────────────────
   if (
     typeof value?.action === 'string' &&
@@ -1331,31 +1309,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
   }
 
-  if (isWorkflowApprovalAction(value?.action)) {
-    const locWf = localeForBot(larkAppId);
-    const workflowData = data as Parameters<typeof handleWorkflowApprovalAction>[0];
-    const result = await handleWorkflowApprovalAction(workflowData, deps.workflowApprovalDeps, locWf);
-    const runId = value?.run_id;
-    if (result?.ok && !result.duplicate && runId) {
-      await deps.workflowApprovalResolved?.(runId);
-    }
-    // Non-approver: surface a toast so the clicker knows nothing happened
-    // (instead of silently leaving the buttons active).
-    if (result && !result.ok && result.error === 'not_approver') {
-      return { toast: { type: 'warning', content: t('toast.not_in_approver_list', undefined, locWf) } };
-    }
-    // Successful resolve / reject / cancel: replace the clicked card with a
-    // frozen "已通过/已拒绝/已取消" body so the buttons can't be re-submitted
-    // from this surface. Duplicate clicks just no-op (the first PATCH already
-    // landed).
-    if (result?.ok && !result.duplicate && result.resolvedCardJson) {
-      try {
-        return JSON.parse(result.resolvedCardJson);
-      } catch {
-        // fall through to undefined
-      }
-    }
-    return;
+  // Historical v2 workflow cards remain in chat history after the runtime is
+  // removed. Treat every legacy callback as a tombstone instead of allowing it
+  // to fall through to an unrelated generic card action.
+  if (
+    typeof value?.action === 'string' &&
+    (value.action.startsWith('wf_') || value.action.startsWith('dash_workflows_'))
+  ) {
+    return {
+      toast: {
+        type: 'warning',
+        content: 'v2 workflow 已下线；旧卡片不再可操作，请迁移定义后使用 /workflow。',
+      },
+    };
   }
 
   // Handle session card button actions (restart/close)

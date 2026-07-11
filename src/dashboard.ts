@@ -21,7 +21,7 @@ import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
-import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
+import { jsonRes } from './dashboard/http.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
@@ -31,7 +31,6 @@ import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
-import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { FeishuLoginManager } from './dashboard/feishu-login.js';
 import {
@@ -78,15 +77,6 @@ import {
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
 } from './dashboard/groups-action-helpers.js';
-import { defaultWorkflowsActionDeps } from './dashboard/workflows-action-helpers.js';
-import {
-  listRuns as listRunsImpl,
-  readRunSnapshot as readRunSnapshotImpl,
-  scrubSnapshotForUnauthed as scrubSnapshotImpl,
-  isValidRunId as isValidRunIdImpl,
-  TERMINAL_RUN_STATUSES as TERMINAL_RUN_STATUSES_IMPL,
-  type RunSnapshotDTO,
-} from './workflows/ops-projection.js';
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -798,15 +788,6 @@ const daemonInternalApi = createDaemonInternalApi({
   buildGroupsMatrix,
   settingsApplierDeps: settingsWriteApplierDeps,
   groupsActionDeps,
-  workflowsActionDeps: defaultWorkflowsActionDeps<RunSnapshotDTO>({
-    runsDir: getRunsDir(),
-    proxyToDaemon,
-    listRuns: listRunsImpl,
-    readRunSnapshot: readRunSnapshotImpl,
-    scrubSnapshotForUnauthed: scrubSnapshotImpl,
-    TERMINAL_RUN_STATUSES: TERMINAL_RUN_STATUSES_IMPL,
-    isValidRunId: isValidRunIdImpl,
-  }),
   proxyToDaemon,
   ownerOf: (sid) => aggregator.ownerOf(sid),
   scheduleOwnerOf: (id) => aggregator.scheduleOwnerOf(id),
@@ -2020,11 +2001,8 @@ const server = createServer(async (req, res) => {
       activeToken: activeToken ?? '',
       publicReadOnly: dashboardSettings.publicReadOnly,
     });
-    // `authed` is consumed by route handlers that need to distinguish
-    // "request got in via public-read carve-out" from "request has a
-    // valid cookie" — e.g. `/api/workflows/runs/<id>/snapshot` strips
-    // log bytes when unauth'd.  Mirror of the `authed` check in
-    // `decideDashboardAuth`.
+    // `authed` is consumed by route handlers that distinguish the public-read
+    // carve-out from a valid management cookie (notably v3 run details).
     const authed = !!presentedToken && presentedToken === activeToken && !!activeToken;
 
     if (decision.kind === 'deny401') {
@@ -2040,6 +2018,14 @@ const server = createServer(async (req, res) => {
       });
       res.end();
       return;
+    }
+
+    if (url.pathname === '/api/workflows' || url.pathname.startsWith('/api/workflows/')) {
+      return jsonRes(res, 410, {
+        ok: false,
+        error: 'legacy_workflow_retired',
+        message: 'v2 workflow dashboard APIs are retired; use /api/v3/runs for v3 run visibility',
+      });
     }
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
@@ -2892,21 +2878,6 @@ const server = createServer(async (req, res) => {
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}/${op}`, { method: 'POST' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
-      return;
-    }
-
-    // ─── Workflows (D0 read-only + D1 cancel mutation) ───────────────────────
-    //
-    // Dashboard reads runsDir directly (single-process; cross-daemon ownership
-    // doesn't matter for read-only).  All readers in `ops-projection` are
-    // pure: no mkdir, no EventLog instantiation.  Unknown / corrupt run → 404.
-    // Mutations are intentionally proxied to the owner daemon from
-    // chat-binding.larkAppId so only the daemon with live workflow runtime
-    // context writes the event log.
-    if (await handleWorkflowApi(req, res, url, {
-      runsDir: getRunsDir(),
-      proxyToDaemon,
-    }, authed)) {
       return;
     }
 

@@ -200,7 +200,7 @@ export async function executeV3SavedWorkflowCommand(
       if (!binding) {
         throw new Error(
           '该 v3 run 不存在、完整性校验失败，或没有可验证的聊天绑定。' +
-          `若 \`${command.runId}\` 是 v2 run，请改用 \`/template cancel ${command.runId}\`。`,
+          `若 \`${command.runId}\` 是 v2 run，它已不可变；请查看离线静态归档。`,
         );
       }
       if (binding.larkAppId !== context.actor.larkAppId || binding.chatId !== context.chatId) {

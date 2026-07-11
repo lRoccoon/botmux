@@ -21,7 +21,7 @@ import {
   beginWebhookLifecycleFiring,
   failWebhookLifecycleGroup,
 } from '../services/webhook-lifecycle-store.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { dispatchTriggerRequest, newTriggerId, queryTriggerResult, type TriggerApiDeps } from './trigger-api.js';
 
 const replayNonces = new Map<string, number>();
@@ -433,6 +433,19 @@ export async function handleWebhookRoute(
   }
 
   const responseOptions = parseTriggerResponseOptions(req, url);
+  // Stored workflow connectors are tombstones only after the v2 runtime
+  // retirement. Fail before lifecycle state or group creation; dispatching to
+  // a daemon would make the safety property depend on daemon version/skew.
+  if (connector.target.kind === 'workflow') {
+    webhookError(
+      res,
+      410,
+      connectorId,
+      'legacy_workflow_retired',
+      'v2 workflow connector targets are retired; migrate the definition and replace this connector with a turn target',
+    );
+    return true;
+  }
   if ((responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) && connector.target.kind !== 'turn') {
     fail(400, 'bad_request', 'wait mode is only supported for turn connectors');
     return true;
@@ -508,47 +521,6 @@ export async function handleWebhookRoute(
         return true;
       }
       dedupKey = value;
-    }
-
-    // A legacy workflow connector must prove that its v2 definition remains
-    // runnable before we reserve lifecycle state or create a Feishu group.
-    // Workflow dry-run deliberately needs no chatId, so this preflight has no
-    // IM side effects. The daemon's migration guard is the source of truth and
-    // its structured retirement response is returned byte-for-byte at the JSON
-    // object level. An explicitly requested dry run ends here even on success.
-    if (connector.target.kind === 'workflow') {
-      const preflightTrigger: TriggerRequest = {
-        source: {
-          type: 'webhook',
-          connectorId: connector.id,
-          requestId,
-          receivedAt: new Date().toISOString(),
-        },
-        target: {
-          kind: 'workflow',
-          botId: connector.target.botId,
-          workflowId: connector.target.workflowId,
-        },
-        envelope: {
-          format: 'botmux.webhook.v1',
-          sourceName: connector.promptEnvelope.sourceName || connector.name,
-          trusted: false,
-          headers: pickAllowedHeaders(req, connector.promptEnvelope.headerAllowlist),
-          payload: parsed.payload,
-          ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
-        },
-        ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
-        options: {
-          ...responseOptions,
-          ...(dedupKey ? { dedupKey } : {}),
-          dryRun: true,
-        },
-      };
-      const preflight = await dispatchTriggerRequest(preflightTrigger, deps);
-      if (!preflight.body.ok || responseOptions.dryRun) {
-        jsonRes(res, preflight.status, preflight.body);
-        return true;
-      }
     }
 
     if (dedupPath) {

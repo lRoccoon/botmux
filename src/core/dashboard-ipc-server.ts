@@ -84,19 +84,10 @@ import {
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
-import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
-import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
-
-// Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
-// deps). Until set, workflow-targeted triggers report not-implemented.
-let workflowRunner: ((input: TriggerInput) => Promise<TriggerResult>) | null = null;
-export function setWorkflowRunner(fn: (input: TriggerInput) => Promise<TriggerResult>): void {
-  workflowRunner = fn;
-}
 
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
@@ -1089,8 +1080,6 @@ ipcRoute('POST', '/api/schedules/:id/delivery', (_req, res, p) => jsonRes(res, 2
 
 ipcRoute('POST', '/api/trigger', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' });
-  const activeSessions = getActiveSessionsRegistry();
-  if (!activeSessions) return jsonRes(res, 503, { ok: false, errorCode: 'trigger_failed', error: 'active session registry unavailable' });
   let body: unknown;
   try {
     body = await readJsonBody(req);
@@ -1107,15 +1096,22 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
     });
   }
   try {
-    let result;
     if (valid.request.target.kind === 'workflow') {
-      if (!workflowRunner) {
-        return jsonRes(res, 501, { ok: false, errorCode: 'workflow_trigger_not_implemented', error: 'workflow runner not wired on this daemon' });
-      }
-      result = await triggerWorkflowFromEnvelope(valid.request, { larkAppId: cachedLarkAppId, runWorkflow: workflowRunner });
-    } else {
-      result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+      return jsonRes(res, 410, {
+        ok: false,
+        errorCode: 'legacy_workflow_retired',
+        error: 'v2 workflow trigger targets are retired; migrate the definition and run it through /workflow',
+      });
     }
+    const activeSessions = getActiveSessionsRegistry();
+    if (!activeSessions) {
+      return jsonRes(res, 503, {
+        ok: false,
+        errorCode: 'trigger_failed',
+        error: 'active session registry unavailable',
+      });
+    }
+    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
     const status = result.ok
       ? 200
       : result.errorCode === 'bot_not_in_chat'
@@ -1124,8 +1120,6 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
           ? 404
         : result.errorCode === 'wait_timeout'
           ? 504
-        : result.errorCode === 'legacy_workflow_retired'
-          ? 409
         : result.errorCode === 'target_required' || result.errorCode === 'bad_request'
           ? 400
           : 500;

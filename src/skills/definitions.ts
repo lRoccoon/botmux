@@ -581,21 +581,21 @@ EOF
 
 const WORKFLOW_CREATE_SKILL = `---
 name: botmux-workflow-create
-description: 【v2 已弃用，仅迁移维护】只在用户明确要求检查、修复或迁移已有 v2 workflow JSON（$HOME/.botmux/workflows/*.workflow.json），或显式提到 legacy botmux template validate 时使用。不要为新需求创建 v2 模板；新建、运行、保存和复用流程统一使用 botmux-workflow（v3 Saved Workflow）。
+description: 【v2 已下线，仅迁移维护】只在用户明确要求检查、原地修复或迁移已有 v2 workflow JSON（$HOME/.botmux/workflows/*.workflow.json），或显式提到 botmux template migrate-v3 时使用。不要创建或运行 v2 流程；新建、运行、保存和复用统一使用 botmux-workflow（v3 Saved Workflow）。
 ---
 
 # botmux-workflow-create — v2 迁移维护助手（已弃用）
 
 > **迁移期兼容能力，不用于新建流程。** 新需求统一使用 **botmux-workflow**：先跑 v3 Workflow，成功后用 \`/workflow save\` 固化为 Saved Workflow。只有用户明确要求维护或迁移现有 v2 JSON 时，才继续使用下面的旧 schema/校验说明；不要因为用户泛泛说“编排”“自动化”而触发本 skill。
 
-本 skill 只帮助检查、修复、校验和迁移已有 v2 workflow JSON；不要再为旧定义创建新 run。存量 run 的 cancel/resume 只在迁移周期内保留。
+本 skill 只帮助检查、经用户确认后原地修复和迁移已有 v2 workflow JSON；不要再创建或执行旧定义，也不要尝试 cancel/resume 旧 run。历史 run 只能通过私有静态归档审计。
 
 ## 硬规则
 
 1. 不要在用户确认设计稿前写文件。
 2. 必须先跑 \`botmux bots list\`，按输出里的 **\`larkAppId\`**（形如 \`cli_xxxxxxxxxxxxxxxx\`）填 \`subagent.bot\`。**不要填 \`name\`**——\`name\` 是 Lark 群里的 displayName（admin 可改、可能带后缀），跨 daemon 必然解析失败。larkAppId 是 bot 的全局唯一 ID。
-3. 写到 \`$HOME/.botmux/workflows/<workflowId>.workflow.json\`（**绝对路径**，daemon 的全局位置）。不要写到当前 cwd 的 \`./workflows/\`——CLI agent 和 daemon 进程的 cwd 不一定一致。\`workflowId\` 推荐 kebab-case。
-4. 写完必须跑 \`botmux template validate $HOME/.botmux/workflows/<workflowId>.workflow.json\`，失败就按错误修到通过。
+3. 只能原地编辑用户明确指定的已有绝对路径；不要创建新的 workflowId、文件或兼容副本。默认历史位置是 \`$HOME/.botmux/workflows/<workflowId>.workflow.json\`，不要把它复制到当前 cwd 的 \`./workflows/\`。
+4. 校验统一跑 \`botmux template migrate-v3 $HOME/.botmux/workflows/<workflowId>.workflow.json\` 的 dry-run；不要调用已下线的 \`template validate/run/resume/cancel\`。
 5. 高风险节点主动建议 \`humanGate\`：发消息、写文件、外部 API、git push、删除/覆盖。纯读、草稿、纯计算通常不加 gate。
 6. 数据流有两套语法：**整字段 \`$ref\` 替换** 和 **字符串内 \`\${...}\` 内嵌引用**。**不要**写 \`{{...}}\` 期望 runtime 展开——支持的是 \`\${...}\`，不是双花括号。
 7. 两套语法的边界：
@@ -640,19 +640,19 @@ botmux bots list
 
 ### Step 4 — 修复或转换旧 JSON
 
-修改用户明确指定的已有 v2 文件；若迁移需要生成兼容副本，仍写到 \`$HOME/.botmux/workflows/<workflowId>.workflow.json\`（**绝对路径**，不要写相对路径）。每个 subagent 节点的 \`bot\` 字段必须填 larkAppId（\`cli_xxx...\`），不是 displayName。每个 node 建议写 \`description\`，记录设计理由或 bot 选择理由。
+只修改用户明确指定的已有 v2 文件，原地修到 migration dry-run 可读；不要创建新的 v2 定义或兼容副本。每个 subagent 节点的 \`bot\` 字段必须填 larkAppId（\`cli_xxx...\`），不是 displayName。每个 node 建议写 \`description\`，记录设计理由或 bot 选择理由。
 
-### Step 5 — 校验
+### Step 5 — 只读校验与转换报告
 
 \`\`\`bash
-botmux template validate $HOME/.botmux/workflows/<workflowId>.workflow.json
+botmux template migrate-v3 $HOME/.botmux/workflows/<workflowId>.workflow.json
 \`\`\`
 
-validate 能抓 JSON/schema/graph 错误；但它**不会**检查 bot 是否真的存在，也不会检查 \`$ref\` 指向的 output 字段是否运行时一定存在——所以你仍要人工核对 bots list（larkAppId 一定要逐字符匹配）和 outputSchema。
+dry-run 会抓 JSON/schema/graph 错误，并报告无法无损转换的 v2 特性；但它**不会**写入 v3 library。你仍要人工核对 bots list（larkAppId 一定要逐字符匹配）和 outputSchema。
 
 ### Step 6 — 交付与迁移
 
-告诉用户文件路径、validate 结果，并先跑只读迁移报告：
+告诉用户文件路径和 dry-run 结果：
 
 \`\`\`bash
 botmux template migrate-v3 <workflowId>
@@ -690,20 +690,9 @@ botmux template migrate-v3 <workflowId>
 - optional 参数没传且有 \`default\`：runtime 会把 default 原样 materialize 到 run input。
 - optional 参数没传且没有 \`default\`：字段缺省；后续引用 \`\${params.X}\` / \`{ "$ref": "params.X" }\` 会在绑定阶段报错。
 
-历史启动语法（仅用于读懂存量资产，**不要新执行**）：
-
-\`\`\`bash
-# CLI: 标量 string / number / boolean
-botmux template run weather-city --param city=上海 --param days=3 --param dryRun=false
-botmux template run weather-city --param=city=上海
-
-# CLI: object / array 或者需要保留 JSON 类型的值
-botmux template run batch-send --param-json tags='["urgent","cn"]'
-botmux template run batch-send --param-json config='{"mode":"safe","limit":3}'
-
-# IM: 只支持 key=value 标量；object / array 暂不支持
-/template run weather-city city=上海 days=3 dryRun=false
-\`\`\`
+旧定义里的 params 仍要按 schema 理解，迁移后的实际运行统一使用
+\`/workflow run <Saved Workflow> key=value\` 或对应 v3 CLI；不要复述或执行任何旧
+\`/template run\` 命令。
 
 在节点里既可以用 \`{ "$ref": "params.<path>" }\` 整字段替换，也可以在字符串里 \`"\${params.<path>}"\` 内嵌（仅限值是标量时）。嵌套对象用点号路径：\`params.user.email\`。
 
@@ -1218,7 +1207,7 @@ description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排
 
 统一处理两类能力：① 把一句模糊的复合目标通过「拷问澄清 → 自动编排 DAG → 人确认 → 自动执行」做完；② 管理 v3 run 与 Saved Workflow，包括保存、复用、查看和取消。整个过程在当前飞书话题里进行（用 botmux send 跟用户对话）。
 
-用户可以用大白话表达，也可以显式发 \`/workflow <目标>\`、\`/workflow save|run|cancel|list|show ...\`。不要再把新流程分流到 \`/template run\` 或 botmux-workflow-create；那套仅用于 v2 存量迁移（存量 v2 run 的取消仍用 \`/template cancel\`）。
+用户可以用大白话表达，也可以显式发 \`/workflow <目标>\`、\`/workflow save|run|cancel|list|show ...\`。不要再把新流程分流到 \`/template\` 或 botmux-workflow-create；\`botmux template\` 只保留 v2 资产的离线迁移与归档。
 
 ## 何时用 / 不用
 - ✅ 一个**有界、需要拆成多步、最终汇成一个交付物**的目标（“调研三家竞品出对比报告”“拉日志分析后生成图表”）。Workflow 跑完即散。
@@ -1239,11 +1228,11 @@ description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排
 
 - “把刚才那个流程存下来（叫周报）” → \`botmux workflow save last 周报\`（IM 等价：\`/workflow save last 周报\`）。只保存已成功结束且属于当前用户/话题的 run；agent-facing CLI 固定为 chat scope。用户明确要求跨话题复用时，不得替用户执行 \`--global\`，请让用户本人在飞书显式发送 \`/workflow save last 周报 --global\`，由 daemon 校验 canOperate。
 - “运行已保存的周报流程，region=sg” → \`botmux workflow run 周报 --param region=sg\`（IM 等价：\`/workflow run 周报 region=sg\`）。缺必填参数时只补问缺的项；名称有歧义时展示候选，不要猜。
-- “取消刚才正在跑的流程” → \`botmux workflow cancel <runId>\`（IM 等价：\`/workflow cancel <runId>\`）。只使用真实 runId；CLI 会校验当前 turn 与 run 的 owner/chat/app 绑定，IM 中本群可操作成员也可取消。若是 v2 run，明确改用 \`/template cancel <runId>\`，不要跨引擎猜测。
+- “取消刚才正在跑的流程” → \`botmux workflow cancel <runId>\`（IM 等价：\`/workflow cancel <runId>\`）。只使用真实 v3 runId；CLI 会校验当前 turn 与 run 的 owner/chat/app 绑定，IM 中本群可操作成员也可取消。v2 run 已不可变，只能查静态归档。
 - “我有哪些流程” → \`botmux workflow list\`（IM：\`/workflow list\`）。
 - “看看周报流程” → \`botmux workflow show 周报\`（IM：\`/workflow show 周报\`）。
 
-保存是用户显式动作，不自动保存每个 run；成功 run 之后可以简短建议一次“要不要保存复用”，不要重复推销。v2 的 \`botmux template migrate-v3|archive-runs\` 只用于存量迁移/归档，\`/template cancel\` 只处理旧 run；新工作一律留在本 skill。
+保存是用户显式动作，不自动保存每个 run；成功 run 之后可以简短建议一次“要不要保存复用”，不要重复推销。v2 的 \`botmux template migrate-v3|archive-runs\` 只用于存量迁移/归档；新工作一律留在本 skill。
 
 安全确认边界：agent 绝不能自行添加 \`--ack-unsafe\`。若保存 lint 报出疑似 secret 或本机绝对路径，先把具体警告展示给用户；只有用户本人在飞书显式发送 \`/workflow save ... --ack-unsafe\` 才能确认。agent-facing CLI 会拒绝该 flag。
 

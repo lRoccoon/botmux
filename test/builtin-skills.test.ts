@@ -59,16 +59,18 @@ describe('built-in botmux-quoted skill', () => {
 });
 
 describe('built-in botmux-workflow-create skill', () => {
-  it('is retained only for v2 migration and teaches legacy validation constraints', () => {
+  it('is retained only for read-only v2 migration and never teaches execution', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow-create');
     expect(skill).toBeDefined();
     const frontmatter = skill!.content.split('---')[1] ?? '';
-    expect(frontmatter).toContain('v2 已弃用');
+    expect(frontmatter).toContain('v2 已下线');
     expect(frontmatter).toContain('仅迁移维护');
-    expect(frontmatter).toContain('不要为新需求创建 v2 模板');
+    expect(frontmatter).toContain('不要创建或运行 v2 流程');
     expect(skill!.content).toContain('新需求统一使用 **botmux-workflow**');
     expect(skill!.content).toContain('botmux template');
-    expect(skill!.content).toContain('botmux template validate');
+    expect(skill!.content).not.toContain('botmux template validate');
+    expect(skill!.content).toContain('botmux template migrate-v3');
+    expect(skill!.content).toContain('历史 run 只能通过私有静态归档审计');
     expect(skill!.content).toContain('botmux bots list');
     expect(skill!.content).toContain('description');
     expect(skill!.content).toContain('feishu-send');
@@ -97,7 +99,7 @@ describe('built-in botmux-workflow-create skill', () => {
     expect(skill!.content).toContain('缺少必填参数：');
     expect(skill!.content).toContain('必须是 number');
     expect(skill!.content).toContain('必须是 boolean');
-    expect(skill!.content).toContain('历史启动语法（仅用于读懂存量资产');
+    expect(skill!.content).toContain('不要复述或执行任何旧');
     expect(skill!.content).toContain('botmux template migrate-v3 <workflowId>');
     expect(skill!.content).toContain('不要再建议 `/template run`');
     expect(skill!.content).toContain('object / array');
@@ -134,7 +136,7 @@ describe('built-in botmux-workflow skill (v3 ad-hoc + Saved Workflow)', () => {
     expect(skill!.content).toContain('只有消息以 `/workflow` 显式发起时才跳过');
     expect(skill!.content).toContain('普通改代码');
     // 新工作不再分流到 v2；旧 namespace 只作为迁移提示存在。
-    expect(skill!.content).toContain('v2 存量迁移');
+    expect(skill!.content).toContain('v2 资产的离线迁移与归档');
     expect(skill!.content).toContain('botmux template');
     // 转义没出 bug：description 里不该出现裸反斜杠-反引号
     expect(skill!.content).not.toContain('\\`');

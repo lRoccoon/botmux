@@ -4,7 +4,7 @@ import { promises as fs } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 import { parseWorkflowDefinition, type WorkflowDefinition } from '../definition.js';
-import { workflowDefinitionSearchPaths } from '../loader.js';
+import { legacyWorkflowDefinitionSearchPaths } from './v2-definition-paths.js';
 
 export type LegacyMigrationCandidate =
   | {
@@ -26,7 +26,7 @@ export type LegacyMigrationCandidate =
   };
 
 function defaultSearchDirs(): string[] {
-  return [...new Set(workflowDefinitionSearchPaths('__migration_sentinel__').map(dirname))];
+  return [...new Set(legacyWorkflowDefinitionSearchPaths('__migration_sentinel__').map(dirname))];
 }
 
 async function parseCandidate(path: string): Promise<LegacyMigrationCandidate> {
@@ -97,7 +97,7 @@ async function scanRefs(refs: string[]): Promise<LegacyMigrationCandidate[]> {
     if (looksLikePath(ref)) {
       path = resolve(ref);
     } else {
-      for (const candidate of workflowDefinitionSearchPaths(ref)) {
+      for (const candidate of legacyWorkflowDefinitionSearchPaths(ref)) {
         try {
           const stat = await fs.stat(candidate);
           if (stat.isFile()) {
@@ -112,7 +112,7 @@ async function scanRefs(refs: string[]): Promise<LegacyMigrationCandidate[]> {
     if (!path) {
       out.push({
         kind: 'invalid',
-        path: looksLikePath(ref) ? resolve(ref) : workflowDefinitionSearchPaths(ref)[0]!,
+        path: looksLikePath(ref) ? resolve(ref) : legacyWorkflowDefinitionSearchPaths(ref)[0]!,
         inferredWorkflowId: ref,
         error: `legacy workflow ${JSON.stringify(ref)} was not found`,
       });

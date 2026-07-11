@@ -3,11 +3,13 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
-import { canonicalJsonStringify } from '../definition.js';
+import { canonicalJsonStringify } from '../../utils/canonical-json.js';
 
 export const V2_RUN_ARCHIVE_SCHEMA_VERSION = 1 as const;
 export const V2_RUN_ARCHIVE_KIND = 'botmux-v2-workflow-run-archive' as const;
 export const V2_RUN_ARCHIVE_COMMIT_SCHEMA_VERSION = 1 as const;
+export const V2_RUN_RETIREMENT_SCHEMA_VERSION = 1 as const;
+export const V2_RUN_RETIREMENT_KIND = 'botmux-v2-workflow-run-retirement' as const;
 
 const Sha256Schema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 const RelativePathSchema = z.string().min(1).max(4096).refine(
@@ -104,6 +106,17 @@ export const V2RunArchiveCommitMarkerSchema = z.object({
 }).strict();
 export type V2RunArchiveCommitMarker = z.infer<typeof V2RunArchiveCommitMarkerSchema>;
 
+export const V2RunRetirementReceiptSchema = z.object({
+  schemaVersion: z.literal(V2_RUN_RETIREMENT_SCHEMA_VERSION),
+  kind: z.literal(V2_RUN_RETIREMENT_KIND),
+  archiveId: Sha256Schema,
+  manifestSha256: Sha256Schema,
+  sourceRunsDir: z.string().min(1),
+  quarantineDir: z.string().min(1),
+  retiredAt: z.string().datetime(),
+}).strict();
+export type V2RunRetirementReceipt = z.infer<typeof V2RunRetirementReceiptSchema>;
+
 export function sha256Ref(data: string | Buffer): string {
   return `sha256:${createHash('sha256').update(data).digest('hex')}`;
 }
@@ -125,4 +138,8 @@ export function parseV2RunArchiveManifest(value: unknown): V2RunArchiveManifest 
 
 export function parseV2RunArchiveCommitMarker(value: unknown): V2RunArchiveCommitMarker {
   return V2RunArchiveCommitMarkerSchema.parse(value);
+}
+
+export function parseV2RunRetirementReceipt(value: unknown): V2RunRetirementReceipt {
+  return V2RunRetirementReceiptSchema.parse(value);
 }

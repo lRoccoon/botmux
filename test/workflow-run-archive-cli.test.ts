@@ -12,6 +12,7 @@ describe('botmux template archive-runs CLI', () => {
       json: false,
       runsDir: join(dataDir, 'workflow-runs'),
       archiveBaseDir: join(dataDir, 'workflow-archives', 'v2-runs'),
+      daemonStoppedAcknowledged: false,
     });
   });
 
@@ -30,11 +31,21 @@ describe('botmux template archive-runs CLI', () => {
       mode: 'verify',
       archiveRef: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     });
+    expect(parseWorkflowRunArchiveCliOptions([
+      '--retire', 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      '--ack-daemon-stopped',
+    ], '/tmp/data')).toMatchObject({
+      mode: 'retire',
+      archiveRef: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      daemonStoppedAcknowledged: true,
+    });
   });
 
   it('rejects ambiguous or loose flags', () => {
     expect(() => parseWorkflowRunArchiveCliOptions(['extra'], '/tmp/data')).toThrow(/positional/);
     expect(() => parseWorkflowRunArchiveCliOptions(['--commit', '--verify', '/tmp/a'], '/tmp/data')).toThrow(/mutually exclusive/);
+    expect(() => parseWorkflowRunArchiveCliOptions(['--retire', '/tmp/a', '--verify', '/tmp/a'], '/tmp/data')).toThrow(/mutually exclusive/);
+    expect(() => parseWorkflowRunArchiveCliOptions(['--ack-daemon-stopped'], '/tmp/data')).toThrow(/only valid with --retire/);
     expect(() => parseWorkflowRunArchiveCliOptions(['--json=true'], '/tmp/data')).toThrow(/does not accept/);
     expect(() => parseWorkflowRunArchiveCliOptions(['--unknown'], '/tmp/data')).toThrow(/unknown flag/);
   });

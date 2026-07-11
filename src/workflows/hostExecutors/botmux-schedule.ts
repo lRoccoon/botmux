@@ -9,7 +9,8 @@ import {
 } from '../../services/schedule-store.js';
 import { computeInputHash } from '../../utils/canonical-input-hash.js';
 import type { ParsedSchedule } from '../../types.js';
-import type { ProviderReconciler } from '../resume.js';
+import type { ProviderReconciler } from '../shared/provider-reconciler.js';
+import { PROVIDER_TTL_MS } from '../shared/provider-reconciler.js';
 import type { SideEffectingExecutor } from './types.js';
 
 export type ScheduleInput = {
@@ -98,7 +99,7 @@ export function parseScheduleInput(input: unknown): ScheduleInput {
  */
 export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, ScheduleOutput> = {
   provider: 'botmux-schedule',
-  idempotencyTtlMs: Number.MAX_SAFE_INTEGER,
+  idempotencyTtlMs: PROVIDER_TTL_MS['botmux-schedule'],
 
   canonicalInput(input) {
     return canonicalScheduleInput(input);
@@ -172,8 +173,6 @@ export const botmuxScheduleReconciler: ProviderReconciler = {
   provider: 'botmux-schedule',
 
   // v3 supplies its verified frozen input and requires exact body matching.
-  // Legacy v2 resume may still call the key-only lookup with `undefined`;
-  // retain that compatibility until the v2 execution path is deleted.
   canonicalInput(input) {
     return botmuxScheduleExecutor.canonicalInput(input as ScheduleInput);
   },

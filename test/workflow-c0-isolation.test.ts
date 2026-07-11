@@ -106,7 +106,6 @@ describe('Slice C0 — chat side-effect isolation', () => {
     'start',
     'retry',
     'grant',
-    'resume',
     'cancel',
   ])('botmux workflow %s refuses workflow mutations from a subagent', (sub) => {
     const out = runCli(['workflow', sub, 'target'], {
@@ -120,9 +119,6 @@ describe('Slice C0 — chat side-effect isolation', () => {
   });
 
   it.each([
-    ['template', 'run'],
-    ['template', 'resume'],
-    ['template', 'cancel'],
     ['template', 'migrate-v3'],
     ['template', 'archive-runs'],
     ['v3', 'run'],
@@ -130,6 +126,18 @@ describe('Slice C0 — chat side-effect isolation', () => {
     const out = runCli([root, sub, 'target'], { BOTMUX_WORKFLOW: '1' });
     expect(out.status).toBe(2);
     expect(out.stderr).toContain(`botmux ${root} ${sub} refused inside workflow`);
+  });
+
+  it.each([
+    ['workflow', 'resume'],
+    ['template', 'run'],
+    ['template', 'resume'],
+    ['template', 'cancel'],
+  ])('botmux %s %s stays a zero-I/O retirement tombstone inside workflow mode', (root, sub) => {
+    const out = runCli([root, sub, 'target'], { BOTMUX_WORKFLOW: '1' });
+    expect(out.status).toBe(1);
+    expect(out.stderr).toContain('v2 workflow runtime 已下线');
+    expect(out.stderr).not.toContain('refused inside workflow');
   });
 
   it.each([

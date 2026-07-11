@@ -15,7 +15,7 @@ import {
   type V3RuntimeDeps,
 } from '../src/workflows/v3/runtime.js';
 import type { HostExecutorRegistry } from '../src/workflows/hostExecutors/registry.js';
-import type { ProviderReconciler } from '../src/workflows/resume.js';
+import type { ProviderReconciler } from '../src/workflows/shared/provider-reconciler.js';
 
 function dag(runId: string) {
   return validateDag({

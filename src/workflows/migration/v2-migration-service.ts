@@ -4,11 +4,11 @@ import type { BotConfig } from '../../bot-registry.js';
 import { existsSync, promises as fs, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { canonicalJsonStringify } from '../../utils/canonical-json.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { parseWorkflowDefinition, type WorkflowDefinition } from '../definition.js';
 import {
   buildSavedWorkflowRevision,
-  canonicalJsonStringify,
   type LoadedSavedWorkflowRevision,
   type SavedWorkflowMetadata,
   type SavedWorkflowOwner,

@@ -28,10 +28,6 @@ export type V3RunCancelResult =
     error: string;
   };
 
-export function shouldProbeLegacyV2Fallback(status: number, alreadyTried: boolean): boolean {
-  return status === 404 && !alreadyTried;
-}
-
 export async function fetchV3Runs(fetcher: V3Fetch = fetch): Promise<RunSummary[]> {
   const response = await fetcher('/api/v3/runs');
   if (!response.ok) return [];
@@ -74,11 +70,6 @@ export async function cancelV3Run(runId: string, fetcher: V3Fetch = fetch): Prom
     ...(isV3RunStatus(rawStatus) ? { runStatus: rawStatus } : {}),
     ...(body.alreadyTerminal === true ? { alreadyTerminal: true } : {}),
   };
-}
-
-export async function probeLegacyV2RunSnapshot(runId: string, fetcher: V3Fetch = fetch): Promise<boolean> {
-  const response = await fetcher(`/api/workflows/runs/${encodeURIComponent(runId)}/snapshot`);
-  return response.ok;
 }
 
 function isV3RunStatus(value: unknown): value is V3RunStatus {

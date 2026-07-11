@@ -33,7 +33,14 @@ export function parseV3SavedWorkflowCommand(content: string): V3SavedWorkflowCom
   if (!tail) return null;
   const tokens = tail.split(/\s+/);
   const sub = tokens[0]!.toLowerCase();
-  if (!['save', 'run', 'cancel', 'list', 'show'].includes(sub)) return null;
+  if (!['save', 'run', 'cancel', 'list', 'show', 'resume'].includes(sub)) return null;
+
+  if (sub === 'resume') {
+    return {
+      kind: 'invalid',
+      error: 'v2 workflow resume 已下线；历史 run 已不可变，只能查看离线静态归档。v3 blocked run 请使用 `/workflow retry <runId>`。',
+    };
+  }
 
   if (sub === 'cancel') {
     if (tokens.length !== 2) {

@@ -4,9 +4,9 @@
  * The legacy definition file is user-authored source material and is never
  * rewritten. One source identity (canonical real path + workflow id) owns one
  * stable Saved Workflow. Every semantic legacy revision then maps to an exact
- * immutable v3 revision. Both `pending` and `committed` revisions fail-close
- * v2 execution; a crash is repaired by re-running the migration command rather
- * than allowing two engines to execute the same asset.
+ * immutable v3 revision. The v2 execution engine is gone; a pending migration
+ * is repaired by re-running the migration command without mutating the legacy
+ * source bytes.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -28,13 +28,13 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
+import { canonicalJsonStringify } from '../../utils/canonical-json.js';
 import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
 import { withFileLockSync } from '../../utils/file-lock.js';
 import { computeRevisionId, type WorkflowDefinition } from '../definition.js';
 import {
   SAVED_WORKFLOW_ID_RE,
   SAVED_WORKFLOW_REVISION_ID_RE,
-  canonicalJsonStringify,
   type SavedWorkflowOwner,
   type SavedWorkflowScope,
 } from '../v3/library-schema.js';
@@ -126,53 +126,6 @@ export class LegacyMigrationLedgerError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'LegacyMigrationLedgerError';
-  }
-}
-
-export class LegacyWorkflowMigratedError extends Error {
-  constructor(
-    public readonly source: LegacyMigrationSourceRecord,
-    public readonly revision: LegacyMigrationRevisionRecord,
-  ) {
-    const recovery = revision.state === 'pending'
-      ? `Migration is incomplete; re-run \`botmux template migrate-v3 ${source.legacy.workflowId} --commit ...\` to recover it.`
-      : `Run the v3 definition with \`/workflow run ${source.target.workflowId}\` instead.`;
-    super(
-      `Legacy workflow '${source.legacy.workflowId}' at ${source.legacy.path} ` +
-      `(${revision.contentHash}) is ${revision.state} to Saved Workflow ` +
-      `${source.target.workflowId}@${revision.targetRevisionId}. ${recovery}`,
-    );
-    this.name = 'LegacyWorkflowMigratedError';
-  }
-}
-
-export class LegacyWorkflowChangedAfterMigrationError extends Error {
-  constructor(
-    public readonly source: LegacyMigrationSourceRecord,
-    public readonly currentContentHash: string,
-  ) {
-    super(
-      `Legacy workflow '${source.legacy.workflowId}' at ${source.legacy.path} changed after migration ` +
-      `(current ${currentContentHash}). v2 execution stays disabled; re-run ` +
-      `\`botmux template migrate-v3 ${source.legacy.workflowId} --commit ...\` to append the new v3 revision.`,
-    );
-    this.name = 'LegacyWorkflowChangedAfterMigrationError';
-  }
-}
-
-export class LegacyWorkflowIdentityConflictError extends Error {
-  constructor(
-    public readonly current: LegacyDefinitionIdentity,
-    public readonly matches: LegacyMigrationSourceRecord[],
-  ) {
-    const sameContent = matches.some((source) => !!source.revisions[current.contentHash]);
-    super(
-      `Legacy workflow '${current.workflowId}' at ${current.path} matches migration evidence ` +
-      `for the same workflowId at another path (${matches.map((item) => item.legacy.path).join(', ')}). ` +
-      `v2 execution stays disabled${sameContent ? ' (the same content is already migrated/pending)' : ''}; ` +
-      `run the existing v3 definition or explicitly migrate this exact path before using it.`,
-    );
-    this.name = 'LegacyWorkflowIdentityConflictError';
   }
 }
 
@@ -830,32 +783,4 @@ export function findLegacyMigration(
     source,
     currentContentHash: identity.contentHash,
   };
-}
-
-export function assertLegacyWorkflowExecutionAllowed(input: {
-  dataDir: string;
-  path: string;
-  definition: WorkflowDefinition;
-}): void {
-  const identity = legacyDefinitionIdentity(input.path, input.definition);
-  const lookup = findLegacyMigration(input.dataDir, identity);
-  if (lookup.kind === 'exact') {
-    throw new LegacyWorkflowMigratedError(lookup.source, lookup.revision);
-  }
-  if (lookup.kind === 'changed_after_migration') {
-    throw new LegacyWorkflowChangedAfterMigrationError(
-      lookup.source,
-      lookup.currentContentHash,
-    );
-  }
-  // Path is part of the exact migration source identity, but it is not a safe
-  // allow signal. A copied/moved definition or a symlink retarget would mint a
-  // new sourceKey and otherwise resurrect v2. Any existing evidence for the
-  // same semantic workflowId therefore fail-closes until this exact path is
-  // explicitly migrated.
-  const matches = Object.values(readLegacyMigrationLedger(input.dataDir).sources)
-    .filter((source) => source.legacy.workflowId === identity.workflowId);
-  if (matches.length > 0) {
-    throw new LegacyWorkflowIdentityConflictError(identity, matches);
-  }
 }

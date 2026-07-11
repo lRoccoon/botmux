@@ -164,15 +164,10 @@ export function buildSetCookie(token: string): string {
  *
  * Public surfaces today (codex review v0.1.2 → canary.3):
  *   - `GET/HEAD /`, `/assets/*`, root icons    — static SPA shell
- *   - `GET /api/workflows/*`                   — workflow read-only API,
- *                                                EXCEPT `…/terminal-log/raw`
- *                                                which serves full PTY byte
- *                                                streams (may include keys,
- *                                                env, tokens) and requires
- *                                                cookie auth.
+ *   - `GET /api/workflows/*`                   — zero-I/O legacy retirement
+ *                                                tombstone (HTTP 410).
  *
- * Anything else (sessions, schedules, dashboard rotate, POST /api/workflows
- * /…/cancel, etc.) requires the active session token, matching the
+ * Anything else (sessions, schedules, dashboard rotate, etc.) requires the active session token, matching the
  * "get_write_link" pattern that the chat web terminal already uses.
  */
 export type AuthDecision =
@@ -212,18 +207,16 @@ export function decideDashboardAuth(opts: {
 }): AuthDecision {
   const { method, pathname, hasTokenParam, presentedToken, activeToken, publicReadOnly } = opts;
 
-  // `…/terminal-log/raw` streams full PTY bytes (`?stream=pty`) or worker
-  // diagnostic log (`?stream=diag`). PTY transcript can leak API keys / env
-  // vars / token reads that happened to scroll the terminal, so both stream
-  // variants stay behind cookie auth in EVERY mode (workflow reads excluded).
+  // Historical `…/terminal-log/raw` routes are gone, but keep the generic raw
+  // suffix excluded from public-read policy so future APIs cannot expose a PTY
+  // transcript by accidentally inheriting this carve-out.
   const isRawTerminalLog = pathname.endsWith('/terminal-log/raw');
 
-  // Workflow read-only paths + static SPA shell are public in EVERY mode — the
-  // dashboard must be linkable from Lark cards without forcing a
-  // `botmux dashboard` round-trip.  Write actions still need a cookie / token.
+  // The legacy workflow prefix is now a public zero-I/O 410 tombstone. Keeping
+  // it public lets stale cards/clients receive an actionable retirement result.
   const isWorkflowReadOnly =
     method === 'GET' &&
-    pathname.startsWith('/api/workflows/') &&
+    (pathname === '/api/workflows' || pathname.startsWith('/api/workflows/')) &&
     !isRawTerminalLog;
   // v3 read-only API is link-shareable like the v0.2 one, EXCEPT the per-node
   // raw PTY stream (`…/pty-log`) which — same rationale as terminal-log/raw —

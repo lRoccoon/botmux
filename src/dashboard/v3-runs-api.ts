@@ -1,7 +1,7 @@
 /**
  * Dashboard API for v3 workflow runs.
  *
- * Mirrors `workflow-api.ts` (the v0.2 read-only run API): a single
+ * Host-neutral v3 run API: a single
  * `handle...(req, res, url, deps, authed): Promise<boolean>` router that returns
  * `true` once it has handled a route. Read data comes from the v3 run dir via
  * `ops-projection.ts` (journal + dag → RunView); the sole mutation below is
@@ -21,7 +21,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createReadStream, lstatSync, statSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { isValidRunId, listRuns, projectRunById, ptyLogPathFor } from '../workflows/v3/ops-projection.js';
 import { readRunEnvelope, V3_RUN_ENVELOPE_FILE } from '../workflows/v3/run-envelope.js';
 import { readGrillState } from '../workflows/v3/grill-state.js';

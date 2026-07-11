@@ -325,6 +325,7 @@ When a CLI spawns inside a botmux session it automatically gets
 - `botmux quoted <message_id>` — when the user @ed the bot via Lark's quote-reply UI, fetch the quoted message on demand
 - `botmux bots list` — discover bots + their `open_id`s
 - `botmux schedule` — manage scheduled tasks
+- `botmux-workflow` — orchestrate bounded multi-step work with natural language or `/workflow`, then save successful runs for reuse
 
 These capabilities are wired via `--append-system-prompt` and Skill
 descriptions, so the agent picks them up automatically. Compared to
@@ -344,10 +345,9 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 - Disband or leave a chat (associated sessions auto-closed)
 - **Session Insights** (owner-only, read-only): parse each session's transcript to view action spans / work timeline / context curve / failure aggregates + diagnostic suggestions; send `/insight` in chat for the current session's summary card
 - **Workflows console**:
-  - Run List (5 s poll) + Run Detail with summary, dangling-work red panel, node/activity table, event timeline, and a **parallel-execution timeline** (attempt-level), auto-stopping polling once the run reaches a terminal state
-  - **Cancel a run directly from the dashboard**; approve / reject `humanGate` with reviewer comments
-  - **Workflow Catalog**: lists every workflow under `~/.botmux/workflows/`, drills into schema / dependency graph, and triggers a new run from the UI (with params input)
-  - IM approval / cancel cards remain available; `botmux workflow` CLI subcommands also keep working
+  - v3 Run List and Run Detail show the DAG, node states, decisions, and attempt terminal logs, and stop polling at terminal state
+  - **Cancel v3 runs directly from the dashboard**; trusted Lark cards in the bound topic handle `humanGate`, retry, and grant decisions
+  - Create, run, save, and reuse workflows in Lark with natural language or `/workflow`; the v2 Dashboard/Catalog has been retired
 
 <img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
 
@@ -364,6 +364,15 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
 6. Click "Get Write Link" on the card to receive a write-enabled terminal URL via DM
 7. The CLI replies in the thread via the `botmux send` command (wired through the `botmux-send` Skill)
+
+---
+
+### Multi-step Workflow (v3)
+
+- Say “research three competitors and write a report” or “chain A/B/C and run it automatically.” The bot lightly confirms Workflow intent, clarifies the goal, builds a bounded DAG, and executes it.
+- Use `/workflow <goal>` for an explicit start, and `/workflow list|show|cancel` to inspect or cancel runs.
+- Save a successful run with `/workflow save last weekly-report`, then reuse it with `/workflow run weekly-report region=sg`; only missing required parameters are requested.
+- The v2 runtime is retired. Legacy definitions and run history retain only offline `botmux template migrate-v3` / `archive-runs` migration and archive tooling.
 
 ---
 

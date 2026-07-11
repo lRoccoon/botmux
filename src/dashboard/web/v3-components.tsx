@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { SectionHeader } from './dashboard-components.js';
-import { legacyWorkflowDetailHash } from './legacy-workflow-link.js';
 import { useT } from './react-hooks.js';
 import { ui } from './ui.js';
-import { cancelV3Run, fetchV3RunDetail, fetchV3Runs, probeLegacyV2RunSnapshot, shouldProbeLegacyV2Fallback } from './v3-api.js';
-import { WorkflowVersionSwitch } from './workflow-version-switch.js';
+import { cancelV3Run, fetchV3RunDetail, fetchV3Runs } from './v3-api.js';
 import {
   V3_DECISION_LABEL,
   V3_GRAPH,
@@ -74,24 +72,10 @@ function useV3RunDetail(runId: string): DetailPollState {
   useEffect(() => {
     let disposed = false;
     let timer: number | null = null;
-    let triedV2Fallback = false;
 
     const schedule = () => {
       timer = window.setTimeout(() => { void poll(); }, V3_POLL_MS);
     };
-
-    async function maybeRedirectToLegacy(status: number): Promise<boolean> {
-      if (!shouldProbeLegacyV2Fallback(status, triedV2Fallback)) return false;
-      triedV2Fallback = true;
-      try {
-        const exists = await probeLegacyV2RunSnapshot(runId);
-        if (disposed || !exists) return false;
-        window.location.replace(legacyWorkflowDetailHash(runId, location.hash.split('?')[1]));
-        return true;
-      } catch {
-        return false;
-      }
-    }
 
     async function poll(): Promise<void> {
       if (disposed) return;
@@ -101,7 +85,6 @@ function useV3RunDetail(runId: string): DetailPollState {
           const result = await fetchV3RunDetail(runId);
           if (disposed) return;
           if (!result.ok) {
-            if (await maybeRedirectToLegacy(result.status)) return;
             setStatusText(result.status === 404 ? 'not found' : `HTTP ${result.status}`);
           } else {
             setView(result.view);
@@ -131,7 +114,6 @@ function V3ListPage(): JSX.Element {
   const headingActions = (
     <div className="page-heading-actions v3r-run-toolbar">
       <span className="v3r-run-count">{runs.length}</span>
-      <WorkflowVersionSwitch active="v3" />
     </div>
   );
 
@@ -263,7 +245,6 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
             busy={cancelBusy || cancelSubmitted}
             onCancel={() => { void cancelRun(); }}
           />
-          <WorkflowVersionSwitch active="v3" />
         </div>
       </div>
       {cancelNotice ? (

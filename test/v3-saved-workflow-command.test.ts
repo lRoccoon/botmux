@@ -49,6 +49,15 @@ describe('parseV3SavedWorkflowCommand', () => {
     expect(parseV3SavedWorkflowCommand('/workflow cancel r extra')).toMatchObject({ kind: 'invalid' });
   });
 
+  it('reserves the retired v2 resume verb and points to v3 retry/static archive', () => {
+    const result = parseV3SavedWorkflowCommand('/workflow resume old-run');
+    expect(result).toMatchObject({ kind: 'invalid' });
+    const error = result && 'error' in result ? result.error : '';
+    expect(error).toContain('resume 已下线');
+    expect(error).toContain('/workflow retry');
+    expect(error).toContain('静态归档');
+  });
+
   it('treats words before the first key=value as the saved name', () => {
     expect(parseV3SavedWorkflowCommand('/workflow run run the tests and report')).toMatchObject({
       kind: 'run', ref: 'run the tests and report', rawParams: {},

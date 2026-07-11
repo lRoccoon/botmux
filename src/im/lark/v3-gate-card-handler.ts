@@ -1,6 +1,6 @@
 /**
  * v3 humanGate 审批卡点击处理 —— card-handler 的 v3 分支（对称于 v0.2 的
- * `workflow-card-handler`，但走 v3 自己的 wait/journal 权威，不复用 v0.2 wait
+ * 走 v3 自己的 wait/journal 权威，不复用已下线的 v2 wait
  * path）。把一次点击翻译成：权限校验 → `resolveV3GateClick`（幂等 + terminal-safe）
  * → 冻结卡 / toast + 触发 `driveV3Run` 续跑。
  *

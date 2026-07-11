@@ -3,7 +3,7 @@
  * 但**自带 action namespace + value 形态**（codex review #4）：
  *   - action: `v3_gate_approve` / `v3_gate_reject`
  *   - value: `{ action, runId, waitId, nodeId, nonce, selected }`
- * 刻意不复用 v0.2 `workflow-card-handler` 的 wait path —— v3 的 wait 权威是
+ * 刻意不复用已下线的 v2 wait path —— v3 的 wait 权威是
  * `waits/<id>.json + journal.ndjson`，跟 v0.2 events schema 不同（见 humanGate
  * daemon-card 设计 §4.3）。本文件**纯函数**，不碰 daemon / IO，单测友好。
  */

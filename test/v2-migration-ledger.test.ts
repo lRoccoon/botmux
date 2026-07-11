@@ -12,10 +12,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { WorkflowDefinition } from '../src/workflows/definition.js';
 import {
-  LegacyWorkflowChangedAfterMigrationError,
-  LegacyWorkflowIdentityConflictError,
-  LegacyWorkflowMigratedError,
-  assertLegacyWorkflowExecutionAllowed,
   commitLegacyMigration,
   computeLegacyConversionHash,
   findLegacyMigration,
@@ -71,7 +67,7 @@ describe('v2 migration ledger', () => {
       ...(version > 1 ? { expectedLatestRevision: `rev_${'a'.repeat(64)}` } : {}),
       now: new Date(`2026-07-${String(version).padStart(2, '0')}T00:00:00.000Z`),
     });
-    return { def, identity, target, prepared };
+    return { identity, target, prepared };
   }
 
   it('binds pending then committed to exact path/id/content and stable target', () => {
@@ -80,11 +76,6 @@ describe('v2 migration ledger', () => {
       kind: 'exact',
       revision: { state: 'pending' },
     });
-    expect(() => assertLegacyWorkflowExecutionAllowed({
-      dataDir,
-      path: sourcePath,
-      definition: first.def,
-    })).toThrow(LegacyWorkflowMigratedError);
 
     const committed = commitLegacyMigration(dataDir, first.identity, new Date('2026-07-02T00:00:00.000Z'));
     expect(committed.revision.state).toBe('committed');
@@ -101,11 +92,6 @@ describe('v2 migration ledger', () => {
       kind: 'changed_after_migration',
       currentContentHash: secondIdentity.contentHash,
     });
-    expect(() => assertLegacyWorkflowExecutionAllowed({
-      dataDir,
-      path: sourcePath,
-      definition: secondDef,
-    })).toThrow(LegacyWorkflowChangedAfterMigrationError);
   });
 
   it('is idempotent but rejects a different frozen target allocation', () => {
@@ -175,37 +161,6 @@ describe('v2 migration ledger', () => {
       writeFileSync(target, '{}', { mode: 0o600 });
       symlinkSync(target, ledgerPath);
       expect(() => readLegacyMigrationLedger(dataDir)).toThrow(/regular file/);
-    }
-  });
-
-  it('does not let copied, moved, or symlink-retargeted workflowIds resurrect v2', () => {
-    const first = prepare(1);
-    commitLegacyMigration(dataDir, first.identity);
-
-    const copiedPath = join(root, 'copied.workflow.json');
-    writeFileSync(copiedPath, JSON.stringify(first.def), 'utf-8');
-    expect(() => assertLegacyWorkflowExecutionAllowed({
-      dataDir,
-      path: copiedPath,
-      definition: first.def,
-    })).toThrow(LegacyWorkflowIdentityConflictError);
-
-    const editedCopy = definition(2);
-    writeFileSync(copiedPath, JSON.stringify(editedCopy), 'utf-8');
-    expect(() => assertLegacyWorkflowExecutionAllowed({
-      dataDir,
-      path: copiedPath,
-      definition: editedCopy,
-    })).toThrow(LegacyWorkflowIdentityConflictError);
-
-    if (process.platform !== 'win32') {
-      const linkPath = join(root, 'redirect.workflow.json');
-      symlinkSync(copiedPath, linkPath);
-      expect(() => assertLegacyWorkflowExecutionAllowed({
-        dataDir,
-        path: linkPath,
-        definition: editedCopy,
-      })).toThrow(LegacyWorkflowIdentityConflictError);
     }
   });
 });

@@ -3800,7 +3800,7 @@ async function cmdWorkflowStart(runId: string | undefined, rest: string[]): Prom
 
 /** `botmux workflow retry <runId> [--node <id>]` — blocked 节点重试入口（CLI 侧）。
  *  走 daemon 的 retry IPC（journal 写入留在 daemon 进程内，单写者），daemon append
- *  `nodeRetryRequested` 后以新 attempt 重驱动。`resume` 动词归 v0.2，v3 用 retry 避撞。 */
+ *  `nodeRetryRequested` 后以新 attempt 重驱动；已退休的 v2 `resume` 不再参与分发。 */
 async function cmdWorkflowRetry(runId: string | undefined, rest: string[]): Promise<void> {
   if (!runId) {
     console.error('用法: botmux workflow retry <runId> [--node <nodeId>] [--bot <larkAppId>]');
@@ -4198,10 +4198,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   workflow retry|grant [...]           处理受阻节点 / loop
   template migrate-v3 [id|path ...] [--all] [--commit ...]
                                        v2 定义迁移：默认 dry-run，写入需显式 owner/app/scope
-  template archive-runs [--commit|--verify <archive>]
-                                       v2 历史 run 私有静态归档；默认 dry-run，删除执行面前须双关校验
-  template <run|resume|cancel|ls|tail|validate|show> [...]
-                                       v2 执行兼容面（仅保留迁移窗口）
+  template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]
+                                       v2 历史 run 私有静态归档；retire 在维护窗双验后原子迁入 quarantine
   （完整参数见 \`botmux workflow help\` / \`botmux template help\`）
   dispatch --bot <name> [...]          多话题编排：开子话题并把 bot 派进去（详见 \`botmux dispatch --help\`）
   report [...]                         v3/编排场景向上汇报进度或结果（详见 \`botmux report --help\`）
@@ -7347,7 +7345,7 @@ function getVersion(): string {
 const command = process.argv[2];
 
 // Workflow safety gate (Slice C0): a CLI invoked inside a workflow
-// subagent worker (BOTMUX_WORKFLOW=1, set by daemon-spawn) must not
+// subagent worker (BOTMUX_WORKFLOW=1, set by v3/ephemeral-pool) must not
 // trigger chat-facing effects, schedule mutations, or recursively authorize /
 // mutate workflows.  Side effects belong in `hostExecutor` activities so they
 // get `effectAttempted` tracking + reconcile; workflow authorization belongs
@@ -7409,12 +7407,10 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'start',
     'retry',
     'grant',
-    // One-version v2 compatibility aliases that still mutate a run.
-    'resume',
     'cancel',
   ]);
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
-  const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs', 'run', 'resume', 'cancel']);
+  const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
   const v3Sub = command === 'v3' ? (process.argv[3] ?? '') : '';
   const workflowMutation =
     (command === 'workflow' && blockedWorkflowSub.has(workflowSub)) ||
@@ -8034,8 +8030,7 @@ switch (command) {
   case 'workflow': {
     const wfSub = process.argv[3] ?? '';
     if (wfSub === 'cancel') {
-      // Durable v3 run cancellation. v2 cancellation is available only under
-      // `botmux template cancel` during the retirement window.
+      // Durable v3 run cancellation. The v2 runtime is retired.
       await cmdWorkflowCancelV3(process.argv[4], process.argv.slice(5));
       break;
     }
@@ -8047,7 +8042,7 @@ switch (command) {
       break;
     }
     if (wfSub === 'retry') {
-      // v3 blocked-node retry (the `resume` verb belongs to v0.2).
+      // v3 blocked-node retry; the former v2 `resume` verb is retired.
       await cmdWorkflowRetry(process.argv[4], process.argv.slice(5));
       break;
     }

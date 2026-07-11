@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   deriveIdempotencyKey,
   type IdempotencyKeyTuple,
-} from '../src/workflows/events/idempotency.js';
+} from '../src/workflows/shared/idempotency-key.js';
 import {
   canonicalJson,
   computeInputHash,
@@ -170,6 +170,12 @@ describe('computeInputHash', () => {
 // ─── deriveIdempotencyKey ───────────────────────────────────────────────────
 
 describe('deriveIdempotencyKey — determinism', () => {
+  it('keeps the persisted provider-key bytes stable across v2 retirement', () => {
+    expect(deriveIdempotencyKey(baseTuple)).toBe(
+      'wf_113030808efccfab58ec57afdb0187f286a0a9fb6d4f156',
+    );
+  });
+
   it('same tuple → same key', () => {
     const a = deriveIdempotencyKey(baseTuple);
     const b = deriveIdempotencyKey(baseTuple);
