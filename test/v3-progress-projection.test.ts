@@ -258,23 +258,44 @@ describe('projectV3Progress', () => {
       events: [
         ...cancellingEvents,
         at(4, {
+          type: 'hostEffectUncertain',
+          nodeId: 'research',
+          instanceId: 'research#001',
+          attemptId: 'research#001/attempts/001',
+          executor: 'feishu-send',
+          reason: 'ttlExpired',
+          errorCode: 'HOST_EFFECT_TTL_EXPIRED',
+        }),
+        at(5, {
           type: 'nodeCancelled',
           nodeId: 'research',
           attemptId: '001',
           reason: 'runCancelled',
           cancelRequestId: 'cancel-progress',
         }),
-        at(5, {
+        at(6, {
           type: 'nodeCancelled',
           nodeId: 'publish',
           reason: 'runCancelled',
           cancelRequestId: 'cancel-progress',
         }),
-        at(6, { type: 'runCancelled', cancelRequestId: 'cancel-progress', by: 'ou_user' }),
+        at(7, {
+          type: 'runCancelled',
+          cancelRequestId: 'cancel-progress',
+          by: 'ou_user',
+          uncertainHostEffects: [{
+            nodeId: 'research',
+            instanceId: 'research#001',
+            attemptId: 'research#001/attempts/001',
+            executor: 'feishu-send',
+            errorCode: 'HOST_EFFECT_TTL_EXPIRED',
+          }],
+        }),
       ],
     });
     expect(cancelled.status).toBe('cancelled');
     expect(cancelled.counts.cancelled).toBe(2);
+    expect(cancelled.uncertainHostEffectCount).toBe(1);
   });
 
   it('keeps loop body instances outside the outer total while exposing bounded loop metadata', () => {

@@ -12,7 +12,7 @@
  */
 
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
-import { isLoopNode, type V3Dag } from './dag.js';
+import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import {
   V3_SUPPORTED_CLIS,
   isV3SupportedCli,
@@ -93,7 +93,7 @@ export function freezeDagBotSnapshots(
   };
 
   for (const node of dag.nodes) {
-    freeze(node.bot);
+    if (isGoalNode(node)) freeze(node.bot);
     if (isLoopNode(node)) {
       for (const bodyNode of node.body.nodes) freeze(bodyNode.bot ?? node.bot);
     }
@@ -183,7 +183,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
   if (dag) {
     const required = new Set<string>();
     for (const node of dag.nodes) {
-      required.add(node.bot ?? '');
+      if (isGoalNode(node)) required.add(node.bot ?? '');
       if (isLoopNode(node)) {
         for (const bodyNode of node.body.nodes) required.add(bodyNode.bot ?? node.bot ?? '');
       }

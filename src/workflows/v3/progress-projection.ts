@@ -88,6 +88,8 @@ export interface V3ProgressView {
     refreshedNodeIds: string[];
   };
   issue?: V3ProgressIssue;
+  /** Number only: external payloads and provider errors never enter the card. */
+  uncertainHostEffectCount?: number;
   /** Last usable journal timestamp, falling back to run.json.createdAt. */
   updatedAt: string;
 }
@@ -177,6 +179,18 @@ function latestIssue(
   const eventType = status === 'blocked' ? 'nodeBlocked' : 'nodeFailed';
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i]!;
+    if (
+      status === 'blocked' &&
+      event.type === 'hostEffectUncertain' &&
+      outerIds.has(event.nodeId) &&
+      (preferredNodeId === undefined || event.nodeId === preferredNodeId)
+    ) {
+      return {
+        nodeId: event.nodeId,
+        errorClass: 'workerError',
+        ...(ERROR_CODE_RE.test(event.errorCode) ? { errorCode: event.errorCode } : {}),
+      };
+    }
     if (event.type !== eventType || !outerIds.has(event.nodeId)) continue;
     if (preferredNodeId !== undefined && event.nodeId !== preferredNodeId) continue;
     return {
@@ -272,6 +286,9 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     loops,
     revisit: { count: revisitCount, refreshedNodeIds },
     ...(issue ? { issue } : {}),
+    ...(snapshot.uncertainHostEffects && snapshot.uncertainHostEffects.length > 0
+      ? { uncertainHostEffectCount: snapshot.uncertainHostEffects.length }
+      : {}),
     updatedAt: lastTs === undefined ? envelope.createdAt : new Date(lastTs).toISOString(),
   };
 }

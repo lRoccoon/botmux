@@ -23,7 +23,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
-import { isLoopNode, loadDag, type V3Dag } from './dag.js';
+import { isHostNode, isLoopNode, loadDag, type V3Dag } from './dag.js';
 import {
   runWorkflow,
   nextAttemptIdFor,
@@ -64,8 +64,11 @@ import {
   normalizeGateWaitInput,
   readWait,
   resolveWait,
+  resolveWaitOnce,
   selectedResolution,
+  v3GateWaitId,
   writePendingWait,
+  type GateWait,
   type GateWaitStatus,
 } from './human-gate.js';
 import {
@@ -77,7 +80,14 @@ import {
 } from './journal.js';
 import { materialize } from './state.js';
 import { openV3WorkerAttempts } from './attempt-ledger.js';
+import { openV3HostEffects } from './host-effect-ledger.js';
+import { readAndVerifyV3PreparedHostInput } from './host-execution.js';
+import { composeV3HostGatePrompt, renderV3HostInputPreview } from './host-bindings.js';
 import { V3_DRIVE_LEASE_MAX_WAIT_MS, v3DriveLeaseTarget } from './drive-lease.js';
+import {
+  createDefaultHostExecutorRegistry,
+  createDefaultProviderReconcilers,
+} from '../hostExecutors/registry.js';
 import { isValidRunId } from './ops-projection.js';
 import { GOAL_ANSWER_FILE, type GoalAnswer, type GoalAsk, type ValidateManifest } from './contract.js';
 import { validateSpec } from './spec.js';
@@ -146,6 +156,56 @@ function parseResolvedWorkflowData(raw: unknown): {
   return {
     params: { ...(root.params as Record<string, unknown>) },
     context: { ...(context as Record<string, string>) },
+  };
+}
+
+function assertResolvedWorkflowContextMatchesBinding(
+  data: { context: Record<string, string> },
+  binding: RunChatBinding | undefined,
+): void {
+  if (!binding) {
+    throw new Error('saved definition run must carry an authorized chatBinding');
+  }
+  const expected: Record<string, string | undefined> = {
+    chatId: binding.chatId,
+    larkAppId: binding.larkAppId,
+    chatType: binding.chatType,
+    rootMessageId: binding.rootMessageId,
+    initiatorOpenId: binding.ownerOpenId,
+  };
+  for (const [key, actual] of Object.entries(data.context)) {
+    if (!Object.prototype.hasOwnProperty.call(expected, key)) continue;
+    if (!expected[key] || expected[key] !== actual) {
+      throw new Error(
+        `params.resolved.json context.${key} does not match run.json chatBinding`,
+      );
+    }
+  }
+}
+
+function parseSavedDefinitionWorkflowData(
+  raw: unknown,
+  binding: RunChatBinding | undefined,
+): { params: Record<string, unknown>; context: Record<string, string> } {
+  const data = parseResolvedWorkflowData(raw);
+  assertResolvedWorkflowContextMatchesBinding(data, binding);
+  return data;
+}
+
+function bindingWorkflowData(binding: RunChatBinding | undefined): {
+  params: Record<string, unknown>;
+  context: Record<string, string>;
+} | undefined {
+  if (!binding) return undefined;
+  return {
+    params: {},
+    context: {
+      chatId: binding.chatId,
+      larkAppId: binding.larkAppId,
+      ...(binding.chatType ? { chatType: binding.chatType } : {}),
+      ...(binding.rootMessageId ? { rootMessageId: binding.rootMessageId } : {}),
+      ...(binding.ownerOpenId ? { initiatorOpenId: binding.ownerOpenId } : {}),
+    },
   };
 }
 
@@ -246,7 +306,7 @@ export function assertV3RunIntegrityForMutation(runDir: string): void {
     parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
   }
   if (loaded.envelope.source.kind === 'saved_definition') {
-    parseResolvedWorkflowData(loaded.resolvedParams);
+    parseSavedDefinitionWorkflowData(loaded.resolvedParams, loaded.envelope.chatBinding);
   }
 }
 
@@ -323,8 +383,8 @@ export function preflightV3RunStart(runDir: string): V3RunStartPreflight {
         ? undefined
         : parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
       const resolvedWorkflowData = loaded.envelope.source.kind === 'saved_definition'
-        ? parseResolvedWorkflowData(loaded.resolvedParams)
-        : undefined;
+        ? parseSavedDefinitionWorkflowData(loaded.resolvedParams, loaded.envelope.chatBinding)
+        : bindingWorkflowData(loaded.envelope.chatBinding);
       return {
         ok: true,
         context: {
@@ -365,6 +425,9 @@ export function preflightV3RunStart(runDir: string): V3RunStartPreflight {
       context: {
         dag,
         binding: grill.chatBinding,
+        ...(bindingWorkflowData(grill.chatBinding)
+          ? { resolvedWorkflowData: bindingWorkflowData(grill.chatBinding)! }
+          : {}),
         authorizedArtifacts: false,
       },
     };
@@ -413,8 +476,8 @@ function sealLegacyV3Run(
         ? undefined
         : parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
       const resolvedWorkflowData = loaded.envelope.source.kind === 'saved_definition'
-        ? parseResolvedWorkflowData(loaded.resolvedParams)
-        : undefined;
+        ? parseSavedDefinitionWorkflowData(loaded.resolvedParams, loaded.envelope.chatBinding)
+        : bindingWorkflowData(loaded.envelope.chatBinding);
       return {
         dag: loaded.dag,
         binding: loaded.envelope.chatBinding,
@@ -494,6 +557,9 @@ function sealLegacyV3Run(
       dag: loaded.dag,
       binding: loaded.envelope.chatBinding,
       botSnapshots: parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag),
+      ...(bindingWorkflowData(loaded.envelope.chatBinding)
+        ? { resolvedWorkflowData: bindingWorkflowData(loaded.envelope.chatBinding)! }
+        : {}),
       envelope: loaded.envelope,
       authorizedArtifacts: true,
     };
@@ -523,6 +589,91 @@ export function loadV3RunDagForRecovery(runDir: string): V3Dag | undefined {
   try { return loadDag(grill.dagPath); } catch { return undefined; }
 }
 
+interface TrustedHostGateMaterial {
+  waitId: string;
+  nodeId: string;
+  instanceId: string;
+  prompt: string;
+  options: string[];
+  approveOptions: string[];
+  approvers: string[];
+  hostApproval: { attemptId: string; approvalDigest: string; inputHash: string };
+}
+
+/** Rebuild the host approval UI from authorized DAG + durable prepared bytes.
+ * waits/*.json is mutable delivery state and is never trusted as the approval
+ * object by itself. */
+function trustedHostGateMaterial(
+  runDir: string,
+  runId: string,
+  nodeId: string,
+  instanceId: string,
+  events: readonly StoredEvent[],
+): TrustedHostGateMaterial | undefined {
+  const dag = loadV3RunDagForRecovery(runDir);
+  const node = dag?.nodes.find((candidate) => candidate.id === nodeId);
+  if (!node || !isHostNode(node) || !node.humanGate) return undefined;
+  const dispatched = [...events].reverse().find(
+    (event): event is StoredEvent & { type: 'gateDispatched' } =>
+      event.type === 'gateDispatched' &&
+      event.nodeId === nodeId &&
+      event.instanceId === instanceId &&
+      !!event.hostApproval,
+  );
+  if (!dispatched?.hostApproval) return undefined;
+  const prepared = [...events].reverse().find(
+    (event): event is StoredEvent & { type: 'hostInputPrepared' } =>
+      event.type === 'hostInputPrepared' &&
+      event.nodeId === nodeId &&
+      event.instanceId === instanceId &&
+      event.attemptId === dispatched.hostApproval!.attemptId,
+  );
+  const registered = createDefaultHostExecutorRegistry().get(node.executor);
+  if (!prepared || !registered) return undefined;
+  if (
+    prepared.approvalDigest !== dispatched.hostApproval.approvalDigest ||
+    prepared.inputHash !== dispatched.hostApproval.inputHash
+  ) return undefined;
+  try {
+    const artifact = readAndVerifyV3PreparedHostInput({
+      runDir,
+      inputRef: prepared.inputRef,
+      expected: { ...prepared, runId },
+      registered,
+    });
+    const authored = normalizeGateWaitInput(node.humanGate);
+    const hostApproval = {
+      attemptId: prepared.attemptId,
+      approvalDigest: prepared.approvalDigest,
+      inputHash: prepared.inputHash,
+    };
+    return {
+      nodeId,
+      instanceId,
+      waitId: v3GateWaitId(nodeId, instanceId, hostApproval),
+      ...authored,
+      prompt: composeV3HostGatePrompt(
+        authored.prompt,
+        renderV3HostInputPreview(node.executor, artifact.prepared.parsedInput, prepared.inputHash),
+      ),
+      hostApproval,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function waitMatchesTrustedHostGate(wait: GateWait, trusted: TrustedHostGateMaterial): boolean {
+  return wait.waitId === trusted.waitId &&
+    wait.nodeId === trusted.nodeId &&
+    wait.instanceId === trusted.instanceId &&
+    wait.prompt === trusted.prompt &&
+    JSON.stringify(wait.options) === JSON.stringify(trusted.options) &&
+    JSON.stringify(wait.approveOptions) === JSON.stringify(trusted.approveOptions) &&
+    JSON.stringify(wait.approvers) === JSON.stringify(trusted.approvers) &&
+    JSON.stringify(wait.hostApproval) === JSON.stringify(trusted.hostApproval);
+}
+
 export type V3TerminalOutcome = Extract<V3RunOutcome, { reason: 'terminal' }>;
 
 /** What the daemon needs to render a blocked-node retry card. */
@@ -539,6 +690,8 @@ export interface V3BlockedInfo {
   /** Present when errorCode === 'REVISIT_BUDGET_EXHAUSTED': the ancestor this
    *  node tried to revisit → the daemon posts a revisit-grant card. */
   revisitTo?: string;
+  /** No generic retry may mint a fresh idempotency key for this attempt. */
+  retryForbidden?: 'host-effect-uncertain';
 }
 
 /** Latest `nodeBlocked` details for a node (card content).  Falls back to a
@@ -556,6 +709,15 @@ export function blockedInfoFor(events: StoredEvent[], nodeId: string): V3Blocked
         message: e.message,
         ...(e.ask ? { ask: e.ask } : {}),
         ...(e.revisitTo ? { revisitTo: e.revisitTo } : {}),
+      };
+    } else if (e.type === 'hostEffectUncertain' && e.nodeId === nodeId) {
+      found = {
+        nodeId,
+        attemptId: e.attemptId,
+        errorClass: 'workerError',
+        errorCode: e.errorCode,
+        message: '外部操作的最终状态无法确认，请先在目标系统完成对账；为避免重复副作用，普通重试已禁用。',
+        retryForbidden: 'host-effect-uncertain',
       };
     }
   }
@@ -706,7 +868,13 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   const dag = context.dag;
 
   // suspend mode → no resolveGate (runtime writes the wait + returns awaitingGate).
-  const runtimeDeps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+  const runtimeDeps: V3RuntimeDeps = {
+    runNode,
+    validateManifest,
+    resolveBotSnapshot,
+    hostExecutors: createDefaultHostExecutorRegistry(),
+    hostReconcilers: createDefaultProviderReconcilers(),
+  };
   const opts: V3RuntimeOptions = {
     baseDir,
     gateMode: 'suspend',
@@ -817,23 +985,57 @@ export function resolveV3GateClick(
   if (wait.instanceId && wait.instanceId !== snap.nodes.get(wait.nodeId)?.effectiveInstanceId) {
     return { kind: 'stale-run', reason: 'stale-node' };
   }
+  const dagNode = loadV3RunDagForRecovery(runDir)?.nodes.find((node) => node.id === wait.nodeId);
+  const trustedHost = dagNode && isHostNode(dagNode) && wait.instanceId
+    ? trustedHostGateMaterial(runDir, runId, wait.nodeId, wait.instanceId, readJournal(journalPath))
+    : undefined;
+  if (dagNode && isHostNode(dagNode)) {
+    if (!trustedHost || !waitMatchesTrustedHostGate(wait, trustedHost)) {
+      return { kind: 'stale-run', reason: 'no-wait' };
+    }
+  }
   if (!canResolveGateWait(wait, input.by)) return { kind: 'unauthorized' };
   const resolution = selectedResolution(wait, input.selected);
   if (!resolution) return { kind: 'stale-run', reason: 'no-wait' };
 
-  resolveWait(runDir, input.waitId, resolution, input.by, input.selected);
-  const instanceId = snap.nodes.get(wait.nodeId)?.effectiveInstanceId;
+  const settled = resolveWaitOnce(
+    runDir,
+    input.waitId,
+    resolution,
+    input.by,
+    input.selected,
+  );
+  if (!settled.changed) {
+    return { kind: 'already-settled', status: settled.wait.status };
+  }
+  const resolvedWait = settled.wait;
+  if (trustedHost && !waitMatchesTrustedHostGate(resolvedWait, trustedHost)) {
+    appendEvent(journalPath, {
+      type: 'gateResolved',
+      nodeId: trustedHost.nodeId,
+      instanceId: trustedHost.instanceId,
+      waitId: trustedHost.waitId,
+      resolution: 'rejected',
+      by: 'system-host-wait-integrity',
+      hostApproval: trustedHost.hostApproval,
+    });
+    return { kind: 'resolved', resolution: 'rejected' };
+  }
+  const instanceId = snap.nodes.get(resolvedWait.nodeId)?.effectiveInstanceId;
   appendEvent(journalPath, {
     type: 'gateResolved',
     // nodeId from the WAIT FILE, not caller input (codex review #1): the wait is
     // the authoritative state — a wrong/stale caller nodeId must not let us write
     // gateResolved for a different node.
-    nodeId: wait.nodeId,
+    nodeId: resolvedWait.nodeId,
     ...(instanceId ? { instanceId } : {}),
     waitId: input.waitId,
     resolution,
     by: input.by,
     selected: input.selected,
+    ...(trustedHost
+      ? { hostApproval: trustedHost.hostApproval }
+      : resolvedWait.hostApproval ? { hostApproval: resolvedWait.hostApproval } : {}),
   });
   return { kind: 'resolved', resolution };
 }
@@ -898,7 +1100,7 @@ export function requestV3RunCancel(
 export type V3RetryOutcome =
   | { kind: 'requested'; nodeId: string; previousAttemptId: string; nextAttemptId: string }
   | { kind: 'already-requested'; nodeId: string }
-  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' };
+  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' | 'host-effect-uncertain' };
 
 type V3RetryAnswerInput =
   | { selected: string; by: string }
@@ -989,12 +1191,19 @@ export function requestV3Retry(
   const previousAttemptId = latestAttemptIdFor(events, attemptKey);
   if (!previousAttemptId) return { kind: 'stale-run', reason: 'not-blocked' };
   const info = blockedInfoFor(events, nodeId);
+  if (events.some((event) =>
+    (event.type === 'hostEffectIntent' || event.type === 'hostEffectUncertain') &&
+    event.attemptId === previousAttemptId)) {
+    return { kind: 'stale-run', reason: 'host-effect-uncertain' };
+  }
   // Freshness gate (codex blocker): the click must target the CURRENTLY
   // blocked attempt, not an earlier one whose card survived in the chat.
   if (input.expectedAttemptId && input.expectedAttemptId !== info.attemptId) {
     return { kind: 'stale-run', reason: 'stale-attempt' };
   }
   const nextAttemptId = nextAttemptIdFor(events, attemptKey);
+  const resetGate = events.some((event) =>
+    event.type === 'hostInputPrepared' && event.attemptId === previousAttemptId);
 
   // Runtime human-ask answer: persist the chosen option next to the asked
   // attempt (answer.json) and carry its path on the retry event — buildInputs
@@ -1038,6 +1247,7 @@ export function requestV3Retry(
     reason: 'blockedRetry',
     previousErrorClass: info.errorClass,
     previousErrorCode: info.errorCode,
+    ...(resetGate ? { resetGate: true } : {}),
     ...(answer ? { answer } : {}),
   });
   return { kind: 'requested', nodeId, previousAttemptId, nextAttemptId };
@@ -1444,7 +1654,8 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
 
       const events = readJournal(journalPath);
       const snap = materialize(events);
-      const hasOpenAttempts = openV3WorkerAttempts(events).length > 0;
+      const hasOpenAttempts =
+        openV3WorkerAttempts(events).length > 0 || openV3HostEffects(events).length > 0;
       if (
         snap.runStatus === 'succeeded' ||
         snap.runStatus === 'failed' ||
@@ -1566,6 +1777,7 @@ function reconcileOneRun(
   snap: ReturnType<typeof materialize>,
   ownerLarkAppId?: string,
 ): V3GateRecovery | undefined {
+  const events = readJournal(journalPath);
   const gateWaitingNodes = [...snap.nodes.entries()]
     .filter(([, s]) => s.status === 'gateWaiting')
     .map(([id]) => id);
@@ -1580,11 +1792,26 @@ function reconcileOneRun(
   if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) return undefined;
 
   // dag (for humanGate.prompt when re-creating a missing wait).
-  const dagNodeGate = new Map<string, ReturnType<typeof normalizeGateWaitInput>>();
+  const dagNodeGate = new Map<string, ReturnType<typeof normalizeGateWaitInput> & {
+    hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+  }>();
+  const trustedHostGates = new Map<string, TrustedHostGateMaterial>();
   const recoveryDag = loadV3RunDagForRecovery(runDir);
   if (recoveryDag) {
     for (const n of recoveryDag.nodes) {
-      if (n.humanGate?.prompt) dagNodeGate.set(n.id, normalizeGateWaitInput(n.humanGate));
+      if (!n.humanGate?.prompt) continue;
+      const gate = normalizeGateWaitInput(n.humanGate);
+      if (!isHostNode(n)) {
+        dagNodeGate.set(n.id, gate);
+        continue;
+      }
+      const instanceId = snap.nodes.get(n.id)?.effectiveInstanceId;
+      if (!instanceId) continue;
+      const trusted = trustedHostGateMaterial(runDir, runId, n.id, instanceId, events);
+      if (trusted) {
+        trustedHostGates.set(n.id, trusted);
+        dagNodeGate.set(n.id, trusted);
+      }
     }
   }
 
@@ -1594,20 +1821,93 @@ function reconcileOneRun(
     // Instance-level waitId mirrors startGate so recovery reads the SAME wait
     // file the dispatch wrote (stale-card protection).
     const instanceId = snap.nodes.get(nodeId)?.effectiveInstanceId;
-    const waitId = `${instanceId ?? nodeId}-gate`;
+    const recoveredGate = dagNodeGate.get(nodeId);
+    const trustedHostGate = trustedHostGates.get(nodeId);
+    const dispatchedHostApproval = [...events].reverse().find(
+      (event): event is StoredEvent & { type: 'gateDispatched' } =>
+        event.type === 'gateDispatched' &&
+        event.nodeId === nodeId &&
+        event.instanceId === instanceId &&
+        !!event.hostApproval,
+    )?.hostApproval;
+    const waitId = v3GateWaitId(
+      nodeId,
+      instanceId,
+      trustedHostGate?.hostApproval ?? recoveredGate?.hostApproval ?? dispatchedHostApproval,
+    );
     let wait = readWait(runDir, waitId);
+    const recoveryNode = recoveryDag?.nodes.find((node) => node.id === nodeId);
+    if (recoveryNode && isHostNode(recoveryNode)) {
+      if (!trustedHostGate) {
+        // The mutable wait can never substitute for missing/corrupt frozen
+        // input. Reject with the token from the durable dispatch, if any.
+        appendEvent(journalPath, {
+          type: 'gateResolved',
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          waitId,
+          resolution: 'rejected',
+          by: 'system-host-input-unrecoverable',
+          ...(dispatchedHostApproval ? { hostApproval: dispatchedHostApproval } : {}),
+        });
+        resume = true;
+        continue;
+      }
+      if (wait?.status === 'pending' && !waitMatchesTrustedHostGate(wait, trustedHostGate)) {
+        // Pending delivery state is safe to repair because no human decision
+        // has landed. Re-render from authorized DAG + verified sidecar.
+        wait = writePendingWait(runDir, trustedHostGate);
+      } else if (wait && wait.status !== 'pending' && !waitMatchesTrustedHostGate(wait, trustedHostGate)) {
+        appendEvent(journalPath, {
+          type: 'gateResolved',
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          waitId,
+          resolution: 'rejected',
+          by: 'system-host-wait-integrity',
+          hostApproval: trustedHostGate.hostApproval,
+        });
+        resume = true;
+        continue;
+      }
+    }
     if (!wait) {
-      const gate = dagNodeGate.get(nodeId) ?? normalizeGateWaitInput({ prompt: '(humanGate — 等待人工审批)' });
-      wait = writePendingWait(runDir, { waitId, nodeId, ...(instanceId ? { instanceId } : {}), ...gate });
+      const gate = dagNodeGate.get(nodeId);
+      if (!gate && recoveryNode && isHostNode(recoveryNode)) {
+        // A host gate is approval of one frozen input hash. If that input
+        // cannot be verified, never recreate a generic/static card that could
+        // approve different bytes; reject the gate and surface a failed run.
+        const dispatched = [...events].reverse().find(
+          (event): event is StoredEvent & { type: 'gateDispatched' } =>
+            event.type === 'gateDispatched' && event.nodeId === nodeId && event.instanceId === instanceId,
+        );
+        appendEvent(journalPath, {
+          type: 'gateResolved',
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          waitId,
+          resolution: 'rejected',
+          by: 'system-host-input-unrecoverable',
+          ...(dispatched?.hostApproval ? { hostApproval: dispatched.hostApproval } : {}),
+        });
+        resume = true;
+        continue;
+      }
+      const safeGate = gate ?? normalizeGateWaitInput({ prompt: '(humanGate — 等待人工审批)' });
+      wait = writePendingWait(runDir, { waitId, nodeId, ...(instanceId ? { instanceId } : {}), ...safeGate });
     }
     if (wait.status === 'pending') {
+      const display = trustedHostGate ?? wait;
       repost.push({
         nodeId,
         waitId,
-        prompt: wait.prompt,
-        options: wait.options,
-        approveOptions: wait.approveOptions,
-        approvers: wait.approvers,
+        prompt: display.prompt,
+        options: display.options,
+        approveOptions: display.approveOptions,
+        approvers: display.approvers,
+        ...(trustedHostGate
+          ? { hostApproval: trustedHostGate.hostApproval }
+          : wait.hostApproval ? { hostApproval: wait.hostApproval } : {}),
       });
     } else {
       // resolved wait but node still gateWaiting → journal lost gateResolved → heal.
@@ -1620,6 +1920,9 @@ function reconcileOneRun(
         resolution: wait.status,
         by: wait.by ?? 'system',
         selected: wait.selected,
+        ...(trustedHostGate
+          ? { hostApproval: trustedHostGate.hostApproval }
+          : wait.hostApproval ? { hostApproval: wait.hostApproval } : {}),
       });
       resume = true;
     }

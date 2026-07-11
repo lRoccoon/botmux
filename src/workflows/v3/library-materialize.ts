@@ -25,7 +25,7 @@ import {
   validateWorkflowParamSchema,
   type RawParamInput,
 } from '../shared/params.js';
-import { isLoopNode, validateDag, type V3Dag, type V3Node } from './dag.js';
+import { isGoalNode, isLoopNode, validateDag, type V3Dag, type V3Node } from './dag.js';
 import {
   freezeDagBotSnapshots,
   parseFrozenBotSnapshots,
@@ -38,6 +38,7 @@ import { mintV3RunId, type RunChatBinding } from './grill-state.js';
 import { isValidRunId } from './ops-projection.js';
 import {
   computeSavedWorkflowGateDigest,
+  computeSavedWorkflowSideEffects,
   validateDagTemplate,
   validateSpecTemplate,
   type LoadedSavedWorkflowRevision,
@@ -54,7 +55,10 @@ import {
   type V3SavedDefinitionRunEnvelope,
 } from './run-envelope.js';
 import type { BotSnapshot, Spec } from './contract.js';
-import { assertSavedWorkflowTemplateBindings } from './template-bindings.js';
+import {
+  assertSavedWorkflowTemplateBindings,
+  savedWorkflowBindingsForNode,
+} from './template-bindings.js';
 
 export interface CompiledSavedWorkflowFromRun {
   displayName: string;
@@ -106,6 +110,7 @@ function canonicalizeNodeBots(
   inheritedSelector?: string,
 ): V3Node[] {
   return nodes.map((node) => {
+    if (!isGoalNode(node) && !isLoopNode(node)) return { ...node };
     const selector = node.bot ?? inheritedSelector ?? '';
     const snapshot = snapshots.get(selector);
     if (!snapshot) {
@@ -173,7 +178,9 @@ export function compileSavedWorkflowFromRun(
   const { runId: _runId, ...specWithoutRunId } = loaded.spec;
   const specTemplate = validateSpecTemplate(specWithoutRunId);
   const inputs = opts.inputs ?? {};
-  const contextRefs = opts.contextRefs ?? [];
+  const contextRefs = opts.contextRefs ?? [...new Set(
+    dagTemplate.nodes.flatMap((node) => savedWorkflowBindingsForNode(node).context),
+  )];
   // Save and run must enforce the exact same template grammar. Otherwise an
   // ordinary goal containing `${HOME}` (or an undeclared `${params.x}`) could
   // be saved successfully but become an un-runnable definition with no P0 edit
@@ -194,7 +201,7 @@ export function compileSavedWorkflowFromRun(
     dagTemplate,
     safety: {
       gateDigest: computeSavedWorkflowGateDigest(dagTemplate),
-      sideEffects: [],
+      sideEffects: computeSavedWorkflowSideEffects(dagTemplate),
     },
   };
   return {
@@ -241,6 +248,7 @@ function resolveContext(
   const available: Partial<Record<SavedWorkflowBuiltinContextRef, string | undefined>> = {
     chatId: binding?.chatId,
     larkAppId: binding?.larkAppId,
+    chatType: binding?.chatType,
     rootMessageId: binding?.rootMessageId,
     initiatorOpenId: context?.initiatorOpenId ?? binding?.ownerOpenId,
   };

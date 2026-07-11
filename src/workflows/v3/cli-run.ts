@@ -53,6 +53,10 @@ import {
   type V3ManualCliRunEnvelope,
 } from './run-envelope.js';
 import { V3_DRIVE_LEASE_MAX_WAIT_MS, v3DriveLeaseTarget } from './drive-lease.js';
+import {
+  createDefaultHostExecutorRegistry,
+  createDefaultProviderReconcilers,
+} from '../hostExecutors/registry.js';
 
 interface V3RunArgs {
   dagPath: string;
@@ -339,7 +343,14 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot, resolveGate };
+  const deps: V3RuntimeDeps = {
+    runNode,
+    validateManifest,
+    resolveBotSnapshot,
+    resolveGate,
+    hostExecutors: createDefaultHostExecutorRegistry(),
+    hostReconcilers: createDefaultProviderReconcilers(),
+  };
   const opts: V3RuntimeOptions = {
     baseDir: args.baseDir,
     authorizedArtifacts: true,
@@ -385,14 +396,18 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
     console.log(`\n✅ run 成功 — 产物在 ${outcome.runDir}`);
     process.exit(0);
   } else if (outcome.runStatus === 'cancelled') {
-    console.error(`\n⏹ run 已取消 — 详见 ${join(outcome.runDir, 'journal.ndjson')}`);
+    console.error(
+      outcome.uncertainHostEffects?.length
+        ? `\n⚠️ run 已取消，但有 ${outcome.uncertainHostEffects.length} 个外部操作状态待核实；禁止直接重试 — 详见 ${join(outcome.runDir, 'journal.ndjson')}`
+        : `\n⏹ run 已取消 — 详见 ${join(outcome.runDir, 'journal.ndjson')}`,
+    );
     process.exit(1);
   } else if (outcome.runStatus === 'blocked') {
     // Blocked ≠ failed: a contract/semantic failure that a retry can fix —
     // or an exhausted loop that a grant (+1 iteration) can re-open.
-    console.error(
-      `\n⏸️  run 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''} — 节点受阻用 \`botmux workflow retry ${dag.runId}\` 重试；loop 轮数耗尽用 \`botmux workflow grant ${dag.runId}\` 追加一轮；详见 ${join(outcome.runDir, 'journal.ndjson')}`,
-    );
+    console.error(outcome.uncertainHostEffects?.length
+      ? `\n⚠️ run 受阻：外部操作状态无法确认，请先对账；普通 retry 已禁用 — 详见 ${join(outcome.runDir, 'journal.ndjson')}`
+      : `\n⏸️  run 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''} — 节点受阻用 \`botmux workflow retry ${dag.runId}\` 重试；loop 轮数耗尽用 \`botmux workflow grant ${dag.runId}\` 追加一轮；详见 ${join(outcome.runDir, 'journal.ndjson')}`);
     process.exit(1);
   } else {
     console.error(`\n❌ run 失败${outcome.failedNodeId ? `（节点 ${outcome.failedNodeId}）` : ''} — 详见 ${join(outcome.runDir, 'journal.ndjson')}`);

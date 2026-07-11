@@ -59,6 +59,20 @@ export interface SideEffectingExecutor<Input, Output> {
   canonicalInput(input: Input): unknown;
 
   /**
+   * Pure, last-moment validation of a previously frozen/approved payload.
+   * This runs immediately before the durable provider intent is published.
+   * It must not mutate provider state. Time-sensitive inputs (notably a
+   * one-shot schedule) use it to force a fresh attempt + fresh approval when
+   * the approved payload is no longer executable.
+   */
+  validateBeforeIntent?(
+    input: Input,
+    nowMs: number,
+  ):
+    | { ok: true }
+    | { ok: false; errorCode: string; message: string };
+
+  /**
    * Invoke the provider.  `idempotencyKey` is the runtime-derived
    * dedupe token (≤ 50 chars) that callers should forward to the
    * provider's idempotency knob (Feishu uuid / schedule task id).

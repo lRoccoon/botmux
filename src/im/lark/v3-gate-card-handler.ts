@@ -128,11 +128,13 @@ export async function handleV3GateAction(
   // resolved → drive the run forward (fresh replay) + freeze this card.
   deps.driveRun(value.runId);
   const prompt = readWait(runDir, value.waitId)?.prompt ?? '';
+  const hostApproval = readWait(runDir, value.waitId)?.hostApproval;
   const frozen = buildV3GateCard({
     runId: value.runId,
     waitId: value.waitId,
     nodeId: value.nodeId,
     prompt,
+    hostApproval,
     resolution: { kind: outcome.resolution, by: operatorOpenId, selected },
   });
   return JSON.parse(frozen);

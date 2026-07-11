@@ -37,6 +37,7 @@ describe('resolveCurrentTurnProvenance', () => {
       scope: 'thread',
       larkAppId: 'cli_real',
       chatId: 'oc_real',
+      chatType: 'p2p',
       rootMessageId: 'om_real_root',
       ownerOpenId: 'ou_owner_a',
       lastCallerOpenId: 'ou_caller_b',
@@ -63,6 +64,7 @@ describe('resolveCurrentTurnProvenance', () => {
       callerOpenId: 'ou_caller_b',
       larkAppId: 'cli_real',
       chatId: 'oc_real',
+      chatType: 'p2p',
       rootMessageId: 'om_real_root',
     });
   });

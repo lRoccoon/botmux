@@ -67,6 +67,7 @@ export function contextFromEnv(
   return {
     actor: { larkAppId: provenance.larkAppId, openId: provenance.callerOpenId },
     chatId: provenance.chatId,
+    ...(provenance.chatType ? { chatType: provenance.chatType } : {}),
     ...(provenance.rootMessageId ? { rootMessageId: provenance.rootMessageId } : {}),
     sessionId: provenance.sessionId,
   };

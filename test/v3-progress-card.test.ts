@@ -95,6 +95,18 @@ describe('buildV3ProgressCard', () => {
     expect(card.header.title.content).toBe(title);
   });
 
+  it('取消时显式提示外部效果待核实，不泄露具体 payload', () => {
+    const text = allText(parse(baseView({
+      status: 'cancelled',
+      uncertainHostEffectCount: 2,
+      currentNodeIds: [],
+      waitingNodeIds: [],
+    })));
+    expect(text).toContain('外部效果待核实');
+    expect(text).toContain('2 个外部操作');
+    expect(text).toContain('不要直接重试');
+  });
+
   it('进度把 skipped/cancelled 计为已完成，分母仍是固定外层节点数', () => {
     const card = parse(baseView({
       status: 'succeeded',

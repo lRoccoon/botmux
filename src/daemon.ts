@@ -2236,6 +2236,7 @@ interface V3SavedWorkflowImInvocation {
   replyRootId?: string;
   messageId: string;
   chatId: string;
+  chatType: 'group' | 'p2p';
   larkAppId: string;
   initiatorOpenId: string | undefined;
   /** union_id may grant teamBot trust only when the event was bot-authored. */
@@ -2253,6 +2254,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     replyRootId,
     messageId,
     chatId,
+    chatType,
     larkAppId,
     initiatorOpenId,
     teamTrustUnionId,
@@ -2323,6 +2325,7 @@ async function handleV3SavedWorkflowCommandIfAny(
   const context: SavedWorkflowActorContext = {
     actor: { openId: initiatorOpenId, larkAppId },
     chatId,
+    chatType,
     rootMessageId: targets.runRootMessageId,
   };
   const dataDir = dirname(v3DefaultBaseDir());
@@ -2587,6 +2590,7 @@ const v3GateRunner = createV3GateRunner({
       options: gate.options,
       approveOptions: gate.approveOptions,
       approvers: gate.approvers,
+      hostApproval: gate.hostApproval,
     });
     // codex blocker #3: never silently skip — a missing rootMessageId would
     // leave the run stuck at awaitingGate forever.  Reply in-thread when we have
@@ -2605,6 +2609,7 @@ const v3GateRunner = createV3GateRunner({
       errorClass: info.errorClass,
       errorCode: info.errorCode,
       message: info.message,
+      retryForbidden: info.retryForbidden,
       // human-ask 受阻 → 渲染问题 + 选项按钮卡（替代纯重试卡）。
       ...(info.ask ? { ask: info.ask } : {}),
     });
@@ -2650,10 +2655,14 @@ const v3GateRunner = createV3GateRunner({
     const msg = outcome.runStatus === 'succeeded'
       ? `✅ v3 workflow \`${runId}\` 跑完了`
       : outcome.runStatus === 'cancelled'
-        ? `⏹️ v3 workflow \`${runId}\` 已取消`
+        ? outcome.uncertainHostEffects?.length
+          ? `⚠️ v3 workflow \`${runId}\` 已取消，但有 ${outcome.uncertainHostEffects.length} 个外部操作状态待核实；请先对账，不要直接重试`
+          : `⏹️ v3 workflow \`${runId}\` 已取消`
       : outcome.runStatus === 'blocked'
         // Fallback only — the blocked path normally posts a retry/grant card instead.
-        ? `⏸️ v3 workflow \`${runId}\` 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''}，可 \`botmux workflow retry ${runId}\` 重试（loop 耗尽则 \`botmux workflow grant ${runId}\` 追加一轮）`
+        ? outcome.uncertainHostEffects?.length
+          ? `⚠️ v3 workflow \`${runId}\` 因外部操作状态不明而受阻；请先对账，普通 retry 已禁用`
+          : `⏸️ v3 workflow \`${runId}\` 受阻${outcome.blockedNodeId ? `（节点 ${outcome.blockedNodeId}）` : ''}，可 \`botmux workflow retry ${runId}\` 重试（loop 耗尽则 \`botmux workflow grant ${runId}\` 追加一轮）`
         : `❌ v3 workflow \`${runId}\` 失败${outcome.failedNodeId ? `（节点 ${outcome.failedNodeId}）` : ''}`;
     if (binding.rootMessageId) {
       await sessionReply(binding.rootMessageId, msg, 'text', binding.larkAppId).catch(() => {});
@@ -2904,6 +2913,7 @@ ipcRoute('POST', '/api/v3/runs/:runId/retry', async (req, res, params) => {
       error:
         outcome.reason === 'missing' ? 'unknown_run'
         : outcome.reason === 'loop-node' ? 'loop_node_use_grant'
+        : outcome.reason === 'host-effect-uncertain' ? 'host_effect_reconcile_required'
         : 'not_blocked',
     });
   }
@@ -6925,6 +6935,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     replyRootId,
     messageId: parsed.messageId,
     chatId,
+    chatType,
     larkAppId,
     initiatorOpenId: senderOpenId,
     teamTrustUnionId,
@@ -7670,6 +7681,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     replyRootId,
     messageId: parsed.messageId,
     chatId: threadChatId,
+    chatType: ctxChatType,
     larkAppId,
     initiatorOpenId: threadSenderOpenId,
     teamTrustUnionId: threadTeamTrustUnionId,

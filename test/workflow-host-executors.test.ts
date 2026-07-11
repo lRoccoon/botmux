@@ -698,6 +698,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
         prompt: 'do the thing',
         workingDir: '/wd',
         chatId: 'oc_x',
+        chatType: 'group',
       },
       idemKey,
     );
@@ -728,6 +729,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
       prompt: 'do',
       workingDir: '/wd',
       chatId: 'oc_x',
+      chatType: 'group' as const,
     };
     const a = await botmuxScheduleExecutor.invoke(input, idemKey);
     const b = await botmuxScheduleExecutor.invoke(input, idemKey);
@@ -771,17 +773,16 @@ describe('botmuxScheduleExecutor invoke()', () => {
       '../src/workflows/hostExecutors/botmux-schedule.js'
     );
     const idemKey = 'wf_test_schedule_lookup';
-    await botmuxScheduleExecutor.invoke(
-      {
-        name: 'Lookup',
-        schedule: '0 9 * * *',
-        parsed: { kind: 'cron', expr: '0 9 * * *', display: '0 9 * * *' },
-        prompt: 'do',
-        workingDir: '/wd',
-        chatId: 'oc_x',
-      },
-      idemKey,
-    );
+    const input = {
+      name: 'Lookup',
+      schedule: '0 9 * * *',
+      parsed: { kind: 'cron' as const, expr: '0 9 * * *', display: '0 9 * * *' },
+      prompt: 'do',
+      workingDir: '/wd',
+      chatId: 'oc_x',
+      chatType: 'group' as const,
+    };
+    await botmuxScheduleExecutor.invoke(input, idemKey);
 
     await expect(botmuxScheduleReconciler.readOnlyLookup!(idemKey, undefined)).resolves.toMatchObject({
       found: true,
@@ -791,6 +792,52 @@ describe('botmuxScheduleExecutor invoke()', () => {
     await expect(botmuxScheduleReconciler.readOnlyLookup!('missing', undefined)).resolves.toMatchObject({
       found: false,
       evidence: { source: 'getTask', returned: 'undefined' },
+    });
+    await expect(botmuxScheduleReconciler.readOnlyLookup!(idemKey, input)).resolves.toMatchObject({
+      found: true,
+      externalRefs: { taskId: idemKey },
+    });
+    await expect(botmuxScheduleReconciler.readOnlyLookup!(idemKey, {
+      ...input,
+      prompt: 'different body',
+    })).rejects.toThrow(/IdempotencyConflict/);
+  });
+
+  it('freezes relative time once, rejects non-runnable shapes, and detects stale approval', async () => {
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { session: { get dataDir() { return tempDataDir; } } },
+    }));
+    vi.doMock('../src/utils/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    const { botmuxScheduleExecutor, parseScheduleInput } = await import(
+      '../src/workflows/hostExecutors/botmux-schedule.js'
+    );
+    const base = {
+      name: 'Once',
+      prompt: 'do',
+      workingDir: '/wd',
+      chatId: 'oc_x',
+      chatType: 'group' as const,
+    };
+    const frozen = parseScheduleInput({ ...base, schedule: '30m' });
+    expect(frozen.parsed.kind).toBe('once');
+    const runAtMs = Date.parse(frozen.parsed.runAt!);
+    expect(parseScheduleInput(frozen).parsed).toEqual(frozen.parsed);
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(frozen, runAtMs - 1)).toEqual({ ok: true });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(frozen, runAtMs + 120_001)).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_APPROVAL_STALE',
+    });
+    expect(() => parseScheduleInput({ ...base, schedule: 'every 0m' }))
+      .toThrow(/positive integer/);
+    expect(() => parseScheduleInput({ ...base, schedule: '每0分钟' }))
+      .toThrow(/valid future occurrence/);
+    const past = parseScheduleInput({ ...base, schedule: '2020-01-01T00:00:00Z' });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(past, Date.now())).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_APPROVAL_STALE',
     });
   });
 });

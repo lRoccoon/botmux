@@ -16,6 +16,7 @@ import type { V3Node } from './dag.js';
 import { DagValidationError, validateDag } from './dag.js';
 import type { Spec } from './contract.js';
 import { SpecValidationError, validateSpec } from './spec.js';
+import { assertSavedWorkflowTemplateBindings } from './template-bindings.js';
 
 export const SAVED_WORKFLOW_METADATA_SCHEMA_VERSION = 1 as const;
 export const SAVED_WORKFLOW_REVISION_SCHEMA_VERSION = 1 as const;
@@ -73,6 +74,7 @@ export interface SavedWorkflowParamDef {
 export type SavedWorkflowBuiltinContextRef =
   | 'chatId'
   | 'larkAppId'
+  | 'chatType'
   | 'rootMessageId'
   | 'initiatorOpenId';
 
@@ -347,7 +349,7 @@ function normalizeInputs(value: unknown, problems: string[]): Record<string, Sav
 }
 
 const BUILTIN_CONTEXT_REFS: readonly SavedWorkflowBuiltinContextRef[] = [
-  'chatId', 'larkAppId', 'rootMessageId', 'initiatorOpenId',
+  'chatId', 'larkAppId', 'chatType', 'rootMessageId', 'initiatorOpenId',
 ];
 
 function normalizeContextRefs(value: unknown, problems: string[]): SavedWorkflowBuiltinContextRef[] {
@@ -438,6 +440,15 @@ export function computeSavedWorkflowGateDigest(dagTemplate: V3DagTemplate): stri
   return `sha256:${sha256(canonicalJsonStringify(gateProjection(dagTemplate.nodes)))}`;
 }
 
+export function computeSavedWorkflowSideEffects(
+  dagTemplate: V3DagTemplate,
+): Array<{ nodeId: string; kind: string }> {
+  return dagTemplate.nodes
+    .filter((node) => node.type === 'host')
+    .map((node) => ({ nodeId: node.id, kind: node.executor! }))
+    .sort((left, right) => left.nodeId.localeCompare(right.nodeId) || left.kind.localeCompare(right.kind));
+}
+
 function normalizeSafety(value: unknown, dagTemplate: V3DagTemplate, problems: string[]): SavedWorkflowSafety {
   if (!isRecord(value)) {
     problems.push('safety must be an object');
@@ -467,7 +478,15 @@ function normalizeSafety(value: unknown, dagTemplate: V3DagTemplate, problems: s
       });
     }
   }
-  return { gateDigest, sideEffects };
+  const expectedSideEffects = computeSavedWorkflowSideEffects(dagTemplate);
+  const normalizedSideEffects = [...sideEffects]
+    .sort((left, right) => left.nodeId.localeCompare(right.nodeId) || left.kind.localeCompare(right.kind));
+  if (canonicalJsonStringify(normalizedSideEffects) !== canonicalJsonStringify(expectedSideEffects)) {
+    problems.push(
+      `safety.sideEffects does not match host nodes (expected ${canonicalJsonStringify(expectedSideEffects)})`,
+    );
+  }
+  return { gateDigest, sideEffects: normalizedSideEffects };
 }
 
 export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflowRevisionPayloadV1 {
@@ -507,6 +526,15 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
     else throw err;
   }
   const safeDag = dagTemplate ?? { nodes: [] };
+  if (dagTemplate) {
+    try {
+      assertSavedWorkflowTemplateBindings(dagTemplate, inputs, contextRefs);
+    } catch (err) {
+      problems.push(
+        `dagTemplate bindings: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   const safety = normalizeSafety(raw.safety, safeDag, problems);
 
   if (problems.length > 0 || !specTemplate || !dagTemplate) throw new SavedWorkflowSchemaError(problems);

@@ -69,6 +69,7 @@ const nonEmptyString = z.string().min(1);
 const chatBindingSchema = z.object({
   larkAppId: nonEmptyString,
   chatId: nonEmptyString,
+  chatType: z.enum(['group', 'p2p']).optional(),
   rootMessageId: nonEmptyString.optional(),
   sessionId: nonEmptyString.optional(),
   ownerOpenId: nonEmptyString.optional(),

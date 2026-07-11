@@ -91,6 +91,7 @@ export function chatBindingFromEnv(
       return {
         larkAppId: provenance.larkAppId,
         chatId: provenance.chatId,
+        ...(provenance.chatType ? { chatType: provenance.chatType } : {}),
         ...(provenance.rootMessageId ? { rootMessageId: provenance.rootMessageId } : {}),
         sessionId: provenance.sessionId,
         ownerOpenId: provenance.callerOpenId,
@@ -110,6 +111,9 @@ export function chatBindingFromEnv(
   return {
     larkAppId,
     chatId,
+    ...(env.BOTMUX_CHAT_TYPE === 'group' || env.BOTMUX_CHAT_TYPE === 'p2p'
+      ? { chatType: env.BOTMUX_CHAT_TYPE }
+      : {}),
     ...(env.BOTMUX_ROOT_MESSAGE_ID ? { rootMessageId: env.BOTMUX_ROOT_MESSAGE_ID } : {}),
   };
 }

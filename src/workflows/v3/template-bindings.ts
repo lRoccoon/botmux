@@ -1,5 +1,10 @@
 import type { V3DagTemplate, SavedWorkflowBuiltinContextRef, SavedWorkflowParamDef } from './library-schema.js';
 import type { V3Node } from './dag.js';
+import {
+  collectV3HostBindingRefs,
+  parseV3HostBindingRef,
+  V3HostBindingError,
+} from './host-bindings.js';
 
 const MARKER_RE = /\$\{(params|context)\.([A-Za-z_][A-Za-z0-9_]{0,63})\}/g;
 
@@ -25,9 +30,22 @@ function collectFromText(text: string | undefined): SavedWorkflowTemplateBinding
 export function savedWorkflowBindingsForNode(node: V3Node): SavedWorkflowTemplateBindings {
   const goal = collectFromText(node.goal);
   const instructions = collectFromText(node.override?.systemPromptAppend);
+  const host = node.type === 'host'
+    ? collectV3HostBindingRefs(node.input)
+    : [];
   return {
-    params: [...new Set([...goal.params, ...instructions.params])],
-    context: [...new Set([...goal.context, ...instructions.context])],
+    params: [...new Set([
+      ...goal.params,
+      ...instructions.params,
+      ...host.filter((ref) => ref.kind === 'params').map((ref) => ref.path[0]!),
+    ])],
+    context: [...new Set([
+      ...goal.context,
+      ...instructions.context,
+      ...host
+        .filter((ref) => ref.kind === 'context')
+        .map((ref) => ref.path[0] as SavedWorkflowBuiltinContextRef),
+    ])],
   };
 }
 
@@ -42,7 +60,9 @@ export function assertSavedWorkflowTemplateBindings(
   contextRefs: readonly SavedWorkflowBuiltinContextRef[],
 ): void {
   const allowedTextPath = (path: string): boolean =>
-    path.endsWith('.goal') || path.endsWith('.override.systemPromptAppend');
+    path.endsWith('.goal') ||
+    path.endsWith('.override.systemPromptAppend') ||
+    /\.input(?:\.|\[|$)/.test(path);
 
   const walk = (value: unknown, path: string): void => {
     if (typeof value === 'string') {
@@ -80,10 +100,68 @@ export function assertSavedWorkflowTemplateBindings(
       return;
     }
     if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if (Object.keys(record).length === 1 && typeof record.$ref === 'string') {
+        let ref;
+        try {
+          ref = parseV3HostBindingRef(record.$ref);
+        } catch (err) {
+          throw new Error(err instanceof V3HostBindingError ? err.message : String(err));
+        }
+        if (ref.kind === 'params' && !Object.prototype.hasOwnProperty.call(inputs, ref.path[0]!)) {
+          throw new Error(`Saved Workflow host input references undeclared parameter ${ref.path[0]} at ${path}`);
+        }
+        if (ref.kind === 'context' && !contextRefs.includes(ref.path[0] as SavedWorkflowBuiltinContextRef)) {
+          throw new Error(`Saved Workflow host input references undeclared context ${ref.path[0]} at ${path}`);
+        }
+        return;
+      }
       for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
         walk(child, `${path}.${key}`);
       }
     }
   };
   walk(dagTemplate, 'dagTemplate');
+  for (const node of dagTemplate.nodes) {
+    if (node.type !== 'host') continue;
+    const root = node.input;
+    if (!root || typeof root !== 'object' || Array.isArray(root)) {
+      throw new Error(`Saved Workflow host node ${node.id}.input must be an object`);
+    }
+    if (
+      node.executor === 'botmux-schedule' &&
+      Object.prototype.hasOwnProperty.call(root, 'parsed')
+    ) {
+      throw new Error(
+        `Saved Workflow host node ${node.id}.input.parsed must be omitted; ` +
+        'the runtime derives and freezes relative schedule time for each run',
+      );
+    }
+    const requiredIdentity: Record<string, SavedWorkflowBuiltinContextRef> =
+      node.executor === 'feishu-send' ? { larkAppId: 'larkAppId', chatId: 'chatId' }
+      : node.executor === 'feishu-reply' ? { larkAppId: 'larkAppId', rootMessageId: 'rootMessageId' }
+      : { larkAppId: 'larkAppId', chatId: 'chatId', chatType: 'chatType' };
+    if (
+      node.executor === 'botmux-schedule' &&
+      Object.prototype.hasOwnProperty.call(root, 'rootMessageId')
+    ) {
+      requiredIdentity.rootMessageId = 'rootMessageId';
+    }
+    for (const [field, contextName] of Object.entries(requiredIdentity)) {
+      const value = (root as Record<string, unknown>)[field];
+      const expected = `context.${contextName}`;
+      if (
+        !value ||
+        typeof value !== 'object' ||
+        Array.isArray(value) ||
+        Object.keys(value).length !== 1 ||
+        (value as Record<string, unknown>).$ref !== expected
+      ) {
+        throw new Error(
+          `Saved Workflow host node ${node.id}.input.${field} must be exact { "$ref": "${expected}" }; ` +
+          'chat identity cannot come from a mutable parameter or frozen literal',
+        );
+      }
+    }
+  }
 }

@@ -39,6 +39,9 @@ export interface V3NodeState {
    *  gate transitions the node straight to `failed` (set by the runtime), so
    *  this flag only ever records the approved case. */
   gateCleared?: boolean;
+  /** Host-only: the frozen input approved by this gate. It must match the
+   * prepared sidecar before the runtime may publish hostEffectIntent. */
+  approvedHostInput?: { attemptId: string; approvalDigest: string; inputHash: string };
   /** The current live runtime instance of this DEFINITION node (`A#002`).
    *  Set on dispatch; cleared when a revisit supersedes it (the node then
    *  re-dispatches a fresh instance).  Absent on the pre-instance-layer path

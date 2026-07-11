@@ -9,7 +9,16 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  statSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -25,7 +34,10 @@ import {
   writePendingWait,
   readWait,
   resolveWait,
+  resolveWaitOnce,
   listPendingWaits,
+  waitPath,
+  waitsDir,
 } from '../src/workflows/v3/human-gate.js';
 import {
   GOAL_ENV,
@@ -755,6 +767,65 @@ describe('human-gate 文件等待存储', () => {
       expect(() => resolveWait(dir, 'ghost', 'approved', 'u')).toThrow(/no pending wait/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveWaitOnce 跨进程 CAS 以第一个决议为准', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-gate-cas-'));
+    try {
+      writePendingWait(dir, { waitId: 'deploy#001-gate', nodeId: 'deploy', prompt: 'ship?' });
+      expect(resolveWaitOnce(dir, 'deploy#001-gate', 'rejected', 'ou_first')).toMatchObject({
+        changed: true,
+        wait: { status: 'rejected', by: 'ou_first' },
+      });
+      expect(resolveWaitOnce(dir, 'deploy#001-gate', 'approved', 'ou_second')).toMatchObject({
+        changed: false,
+        wait: { status: 'rejected', by: 'ou_first' },
+      });
+      expect(readWait(dir, 'deploy#001-gate')).toMatchObject({ status: 'rejected', by: 'ou_first' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('host wait 以 0600/0700 持久化，且拒绝 final/parent symlink', () => {
+    const root = mkdtempSync(join(tmpdir(), 'v3-gate-private-'));
+    const runDir = join(root, 'run');
+    const outside = join(root, 'outside');
+    mkdirSync(runDir, { mode: 0o700 });
+    mkdirSync(outside, { mode: 0o700 });
+    try {
+      const approval = {
+        attemptId: 'send#001/attempts/001',
+        approvalDigest: `sha256:${'a'.repeat(64)}`,
+        inputHash: `sha256:${'b'.repeat(64)}`,
+      };
+      writePendingWait(runDir, {
+        waitId: 'send#001-host-001-gate',
+        nodeId: 'send',
+        instanceId: 'send#001',
+        prompt: 'approve exact input',
+        hostApproval: approval,
+      });
+      expect(statSync(waitPath(runDir, 'send#001-host-001-gate')).mode & 0o077).toBe(0);
+      expect(statSync(waitsDir(runDir)).mode & 0o077).toBe(0);
+
+      const externalFile = join(outside, 'victim.json');
+      writeFileSync(externalFile, 'unchanged', { mode: 0o600 });
+      symlinkSync(externalFile, waitPath(runDir, 'evil'));
+      expect(() => writePendingWait(runDir, {
+        waitId: 'evil', nodeId: 'send', prompt: 'x', hostApproval: approval,
+      })).toThrow(/regular file/);
+      expect(readFileSync(externalFile, 'utf-8')).toBe('unchanged');
+
+      rmSync(waitsDir(runDir), { recursive: true, force: true });
+      symlinkSync(outside, waitsDir(runDir));
+      expect(() => writePendingWait(runDir, {
+        waitId: 'escape', nodeId: 'send', prompt: 'x', hostApproval: approval,
+      })).toThrow(/real directory/);
+      expect(existsSync(join(outside, 'escape.json'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

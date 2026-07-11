@@ -108,6 +108,14 @@ export function buildV3ProgressCard(
     appendSection(elements, '⚠️ 错误码', parts.length > 0 ? parts.join(' · ') : 'UNKNOWN');
   }
 
+  if (view.uncertainHostEffectCount && view.uncertainHostEffectCount > 0) {
+    appendSection(
+      elements,
+      '⚠️ 外部效果待核实',
+      `流程已停止，但有 ${view.uncertainHostEffectCount} 个外部操作的最终状态无法确认。请在 Web 详情中核对，不要直接重试该节点。`,
+    );
+  }
+
   appendTerminalHint(elements, view);
 
   if (

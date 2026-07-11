@@ -43,6 +43,9 @@ export const GRILL_STATE_SCHEMA_VERSION = 1;
 export interface RunChatBinding {
   larkAppId: string;
   chatId: string;
+  /** Exact IM kind used when a schedule later creates a session. Optional only
+   * for envelopes written before the v3 host protocol existed. */
+  chatType?: 'group' | 'p2p';
   /** thread anchor (rootMessageId) so the card lands in the grill topic. */
   rootMessageId?: string;
   sessionId?: string;

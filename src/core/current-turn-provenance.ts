@@ -9,6 +9,7 @@ interface PersistedTurnSession {
   scope?: 'thread' | 'chat';
   larkAppId?: string;
   chatId?: string;
+  chatType?: 'group' | 'p2p';
   rootMessageId?: string;
   lastCallerOpenId?: string;
   quoteTargetId?: string;
@@ -24,6 +25,7 @@ export interface CurrentTurnProvenance {
   callerOpenId: string;
   larkAppId: string;
   chatId: string;
+  chatType?: 'group' | 'p2p';
   /**
    * The current user-visible thread anchor. Thread sessions use their durable
    * root; a chat-scope turn folded into a topic uses that turn's reply target;
@@ -174,6 +176,9 @@ export function resolveCurrentTurnProvenance(
     callerOpenId: session.lastCallerOpenId,
     larkAppId: session.larkAppId,
     chatId: session.chatId,
+    ...(session.chatType === 'group' || session.chatType === 'p2p'
+      ? { chatType: session.chatType }
+      : {}),
     ...(rootMessageId ? { rootMessageId } : {}),
   };
 }

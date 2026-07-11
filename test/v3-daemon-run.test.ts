@@ -47,6 +47,25 @@ function gateDag(runId: string) {
   };
 }
 
+function hostGateDag(runId: string) {
+  return {
+    runId,
+    nodes: [{
+      id: 'send',
+      type: 'host',
+      executor: 'feishu-send',
+      input: {
+        larkAppId: { $ref: 'context.larkAppId' },
+        chatId: { $ref: 'context.chatId' },
+        content: 'trusted payload',
+      },
+      depends: [],
+      inputs: [],
+      humanGate: { prompt: 'Approve trusted send?' },
+    }],
+  };
+}
+
 /** Birth a run + write an approved dag.json + point grill state at it. */
 function seedApprovedRun(base: string, runId: string, opts: { binding?: typeof BINDING } = {}): string {
   const { runDir } = birthRun({ goal: 'g', baseDir: base, runId, chatBinding: opts.binding });
@@ -57,7 +76,23 @@ function seedApprovedRun(base: string, runId: string, opts: { binding?: typeof B
   return runDir;
 }
 
-function seedSavedDefinitionRun(base: string, runId: string): string {
+function seedApprovedHostRun(base: string, runId: string): string {
+  const { runDir } = birthRun({ goal: 'g', baseDir: base, runId, chatBinding: BINDING });
+  const dagPath = join(runDir, 'dag.json');
+  writeFileSync(dagPath, JSON.stringify(hostGateDag(runId)));
+  const state = readGrillState(runDir)!;
+  writeGrillState(runDir, { ...state, status: 'dag_approved', dagPath });
+  return runDir;
+}
+
+function seedSavedDefinitionRun(
+  base: string,
+  runId: string,
+  opts: {
+    binding?: typeof BINDING;
+    resolvedContext?: Record<string, string>;
+  } = {},
+): string {
   const runDir = join(base, runId);
   mkdirSync(runDir, { recursive: true });
   writeFileSync(join(runDir, 'dag.json'), `${JSON.stringify(gateDag(runId))}\n`);
@@ -79,7 +114,10 @@ function seedSavedDefinitionRun(base: string, runId: string): string {
   writeFileSync(join(runDir, 'bots.snapshot.json'), `${JSON.stringify({
     '': { larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/frozen/work' },
   })}\n`);
-  writeFileSync(join(runDir, 'params.resolved.json'), '{"params":{},"context":{}}\n');
+  writeFileSync(join(runDir, 'params.resolved.json'), `${JSON.stringify({
+    params: {},
+    context: opts.resolvedContext ?? {},
+  })}\n`);
   writeFileSync(join(runDir, 'definition.snapshot.json'), `${JSON.stringify({
     schemaVersion: 1,
     workflowId: 'wf_0123456789abcdef0123456789abcdef',
@@ -100,7 +138,7 @@ function seedSavedDefinitionRun(base: string, runId: string): string {
     humanVersion: 1,
     createdAt: '2026-07-10T08:00:00.000Z',
     authorizedAt: '2026-07-10T08:01:00.000Z',
-    chatBinding: BINDING,
+    chatBinding: opts.binding ?? BINDING,
     artifacts,
   }));
   return runDir;
@@ -202,6 +240,22 @@ describe('driveV3Run — suspend gate → 发卡 → 点击 redrive', () => {
 });
 
 describe('driveV3Run — 错误路径', () => {
+  it('Saved Workflow resolved context must match the immutable run chat binding', () => {
+    const base = freshBase();
+    try {
+      const runDir = seedSavedDefinitionRun(base, 'saved-context-mismatch', {
+        resolvedContext: { chatId: 'oc_other' },
+      });
+      expect(preflightV3RunStart(runDir)).toMatchObject({
+        ok: false,
+        error: 'run_envelope_invalid',
+        detail: expect.stringContaining('context.chatId does not match run.json chatBinding'),
+      });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('旧 dag_approved run 在首次 worker 派发前生成诚实的 legacy backfill envelope', async () => {
     const base = freshBase();
     try {
@@ -337,6 +391,46 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
       expect(gr.resolution).toBe('approved');
       expect(gr.selected).toBe('approve');
       expect(gr.nodeId).toBe('deploy'); // = wait.nodeId（不是 caller 传的）
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('host 点击只信授权 DAG+冻结 sidecar；篡改 pending wait 会拒绝并由 cold attach 修复', async () => {
+    const base = freshBase();
+    try {
+      const runId = 'host-wait-integrity';
+      const runDir = seedApprovedHostRun(base, runId);
+      const shared = stubDeps(base);
+      await driveV3Run(runId, shared.deps);
+      const waitId = 'send#001-host-001-gate';
+      const original = readWait(runDir, waitId)!;
+      expect(original.prompt).toContain('trusted payload');
+      expect(original.hostApproval?.inputHash).toMatch(/^sha256:/);
+
+      writeFileSync(waitPath(runDir, waitId), JSON.stringify({
+        ...original,
+        prompt: 'FORGED PAYLOAD',
+      }, null, 2), { mode: 0o600 });
+      expect(resolveV3GateClick(base, runId, {
+        waitId,
+        selected: 'approve',
+        by: 'ou_user',
+      })).toEqual({ kind: 'stale-run', reason: 'no-wait' });
+      expect(readJournal(join(runDir, 'journal.ndjson'))
+        .some((event) => event.type === 'gateResolved')).toBe(false);
+
+      const recovered = reconcileV3PendingGates(base).find((item) => item.runId === runId)!;
+      expect(recovered.resume).toBe(false);
+      expect(recovered.repost).toEqual([
+        expect.objectContaining({
+          waitId,
+          prompt: expect.stringContaining('trusted payload'),
+          hostApproval: original.hostApproval,
+        }),
+      ]);
+      expect(readWait(runDir, waitId)?.prompt).toContain('trusted payload');
+      expect(readWait(runDir, waitId)?.prompt).not.toContain('FORGED PAYLOAD');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -625,6 +719,102 @@ describe('v3 mutation integrity — tamper fail-closed before side effects', () 
 
       expect(readFileSync(journalPath, 'utf-8')).toBe(journalBefore);
       expect(existsSync(join(runDir, 'deploy#001/attempts/001', 'answer.json'))).toBe(false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('host effect uncertain 禁止普通 retry，pre-intent block 则预约新 attempt 并重置 gate', () => {
+    const base = freshBase();
+    try {
+      const commonPrepared = {
+        type: 'hostInputPrepared' as const,
+        nodeId: 'deploy',
+        instanceId: 'deploy#001',
+        attemptId: 'deploy#001/attempts/001',
+        executor: 'feishu-send',
+        provider: 'feishu-im',
+        inputRef: { path: 'deploy#001/attempts/001/host-input.json', sha256: 'a'.repeat(64), bytes: 10 },
+        inputHash: `sha256:${'b'.repeat(64)}`,
+        idempotencyKey: 'wf3_key',
+        idempotencyTtlMs: 3_600_000,
+        approvalDigest: `sha256:${'c'.repeat(64)}`,
+      };
+
+      const uncertainId = 'host-uncertain-retry';
+      const uncertainDir = seedSavedDefinitionRun(base, uncertainId);
+      const uncertainJournal = join(uncertainDir, 'journal.ndjson');
+      appendEvent(uncertainJournal, { type: 'runStarted', runId: uncertainId });
+      appendEvent(uncertainJournal, commonPrepared);
+      appendEvent(uncertainJournal, { ...commonPrepared, type: 'hostEffectIntent' });
+      appendEvent(uncertainJournal, {
+        type: 'hostEffectUncertain',
+        nodeId: 'deploy',
+        instanceId: 'deploy#001',
+        attemptId: 'deploy#001/attempts/001',
+        executor: 'feishu-send',
+        reason: 'ttlExpired',
+        errorCode: 'HOST_EFFECT_TTL_EXPIRED',
+      });
+      appendEvent(uncertainJournal, { type: 'runBlocked', blockedNodeId: 'deploy' });
+      expect(requestV3Retry(base, uncertainId)).toEqual({
+        kind: 'stale-run', reason: 'host-effect-uncertain',
+      });
+      expect(readJournal(uncertainJournal).some((event) => event.type === 'nodeRetryRequested')).toBe(false);
+
+      const preIntentId = 'host-pre-intent-retry';
+      const preIntentDir = seedSavedDefinitionRun(base, preIntentId);
+      const preIntentJournal = join(preIntentDir, 'journal.ndjson');
+      appendEvent(preIntentJournal, { type: 'runStarted', runId: preIntentId });
+      appendEvent(preIntentJournal, commonPrepared);
+      appendEvent(preIntentJournal, {
+        type: 'nodeBlocked',
+        nodeId: 'deploy',
+        instanceId: 'deploy#001',
+        attemptId: 'deploy#001/attempts/001',
+        errorClass: 'resultInvalid',
+        errorCode: 'HOST_INPUT_UNRECOVERABLE',
+      });
+      appendEvent(preIntentJournal, { type: 'runBlocked', blockedNodeId: 'deploy' });
+      expect(requestV3Retry(base, preIntentId)).toMatchObject({
+        kind: 'requested', nextAttemptId: 'deploy#001/attempts/002',
+      });
+      expect(readJournal(preIntentJournal)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'nodeRetryRequested',
+          nextAttemptId: 'deploy#001/attempts/002',
+          resetGate: true,
+        }),
+      ]));
+
+      const crashLeftId = 'host-crash-left-malformed-retry';
+      const crashLeftDir = seedSavedDefinitionRun(base, crashLeftId);
+      const crashLeftJournal = join(crashLeftDir, 'journal.ndjson');
+      appendEvent(crashLeftJournal, { type: 'runStarted', runId: crashLeftId });
+      // A crash can leave an invalid/partial sidecar before the prepared event.
+      // The blocked verdict alone must consume 001 so operator retry reserves
+      // a clean 002 instead of colliding with the bad path forever.
+      appendEvent(crashLeftJournal, {
+        type: 'nodeBlocked',
+        nodeId: 'deploy',
+        instanceId: 'deploy#001',
+        attemptId: 'deploy#001/attempts/001',
+        errorClass: 'resultInvalid',
+        errorCode: 'HOST_INPUT_UNRECOVERABLE',
+      });
+      appendEvent(crashLeftJournal, { type: 'runBlocked', blockedNodeId: 'deploy' });
+      expect(requestV3Retry(base, crashLeftId)).toMatchObject({
+        kind: 'requested',
+        previousAttemptId: 'deploy#001/attempts/001',
+        nextAttemptId: 'deploy#001/attempts/002',
+      });
+      expect(readJournal(crashLeftJournal)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'nodeRetryRequested',
+          previousAttemptId: 'deploy#001/attempts/001',
+          nextAttemptId: 'deploy#001/attempts/002',
+        }),
+      ]));
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

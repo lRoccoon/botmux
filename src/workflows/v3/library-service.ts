@@ -64,6 +64,7 @@ export interface SavedWorkflowActorContext {
   actor: SavedWorkflowOwner;
   /** Current invocation chat. Optional for a global-only list/resolve. */
   chatId?: string;
+  chatType?: 'group' | 'p2p';
   rootMessageId?: string;
   sessionId?: string;
 }
@@ -656,6 +657,7 @@ export async function instantiatePublishedSavedWorkflow(
       chatBinding: {
         larkAppId: context.actor.larkAppId,
         chatId: context.chatId!,
+        ...(context.chatType ? { chatType: context.chatType } : {}),
         ...(context.rootMessageId ? { rootMessageId: context.rootMessageId } : {}),
         ...(context.sessionId ? { sessionId: context.sessionId } : {}),
         ownerOpenId: context.actor.openId,

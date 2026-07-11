@@ -5066,6 +5066,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // approver allowlist against session.owner. Missing env → exit 2.
   childEnv.BOTMUX_SESSION_ID = cfg.sessionId;
   childEnv.BOTMUX_CHAT_ID = cfg.chatId;
+  if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
+  else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   // NOTE: under read isolation `botmux send` gets this bot's secret from the worker-

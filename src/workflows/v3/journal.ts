@@ -47,6 +47,17 @@ export type V3ErrorClass =
 
 export type V3RunFailureReason = 'allSinksSkipped';
 
+/** Bounded, privacy-safe identity for an external effect whose final provider
+ *  outcome cannot be proved. Full inputs/errors stay in the protected attempt
+ *  artifacts and logs; terminal cards only need this machine-readable tuple. */
+export interface V3UncertainHostEffect {
+  nodeId: string;
+  instanceId: string;
+  attemptId: string;
+  executor: string;
+  errorCode: string;
+}
+
 /**
  * The MVP event union.  Static DAG + fail-fast, so the lifecycle is small:
  * run boundaries, per-node dispatch/settle, and gate dispatch/resolve.  Retry
@@ -75,6 +86,66 @@ export type V3Event =
   // carry their own expanded nodeId) omit it, and consumers fall back to
   // nodeId-keyed behavior (instance restoration design 2026-06-08).
   | { type: 'nodeDispatched'; nodeId: string; instanceId?: string; attemptId: string; loop?: V3LoopRef }
+  // Host preparation is NOT a dispatch and carries no claim that a provider
+  // call began. It freezes the exact parsed input before a runtime gate. The
+  // host rail intentionally never emits nodeDispatched/worker-fence events.
+  | {
+      type: 'hostInputPrepared';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      executor: string;
+      provider: string;
+      inputRef: { path: string; sha256: string; bytes: number };
+      inputHash: string;
+      idempotencyKey: string;
+      idempotencyTtlMs: number;
+      approvalDigest: string;
+    }
+  // The linearization boundary for an external side effect. Durable BEFORE
+  // provider invocation; recovery of an open intent must use this exact
+  // attempt/key/input and must never mint a generic orphan retry.
+  | {
+      type: 'hostEffectIntent';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      executor: string;
+      provider: string;
+      inputRef: { path: string; sha256: string; bytes: number };
+      inputHash: string;
+      idempotencyKey: string;
+      idempotencyTtlMs: number;
+      approvalDigest: string;
+    }
+  // Close proof for the host ledger when the provider outcome cannot be
+  // established without risking a duplicate effect. Ordinary runs become
+  // blocked; cancellation carries the bounded identities into runCancelled.
+  | {
+      type: 'hostEffectUncertain';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      executor: string;
+      reason:
+        | 'ttlExpired'
+        | 'inputUnrecoverable'
+        | 'outputUnrecoverable'
+        | 'definitionMismatch'
+        | 'unknownProvider'
+        | 'inputHashMismatch'
+        | 'providerUncertain';
+      errorCode: string;
+    }
+  | {
+      type: 'hostEffectRetryDeferred';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      retryCount: number;
+      nextRetryAt: number;
+      errorCode: string;
+    }
   // Durable proof that the attempt's pre-fork worker fence was published
   // before factory.spawn(). Recovery treats a missing/corrupt fence after this
   // marker as unknown until process discovery proves no outer worker remains.
@@ -122,6 +193,8 @@ export type V3Event =
       reason: 'blockedRetry';
       previousErrorClass?: V3ErrorClass;
       previousErrorCode?: string;
+      /** Host pre-intent retry must approve the newly frozen attempt again. */
+      resetGate?: boolean;
       // Present ONLY when the retry answers a runtime human-ask: the human's
       // selected option or free-text answer, persisted to `answer.path` (an absolute path, next to
       // the asked attempt).  buildInputs injects it into the retry attempt's
@@ -131,8 +204,10 @@ export type V3Event =
     }
   // Gate is per-INSTANCE: `A#001`'s approval must not clear `A#002` after a
   // revisit (constraint 6).  `instanceId` optional for back-compat.
-  | { type: 'gateDispatched'; nodeId: string; instanceId?: string; waitId: string }
-  | { type: 'gateResolved'; nodeId: string; instanceId?: string; waitId: string; resolution: 'approved' | 'rejected'; by: string; selected?: string }
+  | { type: 'gateDispatched'; nodeId: string; instanceId?: string; waitId: string;
+      hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string } }
+  | { type: 'gateResolved'; nodeId: string; instanceId?: string; waitId: string; resolution: 'approved' | 'rejected'; by: string; selected?: string;
+      hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string } }
   // ── edge activation lifecycle ──
   // Conditional edge predicates read a source node's validated result.json
   // exactly once, then persist the verdict here.  Replay / dashboards /
@@ -261,7 +336,12 @@ export type V3Event =
   // unfinished nodes, then appends runCancelled.  A crash between these two
   // records is recoverable by replay + cold re-drive.
   | { type: 'runCancelRequested'; cancelRequestId: string; by: string; reason?: string }
-  | { type: 'runCancelled'; cancelRequestId: string; by: string }
+  | {
+      type: 'runCancelled';
+      cancelRequestId: string;
+      by: string;
+      uncertainHostEffects?: V3UncertainHostEffect[];
+    }
   | { type: 'runSucceeded' }
   | { type: 'runFailed'; failedNodeId?: string; reason?: V3RunFailureReason; detail?: string }
   // Terminal-for-now: every non-done path is blocked (recoverable).  A retry

@@ -44,6 +44,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // current session/thread. The worker refreshes them per pane/turn.
   'BOTMUX_SESSION_ID',
   'BOTMUX_CHAT_ID',
+  // v3 host effects / schedule delivery need chatType inside the pane.
+  'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
   'BOTMUX_ROOT_MESSAGE_ID',
   'BOTMUX_TURN_ID',

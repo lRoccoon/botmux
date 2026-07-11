@@ -52,6 +52,19 @@ describe('buildV3BlockedCard', () => {
     expect(JSON.stringify(card)).toContain('被中止的并行节点也会重新执行');
   });
 
+  it('host effect uncertain 显示对账警告且不提供普通重试', () => {
+    const card = JSON.parse(buildV3BlockedCard({
+      ...INPUT,
+      errorCode: 'HOST_EFFECT_TTL_EXPIRED',
+      retryForbidden: 'host-effect-uncertain',
+    }));
+    expect(card.header.template).toBe('red');
+    expect(card.header.title.content).toContain('外部效果待核实');
+    const json = JSON.stringify(card);
+    expect(json).toContain('请先在目标系统对账');
+    expect(json).not.toContain(V3_BLOCKED_RETRY_ACTION);
+  });
+
   it('retried 冻结卡：green + 无重试按钮 + 显示新 attempt', () => {
     const card = JSON.parse(buildV3BlockedCard({ ...INPUT, retried: { nextAttemptId: 'deploy/attempts/002', by: 'ou_x' } }));
     expect(card.header.template).toBe('green');

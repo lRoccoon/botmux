@@ -21,18 +21,21 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join, dirname, relative, isAbsolute, resolve, sep } from 'node:path';
 import { readProcessStartIdentity } from '../../core/session-marker.js';
+import { computeInputHash } from '../../utils/canonical-input-hash.js';
 
 import {
   DEFAULT_NODE_TIMEOUT_SEC,
   DEFAULT_REVISIT_BUDGET_PER_PAIR,
   DEFAULT_REVISIT_BUDGET_PER_RUN,
   isGoalNode,
+  isHostNode,
   isLoopNode,
   loopInstanceId,
   type V3Dag,
   type V3InputRef,
   type V3LoopExitWhen,
   type V3LoopNode,
+  type V3HostNode,
   type V3Node,
   type V3ResultSchema,
 } from './dag.js';
@@ -46,6 +49,7 @@ import {
   type V3ErrorClass,
   type V3Event,
   type V3LoopRef,
+  type V3UncertainHostEffect,
 } from './journal.js';
 import { materialize, writeState } from './state.js';
 import {
@@ -61,7 +65,7 @@ import {
   type V3ActiveAttemptWorkerFence,
   type V3ArmedAttemptWorkerFence,
 } from './worker-fence.js';
-import { normalizeGateWaitInput, writePendingWait } from './human-gate.js';
+import { normalizeGateWaitInput, v3GateWaitId, writePendingWait } from './human-gate.js';
 import {
   ASK_HUMAN_ERROR_CODE,
   GOAL_ASK_FILE,
@@ -84,6 +88,22 @@ import {
   openV3WorkerAttempts,
   type V3OpenWorkerAttempt,
 } from './attempt-ledger.js';
+import { openV3HostEffects, type V3OpenHostEffect } from './host-effect-ledger.js';
+import {
+  prepareV3HostInputArtifact,
+  readCrashLeftV3PreparedHostInput,
+  readAndVerifyV3PreparedHostInput,
+  readAndVerifyV3HostSuccessResult,
+  writeV3HostSuccessArtifacts,
+  type V3PreparedHostInputArtifact,
+} from './host-execution.js';
+import {
+  composeV3HostGatePrompt,
+  renderV3HostInputPreview,
+  resolveV3HostInputTemplate,
+} from './host-bindings.js';
+import type { HostExecutorRegistry, RegisteredHostExecutor } from '../hostExecutors/registry.js';
+import type { ProviderReconciler } from '../resume.js';
 
 // ─── goal.txt rendering ─────────────────────────────────────────────────────
 
@@ -438,19 +458,43 @@ export function nextAttemptIdFor(events: StoredEvent[], key: string): string {
   const matches = (e: { nodeId: string; instanceId?: string }): boolean => (e.instanceId ?? e.nodeId) === key;
   let maxSeen = 0;
   let reserved: number | undefined;
+  let prepared: string | undefined;
   for (const e of events) {
     if (e.type === 'nodeDispatched' && matches(e)) {
       const n = attemptNumber(e.attemptId);
       if (n === undefined) continue;
       maxSeen = Math.max(maxSeen, n);
       if (reserved === n) reserved = undefined; // reservation consumed
+    } else if (e.type === 'hostInputPrepared' && matches(e)) {
+      const n = attemptNumber(e.attemptId);
+      if (n === undefined) continue;
+      maxSeen = Math.max(maxSeen, n);
+      if (reserved === n) reserved = undefined;
+      prepared = e.attemptId;
+    } else if (
+      (e.type === 'nodeSucceeded' || e.type === 'nodeFailed' || e.type === 'nodeBlocked') &&
+      matches(e)
+    ) {
+      // A pre-intent host crash can leave only a blocked verdict for the
+      // reserved attempt (the sidecar was partial, so no prepared event is
+      // trustworthy). The verdict is still durable proof that this number was
+      // consumed and a retry must advance rather than collide with it.
+      const n = attemptNumber(e.attemptId);
+      if (n !== undefined) maxSeen = Math.max(maxSeen, n);
+      if (prepared === e.attemptId) prepared = undefined;
+    } else if (
+      e.type === 'hostEffectIntent' && matches(e) && prepared === e.attemptId
+    ) {
+      prepared = undefined;
     } else if (e.type === 'nodeRetryRequested' && matches(e)) {
       const n = attemptNumber(e.nextAttemptId);
       if (n === undefined) continue;
       reserved = n;
+      prepared = undefined;
       maxSeen = Math.max(maxSeen, n);
     }
   }
+  if (prepared) return prepared;
   const n = reserved ?? maxSeen + 1;
   return `${key}/attempts/${String(n).padStart(3, '0')}`;
 }
@@ -461,8 +505,30 @@ export function nextAttemptIdFor(events: StoredEvent[], key: string): string {
  *  a retry stays inside the same instance.  Undefined when never dispatched. */
 export function latestAttemptIdFor(events: StoredEvent[], key: string): string | undefined {
   let latest: string | undefined;
+  let latestNumber = -1;
   for (const e of events) {
-    if (e.type === 'nodeDispatched' && (e.instanceId ?? e.nodeId) === key) latest = e.attemptId;
+    if (
+      (
+        e.type === 'nodeDispatched' ||
+        e.type === 'hostInputPrepared' ||
+        e.type === 'hostEffectIntent' ||
+        e.type === 'nodeSucceeded' ||
+        e.type === 'nodeFailed' ||
+        e.type === 'nodeBlocked'
+      ) &&
+      (e.instanceId ?? e.nodeId) === key
+    ) {
+      const n = attemptNumber(e.attemptId);
+      if (n === undefined) {
+        if (latestNumber < 0) latest = e.attemptId;
+      } else if (n >= latestNumber) {
+        // A stale settle for attempt 001 may arrive after attempt 002 was
+        // dispatched. Choose the highest reserved number, never journal order,
+        // so retry/cancel cannot regress to an obsolete attempt.
+        latest = e.attemptId;
+        latestNumber = n;
+      }
+    }
   }
   return latest;
 }
@@ -478,6 +544,12 @@ export interface V3RuntimeDeps {
    *  undefined → the run's default bot), returns the snapshot persisted in the
    *  runDir and threaded through `runNode` (never re-resolved mid-run). */
   resolveBotSnapshot: (botId: string | undefined) => BotSnapshot;
+  /** Trusted deterministic host executors. Required when the DAG has host nodes. */
+  hostExecutors?: HostExecutorRegistry;
+  /** Provider recovery capabilities keyed by executor.provider. */
+  hostReconcilers?: Map<string, ProviderReconciler>;
+  /** Injectable wall clock for deterministic host idempotency-TTL recovery. */
+  now?: () => number;
   /** Resolve a humanGate.  Required only if the DAG declares any gate; the
    *  runtime throws if a gate is hit without a handler.  (Wired by
    *  `human-gate.ts` post-milestone.) */
@@ -486,6 +558,7 @@ export interface V3RuntimeDeps {
     prompt: string;
     waitId: string;
     runDir: string;
+    hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
   }) => Promise<{ resolution: 'approved' | 'rejected'; by: string; selected?: string }>;
 }
 
@@ -513,6 +586,9 @@ export interface V3RuntimeOptions {
     params: Record<string, unknown>;
     context: Record<string, string>;
   };
+  /** How long the scheduler waits for the original host SDK promise before
+   *  detaching and reconciling the still-open durable intent with the same key. */
+  hostResponseWaitMs?: number;
 }
 
 export interface V3PendingGate {
@@ -522,6 +598,7 @@ export interface V3PendingGate {
   options: string[];
   approveOptions: string[];
   approvers: string[];
+  hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
 }
 
 export type V3RunOutcome =
@@ -534,6 +611,7 @@ export type V3RunOutcome =
       blockedNodeId?: string;
       failureReason?: 'allSinksSkipped';
       failureDetail?: string;
+      uncertainHostEffects?: V3UncertainHostEffect[];
       runDir: string;
     }
   | { reason: 'awaitingGate'; pendingWaits: V3PendingGate[]; runDir: string };
@@ -559,6 +637,10 @@ export async function runWorkflow(
   const perBotCap = opts.perBotConcurrency ?? 1;
   const perCliCap = opts.perCliConcurrency ?? 2;
   const gateMode = opts.gateMode ?? 'blocking';
+  const hostResponseWaitMs = opts.hostResponseWaitMs ?? 15_000;
+  if (!Number.isSafeInteger(hostResponseWaitMs) || hostResponseWaitMs < 1) {
+    throw new Error('v3 runtime: hostResponseWaitMs must be a positive safe integer');
+  }
 
   const nodesById = new Map(dag.nodes.map((n) => [n.id, n]));
 
@@ -581,7 +663,10 @@ export async function runWorkflow(
     botSnapshots.set(key, deps.resolveBotSnapshot(bot));
   };
   for (const node of dag.nodes) {
-    freezeBot(node.bot);
+    if (isGoalNode(node)) freezeBot(node.bot);
+    if (isHostNode(node) && !deps.hostExecutors?.has(node.executor)) {
+      throw new Error(`v3 runtime: host executor "${node.executor}" is not registered`);
+    }
     if (isLoopNode(node)) {
       for (const b of node.body.nodes) freezeBot(b.bot ?? node.bot);
     }
@@ -623,6 +708,8 @@ export async function runWorkflow(
   const nodeControllers = new Map<string, AbortController>();
   const controllerAttemptIds = new Map<string, string>();
   const nodeAbortCleanups = new Map<string, () => void>();
+  const hostPromiseAttempts = new Map<string, string>();
+  const hostDeadlineCancels = new Map<string, () => void>();
   const blockingGateOwners = new Map<string, symbol>();
   const externalDrainSignals = new Map<string, { sigintAt: number; sigkillAt?: number }>();
   const missingFenceNoneSince = new Map<string, number>();
@@ -631,6 +718,72 @@ export async function runWorkflow(
   // would still be in its TDZ while the loop is already draining cancellation.
   const EXTERNAL_CANCEL_KILL_GRACE_MS = 5_000;
   const MISSING_FENCE_DOUBLE_SCAN_MS = 500;
+
+  class HostProviderResponseTimeoutError extends Error {
+    constructor() {
+      super(`host provider did not settle within ${hostResponseWaitMs}ms`);
+      this.name = 'HostProviderResponseTimeoutError';
+    }
+  }
+
+  class HostProviderResponseDetachedError extends Error {
+    constructor() {
+      super('host provider scheduler wait detached after durable effect close');
+      this.name = 'HostProviderResponseDetachedError';
+    }
+  }
+
+  /**
+   * Bound scheduler ownership of an SDK promise without pretending the
+   * provider call itself was cancelled. The attached rejection handler keeps
+   * a late rejection from becoming unhandled. The original invocation may
+   * still close through its guarded artifact+journal continuation; a detached
+   * reconciler result is ignored and the next same-key recovery owns progress.
+   *
+   * The timer intentionally remains referenced. In standalone CLI mode the
+   * SDK promise may own no event-loop handle, and this deadline is the only
+   * thing preventing a process from exiting while an intent is still OPEN.
+   */
+  async function awaitHostProviderResponse<T>(
+    task: Promise<T>,
+    detachableAttemptId?: string,
+  ): Promise<T> {
+    const outcome = await new Promise<
+      | { kind: 'value'; value: T }
+      | { kind: 'error'; error: unknown }
+      | { kind: 'timeout' }
+      | { kind: 'detached' }
+    >((resolveOutcome) => {
+      let settled = false;
+      const finish = (value:
+        | { kind: 'value'; value: T }
+        | { kind: 'error'; error: unknown }
+        | { kind: 'timeout' }
+        | { kind: 'detached' }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (
+          detachableAttemptId &&
+          hostDeadlineCancels.get(detachableAttemptId) === detach
+        ) {
+          hostDeadlineCancels.delete(detachableAttemptId);
+        }
+        resolveOutcome(value);
+      };
+      const detach = (): void => finish({ kind: 'detached' });
+      const timer = setTimeout(() => finish({ kind: 'timeout' }), hostResponseWaitMs);
+      if (detachableAttemptId) hostDeadlineCancels.set(detachableAttemptId, detach);
+      task.then(
+        (value) => finish({ kind: 'value', value }),
+        (error: unknown) => finish({ kind: 'error', error }),
+      );
+    });
+    if (outcome.kind === 'timeout') throw new HostProviderResponseTimeoutError();
+    if (outcome.kind === 'detached') throw new HostProviderResponseDetachedError();
+    if (outcome.kind === 'error') throw outcome.error;
+    return outcome.value;
+  }
 
   type AttemptDrainReason = Extract<V3Event, { type: 'nodeAttemptDrained' }>['reason'];
   const controllerDrainReason = (controller: AbortController): AttemptDrainReason | undefined => {
@@ -658,6 +811,17 @@ export async function runWorkflow(
       !isTrueRunTerminal(snap.runStatus)
     ) {
       requestRuntimeCancellation();
+      continue;
+    }
+
+    // A host intent means an external effect may already exist. Reconcile it
+    // before cancellation, worker orphan recovery, gates, or run terminal
+    // publication. It must never fall through the worker drain→pending recovery rail.
+    const openHostEffects = openV3HostEffects(events);
+    if (openHostEffects.length > 0) {
+      const settled = await reconcileOpenHostEffects(openHostEffects);
+      detachClosedHostInvocations();
+      if (!settled) await new Promise((resolve) => setTimeout(resolve, 1_000));
       continue;
     }
 
@@ -832,15 +996,20 @@ export async function runWorkflow(
     for (const a of actions) {
       if (inFlight.size >= globalCap) break;
       if (a.kind === 'dispatchWork') {
-          // Loop body instances are synthesized from the body definition; the
-          // instance id is theirs alone (attempt dirs, journal events, retry).
-          const node = a.loop ? instanceNodeFor(a.loop) : nodesById.get(a.nodeId)!;
+        // Loop body instances are synthesized from the body definition; the
+        // instance id is theirs alone (attempt dirs, journal events, retry).
+        const node = a.loop ? instanceNodeFor(a.loop) : nodesById.get(a.nodeId)!;
+        if (isHostNode(node)) {
+          if (!a.instanceId) throw new Error(`v3 runtime: host node "${node.id}" has no runtime instance`);
+          if (startHost(node, events, a.instanceId)) startedThisTick++;
+        } else {
           const botKey = node.bot ?? '';
           const botSnap = botSnapshots.get(botKey)!;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
           if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
-        if (startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId)) {
-          startedThisTick++;
+          if (startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId)) {
+            startedThisTick++;
+          }
         }
       } else if (a.kind === 'dispatchGate') {
         if (startGate(nodesById.get(a.nodeId)!, a.instanceId)) startedThisTick++;
@@ -893,6 +1062,7 @@ export async function runWorkflow(
     failureReason: finalSnap.failureReason,
     failureDetail: finalSnap.failureDetail,
     blockedNodeId: finalSnap.blockedNodeId,
+    uncertainHostEffects: finalSnap.uncertainHostEffects,
     runDir,
   };
 
@@ -923,6 +1093,7 @@ export async function runWorkflow(
       const snap = materialize([...events]);
       if (snap.runStatus !== 'running') return false;
       if (openV3WorkerAttempts(events).length > 0) return false;
+      if (openV3HostEffects(events).length > 0) return false;
       const terminal = decideNext(dag, snap.nodes, snap.loops, snap.edges, snap.instances).find(
         (action) =>
           action.kind === 'completeRunSucceeded' ||
@@ -1436,12 +1607,939 @@ export async function runWorkflow(
           cancelRequestId,
         });
       }
+      const uncertainByAttempt = new Map<string, V3UncertainHostEffect>();
+      for (const event of events) {
+        if (event.type !== 'hostEffectUncertain') continue;
+        uncertainByAttempt.set(event.attemptId, {
+          nodeId: event.nodeId,
+          instanceId: event.instanceId,
+          attemptId: event.attemptId,
+          executor: event.executor,
+          errorCode: event.errorCode,
+        });
+      }
+      const uncertainHostEffects = [...uncertainByAttempt.values()];
       append({
         type: 'runCancelled',
         cancelRequestId,
         by: snap.cancelRequestedBy ?? 'unknown',
+        ...(uncertainHostEffects.length > 0 ? { uncertainHostEffects } : {}),
       }, { durable: true });
     });
+  }
+
+  type PreparedEvent = StoredEvent & Extract<V3Event, { type: 'hostInputPrepared' }>;
+
+  function hostExecutorFor(node: V3HostNode): RegisteredHostExecutor {
+    const registered = deps.hostExecutors?.get(node.executor);
+    if (!registered) throw new Error(`v3 runtime: host executor "${node.executor}" is not registered`);
+    return registered;
+  }
+
+  function preparedEventFor(
+    events: readonly StoredEvent[],
+    nodeId: string,
+    instanceId: string,
+    attemptId: string,
+  ): PreparedEvent | undefined {
+    let found: PreparedEvent | undefined;
+    for (const event of events) {
+      if (
+        event.type !== 'hostInputPrepared' ||
+        event.nodeId !== nodeId ||
+        event.instanceId !== instanceId ||
+        event.attemptId !== attemptId
+      ) continue;
+      if (found && !samePreparedEvent(found, event as PreparedEvent)) {
+        throw new Error(`v3 runtime: conflicting hostInputPrepared events for ${attemptId}`);
+      }
+      found = event as PreparedEvent;
+    }
+    return found;
+  }
+
+  function samePreparedEvent(left: PreparedEvent, right: PreparedEvent): boolean {
+    return left.nodeId === right.nodeId &&
+      left.instanceId === right.instanceId &&
+      left.attemptId === right.attemptId &&
+      left.executor === right.executor &&
+      left.provider === right.provider &&
+      left.inputRef.path === right.inputRef.path &&
+      left.inputRef.sha256 === right.inputRef.sha256 &&
+      left.inputRef.bytes === right.inputRef.bytes &&
+      left.inputHash === right.inputHash &&
+      left.idempotencyKey === right.idempotencyKey &&
+      left.idempotencyTtlMs === right.idempotencyTtlMs &&
+      left.approvalDigest === right.approvalDigest;
+  }
+
+  function preparedEventMatchesArtifact(
+    event: PreparedEvent,
+    artifact: V3PreparedHostInputArtifact,
+  ): boolean {
+    const candidate: PreparedEvent = {
+      ...event,
+      executor: artifact.prepared.executor,
+      provider: artifact.prepared.provider,
+      inputRef: artifact.inputRef,
+      inputHash: artifact.prepared.inputHash,
+      idempotencyKey: artifact.prepared.idempotencyKey,
+      idempotencyTtlMs: artifact.prepared.idempotencyTtlMs,
+      approvalDigest: artifact.prepared.approvalDigest,
+    };
+    return samePreparedEvent(event, candidate);
+  }
+
+  function readPreparedFromEvent(node: V3HostNode, event: PreparedEvent): V3PreparedHostInputArtifact {
+    return readAndVerifyV3PreparedHostInput({
+      runDir,
+      inputRef: event.inputRef,
+      expected: { ...event, runId: dag.runId },
+      registered: hostExecutorFor(node),
+    });
+  }
+
+  async function loadHostResult(nodeId: string, events: StoredEvent[]): Promise<unknown> {
+    const snap = materialize(events);
+    const key = snap.nodes.get(nodeId)?.effectiveInstanceId ?? nodeId;
+    const success = [...events].reverse().find(
+      (event): event is StoredEvent & { type: 'nodeSucceeded' } =>
+        event.type === 'nodeSucceeded' && (event.instanceId ?? event.nodeId) === key,
+    );
+    if (!success) throw new Error(`v3 host input source "${nodeId}" has no successful current instance`);
+    const outputDir = join(dirname(success.manifestPath), 'work');
+    const verdict = await deps.validateManifest(success.manifestPath, outputDir);
+    if (!verdict.ok || verdict.manifest?.status !== 'ok') {
+      throw new Error(
+        `v3 host input source "${nodeId}" manifest failed revalidation: ` +
+        `${(verdict.problems ?? ['manifest status is not ok']).join('; ')}`,
+      );
+    }
+    const matches = verdict.manifest.files.filter((file) => file.path === 'result.json');
+    if (matches.length !== 1) {
+      throw new Error(`v3 host input source "${nodeId}" must expose exactly one result.json (found ${matches.length})`);
+    }
+    try {
+      return JSON.parse(readFileSync(join(outputDir, matches[0]!.path), 'utf-8')) as unknown;
+    } catch (err) {
+      throw new Error(
+        `v3 host input source "${nodeId}" result.json is unreadable: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Return a verified preparation, or start its async creation and return
+   * undefined. Preparation leaves node state pending; a later tick dispatches
+   * the gate/effect only after hostInputPrepared is durable.
+   */
+  function ensureHostPrepared(
+    node: V3HostNode,
+    events: StoredEvent[],
+    instanceId: string,
+  ): V3PreparedHostInputArtifact | undefined {
+    const attemptId = nextAttemptIdFor(events, instanceId);
+    const existing = preparedEventFor(events, node.id, instanceId, attemptId);
+    if (existing) {
+      try {
+        return readPreparedFromEvent(node, existing);
+      } catch {
+        // No intent exists yet, so a corrupt/missing frozen input proves that
+        // no provider call began. Surface a normal retryable block; retry gets
+        // a fresh attempt/key and must pass a fresh runtime gate.
+        withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          const current = materialize([...latest]);
+          if (current.runStatus !== 'running') return;
+          const state = current.nodes.get(node.id);
+          if (
+            (state?.status ?? 'pending') !== 'pending' &&
+            state?.status !== 'gateWaiting'
+          ) return;
+          if (openV3HostEffects(latest).some((effect) => effect.attemptId === attemptId)) return;
+          append({
+            type: 'nodeBlocked',
+            nodeId: node.id,
+            instanceId,
+            attemptId,
+            errorClass: 'resultInvalid',
+            errorCode: 'HOST_INPUT_UNRECOVERABLE',
+            message: 'frozen host input is missing or failed integrity validation',
+          }, { durable: true });
+        });
+        return undefined;
+      }
+    }
+
+    const key = `${instanceId}::host-prepare`;
+    if (inFlight.has(key)) return undefined;
+    const registered = hostExecutorFor(node);
+    const attemptDir = safeAttemptDirFromId(attemptId);
+
+    // Crash window: the freeze sidecar is fsync'd before its journal event.
+    // Adopt those exact bytes instead of resolving upstream data again. This
+    // is essential for relative schedules (`30m`, `明天 9:00`), whose parsed
+    // value changes with wall time even though no provider call has begun.
+    try {
+      const orphan = readCrashLeftV3PreparedHostInput({
+        runDir,
+        attemptDir,
+        runId: dag.runId,
+        nodeId: node.id,
+        instanceId,
+        attemptId,
+        executorName: node.executor,
+        registered,
+      });
+      if (orphan) {
+        assertHostExecutionIdentity(
+          node,
+          orphan.prepared.parsedInput,
+          opts.resolvedWorkflowData?.context,
+        );
+        const committed = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          const current = materialize([...latest]);
+          if (current.runStatus !== 'running') return false;
+          if ((current.nodes.get(node.id)?.status ?? 'pending') !== 'pending') return false;
+          if (openV3HostEffects(latest).some((effect) => effect.attemptId === attemptId)) {
+            throw new Error(`v3 runtime: host effect ${attemptId} has intent without prepared input`);
+          }
+          const prior = preparedEventFor([...latest], node.id, instanceId, attemptId);
+          if (prior) {
+            if (!preparedEventMatchesArtifact(prior, orphan)) {
+              throw new Error(`v3 runtime: crash-left host input conflicts with durable preparation ${attemptId}`);
+            }
+            return true;
+          }
+          append({
+            type: 'hostInputPrepared',
+            nodeId: node.id,
+            instanceId,
+            attemptId,
+            executor: orphan.prepared.executor,
+            provider: orphan.prepared.provider,
+            inputRef: orphan.inputRef,
+            inputHash: orphan.prepared.inputHash,
+            idempotencyKey: orphan.prepared.idempotencyKey,
+            idempotencyTtlMs: orphan.prepared.idempotencyTtlMs,
+            approvalDigest: orphan.prepared.approvalDigest,
+          }, { durable: true });
+          return true;
+        });
+        return committed ? orphan : undefined;
+      }
+    } catch {
+      // A sidecar exists but cannot be adopted. No provider intent is open, so
+      // block for an explicit retry (fresh attempt/key/gate) rather than
+      // overwriting the only crash evidence or misclassifying this as a normal
+      // definition failure.
+      withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+        const current = materialize([...latest]);
+        if (current.runStatus !== 'running') return;
+        if ((current.nodes.get(node.id)?.status ?? 'pending') !== 'pending') return;
+        if (openV3HostEffects(latest).some((effect) => effect.attemptId === attemptId)) return;
+        append({
+          type: 'nodeBlocked',
+          nodeId: node.id,
+          instanceId,
+          attemptId,
+          errorClass: 'resultInvalid',
+          errorCode: 'HOST_INPUT_UNRECOVERABLE',
+          message: 'crash-left frozen host input failed integrity validation',
+        }, { durable: true });
+      });
+      return undefined;
+    }
+
+    const p = Promise.resolve()
+      .then(async () => {
+        const resolvedInput = await resolveV3HostInputTemplate(node.input, {
+          params: opts.resolvedWorkflowData?.params ?? {},
+          context: opts.resolvedWorkflowData?.context ?? {},
+          loadResult: (sourceNodeId) => loadHostResult(sourceNodeId, readJournal(journalPath)),
+        });
+        const artifact = prepareV3HostInputArtifact({
+          runDir,
+          attemptDir,
+          runId: dag.runId,
+          nodeId: node.id,
+          instanceId,
+          attemptId,
+          executorName: node.executor,
+          resolvedInput,
+          registered,
+        });
+        assertHostExecutionIdentity(
+          node,
+          artifact.prepared.parsedInput,
+          opts.resolvedWorkflowData?.context,
+        );
+        withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          const current = materialize([...latest]);
+          if (current.runStatus !== 'running') return;
+          const status = current.nodes.get(node.id)?.status ?? 'pending';
+          if (status !== 'pending') return;
+          const prior = preparedEventFor([...latest], node.id, instanceId, attemptId);
+          if (prior) {
+            readPreparedFromEvent(node, prior);
+            return;
+          }
+          append({
+            type: 'hostInputPrepared',
+            nodeId: node.id,
+            instanceId,
+            attemptId,
+            executor: artifact.prepared.executor,
+            provider: artifact.prepared.provider,
+            inputRef: artifact.inputRef,
+            inputHash: artifact.prepared.inputHash,
+            idempotencyKey: artifact.prepared.idempotencyKey,
+            idempotencyTtlMs: artifact.prepared.idempotencyTtlMs,
+            approvalDigest: artifact.prepared.approvalDigest,
+          }, { durable: true });
+        });
+      })
+      .catch((err: unknown) => {
+        // No effect intent exists, so this is an ordinary definition/input
+        // failure. Fail rather than fabricate a retryable host attempt whose
+        // input was never frozen.
+        withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          const current = materialize([...latest]);
+          if (current.runStatus !== 'running') return;
+          if ((current.nodes.get(node.id)?.status ?? 'pending') !== 'pending') return;
+          append({
+            type: 'nodeFailed',
+            nodeId: node.id,
+            attemptId,
+            errorClass: 'resultInvalid',
+            errorCode: 'HOST_INPUT_PREPARE_FAILED',
+            message: err instanceof Error ? err.message : String(err),
+          }, { durable: true });
+        });
+      })
+      .finally(() => {
+        if (inFlight.get(key) === p) inFlight.delete(key);
+      });
+    inFlight.set(key, p);
+    return undefined;
+  }
+
+  function assertHostExecutionIdentity(
+    node: V3HostNode,
+    parsedInput: unknown,
+    context: Readonly<Record<string, string>> | undefined,
+  ): void {
+    if (!parsedInput || typeof parsedInput !== 'object' || Array.isArray(parsedInput)) {
+      throw new Error(`v3 runtime: host node "${node.id}" parsed input is not an object`);
+    }
+    if (!context) {
+      throw new Error(
+        `v3 runtime: host node "${node.id}" requires an authorized chat context; ` +
+        'standalone arbitrary-target host effects are not supported',
+      );
+    }
+    const value = parsedInput as Record<string, unknown>;
+    const expected: Array<[string, string | undefined]> =
+      node.executor === 'feishu-send'
+        ? [['larkAppId', context.larkAppId], ['chatId', context.chatId]]
+      : node.executor === 'feishu-reply'
+        ? [['larkAppId', context.larkAppId], ['rootMessageId', context.rootMessageId]]
+      : [
+          ['larkAppId', context.larkAppId],
+          ['chatId', context.chatId],
+          ['chatType', context.chatType],
+          ...(Object.prototype.hasOwnProperty.call(value, 'rootMessageId')
+            ? [['rootMessageId', context.rootMessageId] as [string, string | undefined]]
+            : []),
+        ];
+    for (const [field, expectedValue] of expected) {
+      if (!expectedValue || value[field] !== expectedValue) {
+        throw new Error(
+          `v3 runtime: host node "${node.id}" ${field} does not match the authorized run context`,
+        );
+      }
+    }
+  }
+
+  function hostGateMaterial(
+    node: V3HostNode,
+    events: StoredEvent[],
+    instanceId: string,
+  ): {
+    gate: ReturnType<typeof normalizeGateWaitInput>;
+    hostApproval: { attemptId: string; approvalDigest: string; inputHash: string };
+  } | undefined {
+    const artifact = ensureHostPrepared(node, events, instanceId);
+    if (!artifact) return undefined;
+    const authored = normalizeGateWaitInput(node.humanGate);
+    return {
+      gate: {
+        ...authored,
+        prompt: composeV3HostGatePrompt(
+          authored.prompt,
+          renderV3HostInputPreview(
+            node.executor,
+            artifact.prepared.parsedInput,
+            artifact.prepared.inputHash,
+          ),
+        ),
+      },
+      hostApproval: {
+        attemptId: artifact.prepared.attemptId,
+        approvalDigest: artifact.prepared.approvalDigest,
+        inputHash: artifact.prepared.inputHash,
+      },
+    };
+  }
+
+  function startHost(node: V3HostNode, events: StoredEvent[], instanceId: string): boolean {
+    const artifact = ensureHostPrepared(node, events, instanceId);
+    if (!artifact) return true;
+    const approval = materialize(events).nodes.get(node.id)?.approvedHostInput;
+    if (
+      !approval ||
+      approval.attemptId !== artifact.prepared.attemptId ||
+      approval.approvalDigest !== artifact.prepared.approvalDigest ||
+      approval.inputHash !== artifact.prepared.inputHash
+    ) {
+      throw new Error(`v3 runtime: host node "${node.id}" has no approval for its frozen input`);
+    }
+    const registered = hostExecutorFor(node);
+    const nowForPreflight = deps.now?.() ?? Date.now();
+    const preflight = registered.executor.validateBeforeIntent?.(
+      artifact.prepared.parsedInput,
+      nowForPreflight,
+    );
+    if (preflight && !preflight.ok) {
+      const blocked = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+        const current = materialize([...latest]);
+        const state = current.nodes.get(node.id);
+        if (
+          current.runStatus !== 'running' ||
+          state?.status !== 'pending' ||
+          state.effectiveInstanceId !== instanceId ||
+          openV3HostEffects(latest).some((effect) =>
+            effect.attemptId === artifact.prepared.attemptId)
+        ) return false;
+        append({
+          type: 'nodeBlocked',
+          nodeId: node.id,
+          instanceId,
+          attemptId: artifact.prepared.attemptId,
+          errorClass: 'resultInvalid',
+          errorCode: /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(preflight.errorCode)
+            ? preflight.errorCode
+            : 'HOST_INPUT_PRECONDITION_FAILED',
+          message: preflight.message,
+        }, { durable: true });
+        return true;
+      });
+      // `true` tells the current scheduler tick that durable progress happened;
+      // it re-folds into the blocked terminal instead of tripping the generic
+      // no-progress guard on its stale dispatchWork action list.
+      return blocked;
+    }
+    const claimed = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+      const current = materialize([...latest]);
+      if (current.runStatus !== 'running') return false;
+      const state = current.nodes.get(node.id);
+      if (
+        state?.status !== 'pending' ||
+        state.effectiveInstanceId !== instanceId ||
+        !state.gateCleared ||
+        state.approvedHostInput?.approvalDigest !== artifact.prepared.approvalDigest ||
+        state.approvedHostInput?.inputHash !== artifact.prepared.inputHash
+      ) return false;
+      const expectedApproval = {
+        attemptId: artifact.prepared.attemptId,
+        approvalDigest: artifact.prepared.approvalDigest,
+        inputHash: artifact.prepared.inputHash,
+      };
+      const waitId = v3GateWaitId(node.id, instanceId, expectedApproval);
+      const dispatchedAt = latest.findIndex((event) =>
+        event.type === 'gateDispatched' &&
+        event.nodeId === node.id &&
+        event.instanceId === instanceId &&
+        event.waitId === waitId &&
+        sameHostApproval(event.hostApproval, expectedApproval));
+      if (dispatchedAt < 0) return false;
+      const firstResolution = latest.slice(dispatchedAt + 1).find((event) =>
+        event.type === 'gateResolved' && event.waitId === waitId);
+      if (
+        !firstResolution ||
+        firstResolution.type !== 'gateResolved' ||
+        firstResolution.resolution !== 'approved' ||
+        firstResolution.nodeId !== node.id ||
+        firstResolution.instanceId !== instanceId ||
+        !sameHostApproval(firstResolution.hostApproval, expectedApproval)
+      ) return false;
+      if (openV3HostEffects(latest).some((effect) => effect.attemptId === artifact.prepared.attemptId)) return false;
+      const prepared = preparedEventFor(
+        [...latest],
+        node.id,
+        instanceId,
+        artifact.prepared.attemptId,
+      );
+      if (!prepared || !preparedEventMatchesArtifact(prepared, artifact)) return false;
+      // The journal lock remains a pure read/check/append critical section.
+      // The sidecar was verified before entry and is verified again after the
+      // durable intent, immediately before provider invocation.
+      append({
+        type: 'hostEffectIntent',
+        nodeId: node.id,
+        instanceId,
+        attemptId: artifact.prepared.attemptId,
+        executor: artifact.prepared.executor,
+        provider: artifact.prepared.provider,
+        inputRef: artifact.inputRef,
+        inputHash: artifact.prepared.inputHash,
+        idempotencyKey: artifact.prepared.idempotencyKey,
+        idempotencyTtlMs: artifact.prepared.idempotencyTtlMs,
+        approvalDigest: artifact.prepared.approvalDigest,
+      }, { durable: true });
+      return true;
+    });
+    if (!claimed) return false;
+
+    const key = instanceId;
+    const providerTask = Promise.resolve()
+      .then(async () => {
+        const verified = readAndVerifyV3PreparedHostInput({
+          runDir,
+          inputRef: artifact.inputRef,
+          expected: artifact.prepared,
+          registered,
+        });
+        const result = await registered.executor.invoke(
+          verified.prepared.parsedInput,
+          verified.prepared.idempotencyKey,
+        );
+        const { manifestPath } = writeV3HostSuccessArtifacts({
+          runDir,
+          attemptDir: safeAttemptDirFromId(verified.prepared.attemptId),
+          runId: verified.prepared.runId,
+          nodeId: verified.prepared.nodeId,
+          instanceId: verified.prepared.instanceId,
+          attemptId: verified.prepared.attemptId,
+          executor: verified.prepared.executor,
+          provider: verified.prepared.provider,
+          idempotencyKey: verified.prepared.idempotencyKey,
+          inputHash: verified.prepared.inputHash,
+          approvalDigest: verified.prepared.approvalDigest,
+          output: result.output,
+          externalRefs: result.externalRefs,
+        });
+        appendHostSuccessIfOpen({
+          nodeId: node.id,
+          instanceId,
+          attemptId: verified.prepared.attemptId,
+        }, manifestPath);
+      })
+      .catch(() => {
+        // Unknown provider outcome after durable intent. Leave it OPEN: the
+        // next tick's host reconciler reuses the same input/key. Writing a
+        // normal node failure here would incorrectly prove the effect closed.
+      });
+    const p = awaitHostProviderResponse(providerTask, artifact.prepared.attemptId)
+      .catch(() => {
+        // A timeout or rejected original provider call leaves the durable
+        // intent OPEN. The next scheduler tick enters same-key reconciliation.
+      })
+      .finally(() => {
+        if (hostPromiseAttempts.get(key) === artifact.prepared.attemptId) {
+          hostPromiseAttempts.delete(key);
+        }
+        if (inFlight.get(key) === p) inFlight.delete(key);
+      });
+    hostPromiseAttempts.set(key, artifact.prepared.attemptId);
+    inFlight.set(key, p);
+    return true;
+  }
+
+  function sameHostApproval(
+    left: { attemptId: string; approvalDigest: string; inputHash: string } | undefined,
+    right: { attemptId: string; approvalDigest: string; inputHash: string },
+  ): boolean {
+    return left?.attemptId === right.attemptId &&
+      left.approvalDigest === right.approvalDigest &&
+      left.inputHash === right.inputHash;
+  }
+
+  async function reconcileOpenHostEffects(effects: readonly V3OpenHostEffect[]): Promise<boolean> {
+    const MAX_HOST_RECONCILE_RETRIES = 10;
+    let allSettled = true;
+    for (const effect of effects) {
+      const node = nodesById.get(effect.nodeId);
+      if (!node || !isHostNode(node) || node.executor !== effect.executor) {
+        appendHostReconcileBlock(effect, 'HOST_EFFECT_DEFINITION_MISMATCH', 'host definition no longer matches intent');
+        continue;
+      }
+      const registered = deps.hostExecutors?.get(effect.executor);
+      if (!registered || registered.executor.provider !== effect.provider) {
+        appendHostReconcileBlock(effect, 'HOST_EFFECT_UNKNOWN_PROVIDER', `no matching executor for ${effect.executor}/${effect.provider}`);
+        continue;
+      }
+      let artifact: V3PreparedHostInputArtifact;
+      try {
+        artifact = readAndVerifyV3PreparedHostInput({
+          runDir,
+          inputRef: effect.inputRef,
+          expected: { ...effect, runId: dag.runId },
+          registered,
+        });
+      } catch (err) {
+        appendHostReconcileBlock(
+          effect,
+          'HOST_EFFECT_INPUT_UNRECOVERABLE',
+          err instanceof Error ? err.message : String(err),
+        );
+        continue;
+      }
+
+      const attemptDir = safeAttemptDirFromId(effect.attemptId);
+      const existingManifest = join(attemptDir, 'manifest.json');
+      if (existsSync(existingManifest)) {
+        const validated = await deps.validateManifest(existingManifest, join(attemptDir, 'work'));
+        if (validated.ok && validated.manifest?.status === 'ok') {
+          try {
+            readAndVerifyV3HostSuccessResult({
+              runDir,
+              attemptDir,
+              manifest: validated.manifest,
+              runId: dag.runId,
+              nodeId: effect.nodeId,
+              instanceId: effect.instanceId,
+              attemptId: effect.attemptId,
+              executor: effect.executor,
+              provider: effect.provider,
+              idempotencyKey: effect.idempotencyKey,
+              inputHash: effect.inputHash,
+              approvalDigest: effect.approvalDigest,
+            });
+          } catch (err) {
+            appendHostReconcileBlock(
+              effect,
+              'HOST_EFFECT_OUTPUT_UNRECOVERABLE',
+              err instanceof Error ? err.message : String(err),
+            );
+            continue;
+          }
+          appendHostSuccessIfOpen(effect, existingManifest);
+          continue;
+        }
+        appendHostReconcileBlock(
+          effect,
+          'HOST_EFFECT_OUTPUT_UNRECOVERABLE',
+          `existing host manifest failed validation: ${(validated.problems ?? ['status is not ok']).join('; ')}`,
+        );
+        continue;
+      }
+
+      const reconciler = deps.hostReconcilers?.get(effect.provider);
+      if (!reconciler) {
+        appendHostReconcileBlock(effect, 'HOST_EFFECT_UNKNOWN_PROVIDER', `no reconciler registered for ${effect.provider}`);
+        continue;
+      }
+      const nowForBackoff = deps.now?.() ?? Date.now();
+      if (!Number.isSafeInteger(nowForBackoff) || nowForBackoff < effect.attemptedAtMs) {
+        appendHostReconcileBlock(
+          effect,
+          'HOST_EFFECT_CLOCK_INVALID',
+          'provider recovery clock moved behind the durable effect intent',
+        );
+        continue;
+      }
+      const deferred = [...readJournal(journalPath)].reverse().find((event) =>
+        event.type === 'hostEffectRetryDeferred' && event.attemptId === effect.attemptId);
+      if (
+        deferred?.type === 'hostEffectRetryDeferred' &&
+        Number.isSafeInteger(nowForBackoff) &&
+        nowForBackoff < deferred.nextRetryAt
+      ) {
+        // A cancel request must not wait behind a previously persisted retry
+        // deadline. Close honestly as uncertainty now; the bounded warning is
+        // carried into runCancelled for operator audit.
+        if (materialize(readJournal(journalPath)).runStatus === 'cancelling') {
+          deferHostReconcile(effect, 'HOST_EFFECT_CANCELLED_DURING_RECOVERY', MAX_HOST_RECONCILE_RETRIES);
+        } else {
+          allSettled = false;
+        }
+        continue;
+      }
+      const inputValue = artifact.prepared.parsedInput;
+      if (reconciler.canonicalInput) {
+        try {
+          if (computeHostCanonicalHash(reconciler.canonicalInput(inputValue)) !== effect.inputHash) {
+            appendHostReconcileBlock(effect, 'HOST_EFFECT_INPUT_HASH_MISMATCH', 'reconciler canonical input differs from intent');
+            continue;
+          }
+        } catch (err) {
+          appendHostReconcileBlock(effect, 'HOST_EFFECT_INPUT_HASH_MISMATCH', err instanceof Error ? err.message : String(err));
+          continue;
+        }
+      } else if (reconciler.requiresEffectInput) {
+        appendHostReconcileBlock(effect, 'HOST_EFFECT_INPUT_UNRECOVERABLE', 'reconciler requires input but cannot canonicalize it');
+        continue;
+      }
+
+      let recovered: { output: unknown; externalRefs: Record<string, unknown> } | undefined;
+      try {
+        let lookupMiss = false;
+        if (reconciler.readOnlyLookup) {
+          const lookup = await awaitHostProviderResponse(
+            Promise.resolve().then(() =>
+              reconciler.readOnlyLookup!(effect.idempotencyKey, inputValue)),
+          );
+          if (lookup.found) recovered = { output: lookup.externalRefs, externalRefs: lookup.externalRefs };
+          else lookupMiss = true;
+        }
+        if (!recovered) {
+          const now = deps.now?.() ?? Date.now();
+          const age = now - effect.attemptedAtMs;
+          if (!Number.isSafeInteger(now) || age < 0 || age >= effect.idempotencyTtlMs) {
+            appendHostReconcileBlock(
+              effect,
+              'HOST_EFFECT_TTL_EXPIRED',
+              `provider idempotency window is expired or clock evidence is invalid; effect outcome is unknown`,
+            );
+            continue;
+          }
+          if (reconciler.idempotentSubmit) {
+            const submit = await awaitHostProviderResponse(
+              Promise.resolve().then(() =>
+                reconciler.idempotentSubmit!(effect.idempotencyKey, inputValue)),
+            );
+            if (submit.ok) recovered = { output: submit.externalRefs, externalRefs: submit.externalRefs };
+            else if (submit.errorClass === 'retryable') {
+              if (deferHostReconcile(effect, submit.errorCode, MAX_HOST_RECONCILE_RETRIES)) {
+                allSettled = false;
+              }
+              continue;
+            } else {
+              appendHostReconcileBlock(effect, submit.errorCode, submit.errorMessage);
+              continue;
+            }
+          } else if (lookupMiss) {
+            // Absence is not a tombstone. A one-shot/finite schedule may have
+            // executed and then been removed from the live store; recreating it
+            // would repeat a real external effect. Only a provider with an
+            // explicit same-key idempotent-submit capability may recover miss.
+            appendHostReconcileBlock(
+              effect,
+              'HOST_EFFECT_LOOKUP_MISS_UNCERTAIN',
+              'provider lookup returned no durable receipt; effect may already have completed',
+            );
+            continue;
+          } else {
+            // Recovery never falls back to the initial executor blindly. The
+            // caller cannot prove whether the pre-crash invocation reached the
+            // provider, so a fresh invoke would be at-least-once without a
+            // declared provider idempotency guarantee.
+            appendHostReconcileBlock(
+              effect,
+              'HOST_EFFECT_NO_IDEMPOTENT_RECOVERY',
+              'provider exposes neither an idempotent submit nor a durable receipt',
+            );
+            continue;
+          }
+        }
+      } catch (err) {
+        if (err instanceof HostProviderResponseTimeoutError) {
+          if (deferHostReconcile(effect, 'HOST_EFFECT_PROVIDER_TIMEOUT', MAX_HOST_RECONCILE_RETRIES)) {
+            allSettled = false;
+          }
+          continue;
+        }
+        const classified = registered.executor.classifyError?.(err);
+        if (classified?.errorClass === 'retryable') {
+          if (deferHostReconcile(effect, classified.errorCode, MAX_HOST_RECONCILE_RETRIES)) {
+            allSettled = false;
+          }
+          continue;
+        }
+        appendHostReconcileBlock(
+          effect,
+          classified?.errorCode ?? 'HOST_EFFECT_RECONCILE_REQUIRED',
+          classified?.errorMessage ?? (err instanceof Error ? err.message : String(err)),
+        );
+        continue;
+      }
+
+      if (!recovered) {
+        allSettled = false;
+        continue;
+      }
+      let manifestPath: string;
+      try {
+        ({ manifestPath } = writeV3HostSuccessArtifacts({
+          runDir,
+          attemptDir,
+          runId: dag.runId,
+          nodeId: effect.nodeId,
+          instanceId: effect.instanceId,
+          attemptId: effect.attemptId,
+          executor: effect.executor,
+          provider: effect.provider,
+          idempotencyKey: effect.idempotencyKey,
+          inputHash: effect.inputHash,
+          approvalDigest: effect.approvalDigest,
+          output: recovered.output,
+          externalRefs: recovered.externalRefs,
+        }));
+      } catch (err) {
+        // Provider recovery succeeded, but local close-proof publication did
+        // not. Never hot-loop or claim success: close the host ledger as
+        // explicit output uncertainty so normal runs block and cancellation
+        // can still converge with an audit warning.
+        appendHostReconcileBlock(
+          effect,
+          'HOST_EFFECT_OUTPUT_UNRECOVERABLE',
+          err instanceof Error ? err.message : String(err),
+        );
+        continue;
+      }
+      appendHostSuccessIfOpen(effect, manifestPath);
+    }
+    return allSettled;
+  }
+
+  function appendHostReconcileBlock(effect: V3OpenHostEffect, errorCode: string, _message: string): void {
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      const open = openV3HostEffects(events).find((candidate) => candidate.attemptId === effect.attemptId);
+      if (!open) return;
+      const safeErrorCode = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(errorCode)
+        ? errorCode
+        : 'HOST_EFFECT_UNCERTAIN';
+      append({
+        type: 'hostEffectUncertain',
+        nodeId: effect.nodeId,
+        instanceId: effect.instanceId,
+        attemptId: effect.attemptId,
+        executor: effect.executor,
+        reason:
+          safeErrorCode === 'HOST_EFFECT_TTL_EXPIRED' ? 'ttlExpired'
+          : safeErrorCode === 'HOST_EFFECT_INPUT_UNRECOVERABLE' ? 'inputUnrecoverable'
+          : safeErrorCode === 'HOST_EFFECT_OUTPUT_UNRECOVERABLE' ? 'outputUnrecoverable'
+          : safeErrorCode === 'HOST_EFFECT_DEFINITION_MISMATCH' ? 'definitionMismatch'
+          : safeErrorCode === 'HOST_EFFECT_UNKNOWN_PROVIDER' ? 'unknownProvider'
+          : safeErrorCode === 'HOST_EFFECT_INPUT_HASH_MISMATCH' ? 'inputHashMismatch'
+          : 'providerUncertain',
+        errorCode: safeErrorCode,
+      }, { durable: true });
+    });
+  }
+
+  function deferHostReconcile(
+    effect: V3OpenHostEffect,
+    errorCode: string,
+    maxRetries: number,
+  ): boolean {
+    return withJournalMutationSync(journalPath, ({ events, append }) => {
+      const open = openV3HostEffects(events).find((candidate) =>
+        candidate.attemptId === effect.attemptId);
+      if (!open) return false;
+      // Cancellation is a request to stop waiting, not permission to claim a
+      // provider outcome. A retryable/timeout reconciliation at this point is
+      // therefore closed as explicit uncertainty and carried into the bounded
+      // runCancelled warning set instead of delaying cancellation for minutes
+      // of exponential backoff.
+      if (materialize([...events]).runStatus === 'cancelling') {
+        append({
+          type: 'hostEffectUncertain',
+          nodeId: effect.nodeId,
+          instanceId: effect.instanceId,
+          attemptId: effect.attemptId,
+          executor: effect.executor,
+          reason: 'providerUncertain',
+          errorCode: 'HOST_EFFECT_CANCELLED_DURING_RECOVERY',
+        }, { durable: true });
+        return false;
+      }
+      const previous = events.filter((event) =>
+        event.type === 'hostEffectRetryDeferred' && event.attemptId === effect.attemptId).length;
+      if (previous >= maxRetries) {
+        append({
+          type: 'hostEffectUncertain',
+          nodeId: effect.nodeId,
+          instanceId: effect.instanceId,
+          attemptId: effect.attemptId,
+          executor: effect.executor,
+          reason: 'providerUncertain',
+          errorCode: 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED',
+        }, { durable: true });
+        return false;
+      }
+      const now = deps.now?.() ?? Date.now();
+      const retryCount = previous + 1;
+      const baseDelay = Math.min(60_000, 1_000 * (2 ** Math.min(retryCount - 1, 6)));
+      const jitter = [...`${effect.attemptId}:${retryCount}`]
+        .reduce((sum, char) => (sum + char.charCodeAt(0)) % 501, 0);
+      if (
+        !Number.isSafeInteger(now) ||
+        now < effect.attemptedAtMs ||
+        now > Number.MAX_SAFE_INTEGER - baseDelay - jitter
+      ) {
+        append({
+          type: 'hostEffectUncertain',
+          nodeId: effect.nodeId,
+          instanceId: effect.instanceId,
+          attemptId: effect.attemptId,
+          executor: effect.executor,
+          reason: 'providerUncertain',
+          errorCode: 'HOST_EFFECT_CLOCK_INVALID',
+        }, { durable: true });
+        return false;
+      }
+      append({
+        type: 'hostEffectRetryDeferred',
+        nodeId: effect.nodeId,
+        instanceId: effect.instanceId,
+        attemptId: effect.attemptId,
+        retryCount,
+        nextRetryAt: now + baseDelay + jitter,
+        errorCode: /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(errorCode)
+          ? errorCode
+          : 'HOST_EFFECT_RETRYABLE',
+      }, { durable: true });
+      return true;
+    });
+  }
+
+  function appendHostSuccessIfOpen(
+    identity: Pick<V3OpenHostEffect, 'nodeId' | 'instanceId' | 'attemptId'>,
+    manifestPath: string,
+  ): boolean {
+    return withJournalMutationSync(journalPath, ({ events, append }) => {
+      const open = openV3HostEffects(events).find((candidate) =>
+        candidate.attemptId === identity.attemptId &&
+        candidate.nodeId === identity.nodeId &&
+        candidate.instanceId === identity.instanceId);
+      if (!open) return false;
+      append({
+        type: 'nodeSucceeded',
+        nodeId: identity.nodeId,
+        instanceId: identity.instanceId,
+        attemptId: identity.attemptId,
+        manifestPath,
+      }, { durable: true });
+      return true;
+    });
+  }
+
+  function detachClosedHostInvocations(): void {
+    const openAttempts = new Set(openV3HostEffects(readJournal(journalPath)).map((effect) => effect.attemptId));
+    for (const [key, attemptId] of hostPromiseAttempts) {
+      if (openAttempts.has(attemptId)) continue;
+      hostDeadlineCancels.get(attemptId)?.();
+      hostPromiseAttempts.delete(key);
+      inFlight.delete(key);
+    }
+  }
+
+  function computeHostCanonicalHash(value: unknown): string {
+    // Local wrapper keeps the legacy host provider interface outside the v3
+    // journal model while enforcing the exact same canonical hash contract.
+    return computeInputHash(value);
   }
 
   function startWork(
@@ -1586,8 +2684,8 @@ export async function runWorkflow(
     botInFlight.set(botKey, (botInFlight.get(botKey) ?? 0) + 1);
     cliInFlight.set(botSnap.cliId, (cliInFlight.get(botSnap.cliId) ?? 0) + 1);
 
-    // `isGoalNode` is guaranteed by validateDag (host is rejected), but the
-    // contract types `runNode` to V3GoalNode, so narrow explicitly.
+    // The host branch is handled before startWork; narrow defensively because
+    // the injected runNode contract accepts goal nodes only.
     if (!isGoalNode(node)) {
       closeV3ArmedFenceWithoutSpawn(attemptDir, workerFence, 'setup_failed');
       appendEvent(journalPath, {
@@ -1938,9 +3036,17 @@ export async function runWorkflow(
     }
   }
 
-  function attachBlockingGate(node: V3Node, instanceId?: string): boolean {
-    const waitId = `${instanceId ?? node.id}-gate`;
-    const gate = normalizeGateWaitInput(node.humanGate!);
+  function attachBlockingGate(
+    node: V3Node,
+    instanceId?: string,
+    material?: {
+      gate: ReturnType<typeof normalizeGateWaitInput>;
+      hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+    },
+  ): boolean {
+    const waitId = v3GateWaitId(node.id, instanceId, material?.hostApproval);
+    const gate = material?.gate ?? normalizeGateWaitInput(node.humanGate!);
+    const hostApproval = material?.hostApproval;
     const resolveGate = deps.resolveGate;
     if (!resolveGate) {
       throw new Error(
@@ -1979,11 +3085,18 @@ export async function runWorkflow(
           resolution,
           by,
           ...(selected ? { selected } : {}),
+          ...(hostApproval ? { hostApproval } : {}),
         });
       });
     };
     const p = Promise.resolve()
-      .then(() => resolveGate({ nodeId: node.id, prompt: gate.prompt, waitId, runDir }))
+      .then(() => resolveGate({
+        nodeId: node.id,
+        prompt: gate.prompt,
+        waitId,
+        runDir,
+        ...(hostApproval ? { hostApproval } : {}),
+      }))
       .then(({ resolution, by, selected }) => {
         // Carry instanceId (mirror gateDispatched + the daemon suspend path): a
         // gateResolved WITHOUT it falls into state.ts's legacy per-node branch,
@@ -2005,10 +3118,18 @@ export async function runWorkflow(
   }
 
   function reattachBlockingGates(snap: ReturnType<typeof materialize>): void {
+    const events = readJournal(journalPath);
     for (const node of dag.nodes) {
       const state = snap.nodes.get(node.id);
       if (state?.status !== 'gateWaiting' || !node.humanGate) continue;
-      attachBlockingGate(node, state.effectiveInstanceId);
+      if (isHostNode(node)) {
+        if (!state.effectiveInstanceId) throw new Error(`v3 runtime: host gate "${node.id}" has no instance`);
+        const material = hostGateMaterial(node, events, state.effectiveInstanceId);
+        if (!material) throw new Error(`v3 runtime: host gate "${node.id}" has no durable prepared input`);
+        attachBlockingGate(node, state.effectiveInstanceId, material);
+      } else {
+        attachBlockingGate(node, state.effectiveInstanceId);
+      }
     }
   }
 
@@ -2016,20 +3137,35 @@ export async function runWorkflow(
     // Instance-level waitId so a revisit's fresh gate (`A#002-gate`) gets its own
     // wait file + card nonce, never overwriting the superseded `A#001-gate`
     // (stale-card protection). Legacy/no-instance → `<nodeId>-gate`.
-    const waitId = `${instanceId ?? node.id}-gate`;
-    const gate = normalizeGateWaitInput(node.humanGate!);
+    let gate = normalizeGateWaitInput(node.humanGate!);
+    let hostApproval: { attemptId: string; approvalDigest: string; inputHash: string } | undefined;
+    if (isHostNode(node)) {
+      if (!instanceId) throw new Error(`v3 runtime: host gate "${node.id}" has no instance`);
+      const material = hostGateMaterial(node, readJournal(journalPath), instanceId);
+      if (!material) return true; // async preparation is now in-flight
+      gate = material.gate;
+      hostApproval = material.hostApproval;
+    }
+    const waitId = v3GateWaitId(node.id, instanceId, hostApproval);
     if (!claimDispatch({
       type: 'gateDispatched',
       nodeId: node.id,
       ...(instanceId ? { instanceId } : {}),
       waitId,
+      ...(hostApproval ? { hostApproval } : {}),
     })) return false;
 
     if (gateMode === 'suspend') {
-      writePendingWait(runDir, { waitId, nodeId: node.id, ...(instanceId ? { instanceId } : {}), ...gate });
+      writePendingWait(runDir, {
+        waitId,
+        nodeId: node.id,
+        ...(instanceId ? { instanceId } : {}),
+        ...gate,
+        ...(hostApproval ? { hostApproval } : {}),
+      });
       return true;
     }
-    return attachBlockingGate(node, instanceId);
+    return attachBlockingGate(node, instanceId, { gate, ...(hostApproval ? { hostApproval } : {}) });
   }
 
   /** Synthesize the effective node a body instance runs as: the body
@@ -2224,14 +3360,30 @@ export async function runWorkflow(
 
   function pendingGateWaits(state: Map<string, { status: string; effectiveInstanceId?: string }>): V3PendingGate[] {
     const waits: V3PendingGate[] = [];
+    const events = readJournal(journalPath);
     for (const node of dag.nodes) {
       if (state.get(node.id)?.status !== 'gateWaiting') continue;
       const prompt = node.humanGate?.prompt;
       if (!prompt) continue;
-      const gate = normalizeGateWaitInput(node.humanGate!);
       // Instance-level waitId mirrors startGate (stale-card protection).
       const instanceId = state.get(node.id)?.effectiveInstanceId;
-      waits.push({ nodeId: node.id, waitId: `${instanceId ?? node.id}-gate`, ...gate });
+      if (isHostNode(node)) {
+        if (!instanceId) throw new Error(`v3 runtime: pending host gate "${node.id}" has no instance`);
+        const material = hostGateMaterial(node, events, instanceId);
+        if (!material) throw new Error(`v3 runtime: pending host gate "${node.id}" has no prepared input`);
+        waits.push({
+          nodeId: node.id,
+          waitId: v3GateWaitId(node.id, instanceId, material.hostApproval),
+          ...material.gate,
+          hostApproval: material.hostApproval,
+        });
+      } else {
+        waits.push({
+          nodeId: node.id,
+          waitId: `${instanceId ?? node.id}-gate`,
+          ...normalizeGateWaitInput(node.humanGate!),
+        });
+      }
     }
     return waits;
   }

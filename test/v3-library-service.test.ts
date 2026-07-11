@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { appendEvent } from '../src/workflows/v3/journal.js';
 import {
   computeSavedWorkflowGateDigest,
+  validateDagTemplate,
   type SavedWorkflowOwner,
   type SavedWorkflowRevisionDraft,
   type V3DagTemplate,
@@ -46,10 +47,12 @@ const OTHER: SavedWorkflowOwner = { openId: 'ou_other', larkAppId: 'cli_test' };
 function context(
   actor: SavedWorkflowOwner = OWNER,
   chatId = 'oc_a',
+  chatType: 'group' | 'p2p' = 'group',
 ) {
   return {
     actor,
     chatId,
+    chatType,
     rootMessageId: 'om_root',
     sessionId: 'session-1',
   };
@@ -160,6 +163,54 @@ function parameterizedRevision(): SavedWorkflowRevisionDraft {
     safety: {
       gateDigest: computeSavedWorkflowGateDigest(dagTemplate),
       sideEffects: [],
+    },
+  };
+}
+
+function scheduleRevision(): SavedWorkflowRevisionDraft {
+  const dagTemplate = validateDagTemplate({
+    nodes: [{
+      id: 'schedule',
+      type: 'host',
+      executor: 'botmux-schedule',
+      input: {
+        name: 'Follow up',
+        schedule: '30m',
+        prompt: 'follow up',
+        workingDir: '/workspace/project',
+        larkAppId: { $ref: 'context.larkAppId' },
+        chatId: { $ref: 'context.chatId' },
+        chatType: { $ref: 'context.chatType' },
+        rootMessageId: { $ref: 'context.rootMessageId' },
+        scope: 'chat',
+      },
+      depends: [],
+      inputs: [],
+      humanGate: { prompt: 'Create schedule?' },
+    }],
+  } satisfies V3DagTemplate);
+  return {
+    inputs: {},
+    contextRefs: ['larkAppId', 'chatId', 'chatType', 'rootMessageId'],
+    specTemplate: {
+      schemaVersion: 1,
+      title: 'Follow-up schedule',
+      requirement: 'create a schedule',
+      nodes: [{
+        sketchId: 'schedule',
+        goal: 'create a schedule',
+        input_needs: [],
+        expected_outputs: ['task id'],
+        acceptance: 'task exists',
+        risk_gate: true,
+        unknowns: [],
+      }],
+    },
+    specStatus: 'current',
+    dagTemplate,
+    safety: {
+      gateDigest: computeSavedWorkflowGateDigest(dagTemplate),
+      sideEffects: [{ nodeId: 'schedule', kind: 'botmux-schedule' }],
     },
   };
 }
@@ -393,6 +444,39 @@ describe('Saved Workflow application service', () => {
     })).rejects.toThrow(/缺少必填参数：city/);
     expect(existsSync(join(runsDir, 'missing-param-run'))).toBe(false);
   });
+
+  it.each(['group', 'p2p'] as const)(
+    'carries authenticated %s chatType into a Saved Workflow schedule run',
+    async (chatType) => {
+      const created = await createSavedWorkflow(dataDir, {
+        displayName: `Schedule ${chatType}`,
+        owner: OWNER,
+        scope: { kind: 'chat', chatId: 'oc_a' },
+        revision: scheduleRevision(),
+        publish: true,
+      });
+      const materialized = await instantiatePublishedSavedWorkflow({
+        dataDir,
+        ref: created.metadata.workflowId,
+        context: context(OWNER, 'oc_a', chatType),
+        bots: [],
+        baseDir: runsDir,
+        runId: `schedule-${chatType}`,
+      });
+      expect(materialized.resolvedContext).toMatchObject({
+        chatId: 'oc_a',
+        chatType,
+        larkAppId: OWNER.larkAppId,
+        rootMessageId: 'om_root',
+      });
+      expect(materialized.envelope.chatBinding?.chatType).toBe(chatType);
+      expect(materialized.dag.nodes[0]).toMatchObject({
+        type: 'host',
+        executor: 'botmux-schedule',
+        input: { chatType: { $ref: 'context.chatType' } },
+      });
+    },
+  );
 
   it('rejects unsupported live bots before publishing a run directory', async () => {
     const created = await createSavedWorkflow(dataDir, {
