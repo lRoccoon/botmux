@@ -32,4 +32,13 @@ describe('webhook invocation log dashboard', () => {
     expect(page).toContain('const query = event.currentTarget.value;');
     expect(page).not.toContain('query: event.currentTarget.value');
   });
+
+  it('shares the compact log layout between standalone and embedded routes', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/webhook-logs-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    expect(page).toContain('webhook-logs-content webhook-logs-panel');
+    expect(page).toContain('page webhook-logs-content webhook-logs-page');
+    expect(css).toContain('.webhook-logs-content form.webhook-log-toolbar');
+    expect(css).toContain('.webhook-logs-panel');
+  });
 });

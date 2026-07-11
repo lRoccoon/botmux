@@ -402,7 +402,9 @@ export function WebhookLogsContent(props: { embedded?: boolean } = {}): JSX.Elem
       </section>
     </>
   );
-  return props.embedded ? <section className="webhook-logs-panel">{body}</section> : <section className="page webhook-logs-page">{body}</section>;
+  return props.embedded
+    ? <section className="webhook-logs-content webhook-logs-panel">{body}</section>
+    : <section className="page webhook-logs-content webhook-logs-page">{body}</section>;
 }
 
 export function renderWebhookLogsPage(root: HTMLElement): PageDisposer {

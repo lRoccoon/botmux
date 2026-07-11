@@ -16285,9 +16285,16 @@ input.office-proxy-input[type="text"]:not([type=checkbox]):not([type=radio]):not
 }
 
 /* ── Webhook invocation logs ─────────────────────────────────────────────── */
-.webhook-logs-page {
+.webhook-logs-content {
+  display: flex;
+  flex-direction: column;
   gap: 12px;
   min-height: 0;
+}
+
+.webhook-logs-panel {
+  height: 100%;
+  overflow: hidden;
 }
 
 .webhook-log-heading-copy {
@@ -16368,7 +16375,7 @@ input.office-proxy-input[type="text"]:not([type=checkbox]):not([type=radio]):not
 }
 .webhook-log-metric.error > strong { color: var(--danger); }
 
-.webhook-logs-page form.webhook-log-toolbar {
+.webhook-logs-content form.webhook-log-toolbar {
   display: grid;
   grid-template-columns: minmax(340px, 1.6fr) minmax(180px, 0.72fr) minmax(150px, 0.62fr) minmax(170px, 0.72fr) auto;
   gap: 8px;
@@ -16376,25 +16383,25 @@ input.office-proxy-input[type="text"]:not([type=checkbox]):not([type=radio]):not
   padding-block: 4px;
 }
 
-.webhook-logs-page form.webhook-log-toolbar > input[type="search"] {
+.webhook-logs-content form.webhook-log-toolbar > input[type="search"] {
   width: 100%;
   min-width: 0;
 }
 
-.webhook-logs-page form.webhook-log-toolbar > .webhook-log-filter-menu {
+.webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu {
   width: 100%;
   min-width: 0;
 }
-.webhook-logs-page form.webhook-log-toolbar > .webhook-log-filter-menu > summary {
+.webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu > summary {
   box-sizing: border-box;
   width: 100%;
   justify-content: flex-start;
   padding-block: 2px;
 }
-.webhook-logs-page form.webhook-log-toolbar > .webhook-log-filter-menu .sect-sort-value {
+.webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu .sect-sort-value {
   max-width: calc(100% - 2px);
 }
-.webhook-logs-page form.webhook-log-toolbar > .webhook-log-filter-menu .sect-sort-pop {
+.webhook-logs-content form.webhook-log-toolbar > .webhook-log-filter-menu .sect-sort-pop {
   left: 0;
   width: max(100%, 220px);
   min-width: 100%;
@@ -16591,7 +16598,7 @@ button.webhook-log-row.active {
   padding: 15px 0;
   border-bottom: 1px solid var(--border-soft);
 }
-.webhook-log-detail-section:last-child { border-bottom: 0; }
+.webhook-log-detail-section:last-child { border-bottom: 0; padding-bottom: 18px; }
 .webhook-log-detail-section h3 {
   display: flex;
   align-items: center;
@@ -16695,22 +16702,24 @@ button.webhook-log-row.active {
   }
   main:has(.webhook-logs-page) .webhook-logs-page {
     height: 100%;
-    grid-template-rows: auto auto auto minmax(0, 1fr);
     overflow: hidden;
   }
-  .webhook-log-workspace { height: 100%; min-height: 0; }
+  .webhook-log-workspace {
+    flex: 1 1 0;
+    min-height: 0;
+  }
 }
 
 @media (max-width: 1200px) {
-  .webhook-logs-page form.webhook-log-toolbar { grid-template-columns: minmax(220px, 1fr) 170px 140px 155px auto; }
+  .webhook-logs-content form.webhook-log-toolbar { grid-template-columns: minmax(220px, 1fr) 170px 140px 155px auto; }
   .webhook-log-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .webhook-log-target-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 980px) {
   .webhook-log-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .webhook-logs-page form.webhook-log-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .webhook-logs-page form.webhook-log-toolbar > input[type="search"] { grid-column: 1 / -1; }
+  .webhook-logs-content form.webhook-log-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .webhook-logs-content form.webhook-log-toolbar > input[type="search"] { grid-column: 1 / -1; }
   .webhook-log-workspace { grid-template-columns: 1fr; }
   .webhook-log-list-panel { max-height: 520px; }
   .webhook-log-detail-panel { max-height: none; }
@@ -16719,10 +16728,10 @@ button.webhook-log-row.active {
 
 @media (max-width: 600px) {
   .webhook-log-metrics,
-  .webhook-logs-page form.webhook-log-toolbar,
+  .webhook-logs-content form.webhook-log-toolbar,
   .webhook-log-facts,
   .webhook-log-target-facts { grid-template-columns: 1fr; }
-  .webhook-logs-page form.webhook-log-toolbar > input[type="search"] { grid-column: auto; }
+  .webhook-logs-content form.webhook-log-toolbar > input[type="search"] { grid-column: auto; }
   .webhook-log-live { display: none; }
   .webhook-log-detail-head { grid-template-columns: 1fr; }
   .webhook-log-detail-head > button { justify-self: start; }
