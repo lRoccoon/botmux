@@ -42,7 +42,7 @@ import {
   serializeFrozenBotSnapshots,
 } from './bot-resolve.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { withFileLockSync } from '../../utils/file-lock.js';
+import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import {
   artifactRef,
   loadAuthorizedV3Run,
@@ -52,6 +52,7 @@ import {
   type PublishRunEnvelopeResult,
   type V3ManualCliRunEnvelope,
 } from './run-envelope.js';
+import { V3_DRIVE_LEASE_MAX_WAIT_MS, v3DriveLeaseTarget } from './drive-lease.js';
 
 interface V3RunArgs {
   dagPath: string;
@@ -355,9 +356,20 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
 
   let outcome;
   try {
-    outcome = await runWorkflow(dag, deps, opts);
+    // Same cross-process drive lease as the daemon. A blocking CLI humanGate
+    // intentionally keeps the lease for the whole prompt so no daemon/manual
+    // runner can spawn a second scheduler for the same on-disk run.
+    outcome = await withFileLock(
+      v3DriveLeaseTarget(args.baseDir, dag.runId),
+      () => runWorkflow(dag, deps, opts),
+      { maxWaitMs: V3_DRIVE_LEASE_MAX_WAIT_MS },
+    );
   } catch (err) {
-    console.error(`\n❌ run 失败（启动期）: ${err instanceof Error ? err.message : String(err)}`);
+    const detail = err instanceof Error ? err.message : String(err);
+    const message = detail.includes('file-lock timeout waiting for')
+      ? `另一进程正在驱动 run "${dag.runId}"，请等待其结束后重试`
+      : detail;
+    console.error(`\n❌ run 失败（启动期）: ${message}`);
     process.exit(1);
   }
 

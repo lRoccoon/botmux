@@ -83,6 +83,8 @@ export interface V3RunSnapshot {
  *   edgeResolved       → edges[first `${from}->${to}`] (first-wins)
  *   nodeSkipped        → skipped
  *   nodeCancelled      → cancelled (settle-wins; late same-attempt settle ignored)
+ *   nodeAttemptDrained → pending only when the exact current attempt was
+ *                        still running; otherwise resource-audit only
  */
 export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const nodes: V3RunState = new Map();
@@ -167,6 +169,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
       cancelRequestId !== undefined &&
       e.type !== 'runCancelRequested' &&
       e.type !== 'nodeCancelled' &&
+      e.type !== 'nodeAttemptDrained' &&
       e.type !== 'runCancelled'
     ) continue;
     switch (e.type) {
@@ -288,6 +291,31 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         if (e.instanceId) recordInstance(e.nodeId, e.instanceId, 'cancelled', false);
         else set(e.nodeId, 'cancelled');
         break;
+      case 'nodeAttemptDrained': {
+        // A drained peer must be retryable after a blocked run is reopened or
+        // after crash recovery. Never revive an obsolete/settled instance, and
+        // A legacy runBlocked may precede peer close; reset that exact peer so
+        // a later retry re-dispatches it. True terminals/cancellation stay
+        // audit-only, and runStatus/blockedNodeId themselves are unchanged.
+        if (runStatus !== 'running' && runStatus !== 'blocked') break;
+        const key = e.instanceId ?? e.nodeId;
+        if (attempts.get(key) !== e.attemptId) break;
+        if (e.instanceId) {
+          if (instances.get(e.instanceId)?.status !== 'running') break;
+          instances.set(e.instanceId, { status: 'pending' });
+          const current = nodes.get(e.nodeId);
+          if (current?.effectiveInstanceId === e.instanceId && current.status === 'running') {
+            nodes.set(e.nodeId, {
+              status: 'pending',
+              effectiveInstanceId: e.instanceId,
+              ...(current.gateCleared ? { gateCleared: true } : {}),
+            });
+          }
+        } else if (nodes.get(e.nodeId)?.status === 'running') {
+          set(e.nodeId, 'pending');
+        }
+        break;
+      }
       case 'runCancelRequested':
         // First request wins. A true terminal event committed before it wins
         // instead; requestV3RunCancel normally prevents that combination, but

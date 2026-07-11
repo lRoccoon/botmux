@@ -49,6 +49,7 @@ describe('buildV3BlockedCard', () => {
       attemptId: 'deploy/attempts/001',
       nonce: v3BlockedCardNonce(INPUT.runId, 'deploy', 'deploy/attempts/001'),
     });
+    expect(JSON.stringify(card)).toContain('被中止的并行节点也会重新执行');
   });
 
   it('retried 冻结卡：green + 无重试按钮 + 显示新 attempt', () => {

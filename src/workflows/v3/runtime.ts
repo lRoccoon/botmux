@@ -39,6 +39,7 @@ import {
 import { decideNext, type V3Action } from './orchestrator.js';
 import {
   appendEvent,
+  appendEventDurable,
   readJournal,
   withJournalMutationSync,
   type StoredEvent,
@@ -79,6 +80,10 @@ import {
   type ValidateManifest,
 } from './contract.js';
 import { savedWorkflowBindingsForNode } from './template-bindings.js';
+import {
+  openV3WorkerAttempts,
+  type V3OpenWorkerAttempt,
+} from './attempt-ledger.js';
 
 // ─── goal.txt rendering ─────────────────────────────────────────────────────
 
@@ -616,8 +621,10 @@ export async function runWorkflow(
   const botInFlight = new Map<string, number>();
   const cliInFlight = new Map<string, number>();
   const nodeControllers = new Map<string, AbortController>();
+  const controllerAttemptIds = new Map<string, string>();
   const nodeAbortCleanups = new Map<string, () => void>();
-  const externalCancelSignals = new Map<string, { sigintAt: number; sigkillAt?: number }>();
+  const blockingGateOwners = new Map<string, symbol>();
+  const externalDrainSignals = new Map<string, { sigintAt: number; sigkillAt?: number }>();
   const missingFenceNoneSince = new Map<string, number>();
   // These values must be initialized before the main loop starts: recovery
   // helpers are function declarations (hoisted), but a later lexical const
@@ -625,22 +632,31 @@ export async function runWorkflow(
   const EXTERNAL_CANCEL_KILL_GRACE_MS = 5_000;
   const MISSING_FENCE_DOUBLE_SCAN_MS = 500;
 
+  type AttemptDrainReason = Extract<V3Event, { type: 'nodeAttemptDrained' }>['reason'];
+  const controllerDrainReason = (controller: AbortController): AttemptDrainReason | undefined => {
+    const reason = controller.signal.reason as unknown;
+    if (typeof reason !== 'object' || reason === null) return undefined;
+    const candidate = reason as { kind?: unknown; drainReason?: unknown };
+    if (candidate.kind !== 'attemptDrain') return undefined;
+    return typeof candidate.drainReason === 'string'
+      ? candidate.drainReason as AttemptDrainReason
+      : undefined;
+  };
+
   while (true) {
     const events = readJournal(journalPath);
     const snap = materialize(events);
     writeState(statePath, snap);
 
-    if (
-      snap.runStatus === 'succeeded' ||
-      snap.runStatus === 'failed' ||
-      snap.runStatus === 'cancelled'
-    ) break;
-
     // An AbortSignal is only the low-latency delivery channel. Turn a bare
     // signal into the same durable journal intent so a direct/dev caller also
     // gets replay-correct cancellation instead of the old "running → failed"
     // fallback. Production daemon paths persist this intent before aborting.
-    if (opts.cancelSignal?.aborted && snap.runStatus !== 'cancelling') {
+    if (
+      opts.cancelSignal?.aborted &&
+      snap.runStatus !== 'cancelling' &&
+      !isTrueRunTerminal(snap.runStatus)
+    ) {
       requestRuntimeCancellation();
       continue;
     }
@@ -660,7 +676,9 @@ export async function runWorkflow(
       // ignored by the cancellation journal cut. Suspend-mode daemon gates are
       // not retained in memory, but clearing both shapes keeps the runtime total.
       for (const key of [...inFlight.keys()]) {
-        if (key.endsWith('::gate')) inFlight.delete(key);
+        if (!key.endsWith('::gate')) continue;
+        blockingGateOwners.delete(key);
+        inFlight.delete(key);
       }
 
       if (inFlight.size > 0) {
@@ -674,7 +692,10 @@ export async function runWorkflow(
       // proves every outer worker closed. Unknown stays cancelling.
       let externalDrained = false;
       try {
-        externalDrained = drainExternallyOwnedAttempts(snap.cancelRequestId);
+        externalDrained = drainExternallyOwnedAttempts({
+          kind: 'runCancellation',
+          cancelRequestId: snap.cancelRequestId,
+        });
       } catch {
         // Integrity/probe uncertainty is deliberately fail-safe: keep the
         // durable cancelling state and retry rather than report a false close.
@@ -691,9 +712,56 @@ export async function runWorkflow(
       continue;
     }
 
-    // blocked is terminal-for-now and returns to the caller; only a later
-    // retry/grant or cancellation intent re-opens it.
+    const trueTerminal =
+      snap.runStatus === 'succeeded' ||
+      snap.runStatus === 'failed' ||
+      snap.runStatus === 'cancelled';
+
+    // New runs never publish these boundaries with an open attempt ledger.
+    // The recovery path also cleans histories written by an older runtime that
+    // reported terminal/blocked before a peer worker had actually closed.
+    if (trueTerminal || snap.runStatus === 'blocked') {
+      const open = openV3WorkerAttempts(events);
+      if (open.length > 0) {
+        dropAllBlockingGatePromises();
+        const drained = await quiesceAttempts(
+          open,
+          trueTerminal ? 'orphanRecovery' : 'terminalPeer',
+        );
+        if (!drained) await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
+      break;
+    }
+
+    // A non-running state not handled above is an integrity anomaly. Keep the
+    // historical defensive exit shape rather than spinning forever.
     if (snap.runStatus !== 'running') break;
+
+    // Revisit supersession and early release are scheduling state, not process
+    // close proof. Drain obsolete resources before a replacement instance can
+    // dispatch or the graph can move to a run-level boundary.
+    dropObsoleteBlockingGatePromises(snap);
+    const obsolete = obsoleteOpenAttempts(events, snap);
+    if (obsolete.length > 0) {
+      const drained = await quiesceAttempts(obsolete, 'obsoleteAttempt');
+      if (!drained) await new Promise((resolve) => setTimeout(resolve, 250));
+      continue;
+    }
+
+    // A journal-running attempt without this runtime's exact controller is a
+    // crash/rolling-restart orphan. It cannot be adopted safely because the
+    // manifest-validation Promise lived in the old process; fence-drain it and
+    // let AttemptDrained requeue a fresh, monotonically numbered attempt.
+    const orphaned = openV3WorkerAttempts(events).filter((attempt) => {
+      const key = attempt.instanceId ?? attempt.nodeId;
+      return controllerAttemptIds.get(key) !== attempt.attemptId;
+    });
+    if (orphaned.length > 0) {
+      const drained = await quiesceAttempts(orphaned, 'orphanRecovery');
+      if (!drained) await new Promise((resolve) => setTimeout(resolve, 250));
+      continue;
+    }
 
     const actions = decideNext(dag, snap.nodes, snap.loops, snap.edges, snap.instances);
 
@@ -706,19 +774,25 @@ export async function runWorkflow(
         a.kind === 'completeRunBlocked',
     );
     if (terminal) {
-      const event: V3Event = terminal.kind === 'completeRunSucceeded'
-        ? { type: 'runSucceeded' }
-        : terminal.kind === 'completeRunFailed'
-          ? {
-              type: 'runFailed',
-              failedNodeId: terminal.failedNodeId,
-              reason: terminal.reason,
-              detail: terminal.detail,
-            }
-          : { type: 'runBlocked', blockedNodeId: terminal.blockedNodeId };
-      appendRunTerminalUnlessCancelling(event);
+      // Gate promises have no process to drain and their guarded callbacks turn
+      // stale once this boundary commits. Worker attempts, however, must prove
+      // outer close before the terminal event can be published.
+      dropAllBlockingGatePromises();
+      const open = openV3WorkerAttempts(events);
+      if (open.length > 0) {
+        const drained = await quiesceAttempts(open, 'terminalPeer');
+        if (!drained) await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
+      appendRunTerminalIfQuiescent();
       continue;
     }
+
+    // A previous blocking/manual drive may have returned `blocked` after
+    // abandoning an unrelated human prompt. Once retry re-opens the run,
+    // attach a fresh resolver to that durable gateWaiting state before work is
+    // scheduled again. Suspend-mode gates are re-posted by the daemon instead.
+    if (gateMode === 'blocking') reattachBlockingGates(snap);
 
     // Control sweep: each action is one cheap journal append (no worker
     // involved), applied together and re-ticked — same single-exit shape as
@@ -785,6 +859,12 @@ export async function runWorkflow(
       if (startedThisTick === 0) {
         const pendingWaits = gateMode === 'suspend' ? pendingGateWaits(snap.nodes) : [];
         if (pendingWaits.length > 0) {
+          const open = openV3WorkerAttempts(events);
+          if (open.length > 0) {
+            const drained = await quiesceAttempts(open, 'orphanRecovery');
+            if (!drained) await new Promise((resolve) => setTimeout(resolve, 250));
+            continue;
+          }
           return { reason: 'awaitingGate', pendingWaits, runDir };
         }
         // Not terminal, nothing running, nothing dispatchable — a correct
@@ -835,16 +915,32 @@ export async function runWorkflow(
     });
   }
 
-  /** Run completion and cancellation share the journal lock. Whichever event
-   *  linearizes first wins; a terminal action computed from a stale snapshot
-   *  can never land after runCancelRequested. */
-  function appendRunTerminalUnlessCancelling(event: Extract<
-    V3Event,
-    { type: 'runSucceeded' | 'runFailed' | 'runBlocked' }
-  >): boolean {
+  /** Re-derive and publish a terminal only while holding the journal lock and
+   *  only after the resource ledger proves every worker attempt closed.
+   *  Cancellation/dispatch races therefore linearize against the same lock. */
+  function appendRunTerminalIfQuiescent(): boolean {
     return withJournalMutationSync(journalPath, ({ events, append }) => {
       const snap = materialize([...events]);
       if (snap.runStatus !== 'running') return false;
+      if (openV3WorkerAttempts(events).length > 0) return false;
+      const terminal = decideNext(dag, snap.nodes, snap.loops, snap.edges, snap.instances).find(
+        (action) =>
+          action.kind === 'completeRunSucceeded' ||
+          action.kind === 'completeRunFailed' ||
+          action.kind === 'completeRunBlocked',
+      );
+      if (!terminal) return false;
+      const event: Extract<V3Event, { type: 'runSucceeded' | 'runFailed' | 'runBlocked' }> =
+        terminal.kind === 'completeRunSucceeded'
+          ? { type: 'runSucceeded' }
+          : terminal.kind === 'completeRunFailed'
+            ? {
+                type: 'runFailed',
+                failedNodeId: terminal.failedNodeId,
+                reason: terminal.reason,
+                detail: terminal.detail,
+              }
+            : { type: 'runBlocked', blockedNodeId: terminal.blockedNodeId };
       append(event, { durable: true });
       return true;
     });
@@ -914,6 +1010,76 @@ export async function runWorkflow(
     });
   }
 
+  function dropAllBlockingGatePromises(): void {
+    // A gate resolver is not a worker resource and cannot be force-killed. Its
+    // completion path re-checks current journal state, so removing it from the
+    // scheduler barrier is safe and prevents an unrelated human prompt from
+    // holding a fail-fast terminal forever.
+    for (const key of [...inFlight.keys()]) {
+      if (!key.endsWith('::gate')) continue;
+      blockingGateOwners.delete(key);
+      inFlight.delete(key);
+    }
+  }
+
+  function dropObsoleteBlockingGatePromises(
+    snap: ReturnType<typeof materialize>,
+  ): void {
+    for (const key of [...inFlight.keys()]) {
+      if (!key.endsWith('::gate')) continue;
+      const dispatchKey = key.slice(0, -'::gate'.length);
+      const instance = snap.instances.get(dispatchKey);
+      const node = snap.nodes.get(dispatchKey);
+      if (
+        instance?.status === 'cancelled' ||
+        instance?.status === 'superseded' ||
+        node?.status === 'cancelled'
+      ) {
+        blockingGateOwners.delete(key);
+        inFlight.delete(key);
+      }
+    }
+  }
+
+  function obsoleteOpenAttempts(
+    events: StoredEvent[],
+    snap: ReturnType<typeof materialize>,
+  ): V3OpenWorkerAttempt[] {
+    return openV3WorkerAttempts(events).filter((attempt) => {
+      const state = attempt.instanceId
+        ? snap.instances.get(attempt.instanceId)
+        : snap.nodes.get(attempt.nodeId);
+      return state?.status === 'cancelled' || state?.status === 'superseded';
+    });
+  }
+
+  /** Abort and prove close for a selected attempt set. Local promises are the
+   *  primary proof; anything not owned in memory falls back to durable fence
+   *  recovery. Returns true only when the selected ledger set is empty. */
+  async function quiesceAttempts(
+    attempts: readonly V3OpenWorkerAttempt[],
+    reason: AttemptDrainReason,
+  ): Promise<boolean> {
+    if (attempts.length === 0) return true;
+    const ids = new Set(attempts.map((attempt) => attempt.attemptId));
+    const local = new Set<Promise<void>>();
+    for (const attempt of attempts) {
+      const key = attempt.instanceId ?? attempt.nodeId;
+      if (controllerAttemptIds.get(key) !== attempt.attemptId) continue;
+      const controller = nodeControllers.get(key);
+      if (controller && !controller.signal.aborted) {
+        controller.abort({ kind: 'attemptDrain', drainReason: reason });
+      }
+      const promise = inFlight.get(key);
+      if (promise) local.add(promise);
+    }
+    if (local.size > 0) {
+      await Promise.allSettled(local);
+      return false; // reload the durable ledger before touching external fences
+    }
+    return drainExternallyOwnedAttempts({ kind: 'quiescence', attemptIds: ids, reason });
+  }
+
   /** Record a worker-fenced attempt cancellation once. */
   function appendCancelledAttempt(
     nodeId: string,
@@ -936,82 +1102,113 @@ export async function runWorkflow(
     });
   }
 
+  /** Persist the resource-close proof before a fence is removed. Idempotent:
+   *  a normal verdict or an earlier drain event already closes the ledger. */
+  function appendAttemptDrained(
+    nodeId: string,
+    instanceId: string | undefined,
+    attemptId: string,
+    reason: AttemptDrainReason,
+  ): void {
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      const open = openV3WorkerAttempts(events).find((attempt) => attempt.attemptId === attemptId);
+      if (!open) return;
+      if (open.nodeId !== nodeId || open.instanceId !== instanceId) {
+        throw new Error(`v3 runtime: attempt identity changed while draining (${attemptId})`);
+      }
+      const priorOrphanRecoveries = reason === 'orphanRecovery'
+        ? events.filter((event) =>
+            event.type === 'nodeAttemptDrained' &&
+            event.reason === 'orphanRecovery' &&
+            (event.instanceId ?? event.nodeId) === (instanceId ?? nodeId)).length
+        : 0;
+      // A repeatedly orphaned worker would otherwise auto-dispatch forever on
+      // daemon restarts. Two replay-safe recovery attempts are allowed; the
+      // third close writes a node verdict that is itself post-close proof and
+      // asks a human to retry explicitly. One durable event avoids a crash gap
+      // between "drained to pending" and "block".
+      if (reason === 'orphanRecovery' && priorOrphanRecoveries >= 2) {
+        const before = materialize([...events]);
+        const state = instanceId ? before.instances.get(instanceId) : before.nodes.get(nodeId);
+        if (
+          before.runStatus === 'running' &&
+          state?.status === 'running' &&
+          latestAttemptIdFor([...events], instanceId ?? nodeId) === attemptId
+        ) {
+          append({
+            type: 'nodeBlocked',
+            nodeId,
+            ...(instanceId ? { instanceId } : {}),
+            attemptId,
+            errorClass: 'workerError',
+            errorCode: 'ORPHAN_RECOVERY_EXHAUSTED',
+            message: 'worker became orphaned repeatedly; retry manually after checking daemon/CLI stability',
+          }, { durable: true });
+          return;
+        }
+      }
+      append({
+        type: 'nodeAttemptDrained',
+        nodeId,
+        ...(instanceId ? { instanceId } : {}),
+        attemptId,
+        reason,
+      }, { durable: true });
+    });
+  }
+
+  type ExternalDrainMode =
+    | { kind: 'runCancellation'; cancelRequestId: string }
+    | { kind: 'quiescence'; attemptIds: ReadonlySet<string>; reason: AttemptDrainReason };
+
   /**
-   * Drain attempts owned by a previous daemon. The drive lease guarantees no
-   * second current-version runtime is spawning concurrently; attempt fences
-   * prove close across crashes. Pre-fence runs use exact Linux `/proc` binding
-   * plus two separated empty scans (startup's global orphan reaper runs first).
-   * Unsupported/ambiguous discovery never guesses: the run stays cancelling.
+   * Drain attempts not represented by an in-memory Promise in this runtime.
+   * The drive lease guarantees a single scheduler. Fences prove close across
+   * crashes; pre-fence runs use exact Linux discovery plus two separated empty
+   * scans. Unknown/ambiguous/corrupt resource truth always stays unquiesced.
    */
-  function drainExternallyOwnedAttempts(cancelRequestId: string): boolean {
+  function drainExternallyOwnedAttempts(mode: ExternalDrainMode): boolean {
     const events = readJournal(journalPath);
     const snap = materialize(events);
-    if (snap.runStatus !== 'cancelling' || snap.cancelRequestId !== cancelRequestId) return false;
+    if (
+      mode.kind === 'runCancellation' &&
+      (snap.runStatus !== 'cancelling' || snap.cancelRequestId !== mode.cancelRequestId)
+    ) return false;
 
-    type RecoverableAttempt = {
-      nodeId: string;
-      instanceId?: string;
-      attemptId: string;
-    };
-    const attempts = new Map<string, RecoverableAttempt>();
-    const workerSettledAttempts = new Set<string>();
-    for (const event of events) {
-      if (
-        event.type === 'nodeSucceeded' ||
-        event.type === 'nodeFailed' ||
-        event.type === 'nodeBlocked' ||
-        (event.type === 'nodeCancelled' && event.reason === 'runCancelled')
-      ) {
-        if (event.attemptId) workerSettledAttempts.add(event.attemptId);
-        continue;
-      }
-      if (event.type !== 'nodeDispatched' && event.type !== 'nodeWorkerFenceArmed') continue;
-      const prior = attempts.get(event.attemptId);
-      if (
-        prior &&
-        (prior.nodeId !== event.nodeId || prior.instanceId !== event.instanceId)
-      ) {
-        throw new Error(`v3 runtime: attempt identity changed in journal (${event.attemptId})`);
-      }
-      attempts.set(event.attemptId, {
-        nodeId: event.nodeId,
-        ...(event.instanceId ? { instanceId: event.instanceId } : {}),
-        attemptId: event.attemptId,
-      });
-    }
+    const attempts = openV3WorkerAttempts(events).filter((attempt) =>
+      mode.kind === 'runCancellation' || mode.attemptIds.has(attempt.attemptId));
+    if (attempts.length === 0) return true;
 
-    // Every currently-running worker must have a dispatch record. Keep this
-    // explicit so a malformed/legacy journal never turns "unknown" into a
-    // false proof of closure. Structured-loop composites were neutral-cancelled
-    // before this function and therefore are no longer running here.
+    const drainReason: AttemptDrainReason = mode.kind === 'runCancellation'
+      ? 'runCancellation'
+      : mode.reason;
     let allDrained = true;
-    for (const [nodeId, nodeState] of snap.nodes) {
-      if (nodeState.status !== 'running') continue;
-      const instanceId = nodeState.effectiveInstanceId;
-      const attemptId = latestAttemptIdFor(events, instanceId ?? nodeId);
-      if (!attemptId) {
-        allDrained = false;
-        continue;
-      }
-      if (!attempts.has(attemptId)) {
-        attempts.set(attemptId, {
-          nodeId,
-          ...(instanceId ? { instanceId } : {}),
-          attemptId,
-        });
-      }
-    }
 
-    // Do not limit recovery to the materialized "running" node view. An
-    // early-release loser is journalled nodeCancelled before its process
-    // closes, and a revisit can supersede an old instance while that worker is
-    // still unwinding. Their armed/active fences remain resource truth and must
-    // be drained before the run-level terminal is published.
-    for (const attempt of attempts.values()) {
+    const recordClosed = (
+      attempt: V3OpenWorkerAttempt,
+      fence?: Parameters<typeof removeV3AttemptWorkerFence>[1],
+    ): boolean => {
       const { nodeId, instanceId, attemptId } = attempt;
-      const state = instanceId ? snap.instances.get(instanceId) : snap.nodes.get(nodeId);
-      const currentRunning = state?.status === 'running' &&
-        latestAttemptIdFor(events, instanceId ?? nodeId) === attemptId;
+      try {
+        // Journal proof must be durable before deleting the sidecar. A crash in
+        // the opposite order would turn a proven close back into ambiguity.
+        appendAttemptDrained(nodeId, instanceId, attemptId, drainReason);
+        if (mode.kind === 'runCancellation') {
+          const latest = materialize(readJournal(journalPath));
+          const state = instanceId ? latest.instances.get(instanceId) : latest.nodes.get(nodeId);
+          if (state?.status === 'running') appendCancelledAttempt(nodeId, instanceId, attemptId);
+        }
+        if (fence) removeV3AttemptWorkerFence(safeAttemptDirFromId(attemptId), fence);
+        externalDrainSignals.delete(attemptId);
+        missingFenceNoneSince.delete(attemptId);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    for (const attempt of attempts) {
+      const { attemptId } = attempt;
       let attemptDir: string;
       try {
         attemptDir = safeAttemptDirFromId(attemptId);
@@ -1032,11 +1229,6 @@ export async function runWorkflow(
         const ownedByThisRuntime = fence.ownerPid === process.pid &&
           fence.ownerProcStart === readProcessStartIdentity(process.pid);
         if (ownedByThisRuntime) {
-          // This happens when missing-fence discovery found a worker but it
-          // vanished before activate(), leaving the recovery daemon's own
-          // armed record. Re-run exact discovery instead of asking the generic
-          // recovery helper (which correctly refuses to steal a live owner's
-          // fence and would therefore deadlock this self-owned repair).
           const discovery = discoverV3AttemptWorker(attemptDir);
           if (discovery.status === 'one') {
             try {
@@ -1057,10 +1249,7 @@ export async function runWorkflow(
             }
             try {
               const closed = closeV3ArmedFenceWithoutSpawn(attemptDir, fence, 'setup_failed');
-              if (currentRunning) appendCancelledAttempt(nodeId, instanceId, attemptId);
-              removeV3AttemptWorkerFence(attemptDir, closed);
-              externalCancelSignals.delete(attemptId);
-              missingFenceNoneSince.delete(attemptId);
+              if (!recordClosed(attempt, closed)) allDrained = false;
               continue;
             } catch {
               allDrained = false;
@@ -1086,10 +1275,7 @@ export async function runWorkflow(
               allDrained = false;
               continue;
             }
-            if (currentRunning) appendCancelledAttempt(nodeId, instanceId, attemptId);
-            removeV3AttemptWorkerFence(attemptDir, fence);
-            externalCancelSignals.delete(attemptId);
-            missingFenceNoneSince.delete(attemptId);
+            if (!recordClosed(attempt, fence)) allDrained = false;
             continue;
           } else {
             missingFenceNoneSince.delete(attemptId);
@@ -1100,30 +1286,10 @@ export async function runWorkflow(
       }
 
       if (!fence) {
-        // A worker outcome is appended only after the outer process closes, so
-        // a settled attempt whose fence was subsequently cleaned needs no
-        // legacy scan. Early-release and supersede events are deliberately not
-        // in workerSettledAttempts: they can precede process close. A current
-        // running attempt or an unsettled current-version fence marker still
-        // requires conservative /proc proof when its sidecar is missing.
-        // Pre-fence one-release runs have no marker, but an early-release or
-        // superseded attempt can still be unwinding. Any dispatched attempt
-        // without a post-close worker outcome therefore needs exact discovery;
-        // ordinary historical success/failure/block attempts skip it.
-        const missingNeedsDiscovery = !workerSettledAttempts.has(attemptId);
-        if (!missingNeedsDiscovery) {
-          externalCancelSignals.delete(attemptId);
-          missingFenceNoneSince.delete(attemptId);
-          continue;
-        }
         const discovery = discoverV3AttemptWorker(attemptDir);
         if (discovery.status === 'one') {
           try {
-            const armed = armV3AttemptWorkerFence({
-              attemptDir,
-              runId: dag.runId,
-              attemptId,
-            });
+            const armed = armV3AttemptWorkerFence({ attemptDir, runId: dag.runId, attemptId });
             fence = activateV3AttemptWorkerFence({
               attemptDir,
               armed,
@@ -1139,9 +1305,7 @@ export async function runWorkflow(
             allDrained = false;
             continue;
           }
-          if (currentRunning) appendCancelledAttempt(nodeId, instanceId, attemptId);
-          externalCancelSignals.delete(attemptId);
-          missingFenceNoneSince.delete(attemptId);
+          if (!recordClosed(attempt)) allDrained = false;
           continue;
         } else {
           missingFenceNoneSince.delete(attemptId);
@@ -1150,15 +1314,9 @@ export async function runWorkflow(
         }
       }
 
-      const probe = probeV3AttemptWorkerFence(attemptDir, {
-        runId: dag.runId,
-        attemptId,
-      });
+      const probe = probeV3AttemptWorkerFence(attemptDir, { runId: dag.runId, attemptId });
       if (probe.status === 'dead') {
-        if (currentRunning) appendCancelledAttempt(nodeId, instanceId, attemptId);
-        removeV3AttemptWorkerFence(attemptDir, probe.fence);
-        externalCancelSignals.delete(attemptId);
-        missingFenceNoneSince.delete(attemptId);
+        if (!recordClosed(attempt, probe.fence)) allDrained = false;
         continue;
       }
       if (probe.status !== 'alive') {
@@ -1166,12 +1324,8 @@ export async function runWorkflow(
         continue;
       }
 
-      if (!signalExternallyOwnedWorker(attemptDir, attemptId, probe.fence)) {
-        allDrained = false;
-        continue;
-      }
-      // A signal is only a request. Re-probe on the next tick and append the
-      // node cancellation only after the process identity is gone/closed.
+      signalExternallyOwnedWorker(attemptDir, attemptId, probe.fence);
+      // A signal is only a request. Re-probe before publishing the close proof.
       allDrained = false;
     }
     return allDrained;
@@ -1203,7 +1357,7 @@ export async function runWorkflow(
     fence: V3ActiveAttemptWorkerFence,
   ): boolean {
     const now = Date.now();
-    const prior = externalCancelSignals.get(attemptId);
+    const prior = externalDrainSignals.get(attemptId);
     const signal = !prior
       ? 'SIGINT'
       : prior.sigkillAt === undefined && now - prior.sigintAt >= EXTERNAL_CANCEL_KILL_GRACE_MS
@@ -1213,8 +1367,8 @@ export async function runWorkflow(
     const result = signalV3AttemptWorker(attemptDir, fence, signal);
     if (result.status === 'dead') return true;
     if (result.status !== 'signalled') return false;
-    if (!prior) externalCancelSignals.set(attemptId, { sigintAt: now });
-    else externalCancelSignals.set(attemptId, { ...prior, sigkillAt: now });
+    if (!prior) externalDrainSignals.set(attemptId, { sigintAt: now });
+    else externalDrainSignals.set(attemptId, { ...prior, sigkillAt: now });
     return false;
   }
 
@@ -1449,6 +1603,7 @@ export async function runWorkflow(
     if (opts.cancelSignal?.aborted) relayAbort();
     else opts.cancelSignal?.addEventListener('abort', relayAbort, { once: true });
     nodeControllers.set(dispatchKey, controller);
+    controllerAttemptIds.set(dispatchKey, attemptId);
     nodeAbortCleanups.set(dispatchKey, () => opts.cancelSignal?.removeEventListener('abort', relayAbort));
 
     const req: RunNodeRequest = {
@@ -1481,10 +1636,45 @@ export async function runWorkflow(
       },
     };
 
+    let closeProofPersisted = false;
+    const appendWorkerOutcome = (event: Extract<
+      V3Event,
+      { type: 'nodeSucceeded' | 'nodeFailed' | 'nodeBlocked' }
+    >): void => {
+      // This is resource-close truth, not only scheduling state. Persist it
+      // before `.finally` may remove the attempt fence; otherwise a crash could
+      // lose the verdict and leave only a missing-fence legacy recovery path.
+      appendEventDurable(journalPath, event);
+      closeProofPersisted = true;
+    };
+    const appendDrainProof = (reason: AttemptDrainReason): void => {
+      appendAttemptDrained(node.id, instanceId, attemptId, reason);
+      closeProofPersisted = true;
+    };
+
     const p = Promise.resolve()
       .then(() => deps.runNode(req))
       .then(async (result) => {
-        if (result.status === 'cancelled' || isRunCancelling()) {
+        const drainReason = controllerDrainReason(controller);
+        if (drainReason) {
+          appendDrainProof(drainReason);
+          return;
+        }
+        const cancellationActive = opts.cancelSignal?.aborted || isRunCancelling();
+        if (result.status === 'cancelled' && !cancellationActive) {
+          appendWorkerOutcome({
+            type: 'nodeFailed',
+            nodeId: node.id,
+            ...(instanceId ? { instanceId } : {}),
+            attemptId,
+            errorClass: 'cancelled',
+            errorCode: 'WORKER_CANCELLED_WITHOUT_RUN_REQUEST',
+            message: 'runNode returned cancelled without a durable run cancellation or attempt-drain request',
+          });
+          return;
+        }
+        if (result.status === 'cancelled' || cancellationActive) {
+          appendDrainProof('runCancellation');
           appendCancelledAttempt(node.id, instanceId, attemptId);
           return;
         }
@@ -1501,7 +1691,7 @@ export async function runWorkflow(
           // BEFORE success/resultSchema — a revisit is not a node success.
           const revisit = readRevisitRequest(verdict.manifest!, outputDir);
           if (!revisit.ok) {
-            appendEvent(journalPath, {
+            appendWorkerOutcome({
               type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
               errorClass: 'resultInvalid', message: revisit.problems.join('; '),
             });
@@ -1509,7 +1699,7 @@ export async function runWorkflow(
           }
           if (revisit.request) {
             if (!node.revisitTo?.includes(revisit.request.toNodeId)) {
-              appendEvent(journalPath, {
+              appendWorkerOutcome({
                 type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
                 errorClass: 'resultInvalid',
                 message: `result.json requests revisit to "${revisit.request.toNodeId}", not in node "${node.id}".revisitTo`,
@@ -1521,7 +1711,7 @@ export async function runWorkflow(
             // a human grants +1 (revisitBudgetGranted) then retries.
             const budget = revisitBudgetStatus(readJournal(journalPath), node.id, revisit.request.toNodeId);
             if (!budget.ok) {
-              appendEvent(journalPath, {
+              appendWorkerOutcome({
                 type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
                 errorClass: 'resultInvalid', errorCode: 'REVISIT_BUDGET_EXHAUSTED', message: budget.detail,
                 revisitTo: revisit.request.toNodeId,
@@ -1531,6 +1721,9 @@ export async function runWorkflow(
             // goal-node dispatches always carry instanceId (首派 #001); the
             // fallback keeps the type total for the legacy/no-instance path.
             appendRevisitEvents(node.id, instanceId ?? node.id, attemptId, revisit.request, result.manifestPath);
+            // A revisit verdict is not nodeSucceeded/Failed/Blocked, so publish
+            // the outer-close proof explicitly before the fence is removed.
+            appendDrainProof('obsoleteAttempt');
             return;
           }
           // Opt-in structured-result contract: the manifest MUST list a
@@ -1541,7 +1734,7 @@ export async function runWorkflow(
           if (node.resultSchema) {
             const entry = verdict.manifest!.files.find((f) => f.path === 'result.json');
             if (!entry) {
-              appendEvent(journalPath, {
+              appendWorkerOutcome({
                 type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
                 errorClass: 'resultInvalid',
                 message: 'node declares resultSchema but its manifest lists no "result.json" file',
@@ -1550,7 +1743,7 @@ export async function runWorkflow(
             }
             const res = validateResult(join(outputDir, entry.path), node.resultSchema);
             if (!res.ok) {
-              appendEvent(journalPath, {
+              appendWorkerOutcome({
                 type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
                 errorClass: 'resultInvalid',
                 message: (res.problems ?? ['result.json failed schema validation']).join('; '),
@@ -1558,7 +1751,7 @@ export async function runWorkflow(
               return;
             }
           }
-          appendEvent(journalPath, {
+          appendWorkerOutcome({
             type: 'nodeSucceeded', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, manifestPath: result.manifestPath,
           });
           return;
@@ -1605,30 +1798,36 @@ export async function runWorkflow(
             errorCode === ASK_HUMAN_ERROR_CODE
               ? readGoalAsk(join(attemptDir, GOAL_ASK_FILE))
               : undefined;
-          appendEvent(journalPath, {
+          appendWorkerOutcome({
             type: 'nodeBlocked',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
             ...(ask ? { ask } : {}),
           });
         } else {
-          appendEvent(journalPath, {
+          appendWorkerOutcome({
             type: 'nodeFailed',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
           });
         }
       })
       .catch((err: unknown) => {
+        const drainReason = controllerDrainReason(controller);
+        if (drainReason) {
+          appendDrainProof(drainReason);
+          return;
+        }
         if (isRunCancelling()) {
+          appendDrainProof('runCancellation');
           appendCancelledAttempt(node.id, instanceId, attemptId);
           return;
         }
-        appendEvent(journalPath, {
+        appendWorkerOutcome({
           type: 'nodeFailed', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
           errorClass: 'workerError', message: err instanceof Error ? err.message : String(err),
         });
       })
       .finally(() => {
-        cleanupSettledWorkerFence(attemptDir, dag.runId, attemptId);
+        if (closeProofPersisted) cleanupSettledWorkerFence(attemptDir, dag.runId, attemptId);
         // Key by dispatchKey (instance-scoped), NOT node.id: after a cross-node
         // revisit, D#001 and D#002 can be in-flight at once under the same
         // node.id. An unguarded inFlight.delete(node.id) here would let the stale
@@ -1638,6 +1837,7 @@ export async function runWorkflow(
         if (inFlight.get(dispatchKey) === p) inFlight.delete(dispatchKey);
         if (nodeControllers.get(dispatchKey) === controller) {
           nodeControllers.delete(dispatchKey);
+          controllerAttemptIds.delete(dispatchKey);
           nodeAbortCleanups.get(dispatchKey)?.();
           nodeAbortCleanups.delete(dispatchKey);
         }
@@ -1731,13 +1931,91 @@ export async function runWorkflow(
         type: 'nodeInstanceSuperseded',
         nodeId: affectedNodeId, instanceId: eff, byNodeId: request.toNodeId, reason: 'refresh',
       });
+      const controller = nodeControllers.get(eff);
+      if (controller && !controller.signal.aborted) {
+        controller.abort({ kind: 'attemptDrain', drainReason: 'obsoleteAttempt' });
+      }
+    }
+  }
+
+  function attachBlockingGate(node: V3Node, instanceId?: string): boolean {
+    const waitId = `${instanceId ?? node.id}-gate`;
+    const gate = normalizeGateWaitInput(node.humanGate!);
+    const resolveGate = deps.resolveGate;
+    if (!resolveGate) {
+      throw new Error(
+        `v3 runtime: node "${node.id}" has a humanGate but no resolveGate handler was injected`,
+      );
+    }
+    // Instance-scoped, like the work path (and the waitId above): a cross-node
+    // revisit can leave D#001's gate in flight while D#002's gate is re-dispatched
+    // under the same node.id. Keying by node.id + an unguarded delete would let
+    // D#001's gate settle remove the LIVE D#002 entry → "no progress possible" crash.
+    const key = `${instanceId ?? node.id}::gate`;
+    if (inFlight.has(key)) return false;
+    const owner = Symbol(key);
+    blockingGateOwners.set(key, owner);
+    const appendResolutionIfCurrent = (
+      resolution: 'approved' | 'rejected',
+      by: string,
+      selected?: string,
+    ): void => {
+      // A blocked/terminal sweep may abandon this resolver without being able
+      // to cancel its Promise. Its late callback must not race a fresh resolver
+      // attached by a later retry in the same process.
+      if (blockingGateOwners.get(key) !== owner) return;
+      withJournalMutationSync(journalPath, ({ events, append }) => {
+        const current = materialize([...events]);
+        if (current.runStatus !== 'running') return;
+        if (instanceId) {
+          if (current.nodes.get(node.id)?.effectiveInstanceId !== instanceId) return;
+          if (current.instances.get(instanceId)?.status !== 'gateWaiting') return;
+        } else if (current.nodes.get(node.id)?.status !== 'gateWaiting') return;
+        append({
+          type: 'gateResolved',
+          nodeId: node.id,
+          ...(instanceId ? { instanceId } : {}),
+          waitId,
+          resolution,
+          by,
+          ...(selected ? { selected } : {}),
+        });
+      });
+    };
+    const p = Promise.resolve()
+      .then(() => resolveGate({ nodeId: node.id, prompt: gate.prompt, waitId, runDir }))
+      .then(({ resolution, by, selected }) => {
+        // Carry instanceId (mirror gateDispatched + the daemon suspend path): a
+        // gateResolved WITHOUT it falls into state.ts's legacy per-node branch,
+        // so a late D#001 gate resolve after a revisit re-dispatched D#002 would
+        // overwrite node D's view → pollute the live D#002 instance.
+        appendResolutionIfCurrent(resolution, by, selected);
+      })
+      .catch(() => {
+        // A gate that errors out is treated as rejected (fail-fast); the
+        // run-failure root cause is the rejection, recorded on the journal.
+        appendResolutionIfCurrent('rejected', 'system');
+      })
+      .finally(() => {
+        if (blockingGateOwners.get(key) === owner) blockingGateOwners.delete(key);
+        if (inFlight.get(key) === p) inFlight.delete(key);
+      });
+    inFlight.set(key, p);
+    return true;
+  }
+
+  function reattachBlockingGates(snap: ReturnType<typeof materialize>): void {
+    for (const node of dag.nodes) {
+      const state = snap.nodes.get(node.id);
+      if (state?.status !== 'gateWaiting' || !node.humanGate) continue;
+      attachBlockingGate(node, state.effectiveInstanceId);
     }
   }
 
   function startGate(node: V3Node, instanceId?: string): boolean {
     // Instance-level waitId so a revisit's fresh gate (`A#002-gate`) gets its own
     // wait file + card nonce, never overwriting the superseded `A#001-gate`
-    // (stale-card protection).  Legacy/no-instance → `<nodeId>-gate`.
+    // (stale-card protection). Legacy/no-instance → `<nodeId>-gate`.
     const waitId = `${instanceId ?? node.id}-gate`;
     const gate = normalizeGateWaitInput(node.humanGate!);
     if (!claimDispatch({
@@ -1751,36 +2029,7 @@ export async function runWorkflow(
       writePendingWait(runDir, { waitId, nodeId: node.id, ...(instanceId ? { instanceId } : {}), ...gate });
       return true;
     }
-
-    if (!deps.resolveGate) {
-      throw new Error(
-        `v3 runtime: node "${node.id}" has a humanGate but no resolveGate handler was injected`,
-      );
-    }
-    // Instance-scoped, like the work path (and the waitId above): a cross-node
-    // revisit can leave D#001's gate in flight while D#002's gate is re-dispatched
-    // under the same node.id. Keying by node.id + an unguarded delete would let
-    // D#001's gate settle remove the LIVE D#002 entry → "no progress possible" crash.
-    const key = `${instanceId ?? node.id}::gate`;
-    const p = deps
-      .resolveGate({ nodeId: node.id, prompt: gate.prompt, waitId, runDir })
-      .then(({ resolution, by, selected }) => {
-        // Carry instanceId (mirror gateDispatched + the daemon suspend path): a
-        // gateResolved WITHOUT it falls into state.ts's legacy per-node branch,
-        // so a late D#001 gate resolve after a revisit re-dispatched D#002 would
-        // overwrite node D's view → pollute the live D#002 instance.
-        appendEvent(journalPath, { type: 'gateResolved', nodeId: node.id, ...(instanceId ? { instanceId } : {}), waitId, resolution, by, selected });
-      })
-      .catch(() => {
-        // A gate that errors out is treated as rejected (fail-fast); the
-        // run-failure root cause is the rejection, recorded on the journal.
-        appendEvent(journalPath, { type: 'gateResolved', nodeId: node.id, ...(instanceId ? { instanceId } : {}), waitId, resolution: 'rejected', by: 'system' });
-      })
-      .finally(() => {
-        if (inFlight.get(key) === p) inFlight.delete(key);
-      });
-    inFlight.set(key, p);
-    return true;
+    return attachBlockingGate(node, instanceId);
   }
 
   /** Synthesize the effective node a body instance runs as: the body
@@ -1962,7 +2211,10 @@ export async function runWorkflow(
       detail: a.detail,
     });
 
-    nodeControllers.get(instanceId ?? a.nodeId)?.abort();
+    const controller = nodeControllers.get(instanceId ?? a.nodeId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort({ kind: 'attemptDrain', drainReason: 'obsoleteAttempt' });
+    }
     // Match startGate's instance-scoped gate key so the right instance's gate
     // in-flight entry is cleared (not a stale node.id-keyed one that never existed).
     const gateKey = `${instanceId ?? a.nodeId}::gate`;

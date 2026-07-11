@@ -197,7 +197,10 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
     } else {
       elements.push({
         tag: 'div',
-        text: { tag: 'lark_md', content: '处理掉阻塞原因（如完成鉴权）后点重试，会以新 attempt 重跑该节点。' },
+        text: {
+          tag: 'lark_md',
+          content: '处理掉阻塞原因（如完成鉴权）后点重试，会以新 attempt 重跑该节点；为避免旧 worker 与重试重叠，进入受阻状态时被中止的并行节点也会重新执行。',
+        },
       });
       elements.push({
         tag: 'action',

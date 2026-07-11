@@ -519,6 +519,14 @@ describe('runWorkflow — durable cancellation convergence', () => {
       const events = readJournal(join(base, dag.runId, 'journal.ndjson'));
       expect(events.filter((event) => event.type === 'runCancelRequested')).toHaveLength(1);
       expect(events.filter((event) => event.type === 'runCancelled')).toHaveLength(1);
+      const drainedAt = events.findIndex((event) =>
+        event.type === 'nodeAttemptDrained' && event.nodeId === 'active');
+      const cancelledAt = events.findIndex((event) =>
+        event.type === 'nodeCancelled' && event.nodeId === 'active');
+      const runCancelledAt = events.findIndex((event) => event.type === 'runCancelled');
+      expect(drainedAt).toBeGreaterThan(-1);
+      expect(cancelledAt).toBeGreaterThan(drainedAt);
+      expect(runCancelledAt).toBeGreaterThan(cancelledAt);
       expect(events.some((event) => event.type === 'nodeDispatched' && event.nodeId === 'downstream')).toBe(false);
       expect(events.some((event) => event.type === 'nodeSucceeded' || event.type === 'nodeFailed')).toBe(false);
       expect(events.filter((event) => event.type === 'nodeCancelled').map((event) => event.nodeId).sort())

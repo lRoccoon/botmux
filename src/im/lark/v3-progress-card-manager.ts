@@ -132,9 +132,9 @@ export class V3ProgressCardManager {
   /**
    * Startup recovery refreshes the durable snapshot once; terminal history is
    * only patched when a sidecar proves that this daemon already owned one.
-   * Continuous polling is attached exclusively by onDriveBegin — a journal
-   * that merely says "running" may be a phantom attempt that v3 intentionally
-   * does not adopt after a crash, and must not leak a permanent timer.
+   * Continuous polling is attached exclusively by onDriveBegin. Recovery may
+   * re-drive a journal-only attempt through the durable attempt barrier, but
+   * cold attach itself must still avoid leaking a permanent observer timer.
    */
   async coldAttach(ownerLarkAppId: string): Promise<void> {
     if (!existsSync(this.deps.baseDir)) return;

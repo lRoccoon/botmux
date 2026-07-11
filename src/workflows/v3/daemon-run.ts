@@ -76,6 +76,8 @@ import {
   type V3ErrorClass,
 } from './journal.js';
 import { materialize } from './state.js';
+import { openV3WorkerAttempts } from './attempt-ledger.js';
+import { V3_DRIVE_LEASE_MAX_WAIT_MS, v3DriveLeaseTarget } from './drive-lease.js';
 import { isValidRunId } from './ops-projection.js';
 import { GOAL_ANSWER_FILE, type GoalAnswer, type GoalAsk, type ValidateManifest } from './contract.js';
 import { validateSpec } from './spec.js';
@@ -1276,10 +1278,11 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
           // The in-memory guard above prevents duplicate drives inside one
           // daemon.  This lease extends the same invariant across rolling
           // restarts / an accidental second daemon: only the process that owns
-          // the live worker promises may fold a cancellation to `runCancelled`.
+          // the live worker promises may schedule, drain peers, or publish a
+          // run boundary.
           // A cancel request itself uses the independent journal lock, so it
           // can still wake the lease holder while a second daemon waits here.
-          const leaseTarget = join(baseDir, `.v3-drive-${runId}`);
+          const leaseTarget = v3DriveLeaseTarget(baseDir, runId);
           let leaseSettled = false;
           while (!leaseSettled) {
             try {
@@ -1304,7 +1307,7 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
                       deps.notifyTerminal ? deps.notifyTerminal(binding, rid, outcome) : Promise.resolve(),
                   });
                 } while (currentRunStatus(baseDir, runId) === 'cancelling');
-              }, { maxWaitMs: 15_000 });
+              }, { maxWaitMs: V3_DRIVE_LEASE_MAX_WAIT_MS });
               leaseSettled = true;
             } catch (err) {
               // A second daemon may legitimately wait longer than one lock
@@ -1441,11 +1444,22 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
 
       const events = readJournal(journalPath);
       const snap = materialize(events);
+      const hasOpenAttempts = openV3WorkerAttempts(events).length > 0;
       if (
         snap.runStatus === 'succeeded' ||
         snap.runStatus === 'failed' ||
         snap.runStatus === 'cancelled'
-      ) continue;
+      ) {
+        if (!hasOpenAttempts) continue;
+        const binding = readV3RunChatBinding(runDir);
+        if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
+        if (!binding) continue;
+        // Pre-barrier histories may have published a terminal before a peer
+        // outer process closed. Re-drive only to clean resources; driveV3Run's
+        // already-terminal guard suppresses duplicate terminal notification.
+        out.push({ runId, runDir, binding, repost: [], resume: true });
+        continue;
+      }
 
       if (snap.runStatus === 'cancelling') {
         const binding = readV3RunChatBinding(runDir);
@@ -1458,6 +1472,15 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
       }
 
       if (snap.runStatus === 'blocked') {
+        if (hasOpenAttempts) {
+          const binding = readV3RunChatBinding(runDir);
+          if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
+          if (!binding) continue;
+          // Cleanup must finish before the retry/grant card is visible: an
+          // immediate click must never overlap a pre-block bypass worker.
+          out.push({ runId, runDir, binding, repost: [], resume: true });
+          continue;
+        }
         // Blocked run: repost the recovery card (covers the crash window
         // between the runBlocked append and the original card send) — grant
         // card for an exhausted loop, retry card for a blocked node.  Owner-
@@ -1491,14 +1514,25 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
       // runStatus === 'running'
       const rec = reconcileOneRun(runId, runDir, journalPath, snap, ownerLarkAppId);
       if (rec) {
-        out.push(rec);
+        // A pending gate may coexist with an attempt owned by the dead daemon.
+        // Let the drive fence/requeue it first; that drive will post every gate
+        // still pending after resource convergence.
+        out.push(hasOpenAttempts ? { ...rec, repost: [], resume: true } : rec);
         continue;
       }
-      // No gate to reconcile.  If nothing is (phantom-)running, the run died in
-      // a resumable spot — e.g. crash right after a `nodeRetryRequested` append
-      // (before the redrive) or right after start — so re-drive it.  Runs with
-      // phantom `running` nodes are the dangling-attempt recovery gap (worker
-      // fencing backlog) and are deliberately left alone.
+      if (hasOpenAttempts) {
+        const binding = readV3RunChatBinding(runDir);
+        if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
+        if (!binding) continue;
+        out.push({ runId, runDir, binding, repost: [], resume: true });
+        continue;
+      }
+      // No gate or open attempt to reconcile. If nothing is materialized as
+      // running, the run died in a resumable control spot — e.g. crash right
+      // after `nodeRetryRequested` or start — so re-drive it. Open worker
+      // attempts were handled above by the unified fence barrier; a remaining
+      // running node without an open ledger record is malformed/legacy state
+      // and stays fail-closed here.
       //
       // Composite LOOP nodes are excluded from the phantom check (codex loop
       // review blocker): a loop is 'running' in PURE CONTROL states with no

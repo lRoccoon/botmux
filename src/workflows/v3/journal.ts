@@ -170,6 +170,18 @@ export type V3Event =
       | { reason: 'earlyReleaseLoser'; byNodeId: string }
       | { reason: 'runCancelled'; cancelRequestId: string }
     ))
+  // Durable resource close proof for an attempt whose normal node verdict was
+  // intentionally discarded (terminal peer teardown, obsolete revisit/
+  // early-release work, or crash recovery). This event may be appended after a
+  // run terminal while cleaning up a pre-fix history; it never changes the run
+  // verdict by itself.
+  | {
+      type: 'nodeAttemptDrained';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      reason: 'terminalPeer' | 'obsoleteAttempt' | 'orphanRecovery' | 'runCancellation';
+    }
   // ── cross-node revisit / instance lifecycle (instance restoration 2026-06-08) ──
   // A node's worker emitted result.json `status:"revisit"` requesting a jump
   // back to ancestor `toNodeId` (must be in the node's `revisitTo`).  Audit +
@@ -420,9 +432,9 @@ export function appendEvent(journalPath: string, event: V3Event): StoredEvent {
 /**
  * Append an event and force both its bytes and a newly-created journal dirent
  * to stable storage before returning. Reserved for host acknowledgement
- * boundaries (for example `/start` returning HTTP 202); the hot runtime path
- * deliberately keeps using {@link appendEvent} to avoid an fsync per node
- * transition.
+ * boundaries (for example `/start` returning HTTP 202) and resource-close
+ * proofs that must reach disk before a worker fence is removed. Other hot
+ * runtime transitions keep using {@link appendEvent}.
  */
 export function appendEventDurable(journalPath: string, event: V3Event): StoredEvent {
   return withJournalMutationSync(journalPath, ({ append }) => append(event, { durable: true }));

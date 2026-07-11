@@ -139,7 +139,8 @@ export type V3Action =
  *
  * Ordering follows topological order so callers see deps-ready nodes first.
  * Fail-fast: the moment any node is `failed`, the only action is
- * `completeRunFailed` (in-flight peers are torn down by the runtime / cancel).
+ * `completeRunFailed` (the runtime's attempt-quiescence barrier tears down and
+ * proves close for every in-flight peer before publishing the run terminal).
  * When no dispatch is possible and nothing is pending, the run is complete.
  */
 export function decideNext(

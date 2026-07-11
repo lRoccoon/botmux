@@ -799,8 +799,8 @@ describe('requestV3LoopGrant + retry loop guard', () => {
         { type: 'runBlocked', blockedNodeId: 'fix' },
         { type: 'loopIterationGranted', loopId: 'fix', fromIteration: 1 },
       ]);
-      // (4) NEGATIVE: a body instance genuinely in flight is real running —
-      // that run stays in the fencing-backlog bucket (no resume record).
+      // (4) A body instance genuinely in flight is recovered by the unified
+      // attempt barrier: fence-drain the orphan, then re-dispatch it.
       seedControl('cw-inflight-260606-0004', [
         { type: 'loopStarted', loopId: 'fix' },
         { type: 'loopIterationStarted', loopId: 'fix', iteration: 1 },
@@ -812,7 +812,7 @@ describe('requestV3LoopGrant + retry loop guard', () => {
       expect(byId.get('cw-started-260606-0001')).toMatchObject({ resume: true });
       expect(byId.get('cw-continue-260606-0002')).toMatchObject({ resume: true });
       expect(byId.get('cw-granted-260606-0003')).toMatchObject({ resume: true });
-      expect(byId.has('cw-inflight-260606-0004')).toBe(false);
+      expect(byId.get('cw-inflight-260606-0004')).toMatchObject({ resume: true, repost: [] });
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

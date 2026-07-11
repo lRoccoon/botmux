@@ -20,6 +20,10 @@ import { resolveWait, readWait, waitPath, writePendingWait } from '../src/workfl
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import type { RunNode } from '../src/workflows/v3/contract.js';
 import {
+  armV3AttemptWorkerFence,
+  closeV3ArmedFenceWithoutSpawn,
+} from '../src/workflows/v3/worker-fence.js';
+import {
   artifactRef,
   loadAuthorizedV3Run,
   makeSavedDefinitionRunEnvelope,
@@ -810,6 +814,54 @@ describe('reconcileV3PendingGates — 重启恢复 + 原子窗口（codex #2/#3�
     }
   });
 
+  it('旧 terminal 仍有 open attempt → resume 只清资源，不重复 repost', () => {
+    const base = freshBase();
+    try {
+      const runDir = seedApprovedRun(base, 'terminal-open', { binding: BINDING });
+      const journalPath = join(runDir, 'journal.ndjson');
+      appendEvent(journalPath, { type: 'runStarted', runId: 'terminal-open' });
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'peer', attemptId: 'peer/attempts/001' });
+      appendEvent(journalPath, { type: 'runFailed', failedNodeId: 'deploy' });
+
+      expect(reconcileV3PendingGates(base).find((r) => r.runId === 'terminal-open'))
+        .toMatchObject({ resume: true, repost: [] });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('旧 blocked 仍有 open peer → 先 resume drain，不提前 repost retry card', () => {
+    const base = freshBase();
+    try {
+      const runDir = seedApprovedRun(base, 'blocked-open', { binding: BINDING });
+      const journalPath = join(runDir, 'journal.ndjson');
+      appendEvent(journalPath, { type: 'runStarted', runId: 'blocked-open' });
+      appendEvent(journalPath, { type: 'nodeBlocked', nodeId: 'deploy', attemptId: 'deploy/attempts/001', errorClass: 'resultInvalid' });
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'peer', attemptId: 'peer/attempts/001' });
+      appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: 'deploy' });
+
+      const rec = reconcileV3PendingGates(base).find((r) => r.runId === 'blocked-open');
+      expect(rec).toMatchObject({ resume: true, repost: [] });
+      expect(rec?.repostBlocked).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('pending gate 与 open peer 并存 → 先 resume drain，不提前 repost gate', () => {
+    const base = freshBase();
+    try {
+      const runDir = seedGateWaiting(base, 'gate-open');
+      const journalPath = join(runDir, 'journal.ndjson');
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'peer', attemptId: 'peer/attempts/001' });
+
+      expect(reconcileV3PendingGates(base).find((r) => r.runId === 'gate-open'))
+        .toMatchObject({ resume: true, repost: [] });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('无 gateWaiting、无 in-flight 的 running run → resume（崩在可恢复点：retry append 后 / 首派前）', () => {
     const base = freshBase();
     try {
@@ -824,7 +876,7 @@ describe('reconcileV3PendingGates — 重启恢复 + 原子窗口（codex #2/#3�
     }
   });
 
-  it('有 phantom running 节点的 run → 不动（dangling-attempt 恢复留给 fencing backlog）', () => {
+  it('有 phantom running 节点的 run → resume，由统一 attempt barrier fence-drain 后重派', () => {
     const base = freshBase();
     try {
       const runDir = seedApprovedRun(base, 'phantom', { binding: BINDING });
@@ -832,7 +884,7 @@ describe('reconcileV3PendingGates — 重启恢复 + 原子窗口（codex #2/#3�
       appendEvent(journalPath, { type: 'runStarted', runId: 'phantom' } as any);
       appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'deploy', attemptId: 'deploy/attempts/001' } as any);
       const recs = reconcileV3PendingGates(base);
-      expect(recs.find((r) => r.runId === 'phantom')).toBeUndefined();
+      expect(recs.find((r) => r.runId === 'phantom')).toMatchObject({ resume: true, repost: [] });
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -1001,6 +1053,100 @@ describe('createV3GateRunner — in-flight 锁 + coldAttach 顺序', () => {
       expect(postCalls).toBe(1); // 只有第一次 drive 发了卡
       release();
       await p1;
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('coldAttach：旧 runBlocked 先清 peer close proof，再投递 retry card', async () => {
+    const base = freshBase();
+    try {
+      const runId = 'cold-blocked-open';
+      const runDir = seedApprovedRun(base, runId, { binding: BINDING });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [
+          { id: 'blocker', type: 'goal', goal: 'blocked', depends: [], inputs: [] },
+          { id: 'peer', type: 'goal', goal: 'old peer', depends: [], inputs: [] },
+        ],
+      }));
+      const journalPath = join(runDir, 'journal.ndjson');
+      const attemptId = 'peer#001/attempts/001';
+      const attemptDir = join(runDir, attemptId);
+      mkdirSync(attemptDir, { recursive: true });
+      appendEvent(journalPath, { type: 'runStarted', runId });
+      appendEvent(journalPath, { type: 'nodeBlocked', nodeId: 'blocker', instanceId: 'blocker#001', attemptId: 'blocker#001/attempts/001', errorClass: 'resultInvalid' });
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'peer', instanceId: 'peer#001', attemptId });
+      const armed = armV3AttemptWorkerFence({ attemptDir, runId, attemptId });
+      closeV3ArmedFenceWithoutSpawn(attemptDir, armed, 'setup_failed');
+      appendEvent(journalPath, { type: 'nodeWorkerFenceArmed', nodeId: 'peer', instanceId: 'peer#001', attemptId });
+      appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: 'blocker' });
+
+      const postBlockedCard = vi.fn(async () => {
+        expect(readJournal(journalPath)).toContainEqual(expect.objectContaining({
+          type: 'nodeAttemptDrained', attemptId,
+        }));
+      });
+      const runNode = vi.fn(async () => { throw new Error('must not dispatch during cleanup'); });
+      const runner = createV3GateRunner({
+        baseDir: base,
+        loadBots: () => [{ larkAppId: 'cli_test', larkAppSecret: 's', cliId: 'claude-code' } as any],
+        makeRunNode: () => runNode,
+        validateManifest: async () => ({ ok: false as const, problems: ['unused'] }),
+        postCard: async () => {},
+        postBlockedCard,
+      });
+
+      await runner.coldAttach();
+      await vi.waitFor(() => expect(postBlockedCard).toHaveBeenCalledTimes(1));
+      expect(runNode).not.toHaveBeenCalled();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('coldAttach：旧 true-terminal 清 open peer，但不重复 terminal 通知', async () => {
+    const base = freshBase();
+    try {
+      const runId = 'cold-terminal-open';
+      const runDir = seedApprovedRun(base, runId, { binding: BINDING });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [
+          { id: 'fatal', type: 'goal', goal: 'failed', depends: [], inputs: [] },
+          { id: 'peer', type: 'goal', goal: 'old peer', depends: [], inputs: [] },
+        ],
+      }));
+      const journalPath = join(runDir, 'journal.ndjson');
+      const attemptId = 'peer#001/attempts/001';
+      const attemptDir = join(runDir, attemptId);
+      mkdirSync(attemptDir, { recursive: true });
+      appendEvent(journalPath, { type: 'runStarted', runId });
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'peer', instanceId: 'peer#001', attemptId });
+      const armed = armV3AttemptWorkerFence({ attemptDir, runId, attemptId });
+      closeV3ArmedFenceWithoutSpawn(attemptDir, armed, 'setup_failed');
+      appendEvent(journalPath, { type: 'nodeWorkerFenceArmed', nodeId: 'peer', instanceId: 'peer#001', attemptId });
+      appendEvent(journalPath, { type: 'runFailed', failedNodeId: 'fatal' });
+
+      const notifyTerminal = vi.fn(async () => {});
+      const runNode = vi.fn(async () => { throw new Error('must not dispatch during cleanup'); });
+      const runner = createV3GateRunner({
+        baseDir: base,
+        loadBots: () => [{ larkAppId: 'cli_test', larkAppSecret: 's', cliId: 'claude-code' } as any],
+        makeRunNode: () => runNode,
+        validateManifest: async () => ({ ok: false as const, problems: ['unused'] }),
+        postCard: async () => {},
+        notifyTerminal,
+      });
+
+      await runner.coldAttach();
+      await vi.waitFor(() => {
+        expect(readJournal(journalPath)).toContainEqual(expect.objectContaining({
+          type: 'nodeAttemptDrained', attemptId,
+        }));
+      });
+      expect(runNode).not.toHaveBeenCalled();
+      expect(notifyTerminal).not.toHaveBeenCalled();
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
