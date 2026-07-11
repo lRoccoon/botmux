@@ -156,7 +156,11 @@ export async function ensureDependencies(): Promise<DependenciesReport> {
 }
 
 function reportHerdrIntegrations(r: HerdrIntegrationResult): void {
-  if (r.attempted.length === 0 && r.unsupportedCliIds.length === 0 && !r.traexPlugin?.attempted) return;
+  // NB: gate on `!r.traexPlugin`, not `!r.traexPlugin?.attempted` — a skipped
+  // traex plugin (disabled / missing_spec) has attempted=false but STILL needs
+  // its hint printed, otherwise a herdr+traex host with the toggle on but no
+  // spec would silently no-op with no diagnostic when traex is the only herdr CLI.
+  if (r.attempted.length === 0 && r.unsupportedCliIds.length === 0 && !r.traexPlugin) return;
   if (r.installed.length > 0) console.log(`✓ herdr integrations 已安装: ${r.installed.join(' / ')}`);
   if (r.alreadyInstalled.length > 0) console.log(`✓ herdr integrations (existing): ${r.alreadyInstalled.join(' / ')}`);
   if (r.traexPlugin) {

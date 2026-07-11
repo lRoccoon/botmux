@@ -116,6 +116,7 @@ import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
+import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SPEC } from './setup/ensure-herdr-integrations.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
@@ -313,8 +314,10 @@ interface ResolvedDashboardSettings {
   localCliOpenMode: 'attach' | 'resume';
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
   chatBotDiscovery: boolean;
-  /** Machine-wide opt-in TraeX herdr plugin bootstrap. Default OFF. */
-  herdrTraexPlugin: { enabled: boolean; spec: string };
+  /** Machine-wide opt-in TraeX herdr plugin bootstrap. Default OFF.
+   *  `recommendedSpec` is a non-default, author-recommended source the SPA can
+   *  offer as a one-click fill; it is never persisted unless the operator picks it. */
+  herdrTraexPlugin: { enabled: boolean; spec: string; recommendedSpec: string };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -716,6 +719,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     herdrTraexPlugin: {
       enabled: dashboard.herdrTraexPlugin?.enabled === true,
       spec: dashboard.herdrTraexPlugin?.spec ?? '',
+      recommendedSpec: TRAEX_RECOMMENDED_SPEC,
     },
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
@@ -2193,7 +2197,18 @@ const server = createServer(async (req, res) => {
         if ('feishuLoginQr' in result && result.feishuLoginQr) body.feishuLoginQr = result.feishuLoginQr;
         return jsonRes(res, 400, body);
       }
-      return jsonRes(res, 200, { ok: true, settings: result.settings });
+      // Opt-in TraeX herdr plugin: when this write enabled it (with a spec),
+      // install right away instead of waiting for the next daemon restart, and
+      // echo the outcome back so the SPA can toast success/failure. No-op for
+      // any settings write that didn't touch herdrTraexPlugin (or left it off /
+      // spec-less). Runs in-daemon (herdr on PATH here); never throws.
+      const herdrTraexInstall = await maybeInstallTraexPluginOnSettingsChange(
+        typeof parsed === 'object' && parsed !== null && 'herdrTraexPlugin' in parsed,
+        result.settings.herdrTraexPlugin,
+      );
+      return jsonRes(res, 200, herdrTraexInstall
+        ? { ok: true, settings: result.settings, herdrTraexInstall }
+        : { ok: true, settings: result.settings });
     }
 
     // ─── Version & manual update ─────────────────────────────────────────────
@@ -3265,6 +3280,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/backend-type — proxy to that bot's daemon. Body
+    // `{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'' }` ('' / 'auto' clears the override).
+    let mBotBackendType: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotBackendType = url.pathname.match(/^\/api\/bots\/([^/]+)\/backend-type$/))) {
+      const appId = decodeURIComponent(mBotBackendType[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-backend-type`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

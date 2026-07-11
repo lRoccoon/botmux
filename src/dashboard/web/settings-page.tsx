@@ -14,7 +14,7 @@ interface DashboardSettings {
   enableLocalCliOpen: boolean;
   localCliOpenMode: 'attach' | 'resume';
   chatBotDiscovery: boolean;
-  herdrTraexPlugin: { enabled: boolean; spec: string };
+  herdrTraexPlugin: { enabled: boolean; spec: string; recommendedSpec: string };
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId: string | null;
@@ -64,6 +64,21 @@ interface ReleaseNote { version: string; name: string; body: string; url: string
 
 type StatusMessage = { text: string; cls?: string } | null;
 
+/** Map a `herdrTraexInstall` result (returned by PUT /api/settings when the
+ *  write triggered a live TraeX plugin install) to a settings status message. */
+function traexInstallMessage(install: any, tr: (k: string) => string): StatusMessage {
+  if (!install || typeof install !== 'object') return null;
+  if (install.failed) {
+    const step = install.failed.step === 'install'
+      ? tr('settings.herdrTraexInstallStepInstall')
+      : tr('settings.herdrTraexInstallStepAction');
+    return { text: `${tr('settings.herdrTraexInstallFailed')}（${step}）: ${install.failed.reason ?? ''}`, cls: 'hint-warn-inline' };
+  }
+  if (install.installed) return { text: tr('settings.herdrTraexInstalled'), cls: 'hint-ok' };
+  if (install.alreadyInstalled) return { text: tr('settings.herdrTraexAlreadyInstalled'), cls: 'hint-ok' };
+  return null;
+}
+
 function parseSettings(s: any): DashboardSettings {
   return {
     publicReadOnly: s?.publicReadOnly === true,
@@ -74,6 +89,7 @@ function parseSettings(s: any): DashboardSettings {
     herdrTraexPlugin: {
       enabled: s?.herdrTraexPlugin?.enabled === true,
       spec: typeof s?.herdrTraexPlugin?.spec === 'string' ? s.herdrTraexPlugin.spec : '',
+      recommendedSpec: typeof s?.herdrTraexPlugin?.recommendedSpec === 'string' ? s.herdrTraexPlugin.recommendedSpec : '',
     },
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
@@ -238,7 +254,10 @@ function SettingsPage() {
       setSettings(saved);
       ui.publicReadOnly = saved.publicReadOnly;
       store.setScheduleTimeZone(saved.effectiveScheduleTimeZone);
-      setSettingsMsg({ text: tr('settings.saved'), cls: 'hint-ok' });
+      // If this write triggered a live TraeX plugin install, surface its result
+      // instead of the generic "saved" toast.
+      const traexMsg = traexInstallMessage(body.herdrTraexInstall, tr);
+      setSettingsMsg(traexMsg ?? { text: tr('settings.saved'), cls: 'hint-ok' });
     } catch (e) {
       if (!mountedRef.current) return;
       setSettings(before);
@@ -546,17 +565,36 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'herdrTraexPlugin'}
             onChange={value => saveHerdrTraexPlugin({ enabled: value })}
           />
-          <div className="settings-field-row">
-            <FieldTitle help={tr('settings.herdrTraexPluginSpecHelp')}>{tr('settings.herdrTraexPluginSpec')}</FieldTitle>
-            <input
-              className="settings-text-input"
-              type="text"
-              value={settings.herdrTraexPlugin.spec}
-              placeholder={tr('settings.herdrTraexPluginSpecPlaceholder')}
-              disabled={dis || savingKey === 'herdrTraexPlugin'}
-              onChange={e => saveHerdrTraexPlugin({ spec: e.currentTarget.value })}
-            />
-          </div>
+          {settings.herdrTraexPlugin.enabled ? (
+            <div className="settings-subfield">
+              <div className="settings-field-row">
+                <FieldTitle help={tr('settings.herdrTraexPluginSpecHelp')}>{tr('settings.herdrTraexPluginSpec')}</FieldTitle>
+                <SpecInput
+                  value={settings.herdrTraexPlugin.spec}
+                  placeholder={tr('settings.herdrTraexPluginSpecPlaceholder')}
+                  disabled={dis || savingKey === 'herdrTraexPlugin'}
+                  onCommit={spec => saveHerdrTraexPlugin({ spec })}
+                />
+              </div>
+              {settings.herdrTraexPlugin.spec.trim() ? null : (
+                <p className="hint-warn-inline settings-subfield-hint">{tr('settings.herdrTraexPluginSpecRequired')}</p>
+              )}
+              {settings.herdrTraexPlugin.recommendedSpec
+                && settings.herdrTraexPlugin.spec.trim() !== settings.herdrTraexPlugin.recommendedSpec ? (
+                  <p className="settings-subfield-hint">
+                    {tr('settings.herdrTraexPluginRecommended')}{' '}
+                    <button
+                      type="button"
+                      className="settings-inline-link"
+                      disabled={dis || savingKey === 'herdrTraexPlugin'}
+                      onClick={() => saveHerdrTraexPlugin({ spec: settings.herdrTraexPlugin.recommendedSpec })}
+                    >
+                      {settings.herdrTraexPlugin.recommendedSpec}
+                    </button>
+                  </p>
+                ) : null}
+            </div>
+          ) : null}
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionWhiteboard')}>
           <ToggleRow
@@ -826,6 +864,38 @@ function ToggleRow(props: {
         <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
       </span>
     </label>
+  );
+}
+
+/** Free-text input that commits on blur / Enter (not per keystroke) with an
+ *  unchanged-guard. Avoids firing a PUT — and disabling the field mid-type — on
+ *  every character; mirrors the timezone field's commit model. */
+function SpecInput(props: { value: string; placeholder: string; disabled: boolean; onCommit(value: string): void }) {
+  const [draft, setDraft] = useState(props.value);
+  const synced = useRef(props.value);
+  useEffect(() => {
+    if (props.value !== synced.current) {
+      synced.current = props.value;
+      setDraft(props.value);
+    }
+  }, [props.value]);
+  const commit = () => {
+    const next = draft.trim();
+    if (next === props.value.trim()) return; // unchanged — skip the PUT
+    synced.current = next;
+    props.onCommit(next);
+  };
+  return (
+    <input
+      className="settings-text-input"
+      type="text"
+      value={draft}
+      placeholder={props.placeholder}
+      disabled={props.disabled}
+      onChange={e => setDraft(e.currentTarget.value)}
+      onBlur={commit}
+      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }}
+    />
   );
 }
 

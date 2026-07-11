@@ -15,7 +15,7 @@
  * Like ensureTmux/ensureHerdr, this never throws — failures only generate
  * warnings. The caller decides whether to surface them.
  */
-import { execSync, spawnSync } from 'node:child_process';
+import { execSync, spawn, spawnSync } from 'node:child_process';
 import type { CliId } from '../adapters/cli/types.js';
 import { resolveHerdrTraexPluginConfig } from '../config.js';
 
@@ -38,6 +38,15 @@ const TRAEX_PLUGIN_ID = 'com.traex.herdr-integration';
 function traexPluginInstallCommand(spec: string): string {
   return `herdr plugin install ${spec} --yes && herdr plugin action invoke ${TRAEX_PLUGIN_ID}.install`;
 }
+
+/**
+ * Author-recommended community plugin source for the TraeX↔herdr integration.
+ * Surfaced in the dashboard ONLY as a one-click suggestion the operator must
+ * actively select — it is NEVER a silent default and is NEVER auto-installed.
+ * botmux ships no default `spec`; operators should verify (and preferably pin)
+ * the source before enabling it. Empty string ⇒ no recommendation offered.
+ */
+export const TRAEX_RECOMMENDED_SPEC = 'Phoobobo/herdr-traex-integration';
 
 export interface HerdrIntegrationResult {
   /** Integrations we attempted (after dedup + filtering by available CLIs). */
@@ -119,6 +128,40 @@ function installSingleIntegration(name: string): { ok: true } | { ok: false; rea
   return result.ok ? { ok: true } : { ok: false, reason: result.reason };
 }
 
+/**
+ * Async sibling of `spawnHerdr`. The TraeX plugin path uses this (not the sync
+ * `spawnSync`) so it can also run live from the dashboard's settings-write
+ * handler without blocking the daemon event loop for up to 120s during a
+ * `herdr plugin install`. Never rejects — resolves an ok/err discriminated
+ * union just like `spawnHerdr`.
+ */
+function spawnHerdrAsync(args: string[], timeout = 60_000): Promise<{ ok: true; stdout: string } | { ok: false; reason: string; stdout: string }> {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const done = (r: { ok: true; stdout: string } | { ok: false; reason: string; stdout: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const child = spawn('herdr', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      done({ ok: false, reason: `timeout after ${timeout}ms`, stdout: stdout.trim() });
+    }, timeout);
+    child.stdout?.on('data', (d) => { stdout += d.toString(); });
+    child.stderr?.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (err) => done({ ok: false, reason: String((err as any)?.message ?? err), stdout: stdout.trim() }));
+    child.on('close', (code) => {
+      const out = stdout.trim();
+      if (code === 0) return done({ ok: true, stdout: out });
+      done({ ok: false, reason: stderr.trim() || out || `exit ${code}`, stdout: out });
+    });
+  });
+}
+
 function pluginsArrayFromJson(parsed: any): any[] | undefined {
   if (Array.isArray(parsed?.result?.plugins)) return parsed.result.plugins;
   if (Array.isArray(parsed?.plugins)) return parsed.plugins;
@@ -127,8 +170,8 @@ function pluginsArrayFromJson(parsed: any): any[] | undefined {
   return undefined;
 }
 
-function isTraexPluginInstalled(): boolean {
-  const result = spawnHerdr(['plugin', 'list', '--json'], 5000);
+async function isTraexPluginInstalled(): Promise<boolean> {
+  const result = await spawnHerdrAsync(['plugin', 'list', '--json'], 5000);
   if (!result.ok) return false;
   try {
     const parsed = JSON.parse(result.stdout);
@@ -144,7 +187,68 @@ function isTraexPluginInstalled(): boolean {
   }
 }
 
-function ensureTraexPlugin(): NonNullable<HerdrIntegrationResult['traexPlugin']> {
+/**
+ * Install/verify the TraeX herdr plugin for an already-resolved, non-empty
+ * operator-supplied spec. Async so it can run both at startup (awaited by
+ * ensureHerdrIntegrations) and live from the dashboard settings-write handler.
+ * Idempotent: if the plugin is already installed we skip both the install and
+ * the install action (never re-runs the ~/.trae hook writer on every call).
+ */
+export async function installTraexPluginNow(spec: string): Promise<NonNullable<HerdrIntegrationResult['traexPlugin']>> {
+  const trimmed = spec.trim();
+  if (!trimmed) {
+    return { attempted: false, enabled: true, installed: false, alreadyInstalled: false, actionInvoked: false, skippedReason: 'missing_spec' };
+  }
+
+  const manualCommand = traexPluginInstallCommand(trimmed);
+  const alreadyInstalled = await isTraexPluginInstalled();
+  if (alreadyInstalled) {
+    return { attempted: true, enabled: true, spec: trimmed, installed: false, alreadyInstalled: true, actionInvoked: false };
+  }
+
+  console.log(`   安装 herdr TraeX plugin: ${trimmed}`);
+  const install = await spawnHerdrAsync(['plugin', 'install', trimmed, '--yes'], 120_000);
+  if (!install.ok) {
+    return {
+      attempted: true, enabled: true, spec: trimmed, installed: false, alreadyInstalled: false, actionInvoked: false,
+      failed: { step: 'install', reason: install.reason, manualCommand },
+    };
+  }
+
+  const action = await spawnHerdrAsync(['plugin', 'action', 'invoke', `${TRAEX_PLUGIN_ID}.install`], 60_000);
+  if (!action.ok) {
+    return {
+      attempted: true, enabled: true, spec: trimmed, installed: true, alreadyInstalled: false, actionInvoked: false,
+      failed: { step: 'action', reason: action.reason, manualCommand },
+    };
+  }
+
+  return { attempted: true, enabled: true, spec: trimmed, installed: true, alreadyInstalled: false, actionInvoked: true };
+}
+
+/**
+ * Live (dashboard) path: when a settings-write flips the TraeX plugin config,
+ * install immediately instead of waiting for the next daemon restart. Returns
+ * undefined (no-op) unless the write actually touched `herdrTraexPlugin` AND
+ * the resolved config is enabled with a non-empty spec — so unrelated settings
+ * writes never trigger an install, and enabling without a spec stays a no-op
+ * (the UI surfaces the required-spec hint). `installFn` is injectable for tests.
+ */
+export async function maybeInstallTraexPluginOnSettingsChange(
+  patchTouchedHerdrTraex: boolean,
+  resolved: { enabled: boolean; spec: string } | undefined,
+  installFn: (spec: string) => Promise<NonNullable<HerdrIntegrationResult['traexPlugin']>> = installTraexPluginNow,
+): Promise<NonNullable<HerdrIntegrationResult['traexPlugin']> | undefined> {
+  if (!patchTouchedHerdrTraex) return undefined;
+  if (!resolved?.enabled || !resolved.spec.trim()) return undefined;
+  return installFn(resolved.spec);
+}
+
+/**
+ * Startup path: resolve the opt-in config (default OFF + operator-supplied
+ * spec, no botmux default source), then delegate to installTraexPluginNow.
+ */
+async function ensureTraexPlugin(): Promise<NonNullable<HerdrIntegrationResult['traexPlugin']>> {
   const cfg = resolveHerdrTraexPluginConfig();
   if (!cfg.enabled) {
     return { attempted: false, enabled: false, installed: false, alreadyInstalled: false, actionInvoked: false, skippedReason: 'disabled' };
@@ -152,48 +256,7 @@ function ensureTraexPlugin(): NonNullable<HerdrIntegrationResult['traexPlugin']>
   if (!cfg.spec) {
     return { attempted: false, enabled: true, installed: false, alreadyInstalled: false, actionInvoked: false, skippedReason: 'missing_spec' };
   }
-
-  const manualCommand = traexPluginInstallCommand(cfg.spec);
-  const alreadyInstalled = isTraexPluginInstalled();
-  if (alreadyInstalled) {
-    return { attempted: true, enabled: true, spec: cfg.spec, installed: false, alreadyInstalled: true, actionInvoked: false };
-  }
-
-  console.log(`   安装 herdr TraeX plugin: ${cfg.spec}`);
-  const install = spawnHerdr(['plugin', 'install', cfg.spec, '--yes'], 120_000);
-  if (!install.ok) {
-    return {
-      attempted: true,
-      enabled: true,
-      spec: cfg.spec,
-      installed: false,
-      alreadyInstalled: false,
-      actionInvoked: false,
-      failed: { step: 'install', reason: install.reason, manualCommand },
-    };
-  }
-
-  const action = spawnHerdr(['plugin', 'action', 'invoke', `${TRAEX_PLUGIN_ID}.install`], 60_000);
-  if (!action.ok) {
-    return {
-      attempted: true,
-      enabled: true,
-      spec: cfg.spec,
-      installed: true,
-      alreadyInstalled: false,
-      actionInvoked: false,
-      failed: { step: 'action', reason: action.reason, manualCommand },
-    };
-  }
-
-  return {
-    attempted: true,
-    enabled: true,
-    spec: cfg.spec,
-    installed: true,
-    alreadyInstalled: false,
-    actionInvoked: true,
-  };
+  return installTraexPluginNow(cfg.spec);
 }
 
 /**
@@ -227,7 +290,7 @@ export async function ensureHerdrIntegrations(cliIds: Iterable<CliId>): Promise<
     unsupportedCliIds,
   };
 
-  if (wantsTraex) result.traexPlugin = ensureTraexPlugin();
+  if (wantsTraex) result.traexPlugin = await ensureTraexPlugin();
   if (targetIntegrations.size === 0) return result;
 
   const alreadyInstalled = listInstalledIntegrations();

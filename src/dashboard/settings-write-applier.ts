@@ -40,7 +40,7 @@ export interface ResolvedDashboardSettingsView {
   enableLocalCliOpen: boolean;
   localCliOpenMode: 'attach' | 'resume';
   chatBotDiscovery: boolean;
-  herdrTraexPlugin: { enabled: boolean; spec: string };
+  herdrTraexPlugin: { enabled: boolean; spec: string; recommendedSpec: string };
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId?: string | null;
