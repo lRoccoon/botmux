@@ -6743,6 +6743,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
 
+  const shouldSendSubstituteControlCard = substituteTrigger
+    && !botCfg.substituteMode?.disableControlCard
+    && !session.substituteControlCardSent;
+
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -6761,6 +6765,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
     pendingSubstituteTrigger: substituteTrigger,
+    pendingSubstituteControlCard: shouldSendSubstituteControlCard,
     pendingSender: newTopicSender,
     ownerOpenId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
@@ -6771,7 +6776,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     sessionStore.updateSession(ds.session);
   }
   const substituteReplyMode = substituteTrigger
-    ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+    ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
   beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
   sessionStore.updateSession(ds.session);
@@ -7574,6 +7579,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.substituteTriggered = !!substituteTrigger;
     sessionStore.updateSession(session);
 
+    const shouldSendSubstituteControlCard = substituteTrigger
+      && !botCfg.substituteMode?.disableControlCard
+      && !session.substituteControlCardSent;
+
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
     const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
@@ -7608,6 +7617,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
       pendingSubstituteTrigger: substituteTrigger,
+      pendingSubstituteControlCard: shouldSendSubstituteControlCard,
       pendingSender: autoCreateSender,
       ownerOpenId,
       currentTurnTitle: parsed.content.substring(0, 50),
@@ -7618,7 +7628,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       sessionStore.updateSession(newDs.session);
     }
     const substituteReplyMode = substituteTrigger
-      ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+      ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
     beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
     sessionStore.updateSession(newDs.session);
