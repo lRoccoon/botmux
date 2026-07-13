@@ -4,6 +4,13 @@ import { basename, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { renderBrandTemplate } from '../src/im/lark/brand-template.js';
 
+// 镜像 brand-template.ts 的 safeText：脚注里显示的文本会走 escapeLarkMd（& < > * _ ~ `）
+// + 剥离链接结构 [ ] ( )。路径派生的显示值也过它，所以下面用它算期望。
+const escText = (s: string) =>
+  s.replace(/[\r\n]+/g, ' ')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/([*_~`])/g, '\\$1').replace(/[[\]()]/g, '');
+
 describe('renderBrandTemplate', () => {
   it('不含 { 的模板原样返回（含 undefined/空串/默认值）', () => {
     expect(renderBrandTemplate(undefined, '/tmp/x')).toBeUndefined();
@@ -14,8 +21,8 @@ describe('renderBrandTemplate', () => {
 
   it('{cwdName} 取目录 basename，{cwd} 取全路径', () => {
     const dir = mkdtempSync(join(tmpdir(), 'brand-'));
-    expect(renderBrandTemplate('{cwdName}', dir)).toBe(basename(dir));
-    expect(renderBrandTemplate('{cwd}', dir)).toBe(dir);
+    expect(renderBrandTemplate('{cwdName}', dir)).toBe(escText(basename(dir)));
+    expect(renderBrandTemplate('{cwd}', dir)).toBe(escText(dir));
   });
 
   it('.botmux-dir.json 的 name 覆盖 basename、url 填充 {cwdUrl}', () => {
@@ -49,7 +56,9 @@ describe('renderBrandTemplate', () => {
     const out = renderBrandTemplate('[{cwdName}]({cwdUrl})', dir)!;
     expect(out).not.toContain('**伪造正文**]');   // 链接文本没被击穿
     expect(out).not.toContain('\n');
-    expect(out).toBe('role **伪造正文**');          // url 非法 → 丢弃 → 空链接降级成纯文本
+    expect(out).not.toContain(']');                // 文本位无裸 ]
+    expect(out).toContain('\\*\\*');              // markdown 强调被转义中和
+    expect(out).not.toMatch(/(?<!\\)\*\*/);        // 没有未转义的 **
   });
 
   it('目录名本身含 ] 时也要消毒（basename fallback / {cwd} 同样落在链接文本位）', () => {
@@ -77,6 +86,27 @@ describe('renderBrandTemplate', () => {
   });
 
   // ── codex 复验抓出的 2 条残留 ────────────────────────────────────────
+  it('name 不能注入 lark_md 标签（</font><at> 伪造 @提及）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'brand-font-'));
+    writeFileSync(join(dir, '.botmux-dir.json'), JSON.stringify({
+      name: "x</font><at id=ou_x></at><font color='grey'>",
+    }));
+    const out = renderBrandTemplate('{cwdName}', dir)!;
+    expect(out).not.toContain('<');          // < 已转义
+    expect(out).not.toContain('<at');
+    expect(out).not.toContain('</font');
+    expect(out).toContain('&lt;');           // 变成转义实体
+  });
+
+  it('目录名含 < 或 markdown 强调字符时被转义（路径派生值同样过 escapeLarkMd）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'brand-lt-'));
+    const evil = join(dir, 'a<font>b');   // 单段名（不含 /，否则会被当嵌套路径）
+    mkdirSync(evil);
+    const out = renderBrandTemplate('{cwdName}', evil)!;
+    expect(out).not.toContain('<font>');
+    expect(out).toContain('a&lt;font&gt;b');
+  });
+
   it('变量落在 URL 位时也安全：路径里的 ) 不能提前闭合链接', () => {
     // brandLabel 是用户可配的，{cwd} 完全可能被放进 URL 位；而目录名可以含 `)`。
     const dir = mkdtempSync(join(tmpdir(), 'brand-paren-'));

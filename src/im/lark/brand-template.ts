@@ -38,11 +38,11 @@ export function readDirMeta(workingDir: string): DirMeta {
 
 /**
  * `.botmux-dir.json` 的内容**不可信**：角色名来自用户（「新建角色：XX」），文件本身也只是磁盘上
- * 的任意 JSON。它会被直接拼进卡片脚注的 markdown 链接 `[{cwdName}]({cwdUrl})` —— 不消毒的话：
- *   name = 'role]\n**伪造正文**'  → 击穿链接文本，把伪造内容注入卡片正文
- *   url  = 'https://x) 尾巴'      → 提前闭合链接，同样注入
- *   url  = 'javascript:alert(1)'  → 危险 scheme 原样交给飞书
- * 所以这里**剥离**（而不是转义 —— 不去赌飞书 markdown 的转义语义）。
+ * 的任意 JSON；`{cwdName}`/`{cwd}` 的 fallback 更是来自**目录路径**（目录名可含任意字符）。它们
+ * 会被拼进卡片脚注，而脚注整体被包进 lark_md 的 `<font color='grey'>…</font>`。不消毒的话：
+ *   name = 'x</font><at id=ou_x></at><font>'  → **注入 font/at 标签，能伪造 @提及**
+ *   name = 'role]\n**伪造正文**'                → 击穿链接文本位
+ *   url  = 'https://x) 尾巴' / 'javascript:…'   → 闭合链接 / 危险 scheme
  */
 function safeName(v: unknown): string | undefined {
   if (typeof v !== 'string') return undefined;
@@ -52,16 +52,22 @@ function safeName(v: unknown): string | undefined {
 }
 
 /**
- * 通用消毒。**模板是用户可配的，我们无法预知某个变量会落在链接的文本位还是 URL 位**
- * （`[{cwdName}]({cwdUrl})` vs `[repo]({cwd})` 都是合法写法），所以每个值必须对**两种位置
- * 都安全**：
- *   - 文本位的杀手：`[` `]` 与换行  → 击穿 `[text](...)`
- *   - URL 位的杀手：`(` `)` 与空白 → 提前闭合 `(...)`，把后面的内容抖进正文
- * 因此一律剥离 `[ ] ( )` 与换行。代价是角色名里的括号会被丢掉（"客服(测试)" → "客服测试"），
- * 这是有意的取舍：宁可掉个括号，也不能让磁盘/路径里的字符串击穿卡片。
+ * 文本位消毒。落进脚注的值要同时防两层：
+ *   ① lark_md 标签/强调注入 —— 与仓库既有的 `escapeLarkMd`（groups-card.ts:662 等 5 处）对齐：
+ *      `&`→`&amp;`（须最先）、`<`→`&lt;`、`>`→`&gt;`、`* _ ~ \`` 反斜杠转义。这层堵死
+ *      `</font><at …>` 之类的标签注入。
+ *   ② markdown 链接结构 —— 模板是用户可配的，同一个变量既可能落文本位 `[{cwdName}]…`
+ *      也可能落 URL 位 `[repo]({cwd})`，所以再剥离 `[ ] ( )`（brand 特有，那 5 个卡片不涉及链接）。
+ * 代价：角色名里的 `()[]` 会被丢掉（"客服(测试)"→"客服测试"）—— 有意取舍：宁可掉括号，不可被击穿。
  */
 function safeText(s: string): string {
-  return s.replace(/[\r\n]+/g, ' ').replace(/[[\]()]/g, '');
+  return s
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/([*_~`])/g, '\\$1')
+    .replace(/[[\]()]/g, '');
 }
 
 /**
