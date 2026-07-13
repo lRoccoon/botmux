@@ -7382,8 +7382,11 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
   // Default-deny the root command surface. New botmux commands otherwise
   // silently become available to a bypass-permission workflow worker until
   // someone remembers to extend a blacklist. Keep only explicit read-only
-  // introspection plus the two CLI startup hooks; mutating subcommands under
-  // schedule/workflow/template/v3 are filtered again below.
+  // introspection plus CLI startup plumbing; mutating subcommands under
+  // schedule/workflow/template/v3 are filtered again below. `mcp serve` is
+  // the stable, botmux-owned Plugin gateway configured for the parent CLI —
+  // it must start inside workflow workers, while every other/future `mcp`
+  // subcommand remains default-denied here.
   const allowedRoot = new Set([
     undefined,
     '--help',
@@ -7398,6 +7401,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'skill',
     'hook',
     'session-ready',
+    'mcp',
     'ask', // dedicated cmdAsk guard emits the humanGate-specific guidance
     'schedule',
     'workflow',
@@ -7405,6 +7409,8 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'v3',
   ]);
   const rootDenied = !allowedRoot.has(command);
+  const mcpSub = command === 'mcp' ? (process.argv[3] ?? '') : '';
+  const mcpDenied = command === 'mcp' && mcpSub !== 'serve';
   const isSchedule = command === 'schedule';
   const scheduleSub = isSchedule ? (process.argv[3] ?? '') : '';
   const blockedScheduleSub = new Set([
@@ -7446,23 +7452,30 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     (command === 'v3' && v3Sub === 'run');
   if (
     rootDenied ||
+    mcpDenied ||
     (isSchedule && blockedScheduleSub.has(scheduleSub)) ||
     workflowMutation
   ) {
     const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
     const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
-    const sub = isSchedule ? scheduleSub : command === 'workflow'
-      ? workflowSub
-      : command === 'template'
-        ? templateSub
-        : command === 'v3'
-          ? v3Sub
-          : '';
-    const guidance = workflowMutation
-      ? 'Workflow authorization and run mutations must be initiated by the host/user, not a subagent.'
-      : rootDenied
-        ? 'This root command is not in the workflow read-only allowlist; chat-facing effects belong in a hostExecutor activity.'
-        : 'Chat-facing or schedule-mutating effects belong in a hostExecutor activity, not a subagent.';
+    const sub = isSchedule
+      ? scheduleSub
+      : command === 'mcp'
+        ? mcpSub
+        : command === 'workflow'
+          ? workflowSub
+          : command === 'template'
+            ? templateSub
+            : command === 'v3'
+              ? v3Sub
+              : '';
+    const guidance = mcpDenied
+      ? 'Only the botmux-owned Plugin MCP gateway bootstrap (`mcp serve`) is available inside a workflow subagent.'
+      : workflowMutation
+        ? 'Workflow authorization and run mutations must be initiated by the host/user, not a subagent.'
+        : rootDenied
+          ? 'This root command is not in the workflow read-only allowlist; chat-facing effects belong in a hostExecutor activity.'
+          : 'Chat-facing or schedule-mutating effects belong in a hostExecutor activity, not a subagent.';
     console.error(
       `botmux ${command}${sub ? ` ${sub}` : ''} refused inside workflow ` +
       `subagent (run=${runId} node=${nodeId}).  ${guidance}`,

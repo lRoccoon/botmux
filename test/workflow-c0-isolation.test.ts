@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const CLI_PATH = join(__dirname, '..', 'dist', 'cli.js');
@@ -91,6 +92,36 @@ describe('Slice C0 — chat side-effect isolation', () => {
       BOTMUX_WORKFLOW: '1',
     });
     expect(out.stderr).not.toMatch(/refused inside workflow/);
+  });
+
+  it('allows the botmux-owned Plugin MCP gateway bootstrap in workflow mode', () => {
+    const home = mkdtempSync(join(tmpdir(), 'workflow-c0-mcp-'));
+    try {
+      const out = spawnSync('node', [CLI_PATH, 'mcp', 'serve'], {
+        env: {
+          ...process.env,
+          HOME: home,
+          SESSION_DATA_DIR: join(home, 'data'),
+          BOTMUX_WORKFLOW: '1',
+          BOTMUX_MCP_GATEWAY: '1',
+        },
+        input: '',
+        encoding: 'utf-8',
+        timeout: 3_000,
+      });
+      expect(out.error).toBeUndefined();
+      expect(out.status).toBe(0);
+      expect(out.stderr).not.toMatch(/refused inside workflow/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps every other or future mcp subcommand default-denied in workflow mode', () => {
+    const out = runCli(['mcp', 'future-command'], { BOTMUX_WORKFLOW: '1' });
+    expect(out.status).toBe(2);
+    expect(out.stderr).toContain('botmux mcp future-command refused inside workflow');
+    expect(out.stderr).toContain('Only the botmux-owned Plugin MCP gateway bootstrap');
   });
 
   it.each([
