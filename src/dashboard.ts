@@ -43,13 +43,22 @@ import {
 } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
 import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
-import { spawnDetachedRestart, npmGlobalUpdateLockTarget, npmGlobalUpdateCwd } from './core/maintenance.js';
+import { spawnDetachedRestart, globalInstallUpdateLockTarget, globalInstallUpdateCwd } from './core/maintenance.js';
+import {
+  detectGlobalInstallManager,
+  formatGlobalInstallCommand,
+  resolveGlobalInstallPlan,
+  tryResolveGlobalInstallPlan,
+  UnsupportedGlobalInstallError,
+  type GlobalInstallPlan,
+} from './utils/global-install.js';
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
@@ -87,7 +96,8 @@ import {
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
-import { loadBotConfigs } from './bot-registry.js';
+import { getBot, loadBotConfigs, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
@@ -102,6 +112,12 @@ import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import { handleDesktopCompat } from './dashboard/compat.js';
+import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
+import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
+import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
+import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
+import { larkHosts } from './im/lark/lark-hosts.js';
+import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -237,9 +253,9 @@ function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: stri
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
         // Run from HOME, not the dashboard's cwd (pm2 `cwd: PKG_ROOT`): a global
-        // npm update replaces that dir, so a still-running dashboard would spawn
-        // start-bot in a deleted directory (uv_cwd/ENOENT). See npmGlobalUpdateCwd.
-        cwd: npmGlobalUpdateCwd(),
+        // package update replaces that dir, so a still-running dashboard would spawn
+        // start-bot in a deleted directory (uv_cwd/ENOENT). See globalInstallUpdateCwd.
+        cwd: globalInstallUpdateCwd(),
       });
       const timer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch { /* already gone */ }
@@ -285,31 +301,419 @@ interface ResolvedDashboardSettings {
   openTerminalInFeishu: boolean;
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
   chatBotDiscovery: boolean;
+  /** Machine-wide VC meeting listener kill-switch. Default ON. */
+  vcMeetingAgent: {
+    enabled: boolean;
+    listenerBotAppId?: string | null;
+    listenerBotOptions: Array<{
+      larkAppId: string;
+      botName?: string | null;
+      cliId?: string;
+      vcMeetingAgentEnabled: boolean;
+      hasLarkCliProfile: boolean;
+    }>;
+    /** Detected lark-cli version, or null if not installed. */
+    larkCliVersion?: string | null;
+    /** True when the installed lark-cli meets the VC bot minimum version. */
+    larkCliMeetsRequirement?: boolean;
+    /** Minimum lark-cli version required for VC bot meeting commands. */
+    larkCliMinVersion?: string;
+  };
   repoPickerMode: RepoPickerMode;
   /** Auto-update / auto-restart schedule (off by default). */
   maintenance: MaintenanceConfig;
-  /** True when running from a source checkout — the Settings UI greys out the
-   *  auto-update toggle (npm-global only). */
+  /** True when running from a source checkout. */
   localDevInstall: boolean;
+  /** False for package layouts whose owning updater is not supported. */
+  autoUpdateSupported: boolean;
   /** Optional local project whiteboard. Disabled by default. */
   whiteboard: WhiteboardConfig;
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
+  /** Configured schedule-task timezone override (IANA), or null when unset
+   *  ⇒ the scheduler follows `hostTimeZone`. */
+  scheduleTimeZone: string | null;
+  /** Host's auto-detected local zone (e.g. 'America/Los_Angeles'). */
+  hostTimeZone: string;
+  /** The TRUE effective zone the scheduler fires/displays in = scheduleTimeZone()
+   *  (env `BOTMUX_SCHEDULE_TIMEZONE` → config → host). The UI must use THIS for
+   *  "currently effective" — never reconstruct it from configured||host, which
+   *  ignores the env override. */
+  effectiveScheduleTimeZone: string;
+}
+
+function vcMeetingListenerBotOptions(): ResolvedDashboardSettings['vcMeetingAgent']['listenerBotOptions'] {
+  try {
+    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+    return loadBotConfigs().map(bot => ({
+      larkAppId: bot.larkAppId,
+      botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+      cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
+      vcMeetingAgentEnabled: bot.vcMeetingAgent?.enabled === true,
+      hasLarkCliProfile: typeof bot.vcMeetingAgent?.larkCliProfile === 'string' && bot.vcMeetingAgent.larkCliProfile.trim().length > 0,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+
+async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  let bots: BotConfig[];
+  try {
+    bots = loadBotConfigs();
+  } catch (err: any) {
+    return { ok: false, error: `vcMeetingAgent_listenerBot_config_unavailable: ${err?.message ?? err}` };
+  }
+  const bot = bots.find(b => b.larkAppId === appId);
+  if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
+  return { ok: true };
+}
+
+function normalizeVcMeetingAgentRecord(raw: unknown): Record<string, unknown> {
+  return raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? { ...(raw as Record<string, unknown>) }
+    : {};
+}
+
+function compactVcMeetingAgentEntry(entry: Record<string, unknown>, next: Record<string, unknown>): void {
+  if (Object.keys(next).length > 0) entry.vcMeetingAgent = next;
+  else delete entry.vcMeetingAgent;
+}
+
+function refreshLocalVcMeetingAgentConfig(appId: string): void {
+  try {
+    const latest = loadBotConfigs().find(bot => bot.larkAppId === appId);
+    const live = getBot(appId);
+    live.config.vcMeetingAgent = latest?.vcMeetingAgent as VcMeetingAgentConfig | undefined;
+  } catch {
+    // This dashboard process may not host the target bot daemon.
+  }
+}
+
+async function reloadVcMeetingBotConfigOnDaemons(appIds: string[]): Promise<void> {
+  const unique = [...new Set(appIds.filter(Boolean))];
+  for (const appId of unique) refreshLocalVcMeetingAgentConfig(appId);
+  await Promise.all(unique.map(async appId => {
+    const d = registry.getByAppId(appId);
+    if (!d) return;
+    await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-config/reload`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(10_000),
+    }).catch(() => undefined);
+  }));
+}
+
+/**
+ * Fetch the set of actually granted scopes for a bot app via Feishu Open API.
+ * Used after automateOpenPlatformSetup to verify that VC meeting scopes were
+ * actually applied (not just "requested").
+ */
+async function fetchGrantedScopesForBot(bot: { larkAppId: string; larkAppSecret: string; brand?: string }): Promise<{ ok: true; granted: Set<string> } | { ok: false; error: string }> {
+  const brand = bot.brand === 'lark' ? 'lark' : 'feishu';
+  const openApi = larkHosts(brand).openApi;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 10_000);
+  try {
+    const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: bot.larkAppId, app_secret: bot.larkAppSecret }),
+      signal: ac.signal,
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (tokenData?.code !== 0 || typeof tokenData?.tenant_access_token !== 'string') {
+      return { ok: false, error: `invalid_credentials: code=${tokenData?.code ?? '?'} msg=${tokenData?.msg ?? ''}` };
+    }
+    const infoRes = await fetch(
+      `${openApi}/open-apis/application/v6/applications/${bot.larkAppId}?lang=zh_cn`,
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: ac.signal },
+    );
+    const infoData = await infoRes.json() as any;
+    if (infoData?.code === 99991672) {
+      return { ok: false, error: 'missing application:application:self_manage' };
+    }
+    if (infoData?.code !== 0) {
+      return { ok: false, error: `scope_check_failed: code=${infoData?.code ?? '?'} msg=${infoData?.msg ?? ''}` };
+    }
+    const scopesRaw: any[] =
+      infoData.data?.app?.scopes
+      ?? infoData.data?.application?.scopes
+      ?? infoData.data?.scopes
+      ?? [];
+    const granted = new Set(
+      scopesRaw.map((s: any) => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
+    );
+    return { ok: true, granted };
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: ac.signal.aborted ? 'timeout' : `${err?.message ?? err}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Validate that a bot has the required VC meeting scopes granted.
+ * Checks both VC_MEETING_FEATURE_SCOPES and (if realtimeVoice is enabled)
+ * VC_MEETING_REALTIME_VOICE_SCOPES.
+ */
+async function validateVcMeetingScopesForBot(bot: { larkAppId: string; larkAppSecret: string; brand?: string; vcMeetingAgent?: any }): Promise<{ ok: true } | { ok: false; error: string }> {
+  const result = await fetchGrantedScopesForBot(bot);
+  if (!result.ok) return { ok: false, error: result.error };
+  const needsRealtime = bot.vcMeetingAgent?.realtimeVoice?.enabled === true;
+  const required = needsRealtime
+    ? [...VC_MEETING_FEATURE_SCOPES, ...VC_MEETING_REALTIME_VOICE_SCOPES]
+    : VC_MEETING_FEATURE_SCOPES;
+  const missing = required.filter(s => !result.granted.has(s.name));
+  if (missing.length > 0) {
+    return { ok: false, error: `缺少权限: ${missing.map(s => s.name).join(', ')}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Wait for FeishuLoginManager to produce a QR code after start().
+ * The start() method returns immediately with status='starting'; the QR code
+ * is set asynchronously in the onQrCode callback. Poll until qrDataUrl appears
+ * or we hit the timeout.
+ */
+async function waitForFeishuLoginQr(timeoutMs = 8_000, intervalMs = 200): Promise<string | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const snap = feishuLogin.get();
+    if (snap?.qrDataUrl) return snap.qrDataUrl;
+    // Also stop waiting if login already failed
+    if (snap?.status === 'failed' || snap?.status === 'success') return null;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
+async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, previousListenerBotAppId?: string | null): Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }> {
+  const nextAppId = listenerBotAppId?.trim() || null;
+  const prevAppId = previousListenerBotAppId?.trim() || null;
+  if (!nextAppId && !prevAppId) return { ok: true };
+
+  // Require lark-cli >= MIN_LARK_CLI_VERSION_FOR_VC_BOT for VC bot meeting commands
+  // (vc +meeting-join/events/message-send --as bot). Earlier versions silently reject
+  // `--as bot` with "this command only supports: user", so the listener bot can
+  // never actually join a meeting.
+  if (nextAppId) {
+    const larkCli = checkLarkCliVersion();
+    if (!larkCli) {
+      return { ok: false, error: 'vcMeetingAgent_listenerBot_larkCli_not_found: 未检测到 lark-cli，请先安装 `npm i -g @larksuite/cli`' };
+    }
+    if (!larkCli.meetsVcBotRequirement) {
+      return {
+        ok: false,
+        error: `vcMeetingAgent_listenerBot_larkCli_too_old: 当前 lark-cli ${larkCli.version} 不支持 VC bot 入会，需要 >= ${MIN_LARK_CLI_VERSION_FOR_VC_BOT}。请运行 \`npm i -g @larksuite/cli@latest\` 升级`,
+      };
+    }
+  }
+
+  // Best-effort auto-import VC meeting scopes via Open Platform automation.
+  // Run BEFORE writing bots.json so that hard failures (missing session, needs QR)
+  // don't leave per-bot vcMeetingAgent in a half-configured state.
+  // For `brand: 'lark'` bots the open-platform automation only supports feishu.cn;
+  // skip it silently and let the user configure manually.
+  if (nextAppId) {
+    const bots = loadBotConfigs();
+    const bot = bots.find(b => b.larkAppId === nextAppId);
+    const brand = bot?.brand === 'lark' ? 'lark' : 'feishu';
+    if (brand === 'lark') {
+      logger.info(`[vc-agent] skipping open-platform automation for lark-brand bot ${nextAppId} (feishu.cn only)`);
+      // For lark brand, still validate that required scopes exist before saving
+      if (bot) {
+        const scopeCheck = await validateVcMeetingScopesForBot(bot);
+        if (!scopeCheck.ok) {
+          return { ok: false, error: `vcMeetingAgent_listenerBot_missing_scopes: ${scopeCheck.error}` };
+        }
+      }
+    } else {
+      try {
+        const result = await automateOpenPlatformSetup({
+          appId: nextAppId,
+          brand,
+          maxWaitMs: 5_000,
+          onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+        });
+        if (result.ok) {
+          logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for listener bot ${nextAppId}`);
+          if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
+          if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
+          // Post-validation: verify VC meeting scopes are actually granted after automation.
+          // The internal scope/update may silently skip some scopes (e.g. not available
+          // in this tenant). Without this check, a bot without VC scopes could be saved
+          // as global listener and silently drop all meeting events.
+          if (bot) {
+            const scopeCheck = await validateVcMeetingScopesForBot(bot);
+            if (!scopeCheck.ok) {
+              return {
+                ok: false,
+                error: `vcMeetingAgent_listenerBot_missing_scopes_after_auto: ${scopeCheck.error}。请到开放平台手动开通 VC 会议权限后重试。`,
+              };
+            }
+          }
+          // Event subscription is also critical: if all 3 event update endpoints
+          // failed (eventWarning set, subscribedEventCount === 0), the bot won't
+          // receive vc.bot.meeting_*_v1 push events → meeting invite black hole.
+          if (result.eventWarning && result.subscribedEventCount === 0) {
+            return {
+              ok: false,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅全部失败(${result.eventWarning})，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
+            };
+          }
+        } else {
+          const reason = result.reason;
+          // Session/login-related failures are hard failures — return QR so user can re-login.
+          // Without a valid Open Platform session, scope/event auto-import is impossible.
+          if (
+            reason === 'missing_session'
+            || reason === 'invalid_session'
+            || reason === 'missing_csrf'
+            || reason === 'qr_expired'
+            || reason === 'timeout'
+            || reason === 'login_failed'
+          ) {
+            feishuLogin.start();
+            // feishuLogin.start() returns immediately with status='starting'; the QR
+            // code is set asynchronously in onQrCode. Wait briefly for it to be ready
+            // so the frontend can display it inline instead of showing an error without
+            // a scan entry.
+            const qrDataUrl = await waitForFeishuLoginQr();
+            const hint = '请用飞书扫码完成开放平台登录，登录后重新选择监听 bot 即可自动配置权限';
+            return {
+              ok: false,
+              error: `vcMeetingAgent_listenerBot_scope_auto_import_failed: ${reason}: ${hint}`,
+              feishuLoginQr: qrDataUrl ?? undefined,
+            };
+          }
+          // Non-login failures (network, api_error, etc.) are best-effort — don't
+          // block the save. The user can fix scopes manually in the console.
+          logger.warn(`[vc-agent] open-platform automation failed for ${nextAppId}: ${reason}: ${result.message}`);
+          // Even on non-login automation failure, verify scopes before saving —
+          // if the bot genuinely lacks VC permissions, don't silently make it listener.
+          if (bot) {
+            const scopeCheck = await validateVcMeetingScopesForBot(bot);
+            if (!scopeCheck.ok) {
+              return {
+                ok: false,
+                error: `vcMeetingAgent_listenerBot_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，请手动开通后重试。`,
+              };
+            }
+          }
+          // Also check event subscription status — if event update failed (all 3
+          // endpoints) before the downstream api_error hit, the bot still won't
+          // receive meeting invite events → listener black hole.
+          if (result.eventWarning && (result.subscribedEventCount ?? 0) === 0) {
+            return {
+              ok: false,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅失败(${result.eventWarning})，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
+            };
+          }
+        }
+      } catch (err: any) {
+        logger.warn(`[vc-agent] open-platform automation error for ${nextAppId}: ${err?.message ?? err}`);
+      }
+    }
+  }
+
+  const changedAppIds = new Set<string>();
+  try {
+    const path = requireConfigPath();
+    await withFileLock(path, async () => {
+      const raw = await readRawConfig(path);
+      let changed = false;
+
+      if (nextAppId) {
+        const idx = findEntryIndex(raw, nextAppId);
+        if (idx < 0) throw new Error('bot_not_in_config');
+        const entry = raw[idx] as Record<string, unknown>;
+        const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+        let entryChanged = false;
+        if (next.enabled !== true) {
+          next.enabled = true;
+          next.dashboardManagedListener = true;
+          entryChanged = true;
+        }
+        if (!next.larkCliProfile) {
+          next.larkCliProfile = nextAppId;
+          entryChanged = true;
+        }
+        const mc = next.meetingConsumer;
+        if (!mc || typeof mc !== 'object' || Array.isArray(mc)) {
+          next.meetingConsumer = { enabled: true };
+          entryChanged = true;
+        } else {
+          const mcRec = mc as Record<string, unknown>;
+          if (mcRec.enabled !== true) {
+            mcRec.enabled = true;
+            next.meetingConsumer = mcRec;
+            entryChanged = true;
+          }
+        }
+        if (entryChanged) {
+          compactVcMeetingAgentEntry(entry, next);
+          changed = true;
+          changedAppIds.add(nextAppId);
+        }
+      }
+
+      if (prevAppId && prevAppId !== nextAppId) {
+        const idx = findEntryIndex(raw, prevAppId);
+        if (idx >= 0) {
+          const entry = raw[idx] as Record<string, unknown>;
+          const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+          if (next.dashboardManagedListener === true) {
+            delete next.dashboardManagedListener;
+            if (next.enabled === true) delete next.enabled;
+            compactVcMeetingAgentEntry(entry, next);
+            changed = true;
+            changedAppIds.add(prevAppId);
+          }
+        }
+      }
+
+      if (changed) await writeRawConfigAtomic(path, raw);
+    });
+  } catch (err: any) {
+    return { ok: false, error: `vcMeetingAgent_listenerBot_config_write_failed: ${err?.message ?? err}` };
+  }
+
+  if (changedAppIds.size > 0) await reloadVcMeetingBotConfigOnDaemons([...changedAppIds]);
+
+  return { ok: true };
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
   const global = readGlobalConfig();
   const dashboard = global.dashboard ?? {};
+  const larkCli = checkLarkCliVersion();
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
+    vcMeetingAgent: {
+      enabled: global.vcMeetingAgent?.enabled !== false,
+      listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
+      listenerBotOptions: vcMeetingListenerBotOptions(),
+      larkCliVersion: larkCli?.version ?? null,
+      larkCliMeetsRequirement: larkCli?.meetsVcBotRequirement ?? false,
+      larkCliMinVersion: MIN_LARK_CLI_VERSION_FOR_VC_BOT,
+    },
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
+    autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     remoteAccess: global.remoteAccess === true,
+    scheduleTimeZone: global.scheduleTimeZone ?? null,
+    hostTimeZone: hostLocalTimeZone(),
+    effectiveScheduleTimeZone: scheduleTimeZone(),
   };
 }
 
@@ -322,6 +726,8 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
   ));
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
+settingsWriteApplierDeps.syncVcMeetingListenerBotConfig = syncVcMeetingListenerBotConfig;
+settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
 function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
@@ -390,6 +796,10 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
  *  Cross-process serialization against the maintenance auto-update (a different
  *  process) is handled separately by the shared file lock in the run route. */
 let updateInFlight = false;
+// The dashboard process survives while pnpm swaps its versioned realpath. Keep
+// the successful plan (including its stable package root) so follow-up status,
+// update, and restart requests do not reuse the removed old runtime realpath.
+let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 
 // Cache the upstream version/changelog lookups so the nav-badge check + the
 // Settings card don't hammer the npm registry / GitHub on every page load.
@@ -418,19 +828,19 @@ async function cachedChangelog(current: string, now = Date.now()): Promise<Chang
 }
 
 /**
- * Run `npm install -g botmux@latest` for the manual-update flow WITHOUT blocking
+ * Run the ownership-aware npm/pnpm update for the manual-update flow WITHOUT blocking
  * the event loop (async spawn, not execSync — the dashboard must keep serving
  * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
  * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
  * a fixed literal — no shell interpolation of untrusted input.
  */
-function runNpmInstallLatest(): Promise<void> {
+function runGlobalInstallLatest(plan: GlobalInstallPlan): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn('npm', ['install', '-g', 'botmux@latest'], {
-      cwd: npmGlobalUpdateCwd(),
+    const child = spawn(plan.command, plan.args, {
+      cwd: globalInstallUpdateCwd(),
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32', // resolve npm.cmd on Windows
+      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd
     });
     let tail = '';
     const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
@@ -438,13 +848,13 @@ function runNpmInstallLatest(): Promise<void> {
     child.stderr?.on('data', capture);
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      reject(new Error('npm install timed out after 180s'));
+      reject(new Error(`${plan.manager} install timed out after 180s`));
     }, 180_000);
     child.on('error', (e) => { clearTimeout(timer); reject(e); });
     child.on('exit', (code) => {
       clearTimeout(timer);
       if (code === 0) resolve();
-      else reject(new Error(`npm exited ${code}: ${tail.trim().slice(-500)}`));
+      else reject(new Error(`${plan.manager} exited ${code}: ${tail.trim().slice(-500)}`));
     });
   });
 }
@@ -514,11 +924,28 @@ registry.on(syncSubscriptions);
 // daemon doesn't block the others.
 await Promise.all(registry.list().map(attachDaemon));
 
+const resourceMonitor = createResourceMonitorService({
+  intervalMs: 10_000,
+  topSessionLimit: 30,
+  sessionHistoryMs: 3 * 60 * 60_000,
+  aggregateHistoryMs: 24 * 60 * 60_000,
+  listSessions: () => {
+    const names = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
+    return aggregator.getSessions()
+      .filter(s => s.status !== 'closed')
+      .map(s => toResourceMonitorSessionSeed(s, names.get(String(s.larkAppId ?? ''))));
+  },
+  listDaemons: () => buildResourceMonitorDaemonSeeds(loadBotConfigs(), registry.list()),
+});
+resourceMonitor.start();
+
 // ─── Static frontend ─────────────────────────────────────────────────────────
 
 // Path to the bundled frontend (sibling of dist/dashboard.js)
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(__dirname, 'dashboard-web');
+const DEV_RELOAD_MARKER = join(WEB_DIR, '.botmux-dashboard-dev');
+const DEV_RELOAD_VERSION = join(WEB_DIR, '.botmux-dashboard-reload');
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -548,6 +975,38 @@ function serveFileAbs(res: ServerResponse, fp: string): boolean {
   return true;
 }
 
+function dashboardDevReloadEnabled(): boolean {
+  return process.env.BOTMUX_DASHBOARD_DEV_RELOAD === '1' || existsSync(DEV_RELOAD_MARKER);
+}
+
+function dashboardDevReloadVersion(): string | null {
+  try {
+    const st = statSync(DEV_RELOAD_VERSION);
+    if (!st.isFile()) return null;
+    return `${st.size}:${Math.floor(st.mtimeMs)}`;
+  } catch {
+    return null;
+  }
+}
+
+function devReloadSnippet(): string {
+  return `
+<script type="module">
+(() => {
+  if (!('__BOTMUX_DASHBOARD_DEV_RELOAD__' in window)) {
+    Object.defineProperty(window, '__BOTMUX_DASHBOARD_DEV_RELOAD__', { value: true });
+    const source = new EventSource('/__dev/reload');
+    source.addEventListener('reload', () => location.reload());
+  }
+})();
+</script>`;
+}
+
+function injectDevReload(html: string): string {
+  const snippet = devReloadSnippet();
+  return html.includes('</body>') ? html.replace('</body>', `${snippet}\n</body>`) : `${html}\n${snippet}`;
+}
+
 function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const fp = resolve(WEB_DIR, rel);
@@ -563,18 +1022,27 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
     // and can be cached immutably once the current app.js points at them.
     const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
     const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+    const devIndex = relToRoot === 'index.html' && dashboardDevReloadEnabled();
     const headers: Record<string, string> = {
       'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
-      'cache-control': immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
+      'cache-control': devIndex ? 'no-store' : immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
       etag,
     };
-    if (req.headers['if-none-match'] === etag) {
+    if (!devIndex && req.headers['if-none-match'] === etag) {
       res.writeHead(304, headers);
       res.end();
       return true;
     }
     res.writeHead(200, headers);
-    res.end(readFileSync(fp));
+    if (req.method === 'HEAD') {
+      res.end();
+      return true;
+    }
+    if (devIndex) {
+      res.end(injectDevReload(readFileSync(fp, 'utf8')));
+    } else {
+      res.end(readFileSync(fp));
+    }
     return true;
   } catch {
     return false;
@@ -1199,10 +1667,36 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Static frontend (index.html + /assets/* + /game/*) ────────────────
+    if (req.method === 'GET' && url.pathname === '/__dev/reload') {
+      if (!dashboardDevReloadEnabled()) return jsonRes(res, 404, { error: 'dev_reload_disabled' });
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+      });
+      let last = dashboardDevReloadVersion();
+      res.write(`event: ready\ndata: ${JSON.stringify({ version: last })}\n\n`);
+      const timer = setInterval(() => {
+        const next = dashboardDevReloadVersion();
+        if (!next || next === last) return;
+        last = next;
+        res.write(`event: reload\ndata: ${JSON.stringify({ version: next })}\n\n`);
+      }, 500);
+      req.on('close', () => clearInterval(timer));
+      return;
+    }
+
+    // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
     if (
-      req.method === 'GET' &&
-      (url.pathname === '/' || url.pathname.startsWith('/assets/') || url.pathname.startsWith('/game/'))
+      (req.method === 'GET' || req.method === 'HEAD') &&
+      (
+        url.pathname === '/' ||
+        url.pathname === '/favicon.ico' ||
+        url.pathname === '/favicon.png' ||
+        url.pathname === '/apple-touch-icon.png' ||
+        url.pathname.startsWith('/assets/') ||
+        url.pathname.startsWith('/game/')
+      )
     ) {
       // HD2D runtime binaries (index.wasm / index.pck) are NOT shipped — they
       // are downloaded on demand into the cache dir and served from there.
@@ -1212,9 +1706,11 @@ const server = createServer(async (req, res) => {
         if (fp && serveFileAbs(res, fp)) return;
         res.writeHead(404); res.end(); return;
       }
-      // Map /assets/foo.js → WEB_DIR/foo.js; /game/* is served as-is.
+      // Map /assets/foo.js → WEB_DIR/foo.js; /favicon.ico is an alias for the PNG favicon.
       const lookupPath = url.pathname.startsWith('/assets/')
         ? '/' + url.pathname.slice(8)
+        : url.pathname === '/favicon.ico'
+          ? '/favicon.png'
         : url.pathname;
       if (serveStatic(req, res, lookupPath)) return;
     }
@@ -1240,6 +1736,10 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Public API (cookie/token already validated above) ──────────────────
+
+    if (await handleResourceMonitorApi(req, res, url, resourceMonitor)) {
+      return;
+    }
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
       // Sessions spawned before a bot config carried a display name store the
@@ -1331,7 +1831,10 @@ const server = createServer(async (req, res) => {
       const schedules = authed
         ? aggregator.getSchedules()
         : redactSchedulesForPublic(aggregator.getSchedules());
-      return jsonRes(res, 200, { schedules });
+      // Effective schedule timezone: nextRunAt/lastRunAt instants must be
+      // rendered in the zone the scheduler fires in (not the viewer's browser
+      // zone), so the web schedule/overview lists match cron/card/CLI displays.
+      return jsonRes(res, 200, { schedules, timezone: scheduleTimeZone() });
     }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
       // `authed` lets the Settings page disable toggles for read-only
@@ -1357,17 +1860,24 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
       const result = await applySettingsWrite(parsed, settingsWriteApplierDeps);
-      if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.error });
+      if (!result.ok) {
+        const body: Record<string, unknown> = { ok: false, error: result.error };
+        if ('feishuLoginQr' in result && result.feishuLoginQr) body.feishuLoginQr = result.feishuLoginQr;
+        return jsonRes(res, 400, body);
+      }
       return jsonRes(res, 200, { ok: true, settings: result.settings });
     }
 
     // ─── Version & manual update ─────────────────────────────────────────────
-    // `npm install -g` and a host restart are privileged: none of these paths
+    // Global package updates and a host restart are privileged: none of these paths
     // are on PUBLIC_READ_PATHS, so decideDashboardAuth already 401s an
     // unauthenticated caller (in both normal and public-read mode). The explicit
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
       const current = resolveCurrentVersion();
+      const packageRoot = botmuxInstallRoot();
+      const installManager = detectGlobalInstallManager(packageRoot);
+      const installPlan = lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan(packageRoot);
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
@@ -1378,6 +1888,9 @@ const server = createServer(async (req, res) => {
         latest,
         behind: !!latest && isNewerVersion(latest, current),
         localDevInstall: isLocalDevInstall(),
+        updateSupported: installPlan !== null,
+        updateManager: installPlan?.manager ?? installManager,
+        updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
         node: checkNode(),
         installs: detectBotmuxInstalls(),
       });
@@ -1398,30 +1911,50 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+      let installPlan: GlobalInstallPlan;
+      try {
+        installPlan = lastSuccessfulUpdatePlan ?? resolveGlobalInstallPlan();
+      } catch (error) {
+        if (error instanceof UnsupportedGlobalInstallError) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'unsupported_install_method',
+            manager: error.manager,
+          });
+        }
+        throw error;
+      }
       const node = checkNode();
       if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
       updateInFlight = true;
-      const oldVersion = botmuxVersion();
+      const oldVersion = botmuxVersionAt(installPlan.activePackageRoot);
       // Acquire the shared cross-process lock so a scheduled maintenance
-      // auto-update (running in the bot-0 daemon) can't `npm install -g` at the
-      // same time. `acquired` distinguishes "lock held by maintenance" (409)
-      // from "npm itself failed" (500). Short wait: don't block the request on a
-      // full in-progress install — report busy fast.
+      // auto-update (running in the bot-0 daemon) can't update the same global
+      // install concurrently. `acquired` distinguishes "lock held by
+      // maintenance" (409) from "the package manager failed" (500). Short wait:
+      // don't block the request on a full in-progress install — report busy fast.
       let acquired = false;
       try {
-        await withFileLock(npmGlobalUpdateLockTarget(), async () => {
+        await withFileLock(globalInstallUpdateLockTarget(), async () => {
           acquired = true;
-          await runNpmInstallLatest();
+          await runGlobalInstallLatest(installPlan);
         }, { maxWaitMs: 2_000 });
       } catch (e) {
         if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
-        return jsonRes(res, 500, { ok: false, error: 'npm_failed', detail: e instanceof Error ? e.message : String(e) });
+        return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
       } finally {
         updateInFlight = false;
       }
-      const newVersion = botmuxVersion();
-      return jsonRes(res, 200, { ok: true, oldVersion, newVersion, changed: newVersion !== oldVersion });
+      const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
+      lastSuccessfulUpdatePlan = installPlan;
+      return jsonRes(res, 200, {
+        ok: true,
+        oldVersion,
+        newVersion,
+        changed: newVersion !== oldVersion,
+        manager: installPlan.manager,
+      });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
@@ -1440,7 +1973,7 @@ const server = createServer(async (req, res) => {
           writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
         } catch { /* breadcrumb is best-effort */ }
       }
-      spawnDetachedRestart('dashboard');
+      spawnDetachedRestart('dashboard', lastSuccessfulUpdatePlan?.activePackageRoot);
       return jsonRes(res, 200, { ok: true });
     }
 
@@ -1885,9 +2418,20 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Roles (proxy to daemon) ────────────────────────────────────────────
+    // POST   /api/roles/batch → collapse role reads to one request per daemon
     // GET    /api/roles/:larkAppId/:chatId → read role file
     // PUT    /api/roles/:larkAppId/:chatId → write role file
     // DELETE /api/roles/:larkAppId/:chatId → delete role file
+
+    if (req.method === 'POST' && url.pathname === '/api/roles/batch') {
+      let body: unknown;
+      try { body = await readJsonBody(req); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const parsed = parseRoleBatchTargets(body);
+      if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+      const result = await aggregateRoleBatch(parsed.targets, proxyToDaemon);
+      return jsonRes(res, 200, result);
+    }
 
     let mRole: RegExpMatchArray | null;
     if ((mRole = url.pathname.match(/^\/api\/roles\/([^/]+)\/([^/]+)$/))) {
@@ -2314,6 +2858,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/substitute-mode — proxy to that bot's daemon. Body
+    // carries `{ enabled, targets, disclosure }`.
+    let mBotSubstituteMode: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSubstituteMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/substitute-mode$/))) {
+      const appId = decodeURIComponent(mBotSubstituteMode[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-substitute-mode`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -3013,6 +3575,7 @@ function shutdown(): void {
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();
+  resourceMonitor.stop();
   platformTunnel?.stop();
   server.close(() => process.exit(0));
   // Hard-exit fallback after 5s

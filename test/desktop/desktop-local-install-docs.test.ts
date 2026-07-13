@@ -28,4 +28,16 @@ describe('desktop local source installer docs', () => {
     expect(readme).not.toContain('--skip-link');
     expect(readme).not.toContain('botmux app');
   });
+
+  it('keeps desktop pack output on a concrete app version', () => {
+    const pkg = JSON.parse(readFileSync('package.json', 'utf-8')) as { scripts: Record<string, string> };
+
+    expect(pkg.scripts['desktop:pack:local']).toBe('node scripts/desktop-pack-local.mjs');
+
+    const script = readFileSync('scripts/desktop-pack-local.mjs', 'utf-8');
+    expect(script).toContain('resolveAppVersion');
+    expect(script).toContain('0.0.1-local');
+    expect(script).toContain('-c.extraMetadata.version=');
+    expect(script).toContain('electron-builder');
+  });
 });

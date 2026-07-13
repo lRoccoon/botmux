@@ -14,6 +14,7 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import * as substituteModeStore from '../services/substitute-mode-store.js';
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
@@ -29,12 +30,12 @@ import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '.
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig } from '../global-config.js';
-import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
+import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -59,6 +60,7 @@ import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
+import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -85,7 +87,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, readBotSkillPolicy } from '../bot-registry.js';
+import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
 import type { DaemonSession } from './types.js';
@@ -413,6 +415,19 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
   jsonRes(res, 200, r);
 });
 
+ipcRoute('POST', '/api/chat-reply-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, reason: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, reason: 'invalid_json' }); }
+  const chatId = typeof (body as any)?.chatId === 'string' ? (body as any).chatId.trim() : '';
+  const mode = normalizeChatReplyMode(typeof (body as any)?.mode === 'string' ? (body as any).mode : undefined);
+  if (!chatId) return jsonRes(res, 400, { ok: false, reason: 'chatId_required' });
+  if (!mode) return jsonRes(res, 400, { ok: false, reason: 'invalid_mode' });
+  const result = await setChatReplyMode(cachedLarkAppId, chatId, mode);
+  if (!result.ok) return jsonRes(res, 500, { ok: false, reason: result.reason });
+  jsonRes(res, 200, { ok: true, mode: result.mode });
+});
+
 // 会话历史：实时拉取该会话所在话题/群的飞书消息（与 botmux history 同链路，
 // 消息体不落盘），给 dashboard 的会话历史弹窗。复杂卡片的「请升级」兜底文本
 // 用 message.get 的完整表示补齐；merge_forward 保持占位符（原型不展开）。
@@ -449,14 +464,42 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
       [...new Set(messages.filter(m => m.senderType === 'user' && m.senderId).map(m => m.senderId))]
         .map(async id => { senders.set(id, await getUserProfile(appId, id)); }),
     );
+    // Bot sender ids are scoped to the observing app. Reuse the chat-member
+    // resolver (cross-ref + observed bot roster) instead of assuming every
+    // non-user message came from the bot that owns this dashboard session.
+    const botMembers: ChatBotMember[] = await listChatBotMembers(appId, session.chatId).catch(() => [] as ChatBotMember[]);
+    let botInfos: HistoryBotInfo[] = [];
+    try {
+      const parsed = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf8'));
+      if (Array.isArray(parsed)) botInfos = parsed;
+    } catch { /* missing/corrupt cache degrades to name/open_id placeholders */ }
+    // listChatBotMembers can be temporarily unavailable during startup. Always
+    // retain a local self-bot fallback so its own messages still have identity.
+    try {
+      const self = getBot(appId);
+      if (self.botOpenId && !botMembers.some(member => member.openId === self.botOpenId)) {
+        const selfName = self.botName || appId;
+        botMembers.push({
+          openId: self.botOpenId,
+          displayName: selfName,
+          name: selfName,
+          larkAppId: appId,
+          source: 'configured',
+          mentionable: true,
+          mentionSource: 'self',
+          hasTeamRole: false,
+        });
+      }
+      if (!botInfos.some(info => info.larkAppId === appId)) {
+        botInfos.push({ larkAppId: appId, botOpenId: self.botOpenId, botName: self.botName, botAvatarUrl: self.botAvatarUrl });
+      }
+    } catch { /* session record may outlive a removed bot config */ }
+
     jsonRes(res, 200, {
       ok: true,
       scope: session.scope ?? 'thread',
       ownerOpenId: session.ownerOpenId,
-      messages: messages.map(m => {
-        const p = m.senderType === 'user' ? senders.get(m.senderId) : null;
-        return p ? { ...m, senderName: p.name, senderAvatar: p.avatarUrl } : m;
-      }),
+      messages: enrichHistorySenders(messages, senders, botMembers, botInfos),
     });
   } catch (err: any) {
     jsonRes(res, 502, { ok: false, error: String(err?.message ?? err) });
@@ -1013,6 +1056,13 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
   }
   const valid = validateTriggerRequest(body);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
+  if (valid.request.target.botId && valid.request.target.botId !== cachedLarkAppId) {
+    return jsonRes(res, 400, {
+      ok: false,
+      errorCode: 'bot_not_found',
+      error: `request target botId ${valid.request.target.botId} does not match daemon ${cachedLarkAppId}`,
+    });
+  }
   try {
     let result;
     if (valid.request.target.kind === 'workflow') {
@@ -1191,26 +1241,49 @@ ipcRoute('DELETE', '/api/oncall/:chatId', async (_req, res, p) => {
 });
 
 // ─── Role management (dashboard) ───────────────────────────────────────────
+// POST   /api/roles/batch   body: {chatIds: string[]} → role snapshots
 // GET    /api/roles/:chatId  → { chatId, content, byteLength, injectMode, effectiveContent, effectiveSource }
 // PUT    /api/roles/:chatId  body: {content?, injectMode?} → write role file and/or injection mode
 // DELETE /api/roles/:chatId  → remove role file (and injection-mode sidecar)
 
-ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
-  const content = resolveRoleFile(cachedLarkAppId, p.chatId);
-  const effective = resolveRole(cachedLarkAppId, p.chatId);
-  jsonRes(res, 200, {
-    chatId: p.chatId,
+const MAX_ROLE_BATCH_CHAT_IDS = 1_000;
+
+function dashboardRolePayload(larkAppId: string, chatId: string): Record<string, unknown> {
+  const content = resolveRoleFile(larkAppId, chatId);
+  const effective = resolveRole(larkAppId, chatId);
+  return {
+    chatId,
     content,
     byteLength: content ? Buffer.byteLength(content, 'utf-8') : 0,
     hasRole: content !== null,
-    injectMode: readRoleInjectMode(cachedLarkAppId, p.chatId),
+    injectMode: readRoleInjectMode(larkAppId, chatId),
     effectiveContent: effective.content,
     effectiveSource: effective.source,
     effectiveByteLength: effective.content ? Buffer.byteLength(effective.content, 'utf-8') : 0,
     hasEffectiveRole: effective.content !== null,
-  });
+  };
+}
+
+ipcRoute('POST', '/api/roles/batch', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { chatIds?: unknown };
+  try { body = await readJsonBody<{ chatIds?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!Array.isArray(body.chatIds)) return jsonRes(res, 400, { ok: false, error: 'chat_ids_required' });
+  if (body.chatIds.length > MAX_ROLE_BATCH_CHAT_IDS) {
+    return jsonRes(res, 400, { ok: false, error: 'too_many_chat_ids' });
+  }
+  if (body.chatIds.some(chatId => typeof chatId !== 'string' || !isValidRoleChatId(chatId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  const chatIds = [...new Set(body.chatIds as string[])];
+  jsonRes(res, 200, { roles: chatIds.map(chatId => dashboardRolePayload(cachedLarkAppId!, chatId)) });
+});
+
+ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  jsonRes(res, 200, dashboardRolePayload(cachedLarkAppId, p.chatId));
 });
 
 ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
@@ -1389,6 +1462,17 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
   } catch { /* default unlimited */ }
+  let logicalSessionCount = 0;
+  let residentSessionCount = 0;
+  let dormantSessionCount = 0;
+  const registry = getActiveSessionsRegistry();
+  if (registry) {
+    logicalSessionCount = registry.size;
+    for (const ds of registry.values()) {
+      if (ds.worker && !ds.worker.killed) residentSessionCount++;
+      else if (!ds.session.queued) dormantSessionCount++;
+    }
+  }
   // startupCommands → newline-joined for the dashboard textarea (one per line).
   let startupCommands = '';
   try {
@@ -1447,6 +1531,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
+    substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
@@ -1458,6 +1543,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    logicalSessionCount,
+    residentSessionCount,
+    dormantSessionCount,
     startupCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
@@ -1509,6 +1597,29 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, ...r.prefs });
+});
+
+ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const rec = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  // Resolve the submitted email / union_id entries into runtime-matchable
+  // open_ids (+ fresh display names) using this bot's own credentials before
+  // persisting; unresolvable entries are dropped but reported back for the UI.
+  const { targets, resolution } = await substituteModeStore.resolveSubstituteTargets(
+    cachedLarkAppId,
+    rec.targets,
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfile },
+  );
+  const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
+    enabled: rec.enabled === true,
+    targets,
+    disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
+  });
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, resolution });
+  jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution });
 });
 
 // Per-bot explicit `/summary` history range. Body `{ limit, sinceHours }`.
@@ -1916,6 +2027,21 @@ ipcRoute('POST', '/api/locale/reload', async (_req, res) => {
   }
 
   jsonRes(res, 200, { ok: true, defaultLocale: resolvedDefault, botLang });
+});
+
+// Hot-reload the current daemon's per-bot config from bots.json after another
+// process edits the shared config file. Keep the live Lark client / resolved
+// allowlist intact; VC listener routing only needs the vcMeetingAgent block.
+ipcRoute('POST', '/api/bot-config/reload', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    const latest = loadBotConfigs().find(bot => bot.larkAppId === cachedLarkAppId);
+    if (!latest) return jsonRes(res, 404, { ok: false, error: 'bot_not_in_config' });
+    getBot(cachedLarkAppId).config.vcMeetingAgent = latest.vcMeetingAgent;
+    jsonRes(res, 200, { ok: true, larkAppId: cachedLarkAppId, vcMeetingAgentEnabled: latest.vcMeetingAgent?.enabled === true });
+  } catch (err: any) {
+    jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
 });
 
 ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {

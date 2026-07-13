@@ -270,17 +270,39 @@ describe('codex-app sandboxExtraExecPaths', () => {
 // path flags / sandbox-chosen session-id are rejected.
 describe('validateRelayRequest', () => {
   it('accepts plain basenames + allowlisted presentation flags', () => {
-    const r = validateRelayRequest({ contentFile: 'c.content', attachments: ['a.png'], flags: ['--mention-back', '--mention', 'ou:X', '--voice'] });
+    const r = validateRelayRequest({
+      contentFile: 'c.content',
+      attachments: ['a.png'],
+      videos: ['replay.mp4'],
+      videoCovers: ['cover.png'],
+      flags: ['--mention-back', '--mention', 'ou:X', '--voice'],
+    });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.attachmentNames).toEqual(['a.png']);
+    expect(r.value.videoNames).toEqual(['replay.mp4']);
+    expect(r.value.videoCoverNames).toEqual(['cover.png']);
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
+  });
+
+  it('accepts a custom card file as a plain outbox basename', () => {
+    const r = validateRelayRequest({
+      contentFile: 'c.content',
+      cardFile: 'card.json',
+      flags: ['--no-mention'],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.contentName).toBe('c.content');
+    expect(r.value.cardName).toBe('card.json');
+    expect(r.value.flags).toEqual(['--no-mention']);
   });
 
   it('rejects the raw-hostArgs exploit (path-bearing flag not allowlisted)', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--content-file', '/root/.botmux/bots.json'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--files', '/root/.ssh/id_rsa'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--card-file', '/root/.botmux/card.json'] }).ok).toBe(false);
   });
 
   it('rejects a sandbox-supplied --session-id (cannot target another session)', () => {
@@ -295,6 +317,9 @@ describe('validateRelayRequest', () => {
   it('rejects non-basename content / attachment names (../ traversal)', () => {
     expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', videos: ['../secret.mp4'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
     expect(validateRelayRequest({ /* missing contentFile */ flags: [] }).ok).toBe(false);
   });

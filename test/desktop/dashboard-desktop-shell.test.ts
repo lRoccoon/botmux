@@ -38,20 +38,22 @@ describe('desktop dashboard shell mode', () => {
       'utf-8',
     );
     const dashboardSource = readFileSync(
-      fileURLToPath(new URL('../../src/dashboard/web/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/dashboard/web/app.tsx', import.meta.url)),
       'utf-8',
     );
     const onboardingSource = readFileSync(
-      fileURLToPath(new URL('../../src/dashboard/web/bot-onboarding.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/dashboard/web/bot-onboarding.tsx', import.meta.url)),
       'utf-8',
     );
 
     expect(rendererSource).toContain("#/?open=bot-onboarding");
     expect(rendererSource).toContain('openBotOnboarding');
     expect(rendererSource).not.toContain('openBotOnboardingDialog');
-    expect(dashboardSource).toContain('consumeBotOnboardingRouteAction');
-    expect(onboardingSource).toContain("action.params.get('open') !== 'bot-onboarding'");
-    expect(onboardingSource).toContain("action.params.delete('open')");
+    expect(dashboardSource).toContain('consumeDesktopShellRouteAction');
+    expect(dashboardSource).toContain("open !== 'bot-onboarding'");
+    expect(dashboardSource).toContain("action.params.delete('open')");
+    expect(onboardingSource).toContain('OPEN_BOT_ONBOARDING_EVENT');
+    expect(onboardingSource).toContain('window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT))');
   });
 
   it('mirrors dashboard topbar actions hidden by the desktop shell', () => {
@@ -64,7 +66,11 @@ describe('desktop dashboard shell mode', () => {
       'utf-8',
     );
     const dashboardSource = readFileSync(
-      fileURLToPath(new URL('../../src/dashboard/web/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/dashboard/web/app.tsx', import.meta.url)),
+      'utf-8',
+    );
+    const sessionsSource = readFileSync(
+      fileURLToPath(new URL('../../src/dashboard/web/sessions-page.tsx', import.meta.url)),
       'utf-8',
     );
 
@@ -72,16 +78,17 @@ describe('desktop dashboard shell mode', () => {
     // the user-visible entry points that master moved into that topbar.
     expect(html).toContain('id="create-session-btn"');
     expect(html).toContain('id="docs-link"');
-    expect(rendererSource).toContain("#/?open=create-session");
+    expect(rendererSource).toContain("#/sessions?open=create-session");
     expect(rendererSource).toContain('openCreateSession');
-    expect(dashboardSource).toContain('consumeCreateSessionRouteAction');
-    expect(dashboardSource).toContain("params.get('open') !== 'create-session'");
-    expect(dashboardSource).toContain("import('./sessions.js')");
+    expect(dashboardSource).toContain('OPEN_CREATE_SESSION_EVENT');
+    expect(dashboardSource).toContain("open !== 'create-session'");
+    expect(sessionsSource).toContain("const OPEN_CREATE_SESSION_EVENT = 'botmux:open-create-session'");
+    expect(sessionsSource).toContain('window.addEventListener(OPEN_CREATE_SESSION_EVENT');
   });
 
   it('lets the embedded dashboard honor the desktop locale from hash params', () => {
     const appSource = readFileSync(
-      fileURLToPath(new URL('../../src/dashboard/web/app.ts', import.meta.url)),
+      fileURLToPath(new URL('../../src/dashboard/web/app.tsx', import.meta.url)),
       'utf-8',
     );
 

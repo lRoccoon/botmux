@@ -11,6 +11,7 @@ import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
@@ -79,6 +80,120 @@ function normalizeNonNegativeInt(raw: unknown): number | undefined {
   if (typeof raw !== 'number') return undefined;
   if (!Number.isInteger(raw) || raw < 0) return undefined;
   return raw;
+}
+
+function normalizePositiveInt(raw: unknown): number | undefined {
+  if (typeof raw !== 'number') return undefined;
+  if (!Number.isInteger(raw) || raw <= 0) return undefined;
+  return raw;
+}
+
+function normalizeNonEmptyString(raw: unknown): string | undefined {
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+}
+
+function normalizeTimeZone(raw: unknown): string | undefined {
+  const timeZone = normalizeNonEmptyString(raw);
+  if (!timeZone) return undefined;
+  try {
+    new Intl.DateTimeFormat('zh-CN', { timeZone }).format(new Date(0));
+    return timeZone;
+  } catch {
+    logger.warn(`vcMeetingAgent.timeZone ignored: invalid IANA time zone ${JSON.stringify(timeZone)}`);
+    return undefined;
+  }
+}
+
+function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const out: VcMeetingAgentConfig = {};
+  if (entry.enabled === true) out.enabled = true;
+  const notificationChatId = normalizeNonEmptyString(entry.notificationChatId);
+  const listenerChatId = normalizeNonEmptyString(entry.listenerChatId);
+  const attentionTargetOpenId = normalizeNonEmptyString(entry.attentionTargetOpenId);
+  const larkCliProfile = normalizeNonEmptyString(entry.larkCliProfile);
+  const timeZone = normalizeTimeZone(entry.timeZone ?? entry.timezone);
+  const inviteTtlMs = normalizePositiveInt(entry.inviteTtlMs);
+  const stabilizeMs = normalizePositiveInt(entry.stabilizeMs);
+  const flushIntervalMs = normalizePositiveInt(entry.flushIntervalMs);
+  const realtimeVoice = normalizeVcMeetingRealtimeVoiceConfig(entry.realtimeVoice);
+  const meetingConsumer = normalizeVcMeetingConsumerConfig(entry.meetingConsumer);
+  if (notificationChatId) out.notificationChatId = notificationChatId;
+  if (listenerChatId) out.listenerChatId = listenerChatId;
+  if (attentionTargetOpenId) out.attentionTargetOpenId = attentionTargetOpenId;
+  if (larkCliProfile) out.larkCliProfile = larkCliProfile;
+  if (timeZone) out.timeZone = timeZone;
+  if (inviteTtlMs !== undefined) out.inviteTtlMs = inviteTtlMs;
+  if (stabilizeMs !== undefined) out.stabilizeMs = stabilizeMs;
+  if (flushIntervalMs !== undefined) out.flushIntervalMs = flushIntervalMs;
+  if (realtimeVoice) out.realtimeVoice = realtimeVoice;
+  if (meetingConsumer) out.meetingConsumer = meetingConsumer;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeVcMeetingConsumerConfig(raw: unknown): VcMeetingConsumerConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const out: VcMeetingConsumerConfig = {};
+  if (entry.enabled === true) out.enabled = true;
+  if (entry.enabled === false) out.enabled = false;
+  if (entry.defaultMode === 'listenOnly' || entry.defaultMode === 'agent') out.defaultMode = entry.defaultMode;
+  const defaultAgentAppId = normalizeNonEmptyString(entry.defaultAgentAppId) ?? normalizeNonEmptyString(entry.defaultAgent);
+  const selectionTimeoutMs = normalizePositiveInt(entry.selectionTimeoutMs);
+  const injectIntervalMs = normalizePositiveInt(entry.injectIntervalMs);
+  const minBatchChars = normalizePositiveInt(entry.minBatchChars);
+  const minBatchItems = normalizePositiveInt(entry.minBatchItems);
+  const maxInjectIntervalMs = normalizePositiveInt(entry.maxInjectIntervalMs);
+  const candidates = normalizeVcMeetingConsumerCandidates(entry.agentCandidates ?? entry.agents);
+  if (defaultAgentAppId) out.defaultAgentAppId = defaultAgentAppId;
+  if (selectionTimeoutMs !== undefined) out.selectionTimeoutMs = selectionTimeoutMs;
+  if (injectIntervalMs !== undefined) out.injectIntervalMs = injectIntervalMs;
+  if (minBatchChars !== undefined) out.minBatchChars = minBatchChars;
+  if (minBatchItems !== undefined) out.minBatchItems = minBatchItems;
+  if (maxInjectIntervalMs !== undefined) out.maxInjectIntervalMs = maxInjectIntervalMs;
+  if (candidates.length > 0) out.agentCandidates = candidates;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeVcMeetingConsumerCandidates(raw: unknown): VcMeetingConsumerAgentConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const out: VcMeetingConsumerAgentConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    let larkAppId: string | undefined;
+    let label: string | undefined;
+    if (typeof item === 'string') {
+      larkAppId = item.trim();
+    } else if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const entry = item as Record<string, unknown>;
+      larkAppId = normalizeNonEmptyString(entry.larkAppId) ?? normalizeNonEmptyString(entry.appId);
+      label = normalizeNonEmptyString(entry.label) ?? normalizeNonEmptyString(entry.name);
+    }
+    if (!larkAppId || seen.has(larkAppId)) continue;
+    seen.add(larkAppId);
+    out.push({
+      larkAppId,
+      ...(label ? { label } : {}),
+    });
+  }
+  return out;
+}
+
+function normalizeVcMeetingRealtimeVoiceConfig(raw: unknown): VcMeetingRealtimeVoiceConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const out: VcMeetingRealtimeVoiceConfig = {};
+  if (entry.enabled === true) out.enabled = true;
+  const sampleRate = normalizePositiveInt(entry.sampleRate);
+  const channels = normalizePositiveInt(entry.channels);
+  const frameMs = normalizePositiveInt(entry.frameMs);
+  const testSpeakOnStartText = normalizeNonEmptyString(entry.testSpeakOnStartText);
+  if (sampleRate !== undefined) out.sampleRate = sampleRate;
+  if (channels !== undefined) out.channels = channels;
+  if (frameMs !== undefined) out.frameMs = frameMs;
+  if (testSpeakOnStartText) out.testSpeakOnStartText = testSpeakOnStartText;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function normalizeStringList(raw: unknown): string[] {
@@ -244,6 +359,92 @@ export interface BotDefaultOncall {
   since: number;
 }
 
+export interface SubstituteTarget {
+  /** App-scoped open_id. Directly comparable with Lark mention payloads. */
+  openId?: string;
+  /** Tenant user_id. Preferred for hand-authored config when available. */
+  userId?: string;
+  /** Tenant-stable union_id. Used when Lark includes it in mention payloads. */
+  unionId?: string;
+  /** Reserved for a later resolver pass; v1 preserves it but does not match on it. */
+  email?: string;
+  /** Human-readable label for prompt disclosure. */
+  name?: string;
+}
+
+export interface SubstituteModeConfig {
+  enabled: boolean;
+  targets: SubstituteTarget[];
+  /** prefix = disclose "I will answer on behalf of X"; none = no extra disclosure instruction. */
+  disclosure?: 'prefix' | 'none';
+}
+
+export interface VcMeetingAgentConfig {
+  enabled?: boolean;
+  /** Existing chat used for meeting transcript/chat sync. If unset, confirmation creates a listener group. */
+  listenerChatId?: string;
+  notificationChatId?: string;
+  attentionTargetOpenId?: string;
+  larkCliProfile?: string;
+  /** IANA time zone used when rendering listener-group timestamps. Defaults to Asia/Shanghai. */
+  timeZone?: string;
+  /** Pending invite confirmation TTL. Defaults to 30 minutes. */
+  inviteTtlMs?: number;
+  /** Transcript stability window before listener-group sync emits a sentence. */
+  stabilizeMs?: number;
+  /** Listener-group sync interval. */
+  flushIntervalMs?: number;
+  /** Realtime voice v0. Disabled by default; requires realtime scope and meeting-side AI speaking permission. */
+  realtimeVoice?: VcMeetingRealtimeVoiceConfig;
+  /** Optional listener-group consumer. Card choices are driven entirely by this bots.json block. */
+  meetingConsumer?: VcMeetingConsumerConfig;
+}
+
+export interface VcMeetingConsumerAgentConfig {
+  /** Target bot app id to receive meeting chunks through daemon-side injection. */
+  larkAppId: string;
+  /** Human-readable card label. Falls back to bot registry name / app id. */
+  label?: string;
+}
+
+export interface VcMeetingConsumerConfig {
+  /** When false, listener groups only sync meeting messages and do not show the agent-selection card. */
+  enabled?: boolean;
+  /** Timeout/default behavior. Defaults to listenOnly. */
+  defaultMode?: 'listenOnly' | 'agent';
+  /** Used only when defaultMode is agent. Accepts defaultAgent as a legacy alias in bots.json. */
+  defaultAgentAppId?: string;
+  /** Card selection timeout. Defaults in daemon; should normally be < flushIntervalMs. */
+  selectionTimeoutMs?: number;
+  /** Agent injection cadence, independent from listener-group flush interval. */
+  injectIntervalMs?: number;
+  /** Minimum rendered meeting delta characters before injecting to the agent. Defaults in daemon. */
+  minBatchChars?: number;
+  /** Minimum meeting delta item count before injecting to the agent. Defaults in daemon. */
+  minBatchItems?: number;
+  /** Maximum time to hold a non-empty meeting delta before injecting to the agent. Defaults in daemon. */
+  maxInjectIntervalMs?: number;
+  /** Optional allowlist. Omitted or [] means all online configured bots with a usable working dir are shown; use enabled:false to disable. */
+  agentCandidates?: VcMeetingConsumerAgentConfig[];
+}
+
+export interface VcMeetingRealtimeVoiceConfig {
+  /**
+   * Enables realtime voice. This opens the meeting realtime WebSocket after bot
+   * join; without vc:meeting.bot.realtime:write or meeting-side speaking
+   * permission it fail-closes with an explicit warning and never sends audio.
+   */
+  enabled?: boolean;
+  /** Expected PCM sample rate for session.create, default 24000. */
+  sampleRate?: number;
+  /** Expected PCM channel count for session.create, default mono. */
+  channels?: number;
+  /** Upstream PCM frame duration, default 100ms (4800B at 24kHz mono s16le). */
+  frameMs?: number;
+  /** M0 dogfood only: speak this text once after realtime session.created. */
+  testSpeakOnStartText?: string;
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -271,7 +472,7 @@ export interface BotConfig {
   /**
    * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
    * `<wrapperCli> <CLI 参数>`（首 token 当 bin 走 PATH 解析），无需 wrapper 脚本、跨系统。
-   * 典型值 `"aiden x claude"` / `"aiden x codex"`（内网网关 aiden-aiproxy + SSO），也能
+   * 典型值 `"aiden x claude"` / `"aiden x codex"`（企业网关 + SSO），也能
    * 承载 ccr / claude-w 等任意启动器。`cliId` 仍是底层适配器（claude→claude-code、
    * codex→codex），所有适配器机制（hook / bridge / resume）照常工作；设了 wrapperCli 后
    * 它的首 token 取代 cliId 的默认 bin（cliPathOverride 不再生效）。检测到前缀是
@@ -360,6 +561,8 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /** Native Lark VC bot meeting copilot bridge. Push is primary; polling remains gate/backfill. */
+  vcMeetingAgent?: VcMeetingAgentConfig;
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
@@ -625,6 +828,13 @@ export interface BotConfig {
    * is the mode's defining behavior, not affected by this policy).
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
+  /**
+   * Regular-group substitute trigger. When enabled, an @mention of one of the
+   * configured people is treated as an address to this bot when the sender can
+   * talk to the bot. Matching currently uses mention open_id / user_id / union_id;
+   * email is preserved for future resolution but is not matched directly.
+   */
+  substituteMode?: SubstituteModeConfig;
   /**
    * 飞书文档订阅入口（/subscribe-lark-doc）新订阅的默认评论触发范围：
    *   • 'mention-only'（或 undefined）— 仅评论里 @bot 才触发（默认，防噪声）
@@ -1051,6 +1261,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .filter((x: any): x is string => typeof x === 'string');
     }
 
+    // Shared normalizer (with substitute-mode-store): keeps a disabled config's
+    // target list so the dashboard toggle can flip without re-entering everyone;
+    // only an enabled-but-unmatchable config collapses to undefined.
+    const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
+
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
     // new-topic｜shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
     // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
@@ -1139,6 +1354,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const skills = readBotSkillPolicy(entry.skills);
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
+    const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
     // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
@@ -1192,6 +1408,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      vcMeetingAgent,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
@@ -1264,6 +1481,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         || entry.regularGroupMentionMode === 'ambient'
         ? entry.regularGroupMentionMode
         : undefined,
+      substituteMode,
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。
       docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,

@@ -23,6 +23,7 @@ import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolv
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
+import { scheduleTimeZone } from '../utils/timezone.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
@@ -87,7 +88,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -600,7 +601,7 @@ async function handleScheduleCommand(
   // forms include the wall-clock components the user cares about; the
   // difference is just punctuation and digit order.
   const timeLocale = loc === 'en' ? 'en-US' : 'zh-CN';
-  const timeZone = 'Asia/Shanghai';
+  const timeZone = scheduleTimeZone();
 
   // /schedule list | /schedule 列表
   if (!trimmed || trimmed === 'list' || trimmed === '列表') {
@@ -1401,6 +1402,7 @@ export async function handleCommand(
               () => sessionReply(rootId, closedCard, 'interactive'),
             );
 
+            const oldSession = ds!.session;
             const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
             ds!.session = session;
             ds!.lastUserPrompt = undefined;
@@ -1408,6 +1410,10 @@ export async function handleCommand(
             ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
             ds!.session.larkAppId = ds!.larkAppId;
+            ds!.session.chatDisplayName = oldSession.chatDisplayName;
+            ds!.session.ownerOpenId = oldSession.ownerOpenId;
+            ds!.session.creatorOpenId = oldSession.creatorOpenId;
+            ds!.session.lastCallerOpenId = oldSession.lastCallerOpenId;
             sessionStore.updateSession(ds!.session);
             ds!.hasHistory = false;
             forkWorker(ds!, '', false);
@@ -2761,6 +2767,7 @@ export async function handleCommand(
           t('help.heading_grant', undefined, loc),
           t('help.grant', undefined, loc),
           t('help.revoke', undefined, loc),
+          t('help.vc_auth', undefined, loc),
           '',
           t('help.heading_config', undefined, loc),
           t('help.config_get', undefined, loc),

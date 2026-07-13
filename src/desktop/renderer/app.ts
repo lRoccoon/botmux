@@ -89,6 +89,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'nav.insights': '洞察',
     'nav.workflows': '工作流',
     'nav.groups': '群组',
+    'nav.monitoring': '监控看板',
     'nav.schedules': '定时',
     'nav.whiteboards': '白板',
     'nav.roles': '角色管理',
@@ -169,6 +170,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'nav.insights': 'Insight',
     'nav.workflows': 'Workflows',
     'nav.groups': 'Groups',
+    'nav.monitoring': 'Monitoring',
     'nav.schedules': 'Schedules',
     'nav.whiteboards': 'Whiteboards',
     'nav.roles': 'Roles',
@@ -715,8 +717,8 @@ async function openBotOnboarding(): Promise<void> {
 
 async function openCreateSession(): Promise<void> {
   // The dashboard's create-session button lives in its hidden topbar; Desktop
-  // mirrors it through the same one-shot hash-action contract as Add Bot.
-  await openDashboardRoute('#/?open=create-session', t('dashboard.openCreateSession'));
+  // routes to Sessions so the page-owned React dialog is mounted before opening.
+  await openDashboardRoute('#/sessions?open=create-session', t('dashboard.openCreateSession'));
 }
 
 async function openDashboardRoute(route: string, notice = t('dashboard.openingPage')): Promise<void> {

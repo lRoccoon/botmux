@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { store } from './store.js';
+import { ui } from './ui.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -9,20 +12,48 @@ interface DashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   chatBotDiscovery: boolean;
+  vcMeetingAgent: {
+    enabled: boolean;
+    listenerBotAppId: string | null;
+    listenerBotOptions: Array<{
+      larkAppId: string;
+      botName?: string | null;
+      cliId?: string;
+      vcMeetingAgentEnabled?: boolean;
+      hasLarkCliProfile?: boolean;
+    }>;
+    larkCliVersion?: string | null;
+    larkCliMeetsRequirement?: boolean;
+    larkCliMinVersion?: string;
+  };
   repoPickerMode: 'all' | 'repos';
   maintenance: MaintenanceCfg;
   localDevInstall: boolean;
+  autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
   remoteAccess: boolean;
+  scheduleTimeZone: string;
+  hostTimeZone: string;
+  effectiveScheduleTimeZone: string;
 }
 
-interface InstallEntry { binPath: string; root: string; kind: 'npm-global' | 'source-checkout' | 'unknown' }
+const COMMON_TIMEZONES = [
+  'Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'Asia/Singapore', 'Asia/Kolkata',
+  'UTC', 'Europe/London', 'Europe/Paris', 'Europe/Moscow',
+  'America/Los_Angeles', 'America/New_York', 'America/Sao_Paulo', 'Australia/Sydney',
+];
+
+type InstallKind = 'npm-global' | 'pnpm-global' | 'yarn-global' | 'bun-global' | 'source-checkout' | 'unknown';
+interface InstallEntry { binPath: string; root: string; kind: InstallKind }
 interface NodeCheck { version: string; major: number; required: number; ok: boolean }
 interface UpdateStatus {
   current: string;
   latest: string | null;
   behind: boolean;
   localDevInstall: boolean;
+  updateSupported: boolean;
+  updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown';
+  updateCommand: string | null;
   node: NodeCheck;
   installs: { entries: InstallEntry[]; multiple: boolean };
 }
@@ -35,11 +66,28 @@ function parseSettings(s: any): DashboardSettings {
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     chatBotDiscovery: s?.chatBotDiscovery !== false,
+    vcMeetingAgent: {
+      enabled: s?.vcMeetingAgent?.enabled !== false,
+      listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
+      listenerBotOptions: Array.isArray(s?.vcMeetingAgent?.listenerBotOptions) ? s.vcMeetingAgent.listenerBotOptions : [],
+      larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
+      larkCliMeetsRequirement: s?.vcMeetingAgent?.larkCliMeetsRequirement === true,
+      larkCliMinVersion: typeof s?.vcMeetingAgent?.larkCliMinVersion === 'string' ? s.vcMeetingAgent.larkCliMinVersion : undefined,
+    },
     repoPickerMode: s?.repoPickerMode === 'repos' ? 'repos' : 'all',
     maintenance: (s?.maintenance && typeof s.maintenance === 'object') ? s.maintenance : {},
     localDevInstall: s?.localDevInstall === true,
+    autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     remoteAccess: s?.remoteAccess === true,
+    scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
+    hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
+    effectiveScheduleTimeZone:
+      typeof s?.effectiveScheduleTimeZone === 'string' && s.effectiveScheduleTimeZone
+        ? s.effectiveScheduleTimeZone
+        : (typeof s?.scheduleTimeZone === 'string' && s.scheduleTimeZone
+            ? s.scheduleTimeZone
+            : (typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC')),
   };
 }
 
@@ -50,6 +98,9 @@ function taskUi(m: MaintenanceCfg, key: 'autoUpdate' | 'autoRestart'): { enabled
 
 function installKindLabel(kind: string, tr: ReturnType<typeof useT>): string {
   if (kind === 'npm-global') return tr('update.kindNpm');
+  if (kind === 'pnpm-global') return tr('update.kindPnpm');
+  if (kind === 'yarn-global') return tr('update.kindYarn');
+  if (kind === 'bun-global') return tr('update.kindBun');
   if (kind === 'source-checkout') return tr('update.kindSource');
   return tr('update.kindUnknown');
 }
@@ -65,6 +116,7 @@ function SettingsPage() {
   const [bound, setBound] = useState(false);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [settingsMsg, setSettingsMsg] = useState<StatusMessage>(null);
+  const [feishuLoginQr, setFeishuLoginQr] = useState<string | null>(null);
 
   const [upStatus, setUpStatus] = useState<UpdateStatus | null>(null);
   const [upStatusError, setUpStatusError] = useState<string | null>(null);
@@ -168,8 +220,15 @@ function SettingsPage() {
       });
       const body = await r.json().catch(() => ({}));
       if (!mountedRef.current) return;
-      if (!r.ok || body.ok === false) throw new Error(body?.error ?? `HTTP ${r.status}`);
-      setSettings(parseSettings(body.settings));
+      if (!r.ok || body.ok === false) {
+        if (typeof body?.feishuLoginQr === 'string' && body.feishuLoginQr) setFeishuLoginQr(body.feishuLoginQr);
+        throw new Error(body?.error ?? `HTTP ${r.status}`);
+      }
+      setFeishuLoginQr(null);
+      const saved = parseSettings(body.settings);
+      setSettings(saved);
+      ui.publicReadOnly = saved.publicReadOnly;
+      store.setScheduleTimeZone(saved.effectiveScheduleTimeZone);
       setSettingsMsg({ text: tr('settings.saved'), cls: 'hint-ok' });
     } catch (e) {
       if (!mountedRef.current) return;
@@ -252,14 +311,20 @@ function SettingsPage() {
       window.alert(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }));
       return;
     }
+    if (!s.updateSupported || !s.updateCommand) {
+      window.alert(tr('update.unsupportedInstall'));
+      return;
+    }
     if (s.installs.multiple) {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
       if (!window.confirm(tr('update.confirmMultiInstall', { paths }))) return;
     }
-    const confirmMsg = s.latest ? tr('update.confirmUpdate', { version: `v${s.latest}` }) : tr('update.confirmUpdateNoVer');
+    const confirmMsg = s.latest
+      ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand })
+      : tr('update.confirmUpdateNoVer', { command: s.updateCommand });
     if (!window.confirm(confirmMsg)) return;
     setUpBusy(true);
-    setUpMsg({ text: tr('update.updating') });
+    setUpMsg({ text: tr('update.updating', { command: s.updateCommand }) });
     try {
       const r = await fetch('/api/update/run', { method: 'POST' });
       const body = await r.json().catch(() => ({}));
@@ -290,6 +355,36 @@ function SettingsPage() {
     }
   }
 
+  const updateBlock = (
+    <UpdateCard
+      canWrite={canWrite}
+      status={upStatus}
+      statusError={upStatusError}
+      changelog={upChangelog}
+      changelogOpen={upChangelogOpen}
+      changelogOk={upChangelogOk}
+      changelogRateLimited={upChangelogRateLimited}
+      releasesUrl={upReleasesUrl}
+      busy={upBusy}
+      message={upMsg}
+      onCheck={() => {
+        setUpStatus(null);
+        setUpChangelog(null);
+        setUpChangelogOpen(false);
+        setUpMsg(null);
+        setUpStatusError(null);
+        void fetchStatus();
+      }}
+      onToggleChangelog={() => {
+        const next = !upChangelogOpen;
+        setUpChangelogOpen(next);
+        if (next && upChangelog === null) void loadChangelog();
+      }}
+      onUpdate={() => void doUpdate()}
+      onRestart={() => { if (window.confirm(tr('update.confirmPlainRestart'))) void doRestart(null); }}
+    />
+  );
+
   const settingsBody = settings ? (
     <SettingsBody
       settings={settings}
@@ -297,51 +392,26 @@ function SettingsPage() {
       bound={bound}
       savingKey={savingKey}
       message={settingsMsg}
+      updateBlock={updateBlock}
+      feishuLoginQr={feishuLoginQr}
+      onCloseFeishuLoginQr={() => setFeishuLoginQr(null)}
       onSave={saveSettings}
     />
   ) : loadError ? (
     <p className="hint-warn">{tr('settings.loadFailed')}: {loadError}</p>
   ) : (
-    <p className="empty">{tr('settings.loading')}</p>
+    <LoadingState label={tr('settings.loading')} />
   );
 
   return (
-    <section className="page">
+    <section className="page settings-page">
       <div className="page-heading">
         <div>
           <p className="eyebrow">{tr('nav.settings')}</p>
           <h1>{tr('settings.title')}</h1>
-          <p>{tr('settings.subtitle')}</p>
         </div>
       </div>
       {settingsBody}
-      <UpdateCard
-        canWrite={canWrite}
-        status={upStatus}
-        statusError={upStatusError}
-        changelog={upChangelog}
-        changelogOpen={upChangelogOpen}
-        changelogOk={upChangelogOk}
-        changelogRateLimited={upChangelogRateLimited}
-        releasesUrl={upReleasesUrl}
-        busy={upBusy}
-        message={upMsg}
-        onCheck={() => {
-          setUpStatus(null);
-          setUpChangelog(null);
-          setUpChangelogOpen(false);
-          setUpMsg(null);
-          setUpStatusError(null);
-          void fetchStatus();
-        }}
-        onToggleChangelog={() => {
-          const next = !upChangelogOpen;
-          setUpChangelogOpen(next);
-          if (next && upChangelog === null) void loadChangelog();
-        }}
-        onUpdate={() => void doUpdate()}
-        onRestart={() => { if (window.confirm(tr('update.confirmPlainRestart'))) void doRestart(null); }}
-      />
     </section>
   );
 }
@@ -352,25 +422,48 @@ function SettingsBody(props: {
   bound: boolean;
   savingKey: string | null;
   message: StatusMessage;
+  updateBlock: ReactNode;
+  feishuLoginQr: string | null;
+  onCloseFeishuLoginQr(): void;
   onSave(key: string, payload: unknown, optimistic: (settings: DashboardSettings) => DashboardSettings): Promise<void>;
 }) {
   const tr = useT();
   const { settings, canWrite, bound, savingKey } = props;
   const dis = !canWrite;
   const autoUpdate = taskUi(settings.maintenance, 'autoUpdate');
-  const autoUpdateDisabled = !canWrite || settings.localDevInstall;
+  const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
   const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'chatBotDiscovery' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
+  const repoModeOptions = useMemo(() => [
+    { value: 'all' as const, label: tr('settings.repoPickerModeAll') },
+    { value: 'repos' as const, label: tr('settings.repoPickerModeRepos') },
+  ], [tr]);
+  const vcListenerOptions = useMemo(() => [
+    { value: '', label: tr('settings.vcMeetingListenerBotAuto') },
+    ...settings.vcMeetingAgent.listenerBotOptions.map(bot => {
+      const label = bot.botName || bot.larkAppId;
+      const detail = bot.cliId ? ` · ${bot.cliId}` : '';
+      const suffixParts = [
+        bot.vcMeetingAgentEnabled === true ? undefined : tr('settings.vcMeetingListenerBotDisabled'),
+        bot.hasLarkCliProfile === true ? undefined : tr('settings.vcMeetingListenerBotNoProfile'),
+      ].filter(Boolean);
+      const suffix = suffixParts.length > 0 ? ` · ${suffixParts.join(' · ')}` : '';
+      return { value: bot.larkAppId, label: `${label}${detail}${suffix}` };
+    }),
+  ], [settings.vcMeetingAgent.listenerBotOptions, tr]);
 
   return (
-    <div className="settings-grid">
-      <article className="bd-card settings-card">
-        {canWrite ? null : <p className="hint-warn">{tr('settings.readOnlyVisitor')}</p>}
-        <section className="bd-section">
-          <h3 className="bd-section-title">{tr('settings.sectionAccess')}</h3>
+    <div className="settings-layout">
+      {canWrite ? null : (
+        <article className="bd-card settings-card settings-alert-card">
+          <p className="hint-warn">{tr('settings.readOnlyVisitor')}</p>
+        </article>
+      )}
+      <SettingsGroup className="settings-group-main">
+        <SettingsBlock title={tr('settings.sectionAccess')}>
           <ToggleRow
             title={tr('settings.publicReadOnly')}
             help={tr('settings.publicReadOnlyHelp')}
@@ -387,9 +480,8 @@ function SettingsBody(props: {
               onChange={value => saveBoolean('remoteAccess', value)}
             />
           ) : null}
-        </section>
-        <section className="bd-section">
-          <h3 className="bd-section-title">{tr('settings.sectionCards')}</h3>
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionCards')}>
           <ToggleRow
             title={tr('settings.openTerminalInFeishu')}
             help={tr('settings.openTerminalInFeishuHelp')}
@@ -397,9 +489,8 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'openTerminalInFeishu'}
             onChange={value => saveBoolean('openTerminalInFeishu', value)}
           />
-        </section>
-        <section className="bd-section">
-          <h3 className="bd-section-title">{tr('settings.sectionExperimental')}</h3>
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionExperimental')}>
           <ToggleRow
             title={tr('settings.chatBotDiscovery')}
             help={tr('settings.chatBotDiscoveryHelp')}
@@ -407,88 +498,251 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'chatBotDiscovery'}
             onChange={value => saveBoolean('chatBotDiscovery', value)}
           />
-        </section>
-        <section className="bd-section">
-          <h3 className="bd-section-title">本地白板</h3>
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionWhiteboard')}>
           <ToggleRow
-            title="启用项目白板"
-            help="默认关闭。开启只启用能力，不会立即创建白板；首次需要时才按群+项目 ensure。"
+            title={tr('settings.whiteboardEnable')}
+            help={tr('settings.whiteboardEnableHelp')}
             checked={settings.whiteboard.enabled}
             disabled={dis || savingKey === 'whiteboard'}
             onChange={value => {
               void props.onSave('whiteboard', { whiteboard: { enabled: value } }, s => ({ ...s, whiteboard: { enabled: value } }));
             }}
           />
-        </section>
-        <section className="bd-section">
-          <h3 className="bd-section-title">{tr('settings.sectionRepoPicker')}</h3>
-          <label className="form-row">
-            <span>{tr('settings.repoPickerMode')}</span>
-            <select
-              value={settings.repoPickerMode}
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionRepoPicker')}>
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.repoPickerModeHelp')}>{tr('settings.repoPickerMode')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.repoPickerMode')}
               disabled={dis || savingKey === 'repoPickerMode'}
-              onChange={e => {
-                const value = e.currentTarget.value === 'repos' ? 'repos' : 'all';
+              value={settings.repoPickerMode}
+              label={dropdownLabel(repoModeOptions, settings.repoPickerMode)}
+              options={repoModeOptions}
+              onChange={value => {
                 void props.onSave('repoPickerMode', { repoPickerMode: value }, s => ({ ...s, repoPickerMode: value }));
               }}
-            >
-              <option value="all">{tr('settings.repoPickerModeAll')}</option>
-              <option value="repos">{tr('settings.repoPickerModeRepos')}</option>
-            </select>
-            <small>{tr('settings.repoPickerModeHelp')}</small>
-          </label>
-        </section>
-        <section className="bd-section">
-          <h3 className="bd-section-title">{tr('settings.sectionMaintenance')}</h3>
-          <ToggleRow
-            title={tr('settings.autoUpdate')}
-            help={tr('settings.autoUpdateHelp')}
-            checked={autoUpdate.enabled}
-            disabled={autoUpdateDisabled || savingKey === 'autoUpdate'}
-            onChange={value => {
-              const task = { enabled: value, time: autoUpdate.time };
-              void props.onSave('autoUpdate', { maintenance: { autoUpdate: task } }, s => ({
-                ...s,
-                maintenance: { ...s.maintenance, autoUpdate: task },
-              }));
+            />
+          </div>
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionSchedule')}>
+          <TimeZoneRow
+            value={settings.scheduleTimeZone}
+            host={settings.hostTimeZone}
+            effective={settings.effectiveScheduleTimeZone}
+            disabled={dis || savingKey === 'scheduleTimeZone'}
+            onSave={tz => {
+              void props.onSave(
+                'scheduleTimeZone',
+                { scheduleTimeZone: tz },
+                s => ({ ...s, scheduleTimeZone: tz ?? '' }),
+              );
             }}
           />
-          <div className="maint-time">
-            <label>
-              {tr('settings.maintenanceTime')}
-              <input
-                type="time"
-                value={autoUpdate.time}
+        </SettingsBlock>
+        <SettingsBlock className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
+          <ToggleRow
+            title={tr('settings.vcMeetingAgent')}
+            help={tr('settings.vcMeetingAgentHelp')}
+            checked={settings.vcMeetingAgent.enabled}
+            disabled={dis || savingKey === 'vcMeetingAgent'}
+            onChange={value => {
+              void props.onSave(
+                'vcMeetingAgent',
+                { vcMeetingAgent: { enabled: value } },
+                s => ({ ...s, vcMeetingAgent: { ...s.vcMeetingAgent, enabled: value } }),
+              );
+            }}
+          />
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.vcMeetingListenerBotHelp')}>{tr('settings.vcMeetingListenerBot')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.vcMeetingListenerBot')}
+              disabled={dis || savingKey === 'vcMeetingAgent'}
+              value={settings.vcMeetingAgent.listenerBotAppId ?? ''}
+              label={dropdownLabel(vcListenerOptions, settings.vcMeetingAgent.listenerBotAppId ?? '')}
+              options={vcListenerOptions}
+              onChange={value => {
+                const next = value || null;
+                void props.onSave(
+                  'vcMeetingAgent',
+                  { vcMeetingAgent: { listenerBotAppId: next } },
+                  s => ({ ...s, vcMeetingAgent: { ...s.vcMeetingAgent, listenerBotAppId: next } }),
+                );
+              }}
+            />
+          </div>
+          <LarkCliStatus settings={settings.vcMeetingAgent} />
+          {props.feishuLoginQr ? (
+            <div className="settings-feishu-login">
+              <button
+                type="button"
+                className="settings-feishu-login-close"
+                aria-label={tr('settings.feishuLoginClose')}
+                title={tr('settings.feishuLoginClose')}
+                onClick={props.onCloseFeishuLoginQr}
+              />
+              <p>{tr('settings.feishuLoginRequired')}</p>
+              <img src={props.feishuLoginQr} alt={tr('settings.feishuLoginQrAlt')} />
+            </div>
+          ) : null}
+        </SettingsBlock>
+      </SettingsGroup>
+      <SettingsGroup className="settings-group-ops">
+        <SettingsBlock
+          title={tr('settings.sectionMaintenance')}
+          titleExtra={settings.localDevInstall
+            ? <span className="settings-title-note">{tr('settings.autoUpdateLocalDev')}</span>
+            : !settings.autoUpdateSupported
+              ? <span className="settings-title-note">{tr('settings.autoUpdateUnsupportedInstall')}</span>
+              : null}
+        >
+          <div className="settings-maintenance-grid">
+            <div className="settings-maintenance-update">
+              <ToggleRow
+                title={tr('settings.autoUpdate')}
+                help={tr('settings.autoUpdateHelp')}
+                checked={autoUpdate.enabled}
                 disabled={autoUpdateDisabled || savingKey === 'autoUpdate'}
-                onChange={e => {
-                  const task = { enabled: autoUpdate.enabled, time: e.currentTarget.value || '04:00' };
+                onChange={value => {
+                  const task = { enabled: value, time: autoUpdate.time };
                   void props.onSave('autoUpdate', { maintenance: { autoUpdate: task } }, s => ({
                     ...s,
                     maintenance: { ...s.maintenance, autoUpdate: task },
                   }));
                 }}
               />
-            </label>
+              <div className="maint-time">
+                <label>
+                  <span>{tr('settings.maintenanceTime')}</span>
+                  <input
+                    type="time"
+                    value={autoUpdate.time}
+                    disabled={autoUpdateDisabled || savingKey === 'autoUpdate'}
+                    onChange={e => {
+                      const task = { enabled: autoUpdate.enabled, time: e.currentTarget.value || '04:00' };
+                      void props.onSave('autoUpdate', { maintenance: { autoUpdate: task } }, s => ({
+                        ...s,
+                        maintenance: { ...s.maintenance, autoUpdate: task },
+                      }));
+                    }}
+                  />
+                </label>
+              </div>
+            </div>
+            <div className="settings-maintenance-restart">
+              <ToggleRow
+                title={tr('settings.autoRestart')}
+                help={tr('settings.autoRestartHelp')}
+                checked={settings.maintenance.autoRestart?.enabled === true}
+                disabled={autoRestartDisabled || savingKey === 'autoRestart'}
+                onChange={value => {
+                  const task = { enabled: value };
+                  void props.onSave('autoRestart', { maintenance: { autoRestart: task } }, s => ({
+                    ...s,
+                    maintenance: { ...s.maintenance, autoRestart: task },
+                  }));
+                }}
+              />
+            </div>
           </div>
-          {settings.localDevInstall ? <p className="hint-warn">{tr('settings.autoUpdateLocalDev')}</p> : null}
-          <ToggleRow
-            title={tr('settings.autoRestart')}
-            help={tr('settings.autoRestartHelp')}
-            checked={settings.maintenance.autoRestart?.enabled === true}
-            disabled={autoRestartDisabled || savingKey === 'autoRestart'}
-            onChange={value => {
-              const task = { enabled: value };
-              void props.onSave('autoRestart', { maintenance: { autoRestart: task } }, s => ({
-                ...s,
-                maintenance: { ...s.maintenance, autoRestart: task },
-              }));
-            }}
-          />
-        </section>
-        <div className="actions settings-actions">
-          <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
-        </div>
+        </SettingsBlock>
+        {props.updateBlock}
+      </SettingsGroup>
+      <div className="settings-status-row">
+        <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
+      </div>
+    </div>
+  );
+}
+
+function LarkCliStatus(props: { settings: DashboardSettings['vcMeetingAgent'] }) {
+  const tr = useT();
+  const version = props.settings.larkCliVersion;
+  const ready = typeof version === 'string' && props.settings.larkCliMeetsRequirement === true;
+  const text = ready
+    ? tr('settings.larkCliReady', { version })
+    : typeof version === 'string'
+      ? tr('settings.larkCliOutdated', { version, minimum: props.settings.larkCliMinVersion ?? '-' })
+      : tr('settings.larkCliMissing');
+
+  return (
+    <div className={`settings-lark-cli-status ${ready ? 'is-ready' : 'is-warning'}`}>
+      <span aria-hidden="true" />
+      <strong>{text}</strong>
+      {ready ? null : <code>npm i -g @larksuite/cli@latest</code>}
+    </div>
+  );
+}
+
+function SettingsGroup(props: {
+  className?: string;
+  children: ReactNode;
+}): JSX.Element {
+  const cls = ['settings-group', props.className].filter(Boolean).join(' ');
+  return (
+    <section className={cls}>
+      <article className="bd-card settings-group-card">
+        {props.children}
       </article>
+    </section>
+  );
+}
+
+function SettingsBlock(props: {
+  className?: string;
+  title: ReactNode;
+  titleExtra?: ReactNode;
+  children: ReactNode;
+}): JSX.Element {
+  const cls = ['settings-block', props.className].filter(Boolean).join(' ');
+  return (
+    <section className={cls}>
+      <article className="bd-card settings-card">
+        <div className="settings-block-title-row">
+          <h2 className="bd-section-title">{props.title}</h2>
+          {props.titleExtra ? <div className="settings-block-title-extra">{props.titleExtra}</div> : null}
+        </div>
+        {props.children}
+      </article>
+    </section>
+  );
+}
+
+export function TimeZoneRow(props: {
+  value: string;
+  host: string;
+  effective: string;
+  disabled: boolean;
+  onSave(tz: string | null): void;
+}) {
+  const tr = useT();
+  const value = props.value.trim();
+  const effective = props.effective || props.value.trim() || props.host;
+  const timeZoneOptions = useMemo(() => {
+    const zones = value && !COMMON_TIMEZONES.includes(value) ? [value, ...COMMON_TIMEZONES] : COMMON_TIMEZONES;
+    return [
+      { value: '', label: tr('settings.scheduleTimeZoneHost', { host: props.host }) },
+      ...zones.map(zone => ({ value: zone, label: zone })),
+    ];
+  }, [props.host, tr, value]);
+
+  return (
+    <div className="settings-field-row settings-timezone-row">
+      <FieldTitle help={tr('settings.scheduleTimeZoneHelp', { host: props.host, effective })}>
+        {tr('settings.scheduleTimeZone')}
+      </FieldTitle>
+      <DropdownMenu
+        className="settings-field-menu settings-timezone-menu"
+        ariaLabel={tr('settings.scheduleTimeZone')}
+        value={value}
+        label={dropdownLabel(timeZoneOptions, value)}
+        options={timeZoneOptions}
+        disabled={props.disabled}
+        onChange={next => props.onSave(next === '' ? null : next)}
+      />
     </div>
   );
 }
@@ -510,8 +764,7 @@ function ToggleRow(props: {
       />
       <span className="switch" aria-hidden="true" />
       <span className="toggle-tx">
-        <strong>{props.title}</strong>
-        <small>{props.help}</small>
+        <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
       </span>
     </label>
   );
@@ -545,10 +798,10 @@ function UpdateCard(props: {
       </>
     );
   } else if (!props.status) {
-    inner = <p className="empty">{tr('update.loading')}</p>;
+    inner = <LoadingState label={tr('update.loading')} compact />;
   } else {
     const s = props.status;
-    const updateDisabled = s.localDevInstall || props.busy;
+    const updateDisabled = s.localDevInstall || !s.updateSupported || props.busy;
     inner = (
       <>
         <p className="update-version">
@@ -556,14 +809,14 @@ function UpdateCard(props: {
           <UpdateBadge status={s} />
         </p>
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
-        {s.localDevInstall ? <p className="hint-warn">{tr('update.localDev')}</p> : null}
+        {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
         {s.installs.multiple ? <MultiInstallWarning entries={s.installs.entries} /> : null}
         <div className="update-actions">
           <button type="button" data-up="check" disabled={props.busy} onClick={props.onCheck}>{tr('update.btnCheck')}</button>
           <button type="button" data-up="changelog" disabled={props.busy} onClick={props.onToggleChangelog}>
             {props.changelogOpen ? tr('update.btnChangelogHide') : tr('update.btnChangelog')}
           </button>
-          <button type="button" className="primary" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
+          <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
         {props.changelogOpen ? (
@@ -579,14 +832,17 @@ function UpdateCard(props: {
     );
   }
   return (
-    <div className="settings-grid">
-      <article className="bd-card settings-card">
-        <section className="bd-section">
-          <h3 className="bd-section-title">{tr('update.section')}</h3>
-          {inner}
-        </section>
-      </article>
-    </div>
+    <SettingsBlock
+      className="settings-update-block"
+      title={tr('update.section')}
+      titleExtra={props.status?.localDevInstall
+        ? <span className="settings-title-note">{tr('update.localDev')}</span>
+        : props.status && !props.status.updateSupported
+          ? <span className="settings-title-note">{tr('update.unsupportedInstall')}</span>
+          : null}
+    >
+      {inner}
+    </SettingsBlock>
   );
 }
 
@@ -622,7 +878,7 @@ function ChangelogPanel(props: {
   releasesUrl: string;
 }) {
   const tr = useT();
-  if (props.changelog === null) return <p className="empty">{tr('update.changelogLoading')}</p>;
+  if (props.changelog === null) return <LoadingState label={tr('update.changelogLoading')} compact />;
   if (!props.ok) {
     const reason = props.rateLimited ? tr('update.changelogRateLimited') : tr('update.changelogFailed');
     return (

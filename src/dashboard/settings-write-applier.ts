@@ -25,6 +25,8 @@ import {
 } from '../global-config.js';
 import { isLocale } from '../i18n/types.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
+import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
+import { isValidTimeZone } from '../utils/timezone.js';
 
 /**
  * Snapshot returned by `resolveDashboardSettings` — mirrors the existing
@@ -36,9 +38,32 @@ export interface ResolvedDashboardSettingsView {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   chatBotDiscovery: boolean;
+  vcMeetingAgent: {
+    enabled: boolean;
+    listenerBotAppId?: string | null;
+    listenerBotOptions?: Array<{
+      larkAppId: string;
+      botName?: string | null;
+      cliId?: string;
+      vcMeetingAgentEnabled?: boolean;
+      hasLarkCliProfile?: boolean;
+    }>;
+    larkCliVersion?: string | null;
+    larkCliMeetsRequirement?: boolean;
+    larkCliMinVersion?: string;
+  };
   maintenance: MaintenanceConfig;
   localDevInstall: boolean;
+  autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
+  /** Configured schedule-task timezone override (IANA), or null/absent when
+   *  unset ⇒ the scheduler follows `hostTimeZone`. */
+  scheduleTimeZone?: string | null;
+  /** Host's auto-detected local zone. */
+  hostTimeZone?: string;
+  /** The TRUE effective zone (scheduleTimeZone(): env → config → host). The UI
+   *  must use this for "currently effective", not configured||host. */
+  effectiveScheduleTimeZone?: string;
 }
 
 export type ParseMaintenanceResult =
@@ -51,8 +76,9 @@ export interface SettingsWriteApplierDeps {
   readGlobalConfig: () => GlobalConfig;
   /** Atomic write of dashboard-level fields (publicReadOnly / openTerminalInFeishu). */
   mergeDashboardConfig: (patch: DashboardGlobalConfig) => DashboardGlobalConfig;
-  /** Atomic write of global-level fields (repoPickerMode). */
-  mergeGlobalConfig: (patch: Partial<GlobalConfig>) => void;
+  /** Atomic write of global-level fields (repoPickerMode / scheduleTimeZone / …).
+   *  Mirrors the real `mergeGlobalConfig`: a `null` value deletes that key. */
+  mergeGlobalConfig: (patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>) => void;
   /** Atomic write of maintenance-level fields (autoUpdate / autoRestart). */
   mergeMaintenanceConfig: (patch: MaintenanceConfig) => MaintenanceConfig;
   /** Set global UI locale (null = clear). Fans out to daemons via IPC. */
@@ -61,12 +87,18 @@ export interface SettingsWriteApplierDeps {
   parseMaintenancePatch: (body: unknown) => ParseMaintenanceResult;
   /** True iff the current install is a source-checkout (auto-update unavailable). */
   isLocalDevInstall: () => boolean;
+  /** True iff the current global install is owned by a supported updater. */
+  isAutoUpdateSupportedInstall: () => boolean;
   /** Returns the post-merge view the response body echoes back to the caller. */
   resolveDashboardSettings: () => ResolvedDashboardSettingsView;
   /** Validate locale string. */
   isLocale: (v: unknown) => v is 'zh' | 'en';
   /** Fan out locale reload to all online daemons. */
   reloadLocaleOnAllDaemons?: () => Promise<void>;
+  /** Validate a global VC listener bot selection before mutating bot/global config. */
+  validateVcMeetingListenerBotAppId?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Sync per-bot meeting-listener config after validation passes or when clearing the selection. */
+  syncVcMeetingListenerBotConfig?: (listenerBotAppId: string | null, previousListenerBotAppId?: string | null) => Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }>;
 }
 
 /** Production deps wiring — call once per dashboard process. */
@@ -82,6 +114,7 @@ export function defaultSettingsWriteApplierDeps(
     setGlobalLocale,
     parseMaintenancePatch,
     isLocalDevInstall,
+    isAutoUpdateSupportedInstall,
     resolveDashboardSettings,
     isLocale,
     reloadLocaleOnAllDaemons,
@@ -90,7 +123,7 @@ export function defaultSettingsWriteApplierDeps(
 
 export type ApplySettingsWriteResult =
   | { ok: true; settings: ResolvedDashboardSettingsView }
-  | { ok: false; error: ApplySettingsWriteError };
+  | { ok: false; error: ApplySettingsWriteError; feishuLoginQr?: string };
 
 /**
  * Discrete error codes — every one of these MUST match the strings the old
@@ -103,11 +136,16 @@ export type ApplySettingsWriteError =
   | 'invalid_chatBotDiscovery'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
+  | 'invalid_vcMeetingAgent'
+  | 'invalid_vcMeetingAgent_enabled'
+  | 'invalid_vcMeetingAgent_listenerBotAppId'
+  | 'invalid_scheduleTimeZone'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
   | 'invalid_maintenance' // ← never returned literally; surfaces parseMaintenancePatch's reason instead
   | 'local_dev_no_autoupdate'
+  | 'unsupported_install_no_autoupdate'
   | 'autoupdate_required'
   | 'empty_patch'
   | string;          // catch-all: parseMaintenancePatch error strings
@@ -176,6 +214,63 @@ export async function applySettingsWrite(
     touched = true;
   }
 
+  if ('vcMeetingAgent' in obj) {
+    const raw = obj.vcMeetingAgent;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_vcMeetingAgent' };
+    }
+    const vc = raw as Record<string, unknown>;
+    const currentVcMeetingAgent = deps.readGlobalConfig().vcMeetingAgent ?? {};
+    const next = { ...currentVcMeetingAgent };
+    if ('enabled' in vc) {
+      if (typeof vc.enabled !== 'boolean') {
+        return { ok: false, error: 'invalid_vcMeetingAgent_enabled' };
+      }
+      next.enabled = vc.enabled;
+    }
+    if ('listenerBotAppId' in vc) {
+      if (vc.listenerBotAppId === null || vc.listenerBotAppId === '') {
+        if (deps.syncVcMeetingListenerBotConfig) {
+          const synced = await deps.syncVcMeetingListenerBotConfig(null, currentVcMeetingAgent.listenerBotAppId ?? null);
+          if (!synced.ok) return { ok: false, error: synced.error, feishuLoginQr: (synced as any).feishuLoginQr };
+        }
+        delete next.listenerBotAppId;
+      } else if (typeof vc.listenerBotAppId === 'string' && vc.listenerBotAppId.trim()) {
+        const listenerBotAppId = vc.listenerBotAppId.trim();
+        if (deps.validateVcMeetingListenerBotAppId) {
+          const validation = await deps.validateVcMeetingListenerBotAppId(listenerBotAppId);
+          if (!validation.ok) return { ok: false, error: validation.error };
+        }
+        if (deps.syncVcMeetingListenerBotConfig) {
+          const synced = await deps.syncVcMeetingListenerBotConfig(listenerBotAppId, currentVcMeetingAgent.listenerBotAppId ?? null);
+          if (!synced.ok) return { ok: false, error: synced.error, feishuLoginQr: (synced as any).feishuLoginQr };
+        }
+        next.listenerBotAppId = listenerBotAppId;
+      } else {
+        return { ok: false, error: 'invalid_vcMeetingAgent_listenerBotAppId' };
+      }
+    }
+    if (!('enabled' in vc) && !('listenerBotAppId' in vc)) {
+      return { ok: false, error: 'invalid_vcMeetingAgent_enabled' };
+    }
+    deps.mergeGlobalConfig({ vcMeetingAgent: next });
+    touched = true;
+  }
+
+  if ('scheduleTimeZone' in obj) {
+    const v = obj.scheduleTimeZone;
+    if (v === null || v === '') {
+      // Clear the override → the scheduler falls back to the host local zone.
+      deps.mergeGlobalConfig({ scheduleTimeZone: null });
+      touched = true;
+    } else if (typeof v === 'string' && isValidTimeZone(v.trim())) {
+      deps.mergeGlobalConfig({ scheduleTimeZone: v.trim() });
+      touched = true;
+    } else {
+      return { ok: false, error: 'invalid_scheduleTimeZone' };
+    }
+  }
+
   if ('whiteboard' in obj) {
     const raw = obj.whiteboard;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -192,9 +287,12 @@ export async function applySettingsWrite(
   if ('maintenance' in obj) {
     const r = deps.parseMaintenancePatch(obj.maintenance);
     if (!r.ok) return { ok: false, error: r.error };
-    // Auto-update is npm-global only; refuse enabling it on a source checkout.
+    // Auto-update is global-package only; refuse enabling it on a source checkout.
     if (r.patch.autoUpdate?.enabled && deps.isLocalDevInstall()) {
       return { ok: false, error: 'local_dev_no_autoupdate' };
+    }
+    if (r.patch.autoUpdate?.enabled && !deps.isAutoUpdateSupportedInstall()) {
+      return { ok: false, error: 'unsupported_install_no_autoupdate' };
     }
     // Auto-restart only applies an auto-update — it's meaningless without it.
     if (r.patch.autoRestart?.enabled) {

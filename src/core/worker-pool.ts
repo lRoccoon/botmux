@@ -48,6 +48,7 @@ import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
 import { prepareSkillDelivery } from './skills/delivery.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
@@ -72,6 +73,9 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
+  /** Re-check the per-bot resident-session cap after a process starts or an
+   * over-cap busy session becomes idle. Optional for unit-test callers. */
+  enforceLiveSessionCap?: () => void;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -1162,6 +1166,9 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+  // Screen state describes the process we just stopped. Keeping it would make
+  // the dashboard hydrate this process-less logical session as idle/working.
+  ds.lastScreenStatus = undefined;
   ds.session.webPort = undefined;
   // The worker's suspend handler destroys the backing session + CLI (frees
   // memory), so there is no live CLI to reattach to: the next turn MUST
@@ -1179,8 +1186,15 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   if (!ds.exitEventEmitted) {
     ds.exitEventEmitted = true;
     dashboardEventBus.publish({
-      type: 'session.exited',
-      body: { sessionId: ds.session.sessionId, reason },
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          status: 'dormant',
+          webPort: null,
+          workerPid: null,
+        },
+      },
     });
   }
   logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
@@ -1855,6 +1869,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  cb.enforceLiveSessionCap?.();
   emitSessionLifecycleHook(ds, 'session.start', {
     reason: resume ? 'resume' : 'worker_spawn',
     pid: worker.pid ?? null,
@@ -1873,6 +1888,12 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
 function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  // Source authorization belongs to one worker lifetime. A replacement worker
+  // must announce its own Hermes sources before any stamped final_output is
+  // trusted; `/clear` rebinds within the same lifetime accumulate afterwards.
+  if (ds.session.cliId === 'hermes' && ds.worker !== worker) {
+    ds.hermesBridgeSourceSessionIds = undefined;
+  }
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
@@ -2155,6 +2176,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
+          }
+          // If every over-cap process was busy, the earlier check deliberately
+          // left them alone. Re-check on the first idle edge so capacity is
+          // reclaimed immediately instead of waiting for the 60s backstop.
+          if (ds.lastScreenStatus === 'idle' && cb.enforceLiveSessionCap) {
+            // Defer until this screen_update has finished using process state.
+            // The newly-idle session itself may be the oldest eviction target.
+            queueMicrotask(cb.enforceLiveSessionCap);
           }
         }
 
@@ -2469,6 +2498,23 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         break;
       }
 
+      case 'bridge_source_session': {
+        if (msg.bridge !== 'hermes') break;
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored Hermes source binding from stale worker: ${msg.sourceSessionId}`);
+          break;
+        }
+        const sourceSessionIds = ds.hermesBridgeSourceSessionIds ??= new Set<string>();
+        if (sourceSessionIds.has(msg.sourceSessionId)) break;
+        if (sourceSessionIds.size === 0) {
+          logger.info(`[${t}] Hermes bridge sourceSessionId bound: ${msg.sourceSessionId}`);
+        } else {
+          logger.info(`[${t}] Hermes bridge sourceSessionId added after rebind: ${msg.sourceSessionId}`);
+        }
+        sourceSessionIds.add(msg.sourceSessionId);
+        break;
+      }
+
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -2485,11 +2531,18 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'final_output': {
         // Adopt-bridge: worker harvested the assistant turn from Claude Code's
-        // transcript JSONL and forwarded it to us. Dedup by lastUuid so a
-        // re-drain after a noisy idle doesn't re-send the same answer.
+        // transcript JSONL and forwarded it to us. Dedup with a session-scoped
+        // key so a re-drain can't re-send the same answer or cross-suppress
+        // another session.
         if (!msg.content || !msg.content.trim()) break;
-        if (msg.lastUuid && ds.lastBridgeEmittedUuid === msg.lastUuid) {
-          logger.debug(`[${t}] final_output deduped (uuid ${msg.lastUuid.substring(0, 8)})`);
+        if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
+        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
+        if (!msg.sessionId) {
+          logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
+        }
+        const dedupeKey = finalOutputDedupeKey(ds, msg);
+        if (ds.lastBridgeEmittedUuid === dedupeKey) {
+          logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
           break;
         }
         // Worker pops the turn off its queue right after emit, so it will
@@ -2562,6 +2615,48 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 
+function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
+  return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
+}
+
+function shouldDropMismatchedFinalOutput(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+): boolean {
+  if (!msg.sessionId || msg.sessionId === ds.session.sessionId) return false;
+  logger.error(
+    `[${t}] Dropped final_output with mismatched sessionId ` +
+    `(msg=${msg.sessionId}, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+  );
+  return true;
+}
+
+function shouldDropMismatchedHermesFinalOutput(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+): boolean {
+  if (ds.session.cliId !== 'hermes') return false;
+  const sourceSessionIds = ds.hermesBridgeSourceSessionIds;
+  const hasBoundSource = !!sourceSessionIds && sourceSessionIds.size > 0;
+  if (!msg.sourceHermesSessionId) {
+    if (!hasBoundSource) return false;
+    logger.error(
+      `[${t}] Dropped Hermes final_output without sourceHermesSessionId ` +
+      `(expected one of ${sourceSessionIds!.size} bound sources, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+    );
+    return true;
+  }
+  if (sourceSessionIds?.has(msg.sourceHermesSessionId)) return false;
+  logger.error(
+    `[${t}] Dropped Hermes final_output with mismatched sourceHermesSessionId ` +
+    `(msg=${msg.sourceHermesSessionId}, expected one of ${sourceSessionIds?.size ?? 0} bound sources, ` +
+    `session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+  );
+  return true;
+}
+
 /**
  * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
  * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
@@ -2616,7 +2711,7 @@ function deliverFinalOutput(
   const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
   if (waitPromise) {
     waitPromise.resolve(msg.content);
-    ds.lastBridgeEmittedUuid = msg.lastUuid;
+    ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
   }
@@ -2626,7 +2721,7 @@ function deliverFinalOutput(
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
     asyncResult.completedAt = Date.now();
-    ds.lastBridgeEmittedUuid = msg.lastUuid;
+    ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
   }
@@ -2654,7 +2749,7 @@ function deliverFinalOutput(
           await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
         }
         ds.docCommentTurns?.delete(msg.turnId);
-        ds.lastBridgeEmittedUuid = msg.lastUuid;
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
         return;
       }
@@ -2689,13 +2784,13 @@ function deliverFinalOutput(
       // place. message.patch is silent (no Feishu notification / unread), which
       // used to swallow the answer; a brand-new message always pings.
       await scopedReply(cardJson, 'interactive', msg.turnId);
-      ds.lastBridgeEmittedUuid = msg.lastUuid;
+      ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
       if (err instanceof MessageWithdrawnError) {
         // Root message gone — no point retrying. Mark as emitted so any
         // duplicate IPC is correctly deduped, and tear the session down.
-        ds.lastBridgeEmittedUuid = msg.lastUuid;
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.warn(`[${t}] Root message withdrawn while forwarding final_output, closing session`);
         cb.closeSession(ds);
         return;
@@ -2719,6 +2814,7 @@ function deliverFinalOutput(
 export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
+export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
@@ -2829,7 +2925,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   // open store.db fd (chatId), or from cliSessionId (= chatId) when discovery
   // captured it — so adopt must forward the pid + cwd like the other
   // transcript-backed CLIs.
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'traex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
+  const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
   const initMsg: DaemonToWorker = {
@@ -2917,6 +3013,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  cb.enforceLiveSessionCap?.();
   emitSessionLifecycleHook(ds, 'session.start', {
     reason: opts?.restoredFromMetadata ? 'adopt_restore' : 'adopt',
     pid: worker.pid ?? null,

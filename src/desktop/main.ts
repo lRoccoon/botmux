@@ -27,10 +27,22 @@ app.on('activate', () => {
   }
 });
 
-void bootstrap().catch(error => {
-  console.error('[desktop] bootstrap failed', error);
+const singleInstanceLock = app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
   app.quit();
-});
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+
+  void bootstrap().catch(error => {
+    console.error('[desktop] bootstrap failed', error);
+    app.quit();
+  });
+}
 
 async function bootstrap(): Promise<void> {
   await app.whenReady();

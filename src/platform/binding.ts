@@ -15,8 +15,9 @@ export interface PlatformBinding {
   name?: string;
   /** 本机所属的平台团队（成员关系下沉到部署本地，平台零存储靠各机上报重组） */
   teams?: PlatformTeam[];
-  /** 与平台通信固定走的 IP 协议族。bind 时默认路径不通、单协议族兜底成功后记下，
-   *  之后隧道等所有平台连接默认走它；缺省表示跟随系统默认解析。 */
+  /** @deprecated 遗留字段：仅为兼容旧 platform.json 而保留解析，运行期已不再读取。
+   *  隧道与所有平台连接现在都不传 family，交给 Node happy-eyeballs 自动选族；
+   *  bind 也不再把兜底成功的协议族落盘。 */
   ipFamily?: 4 | 6;
 }
 
@@ -73,6 +74,20 @@ export function platformMachineBaseUrl(): string | null {
   }
 }
 
+/**
+ * 自建反代对外基址（`BOTMUX_PUBLIC_URL`）：没接中心平台、但自己用 nginx 等反代把
+ * dashboard 暴露到单一公网/内网域名时，设成 `http://botmux.example.com`
+ * （scheme + host[:port]，尾部斜杠会被去掉）。设了之后 dashboard / 卡片终端链接改吐
+ * `<基址>/…`、`<基址>/s/<sessionId>`，走 dashboard 前门、无需 per-bot 端口。未设返回
+ * null → 调用方回退本地 `host:port`。它与 {@link platformMachineBaseUrl} 是「中心平台
+ * vs 自建反代」两条对外基址来源；优先级由调用方定（平台 > 本函数 > 本地）。
+ */
+export function publicReverseProxyBaseUrl(): string | null {
+  const raw = process.env.BOTMUX_PUBLIC_URL?.trim();
+  if (!raw) return null;
+  return raw.replace(/\/+$/, '');
+}
+
 /** 更新本机平台团队列表并落盘（读最新 binding 防覆盖其它字段）。返回更新后的列表。 */
 export function setPlatformTeams(teams: PlatformTeam[]): PlatformTeam[] {
   const b = readPlatformBinding();
@@ -80,13 +95,4 @@ export function setPlatformTeams(teams: PlatformTeam[]): PlatformTeam[] {
   b.teams = teams;
   writePlatformBinding(b);
   return teams;
-}
-
-/** 更新与平台通信的 IP 协议族偏好并落盘（隧道运行期换族成功后自愈式记忆）。 */
-export function setPlatformIpFamily(family: 4 | 6 | undefined): void {
-  const b = readPlatformBinding();
-  if (!b) return;
-  if (family === undefined) delete b.ipFamily;
-  else b.ipFamily = family;
-  writePlatformBinding(b);
 }

@@ -67,6 +67,7 @@ export interface DaemonSession {
   pendingFollowUpInput?: { userPrompt: string; cliInput: string };
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
+  pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
   /** Sender (open_id + type + resolved name) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
@@ -144,14 +145,20 @@ export interface DaemonSession {
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
    *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
   docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string }>;
-  /** Last assistant uuid emitted via the adopt bridge final_output pipeline.
-   *  Used by the daemon to dedupe successive `final_output` IPCs (e.g. when
-   *  the worker re-drains the transcript after a noisy idle). */
+  /** Last scoped dedupe key emitted via the bridge final_output pipeline.
+   *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
+   *  never suppress each other's final_output payloads. */
   lastBridgeEmittedUuid?: string;
-  /** Flag flipped to true once a `session.exited` dashboard event has been
-   *  published for this session. Both the dashboard-driven close path
-   *  (closeSession) and the worker-process exit handler may try to publish;
-   *  this guard prevents double-counting on the dashboard side. */
+  /** Native Hermes messages.session_id values bound by this worker after
+   *  seeing botmux-injected `<session_id>...` markers in Hermes state.db.
+   *  Hermes `/clear` can rebind to a new native session while a completed
+   *  turn from the previous source is still queued for emission, so the
+   *  daemon keeps every source announced by the current worker. */
+  hermesBridgeSourceSessionIds?: Set<string>;
+  /** Flag flipped once this process lifecycle has already been reflected on the
+   *  dashboard. A real close publishes `session.exited`; a deliberate suspend
+   *  publishes `status=dormant`. The later child-process exit must not emit a
+   *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode).
    *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */

@@ -10,6 +10,11 @@ describe('desktop dashboard embed', () => {
     return [...nav.matchAll(/\bdata-route="([^"]+)"/g)].map(match => match[1]);
   }
 
+  function dashboardNavRoutes(source: string): string[] {
+    const navItems = /const NAV_ITEMS: NavItem\[] = \[([\s\S]*?)\];/.exec(source)?.[1] ?? '';
+    return [...navItems.matchAll(/\bid: '([^']+)'/g)].map(match => match[1]);
+  }
+
   it('renders native dashboard chrome around the webview', () => {
     const html = readFileSync(
       fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
@@ -32,8 +37,8 @@ describe('desktop dashboard embed', () => {
   });
 
   it('mirrors the browser dashboard navigation routes', () => {
-    const dashboardHtml = readFileSync(
-      fileURLToPath(new URL('../../src/dashboard/web/index.html', import.meta.url)),
+    const dashboardSource = readFileSync(
+      fileURLToPath(new URL('../../src/dashboard/web/app.tsx', import.meta.url)),
       'utf-8',
     );
     const desktopHtml = readFileSync(
@@ -41,7 +46,7 @@ describe('desktop dashboard embed', () => {
       'utf-8',
     );
 
-    expect(sidebarRoutes(desktopHtml)).toEqual(sidebarRoutes(dashboardHtml));
+    expect(sidebarRoutes(desktopHtml)).toEqual(dashboardNavRoutes(dashboardSource));
   });
 
   it('keeps lower-left runtime status distinct from topbar counts', () => {
