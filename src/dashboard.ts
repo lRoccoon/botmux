@@ -855,7 +855,7 @@ async function cachedChangelog(current: string, now = Date.now()): Promise<Chang
 }
 
 /**
- * Run the ownership-aware npm/pnpm update for the manual-update flow WITHOUT blocking
+ * Run the ownership-aware npm/pnpm/Bun update for the manual-update flow WITHOUT blocking
  * the event loop (async spawn, not execSync — the dashboard must keep serving
  * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
  * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
@@ -865,9 +865,9 @@ function runGlobalInstallLatest(plan: GlobalInstallPlan): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(plan.command, plan.args, {
       cwd: globalInstallUpdateCwd(),
-      env: process.env,
+      env: { ...process.env, ...plan.env },
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd
+      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd / bun.exe
     });
     let tail = '';
     const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };

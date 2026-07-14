@@ -81,9 +81,10 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ```bash
 npm install -g botmux
 # or: pnpm add -g botmux
+# or: bun add -g botmux
 ```
 
-Manual and scheduled updates keep using the npm or pnpm global location that owns the running botmux install. Unknown install layouts are never silently updated with npm.
+Manual and scheduled updates keep using the npm, pnpm, or Bun global location that owns the running botmux install. Unknown install layouts are never silently updated with npm.
 
 > Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `kimi` / `grok` / `kiro-cli` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
 
