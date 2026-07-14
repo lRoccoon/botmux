@@ -2229,6 +2229,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
     larkAppIds?: unknown;
     userOpenIds?: unknown;
     ownerUnionIds?: unknown;
+    transferOwnerUnionId?: unknown;
     transferOwnerTo?: unknown;
     notifyOwnerOpenId?: unknown;
     bindWorkingDir?: unknown;
@@ -2240,6 +2241,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       larkAppIds?: string[];
       userOpenIds?: string[];
       ownerUnionIds?: string[];
+      transferOwnerUnionId?: string;
       transferOwnerTo?: string;
       notifyOwnerOpenId?: string;
       bindWorkingDir?: string;
@@ -2263,6 +2265,13 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
   const ownerUnionIds = Array.isArray(body.ownerUnionIds) && body.ownerUnionIds.every(x => typeof x === 'string')
     ? (body.ownerUnionIds as string[])
     : [];
+  const transferOwnerUnionId = typeof body.transferOwnerUnionId === 'string' && body.transferOwnerUnionId.trim()
+    ? body.transferOwnerUnionId.trim()
+    : null;
+  if (body.transferOwnerUnionId !== undefined
+    && (!transferOwnerUnionId || !transferOwnerUnionId.startsWith('on_') || !ownerUnionIds.includes(transferOwnerUnionId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_transfer_owner_union_id' });
+  }
   const transferTo = typeof body.transferOwnerTo === 'string' && body.transferOwnerTo.trim()
     ? body.transferOwnerTo.trim()
     : null;
@@ -2289,6 +2298,7 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       name,
       userOpenIds: userIds,
       ownerUnionIds,
+      transferOwnerUnionId: transferOwnerUnionId ?? undefined,
       transferOwnerTo: transferTo ?? undefined,
       notifyOwnerOpenId: notifyTo ?? undefined,
       bindWorkingDir: bindWorkingDir || undefined,

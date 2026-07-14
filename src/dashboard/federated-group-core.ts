@@ -43,7 +43,7 @@ export function hubError(e: unknown): { status: number; error: string } {
 
 export interface OrchestrateGroupDeps {
   /** Picks a LOCAL online creator + proxies to its daemon (federated bots added by app_id). */
-  createTeamGroup: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[] }) => Promise<{
+  createTeamGroup: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[]; transferOwnerUnionId?: string }) => Promise<{
     ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string;
   }>;
   fetcher: Fetcher;
@@ -98,7 +98,12 @@ export async function orchestrateFederatedGroup(
   ]));
   const missingOperatorIdentity = !operatorUnionId;
 
-  const r = await deps.createTeamGroup({ name, larkAppIds: eligible, ownerUnionIds });
+  const r = await deps.createTeamGroup({
+    name,
+    larkAppIds: eligible,
+    ownerUnionIds,
+    transferOwnerUnionId: operatorUnionId,
+  });
   if (r.ok) {
     // The creator bot adds the owners IT can reach; owners outside its app's
     // visibility scope (Lark code 232024 — typically owners of OTHER deployments)
@@ -125,7 +130,7 @@ export async function orchestrateFederatedGroup(
         const dr = await fetchWithTimeout(deps.fetcher, `${dep.callbackUrl}/api/federation/delegate-group`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${dep.delegationToken}` },
-          body: JSON.stringify({ name, larkAppIds: eligible, ownerUnionIds, requestId }),
+          body: JSON.stringify({ name, larkAppIds: eligible, ownerUnionIds, transferOwnerUnionId: operatorUnionId, requestId }),
         });
         const dj = await dr.json().catch(() => ({} as any));
         if (dr.ok && dj?.ok && dj.chatId) {

@@ -301,7 +301,7 @@ export interface FederationSpokeDeps {
   liveBots?: () => LiveBot[];
   /** Injected by dashboard.ts — picks a local online creator + proxies to its
    *  daemon's /api/groups/create (federated bots are added by larkAppId). */
-  createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[] }) => Promise<{
+  createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[]; transferOwnerUnionId?: string }) => Promise<{
     ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string;
   }>;
   /** Test seam: resolve owner candidates from allowedUsers (defaults to the real

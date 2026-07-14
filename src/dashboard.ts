@@ -20,7 +20,7 @@ import {
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
-import { planGroupCreator } from './dashboard/team-group.js';
+import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
@@ -1441,7 +1441,7 @@ function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
   });
 }
 
-async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[]; roleProfileId?: string }): Promise<{
+async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[]; transferOwnerUnionId?: string; roleProfileId?: string }): Promise<{
   ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidUserIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string; autoInviteUnavailable?: boolean;
 }> {
   const selectedIds = Array.from(new Set(args.larkAppIds.filter(Boolean)));
@@ -1467,13 +1467,14 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     const upstream = await proxyToDaemon(plan.creatorLarkAppId, '/api/groups/create', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
+      body: JSON.stringify(buildTeamGroupCreatePayload({
         name: args.name,
         larkAppIds: selectedIds,
         userOpenIds,
         ownerUnionIds: args.ownerUnionIds ?? [],
-        ...(args.roleProfileId ? { roleProfileId: args.roleProfileId } : {}),
-      }),
+        transferOwnerUnionId: args.transferOwnerUnionId,
+        roleProfileId: args.roleProfileId,
+      })),
     });
     const text = await upstream.text();
     let parsed: any = null;

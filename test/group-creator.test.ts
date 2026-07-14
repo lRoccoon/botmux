@@ -34,9 +34,11 @@ const SHARE_LINK = 'https://applink.feishu.cn/client/chat/chatter/add_by_link?li
 
 const mockSendMessage = vi.fn();
 const mockListChatBotMembers = vi.fn();
+const mockResolveAllowedUsersWithMap = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...args: any[]) => mockSendMessage(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
+  resolveAllowedUsersWithMap: (...args: any[]) => mockResolveAllowedUsersWithMap(...args),
 }));
 
 const mockBindOncall = vi.fn();
@@ -69,6 +71,7 @@ describe('createGroupWithBots', () => {
     mockGetChatShareLink.mockReset();
     mockSendMessage.mockReset();
     mockListChatBotMembers.mockReset();
+    mockResolveAllowedUsersWithMap.mockReset();
     mockBindOncall.mockReset();
     mockAddUsersByUnionId.mockReset();
     mockAddBotToChat.mockReset();
@@ -78,6 +81,7 @@ describe('createGroupWithBots', () => {
     // createChat; individual tests override to exercise the fallback path.
     mockGetChatShareLink.mockResolvedValue({ ok: true, shareLink: SHARE_LINK });
     mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: [] });
+    mockResolveAllowedUsersWithMap.mockResolvedValue({ resolved: [], map: new Map() });
     mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
       ids.map(id => ({ id, ok: true })),
     );
@@ -96,6 +100,54 @@ describe('createGroupWithBots', () => {
     expect(mockAddUsersByUnionId).toHaveBeenCalledWith(CREATOR, 'oc_fed', ['on_me', 'on_gone']);
     expect(result.invalidOwnerUnionIds).toEqual(['on_gone']);
     expect(result.chatId).toBe('oc_fed');
+  });
+
+  it('resolves the team operator union_id in the creator app scope, then transfers and notifies', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_team', invalidBotIds: [], invalidUserIds: [] });
+    mockResolveAllowedUsersWithMap.mockResolvedValue({
+      resolved: [USER_OPEN_ID],
+      map: new Map([['on_operator', USER_OPEN_ID]]),
+    });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    mockSendMessage.mockResolvedValue('om_owner_notify');
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      ownerUnionIds: ['on_operator', 'on_other_owner'],
+      transferOwnerUnionId: 'on_operator',
+    });
+
+    expect(mockResolveAllowedUsersWithMap).toHaveBeenCalledWith(CREATOR, ['on_operator']);
+    expect(mockTransferChatOwner).toHaveBeenCalledWith(CREATOR, 'oc_team', USER_OPEN_ID);
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      CREATOR,
+      'oc_team',
+      `<at user_id="${USER_OPEN_ID}"></at>`,
+      'text',
+    );
+    expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+    expect(result.transferError).toBeNull();
+    expect(result.notifyMessageId).toBe('om_owner_notify');
+    expect(result.notifyError).toBeNull();
+  });
+
+  it('does not resolve or transfer when Lark rejected the operator union_id invite', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_team', invalidBotIds: [], invalidUserIds: [] });
+    mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: ['on_operator'] });
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      ownerUnionIds: ['on_operator'],
+      transferOwnerUnionId: 'on_operator',
+    });
+
+    expect(mockResolveAllowedUsersWithMap).not.toHaveBeenCalled();
+    expect(mockTransferChatOwner).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.transferError).toBe('invitee_rejected');
+    expect(result.notifyError).toBe('invitee_rejected');
   });
 
   it('skips the union_id owner add when no ownerUnionIds given', async () => {

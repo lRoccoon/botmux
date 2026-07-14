@@ -129,7 +129,7 @@ export interface FederationApiDeps {
   liveBots?: () => LiveBot[];
   /** Injected by dashboard.ts — used when a HUB delegates 拉群 to THIS spoke
    *  (we create the chat with one of OUR local online bots as creator). */
-  createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[] }) => Promise<{
+  createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[]; transferOwnerUnionId?: string }) => Promise<{
     ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string;
   }>;
   /** Add owners to an existing chat via one of OUR local bots (defaults to
@@ -318,14 +318,26 @@ export async function handleFederationApi(
     // Dedup + cap inputs (pre-auth command endpoint — keep blast radius small).
     const larkAppIds: string[] = Array.from(new Set((Array.isArray(body?.larkAppIds) ? body.larkAppIds : []).filter((x: any) => typeof x === 'string')));
     const ownerUnionIds: string[] = Array.from(new Set((Array.isArray(body?.ownerUnionIds) ? body.ownerUnionIds : []).filter((x: any) => typeof x === 'string')));
+    const transferOwnerUnionId = typeof body?.transferOwnerUnionId === 'string'
+      ? body.transferOwnerUnionId.trim()
+      : '';
     const name = (String(body?.name ?? '').trim()) || '协作群';
     if (larkAppIds.length === 0) { jsonRes(res, 400, { ok: false, error: 'no_bots_selected' }); return true; }
     if (larkAppIds.length > MAX_BOTS || ownerUnionIds.length > MAX_OWNERS) { jsonRes(res, 400, { ok: false, error: 'too_many' }); return true; }
+    if (body?.transferOwnerUnionId !== undefined
+      && (!transferOwnerUnionId.startsWith('on_') || !ownerUnionIds.includes(transferOwnerUnionId))) {
+      jsonRes(res, 400, { ok: false, error: 'invalid_transfer_owner_union_id' }); return true;
+    }
     // Guardrail: the delegation must involve at least one of OUR local bots
     // (otherwise it's unrelated to this deployment — refuse to act as creator).
     const localIds = new Set(buildTeamRoster(dataDir, undefined, undefined, deps.liveBots?.()).bots.map(b => b.larkAppId));
     if (!larkAppIds.some(id => localIds.has(id))) { jsonRes(res, 400, { ok: false, error: 'no_local_bot' }); return true; }
-    const r = await deps.createTeamGroup({ name, larkAppIds, ownerUnionIds });
+    const r = await deps.createTeamGroup({
+      name,
+      larkAppIds,
+      ownerUnionIds,
+      transferOwnerUnionId: transferOwnerUnionId || undefined,
+    });
     const result = { status: r.ok ? 200 : 502, body: r };
     idemSet(idemKey, result); // cache terminal result (success AND failure)
     jsonRes(res, result.status, result.body);
