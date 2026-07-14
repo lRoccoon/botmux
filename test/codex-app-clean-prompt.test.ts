@@ -46,6 +46,57 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.codexAppInput?.localImages).toEqual([{ path: '/tmp/a.jpg', detail: 'original' }]);
   });
 
+  it('keeps mentioned bots separate while collapsing a large available-bot roster as untrusted context', () => {
+    const availableBots = Array.from({ length: 5 }, (_, index) => ({
+      name: `peer-${index + 1}`,
+      displayName: `Peer ${index + 1}`,
+      openId: `ou_peer_${index + 1}`,
+    }));
+    const built = buildNewTopicCliInput(
+      '请协调审核',
+      'sid-many-bots',
+      'codex-app',
+      undefined,
+      undefined,
+      [{ key: '@_user_1', name: 'Peer 1', openId: 'ou_peer_1' }],
+      availableBots,
+      undefined,
+      { name: 'This Bot', openId: 'ou_self' },
+      'zh',
+    );
+    expect(built.codexAppInput?.additionalContext?.botmux_mentions).toEqual({
+      kind: 'untrusted',
+      value: expect.stringContaining('ou_peer_1'),
+    });
+    const roster = built.codexAppInput?.additionalContext?.botmux_available_bots;
+    expect(roster?.kind).toBe('untrusted');
+    expect(roster?.value).toContain('count="4"');
+    expect(roster?.value).toContain('Peer 2、Peer 3、Peer 4、Peer 5');
+    expect(roster?.value).not.toContain('Peer 1');
+    expect(roster?.value).not.toContain('<bot ');
+    expect(roster?.value).not.toContain('ou_');
+    expect(built.codexAppInput?.text).toBe('请协调审核');
+  });
+
+  it('keeps an empty join prompt in legacy XML while giving Codex App a localized visible title', () => {
+    const built = buildNewTopicCliInput(
+      '',
+      'sid-auto-join',
+      'codex-app',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'zh',
+      undefined,
+      { codexAppText: '主动开工（入群）' },
+    );
+    expect(built.content).toContain('<user_message>\n\n</user_message>');
+    expect(built.codexAppInput?.text).toBe('主动开工（入群）');
+  });
+
   it('builds the same split for a follow-up and excludes the legacy reminder from hidden context', () => {
     const built = buildFollowUpCliInput('继续看一下', 'sid-2', {
       cliId: 'codex-app',

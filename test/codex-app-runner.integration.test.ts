@@ -29,12 +29,19 @@ interface RunResult {
   output: string;
   requests: Array<Record<string, any>>;
   imagePath: string;
+  missingImagePath: string;
   final: Record<string, any>;
 }
 
 const liveChildren = new Set<ChildProcessWithoutNullStreams>();
 
-function startRunner(fakeCodex: string, cwd: string, logPath: string, version: string, behavior: string): Harness {
+function startRunner(
+  fakeCodex: string,
+  cwd: string,
+  logPath: string,
+  version: string,
+  behavior: string,
+): Harness {
   let stdout = '';
   let stderr = '';
   const child = spawn(process.execPath, [
@@ -125,14 +132,19 @@ function readRequests(logPath: string): Array<Record<string, any>> {
 async function exerciseRunner(opts: {
   version: string;
   behavior?: 'success' | 'capability-error' | 'generic-error';
+  includeMissingImage?: boolean;
 }): Promise<RunResult> {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-'));
   const fakeCodex = join(dir, 'fake-codex');
   const logPath = join(dir, 'requests.jsonl');
   const imagePath = join(dir, 'image.png');
+  const missingImagePath = join(dir, 'missing.png');
   copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
   chmodSync(fakeCodex, 0o755);
-  writeFileSync(imagePath, 'not-a-real-png-but-readable');
+  writeFileSync(imagePath, Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zg0sAAAAASUVORK5CYII=',
+    'base64',
+  ));
 
   const sidecar: CodexAppTurnInput = {
     text: 'clean user text',
@@ -140,7 +152,10 @@ async function exerciseRunner(opts: {
       botmux_sender: { kind: 'untrusted', value: 'Alice <xml stays hidden>' },
       botmux_role: { kind: 'application', value: '经营助手' },
     },
-    localImages: [{ path: imagePath, detail: 'original' }],
+    localImages: [
+      { path: imagePath, detail: 'original' },
+      ...(opts.includeMissingImage ? [{ path: missingImagePath, detail: 'high' as const }] : []),
+    ],
     clientUserMessageId: 'om_integration_123',
   };
   const harness = startRunner(fakeCodex, dir, logPath, opts.version, opts.behavior ?? 'success');
@@ -154,7 +169,7 @@ async function exerciseRunner(opts: {
     const output = harness.stdout;
     const final = decodeFinalMarker(output);
     await stopChild(harness.child);
-    return { output, requests: readRequests(logPath), imagePath, final };
+    return { output, requests: readRequests(logPath), imagePath, missingImagePath, final };
   } finally {
     await stopChild(harness.child);
     rmSync(dir, { recursive: true, force: true });
@@ -167,7 +182,7 @@ afterEach(async () => {
 
 describe('codex-app-runner app-server protocol integration', () => {
   it('sends clean text, hidden context, localImage, and clientUserMessageId on codex >= 0.136', async () => {
-    const result = await exerciseRunner({ version: '0.136.0' });
+    const result = await exerciseRunner({ version: '0.136.0', includeMissingImage: true });
     const initialize = result.requests.find(request => request.method === 'initialize');
     expect(initialize?.params.capabilities).toEqual({ experimentalApi: true });
 
@@ -183,6 +198,7 @@ describe('codex-app-runner app-server protocol integration', () => {
     });
     expect(turns[0].params.clientUserMessageId).toBe('om_integration_123');
     expect(JSON.stringify(turns[0].params)).not.toContain('legacy <sender>prompt</sender>');
+    expect(result.output).toContain(`skipped unreadable local image: ${result.missingImagePath}`);
     expect(result.final.content).toBe('fake answer 1');
   });
 

@@ -7041,6 +7041,11 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
     const mode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
     const promptBody = resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
     const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
+    // D8 deliberately keeps the legacy prompt empty when no join prompt is
+    // configured, so the agent can inspect group context without receiving a
+    // synthetic instruction. Codex App still needs a non-blank visible
+    // UserMessage; reuse the localized session title only in its clean sidecar.
+    const codexAppText = promptBody || title;
 
     // Pick scope + anchor. 话题群 → seed a topic and anchor thread-scope there;
     // 普通群 → chat-scope anchored at chatId.
@@ -7090,6 +7095,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptBody,
+      pendingCodexAppText: botCfg.cliId === 'codex-app' ? codexAppText : undefined,
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
@@ -7104,7 +7110,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       promptBody, session.sessionId, botCfg.cliId, botCfg.cliPathOverride,
       undefined, undefined, await getAvailableBots(larkAppId, chatId), undefined,
       { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
-      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId },
+      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, codexAppText },
     );
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
