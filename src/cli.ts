@@ -4942,7 +4942,7 @@ async function registerSelfFromCredFile(): Promise<void> {
  * Returns null when not in riff mode (env vars missing or local session data
  * exists), so the normal flow takes over.
  */
-function riffModeSession(): { session: SessionData; botConfig: import('./bot-registry.js').BotConfig } | null {
+function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { session: SessionData; botConfig: import('./bot-registry.js').BotConfig } | null {
   const appId = process.env.BOTMUX_LARK_APP_ID;
   const appSecret = process.env.BOTMUX_LARK_APP_SECRET;
   if (!appId || !appSecret) return null;
@@ -4951,11 +4951,19 @@ function riffModeSession(): { session: SessionData; botConfig: import('./bot-reg
   const chatId = process.env.BOTMUX_CHAT_ID;
   if (!sessionId || !chatId) return null;
 
-  // If local session data exists, we're NOT in riff mode — let the normal flow
-  // handle it (a real daemon session takes precedence over env-only mode).
-  try {
-    if (loadSessions().size > 0) return null;
-  } catch { /* no data dir → riff mode */ }
+  // If local session data exists, we're normally NOT in riff mode — a real
+  // daemon session takes precedence over env-only mode. Exception: when the
+  // caller targets exactly the env-injected session id (evenWithLocalSessions),
+  // the env identity is authoritative — warm riff sandboxes can carry stale
+  // hand-crafted session files that must not shadow the daemon-injected creds.
+  // (On daemon hosts BOTMUX_LARK_APP_SECRET is never in process env — PTY
+  // sessions get credentials via worker cred files — so this path cannot
+  // hijack a genuine local session.)
+  if (!opts.evenWithLocalSessions) {
+    try {
+      if (loadSessions().size > 0) return null;
+    } catch { /* no data dir → riff mode */ }
+  }
 
   const brand = process.env.BOTMUX_LARK_BRAND as 'feishu' | 'lark' | undefined;
   // Only trust a real message id as the thread anchor — chat-scope sessions
@@ -5119,9 +5127,14 @@ async function cmdSend(rest: string[]): Promise<void> {
   // The daemon injects BOTMUX_LARK_APP_ID/SECRET/CHAT_ID/SESSION_ID into
   // the sandbox env; riffModeSession() builds a synthetic session + bot from
   // them and registers the bot so the Lark client works.
-  if (!s) {
-    const riff = riffModeSession();
-    if (riff) {
+  //
+  // The env-injected identity is AUTHORITATIVE for its own session id: a warm
+  // riff sandbox may carry stale local session data (hand-crafted by an agent
+  // in an earlier task, or baked into the image) that would otherwise shadow
+  // the daemon-injected identity and deliver through the wrong bot.
+  {
+    const riff = riffModeSession({ evenWithLocalSessions: sid === process.env.BOTMUX_SESSION_ID });
+    if (riff && (!s || riff.session.sessionId === sid)) {
       s = riff.session;
       const { registerBot } = await import('./bot-registry.js');
       try { registerBot(riff.botConfig); } catch { /* already registered */ }

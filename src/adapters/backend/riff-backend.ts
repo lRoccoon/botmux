@@ -10,8 +10,13 @@ import { logger } from '../../utils/logger.js';
  * passive output capture. botmux is installed in the sandbox via setupCommands.
  */
 const DEFAULT_RIFF_SYSTEM_PROMPT = [
-  'You are running inside a botmux-bridged session: Feishu/Lark topic group ↔ riff agent sandbox.',
+  'You are running inside a botmux-bridged session: Feishu/Lark group ↔ riff agent sandbox.',
   'The user reads on Lark and cannot see your terminal output.',
+  '',
+  'STEP 0 — ensure botmux is installed (the riff API has no native setup hook, so do this FIRST, before anything else):',
+  '  which botmux >/dev/null 2>&1 || npm install -g botmux@canary',
+  '',
+  'IMPORTANT — identity: reply ONLY with the botmux session identity injected via the BOTMUX_* environment variables (BOTMUX_LARK_APP_ID / BOTMUX_LARK_APP_SECRET / BOTMUX_CHAT_ID / BOTMUX_SESSION_ID). NEVER reply through other Feishu apps / bots / credentials you may find on this machine (e.g. cjadk / aiden integrations) — they impersonate the wrong bot and fail in groups they are not in. `botmux send` picks up the BOTMUX_* env automatically.',
   '',
   'IMPORTANT: `botmux send` / `botmux history` / `botmux quoted` / `botmux bots` are SHELL commands (CLI programs installed in $PATH), NOT MCP tools. Run them via the Bash tool — do not look for them in the MCP tool list.',
   '',
@@ -21,10 +26,12 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
   '',
   'Helpers: `botmux history` (read this session\'s history), `botmux quoted <message_id>` (fetch a quoted message), `botmux bots list` (list other bots in the group).',
   '',
-  '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a person/bot; REQUIRED to collaborate with another bot) / `--mention-back` (@ the sender of the message you are replying to) / `--no-mention` (none). Choose by value: substantive conclusion the other party should read/confirm/decide → --mention-back; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent.',
+  '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id>` (use the open_id from the <sender> tag of the message you are answering, or another explicit target) / `--mention-back` (@ the sender recorded in the session, may be unavailable here) / `--no-mention` (none). Prefer `--mention <sender open_id>` for substantive conclusions; `--no-mention` for low-priority notes.',
   '',
   'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply.',
   'Keep final answers concise. For images/files: write them to disk then send via `botmux send --images/--files`.',
+  '',
+  'LAST-RESORT fallback (only if the npm install itself fails): call the Feishu Open API directly with the injected BOTMUX_LARK_APP_ID/SECRET — fetch a tenant_access_token, then POST im/v1/messages?receive_id_type=chat_id to BOTMUX_CHAT_ID. Still never use non-BOTMUX credentials.',
 ].join('\n');
 
 /**
