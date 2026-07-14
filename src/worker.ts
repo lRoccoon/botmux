@@ -4392,9 +4392,18 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       BOTMUX_SESSION_ID: cfg.sessionId,
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
-      BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId,
     };
+    // Session scope for `botmux send` inside the sandbox. Thread sessions
+    // anchor on a real om_ message (reply_in_thread); chat-scope sessions use
+    // the chat id as anchor (sessionAnchorId), which is NOT a message id —
+    // passing it as BOTMUX_ROOT_MESSAGE_ID would break reply threading, so
+    // only forward real message ids and tell the sandbox the scope explicitly.
+    const rootIsMessage = cfg.rootMessageId?.startsWith('om_') === true;
+    sessionEnv.BOTMUX_SESSION_SCOPE = rootIsMessage ? 'thread' : 'chat';
+    if (rootIsMessage) sessionEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
     if (cfg.turnId) sessionEnv.BOTMUX_TURN_ID = cfg.turnId;
+    // Turn sender so `--mention-back` can resolve an @ target in the sandbox.
+    if (cfg.ownerOpenId) sessionEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
     // Lark credentials so `botmux send` works inside the riff sandbox without a
     // local daemon or bots.json. The sandbox has no session data / bot config,
     // so cmdSend falls back to these env vars to call the Lark API directly.

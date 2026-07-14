@@ -2253,6 +2253,9 @@ function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
+/** Agents supported by the riff runner (free text still allowed for new ones). */
+const RIFF_AGENT_SUGGESTIONS = ['aiden', 'aiden-claude', 'codex', 'opencode'];
+
 function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
@@ -2329,13 +2332,16 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       </div>
       <div className="bd-row">
         <label>
-          <span>{tr('botDefaults.riffAgent')}</span>
-          <input type="text" data-input="riff-agent" placeholder={tr('botDefaults.riffAgentPlaceholder')} value={agent} disabled={busy} onChange={e => setAgent(e.currentTarget.value)} />
+          <span><FieldTitle help={tr('botDefaults.riffAgentHelp')}>{tr('botDefaults.riffAgent')}</FieldTitle></span>
+          <input type="text" data-input="riff-agent" list={`riff-agent-suggestions-${props.bot.larkAppId}`} placeholder={tr('botDefaults.riffAgentPlaceholder')} value={agent} disabled={busy} onChange={e => setAgent(e.currentTarget.value)} />
+          <datalist id={`riff-agent-suggestions-${props.bot.larkAppId}`}>
+            {RIFF_AGENT_SUGGESTIONS.map(item => <option value={item} key={item} />)}
+          </datalist>
         </label>
       </div>
       <div className="bd-row">
         <label>
-          <span>{tr('botDefaults.riffModel')}</span>
+          <span><FieldTitle help={tr('botDefaults.riffModelHelp')}>{tr('botDefaults.riffModel')}</FieldTitle></span>
           <input type="text" data-input="riff-model" placeholder={tr('botDefaults.riffModelPlaceholder')} value={model} disabled={busy} onChange={e => setModel(e.currentTarget.value)} />
         </label>
       </div>

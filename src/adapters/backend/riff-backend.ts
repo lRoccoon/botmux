@@ -36,7 +36,11 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
  * these mandatory commands.
  */
 const MANDATORY_SETUP_COMMANDS = [
-  'which botmux >/dev/null 2>&1 || npm install -g botmux@canary 2>/dev/null',
+  // Unconditional install/upgrade: a `which botmux` guard would skip the
+  // install when the sandbox image preinstalls an older botmux, freezing the
+  // sandbox on a version without riff-aware `botmux send`. Falls back to any
+  // preinstalled botmux only when the install itself fails (e.g. npm offline).
+  'npm install -g botmux@canary >/dev/null 2>&1 || which botmux >/dev/null 2>&1',
 ];
 
 export interface RiffBackendConfig {
@@ -91,6 +95,7 @@ interface RiffTaskResponse {
     id: string;
     status: string;
     accessUrl?: string;
+    directAccessUrl?: string;
     queuePosition?: number | null;
   };
 }
@@ -118,11 +123,17 @@ export class RiffBackend implements SessionBackend {
   private outputBuffer = '';
   private currentTaskId: string | null = null;
   private currentAccessUrl: string | null = null;
+  /** True when currentAccessUrl is the sandbox directAccessUrl (never downgrade it). */
+  private accessUrlIsDirect = false;
   private abortController: AbortController | null = null;
   private killed = false;
   private taskDone = false;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 3;
+  /** Serializes write() → createTask/followUp. Without this, a second message
+   *  arriving before the first task-execute HTTP returns would see
+   *  currentTaskId === null and create a duplicate task. */
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(config: RiffBackendConfig, sessionId: string) {
     this.config = config;
@@ -185,12 +196,19 @@ export class RiffBackend implements SessionBackend {
 
     const { text, attachments } = this.extractAttachments(data);
 
-    if (!this.currentTaskId || this.taskDone) {
-      this.createTask(text, attachments);
-    } else {
-      this.followUp(text, attachments);
-    }
-    this.taskDone = false;
+    this.writeChain = this.writeChain
+      .then(async () => {
+        if (this.killed) return;
+        if (!this.currentTaskId || this.taskDone) {
+          this.taskDone = false;
+          await this.createTask(text, attachments);
+        } else {
+          await this.followUp(text, attachments);
+        }
+      })
+      .catch((err) => {
+        logger.warn(`[riff] queued write failed: ${err}`);
+      });
   }
 
   resize(_cols: number, _rows: number): void {
@@ -396,11 +414,9 @@ export class RiffBackend implements SessionBackend {
       throw new Error(`riff API returned error: ${JSON.stringify(result)}`);
     }
 
-    // Capture accessUrl from response if available
-    if (result.data.accessUrl) {
-      this.currentAccessUrl = result.data.accessUrl;
-      this.accessUrlCb?.(result.data.accessUrl);
-    }
+    // New task → new sandbox URLs may flow in; allow them to replace the old ones.
+    this.accessUrlIsDirect = false;
+    this.updateAccessUrl(result.data);
 
     // If queued, inject a status line
     if (result.data.status === 'queued' && result.data.queuePosition != null) {
@@ -524,15 +540,21 @@ export class RiffBackend implements SessionBackend {
         case 'init':
         case 'session_info': {
           // accessUrl lives in init / session_info events, not in done
-          const accessUrl = data['accessUrl'] as string | undefined;
-          if (accessUrl) {
-            this.currentAccessUrl = accessUrl;
-            this.accessUrlCb?.(accessUrl);
-            if (this.config.injectStatusLines !== false) {
-              const line = `\n[riff] Sandbox: ${accessUrl}\n`;
-              this.outputBuffer += line;
-              this.dataCb?.(line);
-            }
+          const changed = this.updateAccessUrl({
+            accessUrl: data['accessUrl'] as string | undefined,
+            directAccessUrl: data['directAccessUrl'] as string | undefined,
+          });
+          if (changed && this.currentAccessUrl && this.config.injectStatusLines !== false) {
+            const line = `\n[riff] Sandbox: ${this.currentAccessUrl}\n`;
+            this.outputBuffer += line;
+            this.dataCb?.(line);
+          }
+          // SSE events usually carry only accessUrl (riff frontend page — its
+          // domain may not match the configured baseUrl environment). The
+          // directly-openable AIO sandbox terminal lives in task-detail's
+          // directAccessUrl — try to upgrade once the first URL arrives.
+          if (changed && !this.accessUrlIsDirect) {
+            void this.fetchDirectAccessUrl(taskId);
           }
           break;
         }
@@ -575,6 +597,62 @@ export class RiffBackend implements SessionBackend {
     }
   }
 
+  /**
+   * Track the best sandbox URL for the "Web 终端" button.
+   * Preference: directAccessUrl (the AIO sandbox terminal, directly openable)
+   * over accessUrl (riff frontend page — hardcoded to the production domain
+   * even on BOE deployments, so its origin is rewritten to the configured
+   * baseUrl). A direct URL is never downgraded back to a frontend URL within
+   * the same task. Returns true when the current URL changed.
+   */
+  private updateAccessUrl(src: { accessUrl?: string; directAccessUrl?: string }): boolean {
+    let next: string | null = null;
+    let isDirect = false;
+    if (src.directAccessUrl) {
+      next = src.directAccessUrl;
+      isDirect = true;
+    } else if (src.accessUrl && !this.accessUrlIsDirect) {
+      next = this.rewriteToBaseOrigin(src.accessUrl);
+    }
+    if (!next || next === this.currentAccessUrl) return false;
+    this.currentAccessUrl = next;
+    this.accessUrlIsDirect = isDirect;
+    this.accessUrlCb?.(next);
+    return true;
+  }
+
+  /** Rewrite a riff frontend URL onto the configured baseUrl origin (BOE vs prod). */
+  private rewriteToBaseOrigin(url: string): string {
+    try {
+      const u = new URL(url);
+      const base = new URL(this.config.baseUrl);
+      if (u.origin === base.origin) return url;
+      return `${base.origin}${u.pathname}${u.search}${u.hash}`;
+    } catch {
+      return url;
+    }
+  }
+
+  /** One-shot task-detail fetch to pick up directAccessUrl (not present in SSE events). */
+  private async fetchDirectAccessUrl(taskId: string): Promise<void> {
+    try {
+      const url = `${this.config.baseUrl}/api/task-detail?id=${encodeURIComponent(taskId)}`;
+      const headers: Record<string, string> = {};
+      const jwt = this.getJwt();
+      if (jwt) headers['x-jwt-token'] = jwt;
+      const resp = await fetch(url, { headers });
+      if (!resp.ok) return;
+      const result = (await resp.json()) as {
+        success: boolean;
+        data?: { task?: { accessUrl?: string; directAccessUrl?: string } };
+      };
+      const task = result.data?.task;
+      if (task) this.updateAccessUrl(task);
+    } catch (err) {
+      logger.warn(`[riff] fetchDirectAccessUrl failed: ${err}`);
+    }
+  }
+
   private emitError(message: string): void {
     const line = `\n[riff] 错误: ${message}\n`;
     this.outputBuffer += line;
@@ -599,6 +677,8 @@ export class RiffBackend implements SessionBackend {
         data?: {
           task?: {
             output?: string;
+            accessUrl?: string;
+            directAccessUrl?: string;
             resultOutput?: {
               displayReport?: {
                 content?: string;
@@ -608,6 +688,8 @@ export class RiffBackend implements SessionBackend {
           };
         };
       };
+
+      if (result.data?.task) this.updateAccessUrl(result.data.task);
 
       // Prefer displayReport content (cleaner), fall back to raw output
       const displayContent = result.data?.task?.resultOutput?.displayReport?.content;

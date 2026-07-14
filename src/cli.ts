@@ -4958,7 +4958,14 @@ function riffModeSession(): { session: SessionData; botConfig: import('./bot-reg
   } catch { /* no data dir → riff mode */ }
 
   const brand = process.env.BOTMUX_LARK_BRAND as 'feishu' | 'lark' | undefined;
-  const rootMessageId = process.env.BOTMUX_ROOT_MESSAGE_ID;
+  // Only trust a real message id as the thread anchor — chat-scope sessions
+  // anchor on the chat id (oc_…), which must NOT be used as a reply target.
+  const rootEnv = process.env.BOTMUX_ROOT_MESSAGE_ID;
+  const rootMessageId = rootEnv?.startsWith('om_') ? rootEnv : '';
+  const scopeEnv = process.env.BOTMUX_SESSION_SCOPE;
+  const scope: 'thread' | 'chat' =
+    scopeEnv === 'chat' || scopeEnv === 'thread' ? scopeEnv : (rootMessageId ? 'thread' : 'chat');
+  const ownerOpenId = process.env.BOTMUX_OWNER_OPEN_ID;
 
   const botConfig = {
     larkAppId: appId,
@@ -4971,12 +4978,15 @@ function riffModeSession(): { session: SessionData; botConfig: import('./bot-reg
   const session: SessionData = {
     sessionId,
     chatId,
-    rootMessageId: rootMessageId ?? '',
+    rootMessageId,
     title: 'riff',
     status: 'active',
     createdAt: new Date().toISOString(),
     larkAppId: appId,
-    scope: 'thread',
+    scope,
+    ownerOpenId,
+    // Lets `--mention-back` @ the turn's sender even without local session state.
+    quoteTargetSenderOpenId: ownerOpenId,
   };
 
   return { session, botConfig };
