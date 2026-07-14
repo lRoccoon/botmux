@@ -2513,8 +2513,39 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           logger.warn(`[${t}] Ignored riff_access_url from stale worker: ${msg.accessUrl}`);
           break;
         }
+        if (ds.riffAccessUrl === msg.accessUrl) break;
         ds.riffAccessUrl = msg.accessUrl;
         logger.info(`[${t}] Riff sandbox access URL updated: ${msg.accessUrl}`);
+        // Dashboard: refresh the session row's Web 终端 link immediately.
+        dashboardEventBus.publish({
+          type: 'session.update',
+          body: { sessionId: ds.session.sessionId, patch: { riffAccessUrl: msg.accessUrl } },
+        });
+        // Refresh the live streaming card so its "打开 Web 终端" button picks up
+        // the sandbox URL now — the URL often lands between status changes, and
+        // waiting for the next status-edge PATCH can leave the button pointing
+        // at the local worker terminal for the whole turn.
+        if (!streamingCardDisabled(ds) && !ds.suppressRecoveryCard
+            && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+          const cardJson = buildStreamingCard(
+            ds.session.sessionId,
+            sessionAnchorId(ds),
+            buildTerminalUrl(ds),
+            ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
+            ds.lastScreenContent ?? '',
+            ds.lastScreenStatus ?? 'starting',
+            effectiveCliId,
+            ds.displayMode ?? 'hidden',
+            ds.streamCardNonce,
+            ds.currentImageKey,
+            isAdopt,
+            showTakeover,
+            loc,
+            cardUsageLimit(ds),
+            writableTerminalLinkFor(ds),
+          );
+          scheduleCardPatch(ds, cardJson);
+        }
         break;
       }
 
