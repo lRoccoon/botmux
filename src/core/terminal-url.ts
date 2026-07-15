@@ -68,9 +68,11 @@ export function resetTerminalProxy(): void {
 }
 
 export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean } = {}): string {
-  // Riff backend: the "Web终端" opens the riff AIO Sandbox link directly,
-  // bypassing the local terminal proxy / port forwarding entirely.
-  if (ds.riffAccessUrl) return ds.riffAccessUrl;
+  // Riff backend: the AIO Sandbox link is the OPERATE entry — served via
+  // 「获取操作链接」/ write links only (opts.write). The read-only
+  // 「打开 Web 终端」keeps the local worker terminal (task log view), so both
+  // stay reachable: Web终端=日志页常驻，操作链接=AIO Sandbox。
+  if (ds.riffAccessUrl && opts.write) return ds.riffAccessUrl;
   // When 远程访问 is enabled AND this daemon is bound to the central platform AND
   // the local terminal proxy is up, route terminal links through the machine
   // subdomain (`https://m-<machineId>.<platformHost>/s/<sessionId>`). The platform

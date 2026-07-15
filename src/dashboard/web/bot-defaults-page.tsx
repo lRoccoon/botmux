@@ -1045,7 +1045,7 @@ function WorkingDirSection(props: {
           <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux" value={workingDir} disabled={busy} onChange={event => setWorkingDir(event.currentTarget.value)} />
         </label>
       </div>
-      <label className="toggle-row" data-wd-worktree-row hidden={mode !== 'default'}>
+      <label className="toggle-row" data-wd-worktree-row hidden={mode !== 'default' || props.bot.cliId === 'riff'}>
         <input type="checkbox" data-input="autoWorktree" checked={autoWorktree} disabled={busy} onChange={event => setAutoWorktree(event.currentTarget.checked)} />
         <span className="switch" aria-hidden="true" />
         <span className="toggle-tx"><strong><FieldTitle help={tr('botDefaults.autoWorktreeHelp')}>{tr('botDefaults.autoWorktree')}</FieldTitle></strong></span>
@@ -2264,8 +2264,6 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const [model, setModel] = useState(typeof riff.model === 'string' ? riff.model : '');
   const [jwtEnv, setJwtEnv] = useState(typeof riff.jwtEnv === 'string' ? riff.jwtEnv : '');
   const [sandboxCluster, setSandboxCluster] = useState(typeof riff.sandboxCluster === 'string' ? riff.sandboxCluster : '');
-  const [defaultRepo, setDefaultRepo] = useState(typeof riff.defaultRepo === 'string' ? riff.defaultRepo : '');
-  const [defaultBranch, setDefaultBranch] = useState(typeof riff.defaultBranch === 'string' ? riff.defaultBranch : '');
   const [injectStatusLines, setInjectStatusLines] = useState(riff.injectStatusLines === true);
   const [systemPrompt, setSystemPrompt] = useState(typeof riff.systemPrompt === 'string' ? riff.systemPrompt : '');
   const [setupCommands, setSetupCommands] = useState(
@@ -2281,8 +2279,6 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     setModel(typeof r.model === 'string' ? r.model : '');
     setJwtEnv(typeof r.jwtEnv === 'string' ? r.jwtEnv : '');
     setSandboxCluster(typeof r.sandboxCluster === 'string' ? r.sandboxCluster : '');
-    setDefaultRepo(typeof r.defaultRepo === 'string' ? r.defaultRepo : '');
-    setDefaultBranch(typeof r.defaultBranch === 'string' ? r.defaultBranch : '');
     setInjectStatusLines(r.injectStatusLines === true);
     setSystemPrompt(typeof r.systemPrompt === 'string' ? r.systemPrompt : '');
     setSetupCommands(Array.isArray(r.setupCommands) ? r.setupCommands.join('\n') : '');
@@ -2298,8 +2294,6 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       if (model.trim()) config.model = model.trim();
       if (jwtEnv.trim()) config.jwtEnv = jwtEnv.trim();
       if (sandboxCluster.trim()) config.sandboxCluster = sandboxCluster.trim();
-      if (defaultRepo.trim()) config.defaultRepo = defaultRepo.trim();
-      if (defaultBranch.trim()) config.defaultBranch = defaultBranch.trim();
       if (injectStatusLines) config.injectStatusLines = true;
       if (systemPrompt.trim()) config.systemPrompt = systemPrompt.trim();
       if (setupCommands.trim()) {
@@ -2355,18 +2349,6 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         <label>
           <span>{tr('botDefaults.riffSandboxCluster')}</span>
           <input type="text" data-input="riff-sandbox-cluster" placeholder={tr('botDefaults.riffSandboxClusterPlaceholder')} value={sandboxCluster} disabled={busy} onChange={e => setSandboxCluster(e.currentTarget.value)} />
-        </label>
-      </div>
-      <div className="bd-row">
-        <label>
-          <span><FieldTitle help={tr('botDefaults.riffDefaultRepoHelp')}>{tr('botDefaults.riffDefaultRepo')}</FieldTitle></span>
-          <input type="text" data-input="riff-default-repo" placeholder={tr('botDefaults.riffDefaultRepoPlaceholder')} value={defaultRepo} disabled={busy} onChange={e => setDefaultRepo(e.currentTarget.value)} />
-        </label>
-      </div>
-      <div className="bd-row">
-        <label>
-          <span>{tr('botDefaults.riffDefaultBranch')}</span>
-          <input type="text" data-input="riff-default-branch" placeholder={tr('botDefaults.riffDefaultBranchPlaceholder')} value={defaultBranch} disabled={busy} onChange={e => setDefaultBranch(e.currentTarget.value)} />
         </label>
       </div>
       <label className="toggle-row">

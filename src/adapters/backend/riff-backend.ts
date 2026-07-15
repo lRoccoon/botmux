@@ -373,6 +373,35 @@ export class RiffBackend implements SessionBackend {
 
   // ── Private helpers ──────────────────────────────────────────────
 
+  /**
+   * Emit a styled status line into the terminal stream. The worker renders
+   * this through a headless xterm — bare `\n` (no carriage return) makes
+   * lines stair-step to the right, which is the main reason the raw log view
+   * was hard to read. Always emit `\r\n` and reset ANSI styling per line.
+   */
+  private emitLine(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'plain' = 'info'): void {
+    const codes: Record<string, string> = {
+      info: '\x1b[36m',   // cyan — routine status
+      warn: '\x1b[33m',   // yellow — degraded/attention
+      ok: '\x1b[32m',     // green — completion
+      err: '\x1b[31m',    // red — failure
+      title: '\x1b[1m',   // bold — section separators
+      plain: '',
+    };
+    const open = codes[style] ?? '';
+    const close = open ? '\x1b[0m' : '';
+    const line = `\r\n${open}${text}${close}\r\n`;
+    this.outputBuffer += line;
+    this.dataCb?.(line);
+  }
+
+  /** Normalize newlines for xterm rendering (bare \n → \r\n, keep existing \r\n). */
+  private emitText(text: string): void {
+    const normalized = text.replace(/\r?\n/g, '\r\n');
+    this.outputBuffer += normalized;
+    this.dataCb?.(normalized);
+  }
+
   private extractAttachments(content: string): { text: string; attachments: RiffAttachment[] } {
     const attachments: RiffAttachment[] = [];
     const attachRegex = /<attachments[^>]*>([\s\S]*?)<\/attachments>/g;
@@ -421,10 +450,8 @@ export class RiffBackend implements SessionBackend {
       config.repos = repos;
       if (this.config.injectStatusLines !== false) {
         const desc = repos.map(r => r.repoBranch ? `${r.repoName}@${r.repoBranch}` : `${r.repoName}(默认分支)`).join(', ');
-        const warn = (this.config.repoWarnings ?? []).map(w => `\n[riff] ⚠️ ${w}`).join('');
-        const line = `\n[riff] 仓库: ${desc}${warn}\n`;
-        this.outputBuffer += line;
-        this.dataCb?.(line);
+        this.emitLine(`[riff] 仓库: ${desc}`);
+        for (const w of this.config.repoWarnings ?? []) this.emitLine(`[riff] ⚠️ ${w}`, 'warn');
       }
     }
     // Inject env into the riff sandbox so the agent can use `botmux send` etc.
@@ -548,9 +575,7 @@ export class RiffBackend implements SessionBackend {
 
     // If queued, inject a status line
     if (result.data.status === 'queued' && result.data.queuePosition != null) {
-      const line = `\n[riff] 任务排队中，位置: ${result.data.queuePosition}\n`;
-      this.outputBuffer += line;
-      this.dataCb?.(line);
+      this.emitLine(`[riff] 任务排队中，位置: ${result.data.queuePosition}`, 'warn');
     }
 
     return result.data.id;
@@ -632,9 +657,7 @@ export class RiffBackend implements SessionBackend {
         this.reconnectAttempts++;
         const delay = 1000 * this.reconnectAttempts;
         logger.info(`[riff] SSE reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
-        const line = `\n[riff] 连接中断，正在重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})\n`;
-        this.outputBuffer += line;
-        this.dataCb?.(line);
+        this.emitLine(`[riff] 连接中断，正在重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})`, 'warn');
         await new Promise((r) => setTimeout(r, delay));
         this.streamTask(taskId);
       } else if (!this.killed && !this.taskDone) {
@@ -665,20 +688,13 @@ export class RiffBackend implements SessionBackend {
       switch (eventType) {
         case 'output': {
           const chunk = data['chunk'] as string | undefined;
-          if (chunk) {
-            this.outputBuffer += chunk;
-            this.dataCb?.(chunk);
-          }
+          if (chunk) this.emitText(chunk);
           break;
         }
         case 'status': {
           if (this.config.injectStatusLines !== false) {
             const status = data['status'] as string | undefined;
-            if (status) {
-              const line = `\n[riff] 状态: ${status}\n`;
-              this.outputBuffer += line;
-              this.dataCb?.(line);
-            }
+            if (status) this.emitLine(`[riff] 状态: ${status}`);
           }
           break;
         }
@@ -690,9 +706,7 @@ export class RiffBackend implements SessionBackend {
             directAccessUrl: data['directAccessUrl'] as string | undefined,
           });
           if (changed && this.currentAccessUrl && this.config.injectStatusLines !== false) {
-            const line = `\n[riff] Sandbox: ${this.currentAccessUrl}\n`;
-            this.outputBuffer += line;
-            this.dataCb?.(line);
+            this.emitLine(`[riff] Sandbox: ${this.currentAccessUrl}`);
           }
           // SSE events usually carry only accessUrl (riff frontend page — its
           // domain may not match the configured baseUrl environment). The
@@ -713,9 +727,7 @@ export class RiffBackend implements SessionBackend {
           const status = data['status'] as string | undefined;
           const exitCode = data['exitCode'] as number | undefined;
           if (this.config.injectStatusLines !== false) {
-            const doneLine = `\n[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}\n`;
-            this.outputBuffer += doneLine;
-            this.dataCb?.(doneLine);
+            this.emitLine(`[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}`, status === 'failed' ? 'warn' : 'ok');
           }
           // Fetch final output from task-detail API (SSE has no output events for runner tasks)
           if (status === 'completed' || status === 'failed') {
@@ -735,12 +747,9 @@ export class RiffBackend implements SessionBackend {
             ?? (data['payload'] as Record<string, unknown> | undefined)?.['group'] as string | undefined;
           // stdout logs are the real output stream — emit as data regardless of logLevel
           if (group === 'stdout' && text) {
-            this.outputBuffer += text;
-            this.dataCb?.(text);
+            this.emitText(text);
           } else if (this.config.logLevel === 'verbose' && text) {
-            const logLine = `\n[riff:${kind ?? 'log'}] ${text}\n`;
-            this.outputBuffer += logLine;
-            this.dataCb?.(logLine);
+            this.emitLine(`[riff:${kind ?? 'log'}] ${text}`);
           }
           break;
         }
@@ -807,9 +816,7 @@ export class RiffBackend implements SessionBackend {
   }
 
   private emitError(message: string): void {
-    const line = `\n[riff] 错误: ${message}\n`;
-    this.outputBuffer += line;
-    this.dataCb?.(line);
+    this.emitLine(`[riff] 错误: ${message}`, 'err');
     logger.error(`[riff] ${message}`);
     // A failed task is also a turn boundary — without this, a task-execute /
     // follow-up / SSE failure would leave the worker "busy" forever and queued
@@ -860,8 +867,8 @@ export class RiffBackend implements SessionBackend {
         // Clean up: strip leading "startedcompleted" noise from aiden runner
         const cleaned = output.replace(/^(started|completed)+/, '').trim();
         if (cleaned.length > 0) {
-          this.outputBuffer += cleaned;
-          this.dataCb?.(cleaned);
+          this.emitLine('────────── 任务报告 ──────────', 'title');
+          this.emitText(cleaned + '\n');
         }
       }
     } catch (err) {

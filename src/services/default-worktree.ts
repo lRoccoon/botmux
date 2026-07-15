@@ -53,6 +53,9 @@ export interface MaybeCreateWorktreeCtx {
 export function botAutoWorktreeEnabled(larkAppId: string): boolean {
   try {
     const cfg = getBot(larkAppId).config;
+    // riff 每个任务在远程沙箱重新 clone，本地 worktree 只会白建一份没人用的
+    // checkout（dashboard 对 riff 也隐藏了该开关；这里兜住历史遗留的开启状态）。
+    if (cfg.backendType === 'riff') return false;
     return cfg.defaultWorkingDirAutoWorktree === true && !!cfg.defaultWorkingDir;
   } catch {
     return false;

@@ -6511,15 +6511,6 @@ async function startInitialPassthroughSession(args: {
     return;
   }
 
-  // Riff backend: skip repo selection — riff manages its own remote sandbox
-  if (botCfg.backendType === 'riff') {
-    ds.pendingRepo = false;
-    rememberLastCliInput(ds, commandContent, commandContent);
-    forkWorker(ds, '', false);
-    logger.info(`[${tag(ds)}] riff backend: skipping repo selection`);
-    return;
-  }
-
   if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
   const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
@@ -6911,19 +6902,6 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
       : `bot defaultWorkingDir`;
     logger.info(`[${tag(ds)}] ${reason} → workingDir=${ds.workingDir}, skipped repo select`);
-    return;
-  }
-
-  // Riff backend: skip repo selection — riff manages its own remote sandbox
-  if (botCfg.backendType === 'riff') {
-    ds.pendingRepo = false;
-    const selfBot = getBot(larkAppId);
-    ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger });
-    rememberLastCliInput(ds, promptContent, prompt);
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkWorker(ds, prompt);
-    logger.info(`[${tag(ds)}] riff backend: skipping repo selection`);
     return;
   }
 

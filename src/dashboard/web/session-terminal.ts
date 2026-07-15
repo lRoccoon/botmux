@@ -9,7 +9,8 @@ function currentLocation(): SessionTerminalLocation | null {
 }
 
 export function sessionTerminalHref(s: any, loc: SessionTerminalLocation | null = currentLocation()): string | null {
-  // Riff backend: the "Web终端" opens the riff AIO Sandbox link directly.
+  // riff：dashboard 行内按钮保留 AIO Sandbox 直达（飞书卡片侧 Web终端=日志页、
+  // 操作链接=AIO；dashboard 只有一个终端入口，直达沙箱更有用）。
   if (s?.riffAccessUrl) return s.riffAccessUrl;
   if (!s?.webPort || !loc) return null;
   // On the central HTTPS machine domain, terminals must go through the same
