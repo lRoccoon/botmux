@@ -1,8 +1,9 @@
 import * as pty from 'node-pty';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
 import { resolveUserShell, buildBotmuxEnvAssignments, SHELL_WRAPPER_SCRIPT } from './tmux-backend.js';
@@ -377,7 +378,60 @@ export function tmuxKeyToBytes(key: string): string {
  * the trailing path component of the server's socket argument, so we match the
  * cmdline ending in `/<sessionName>`.
  */
+/** A running `zellij --server <socketPath>` process. */
+export interface ZellijServerProc {
+  pid: number;
+  /** The socket path from argv — the session name AT SPAWN TIME. */
+  socketPath: string;
+}
+
+/** Parse `ps -eo pid=,args=` output into the zellij server processes. Pure. */
+export function parseZellijServerProcs(psOut: string): ZellijServerProc[] {
+  const servers: ZellijServerProc[] = [];
+  for (const line of psOut.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const argv = m[2]!.trim();
+    const s = argv.match(/zellij\b.*--server\s+(\S+)$/);
+    if (s) servers.push({ pid: Number(m[1]), socketPath: s[1]! });
+  }
+  return servers;
+}
+
+/**
+ * Rename-proof server lookup: `zellij action rename-session` (what the
+ * session-manager plugin drives) renames the session's SOCKET FILE, but the
+ * server's argv AND the kernel's bound-address string (/proc/net/unix) keep
+ * the spawn-time path forever (verified live on 0.44.1). So a renamed session
+ * is visible in `list-sessions` under its new name while no server argv ends
+ * with that name — the argv fast path misses and /adopt used to skip the
+ * whole session. There is no passive name→pid mapping left; instead we
+ * actively probe: connecting to the renamed socket file makes the server
+ * accept() a socket that appears in /proc/net/unix under the STALE bound
+ * path — the probe child diffs row counts across the connect and prints the
+ * revealed spawn-time path, which we match back to a server argv. Exact, no
+ * name guessing. Linux-only (/proc); on other platforms the argv fast path is
+ * the whole behavior, as before.
+ */
+function findServerPidByProbe(sessionName: string, servers: ZellijServerProc[]): number | null {
+  if (process.platform !== 'linux') return null;
+  const probeScript = fileURLToPath(new URL('./zellij-socket-probe.js', import.meta.url));
+  for (const dir of [...new Set(servers.map(s => dirname(s.socketPath)))]) {
+    const sock = join(dir, sessionName);
+    if (!existsSync(sock)) continue;
+    const r = spawnSync(process.execPath, [probeScript, sock], {
+      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000,
+    });
+    if (r.status !== 0) continue;
+    const bound = (r.stdout ?? '').trim();
+    const hit = servers.find(s => s.socketPath === bound);
+    if (hit) return hit.pid;
+  }
+  return null;
+}
+
 export function findServerPid(sessionName: string): number | null {
+  let servers: ZellijServerProc[];
   try {
     const out = execFileSync('ps', ['-eo', 'pid=,args='], {
       encoding: 'utf-8',
@@ -385,16 +439,15 @@ export function findServerPid(sessionName: string): number | null {
       timeout: 3000,
       env: zellijEnv(),
     });
-    for (const line of out.split('\n')) {
-      const m = line.trim().match(/^(\d+)\s+(.*)$/);
-      if (!m) continue;
-      const argv = m[2]!;
-      if (/zellij\b.*--server\b/.test(argv) && new RegExp(`/${escapeRe(sessionName)}$`).test(argv.trim())) {
-        return Number(m[1]);
-      }
-    }
-  } catch { /* ps unavailable */ }
-  return null;
+    servers = parseZellijServerProcs(out);
+  } catch { return null; /* ps unavailable */ }
+  // Fast path: argv still ends with the session name (never renamed).
+  const suffix = new RegExp(`/${escapeRe(sessionName)}$`);
+  for (const s of servers) {
+    if (suffix.test(s.socketPath)) return s.pid;
+  }
+  // Renamed session: resolve via an active socket probe.
+  return findServerPidByProbe(sessionName, servers);
 }
 
 /**
