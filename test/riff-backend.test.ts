@@ -42,6 +42,10 @@ describe('RiffBackend', () => {
       if (u.includes('/api/task-detail')) {
         return Response.json({ success: true, data: { task: {} } });
       }
+      // task-cancel：即时成功（mock fetch 不接 AbortSignal，挂起会假死测试）
+      if (u.includes('/api/task-cancel')) {
+        return Response.json({ success: true, data: {} });
+      }
       // task-execute / task-follow-up: resolve manually so tests control timing
       return new Promise<Response>((resolve) => { resolvers.push(resolve); });
     });
@@ -93,6 +97,7 @@ describe('RiffBackend', () => {
       // Task completes — the next turn must still follow up on task-1, not
       // cold-boot a brand-new task/sandbox.
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-1');
+      await flush(); await flush();
 
       be.write('second');
       await flush();
@@ -112,6 +117,7 @@ describe('RiffBackend', () => {
       resolvers.shift()!(taskResponse('task-1'));
       await flush();
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-1');
+      await flush(); await flush();
 
       be.write('second');
       await flush();
@@ -123,13 +129,14 @@ describe('RiffBackend', () => {
       expect(calls.filter(c => c.url.includes('/api/task-execute')).length).toBe(2);
     });
 
-    it('ignores a duplicate done event (no double turn-boundary)', () => {
+    it('ignores a duplicate done event (no double turn-boundary)', async () => {
       const be = makeBackend({ injectStatusLines: false });
       const done = vi.fn();
       be.onTaskDone(done);
       (be as any).currentTaskId = 'task-1';
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-1');
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-1');
+      await flush(); await flush();
       expect(done).toHaveBeenCalledTimes(1);
     });
 
@@ -144,6 +151,7 @@ describe('RiffBackend', () => {
       await flush();
       // A completes → boundary fires once, queued follow-up becomes task B.
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-A');
+      await flush(); await flush();
       expect(done).toHaveBeenCalledTimes(1);
       be.write('second');
       await flush();
@@ -152,10 +160,12 @@ describe('RiffBackend', () => {
       expect((be as any).taskDone).toBe(false); // B is running
       // A's duplicate done arrives ~500ms later (observed live): must be inert.
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-A');
+      await flush(); await flush();
       expect(done).toHaveBeenCalledTimes(1);
       expect((be as any).taskDone).toBe(false); // B must not be marked done
       // B's own done still fires the boundary normally.
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-B');
+      await flush(); await flush();
       expect(done).toHaveBeenCalledTimes(2);
     });
   });
@@ -302,7 +312,7 @@ describe('RiffBackend', () => {
   });
 
   describe('completedTaskIds bounded eviction (finding E)', () => {
-    it('never evicts the just-completed task — its duplicate done stays inert past 64 turns', () => {
+    it('never evicts the just-completed task — its duplicate done stays inert past 64 turns', async () => {
       const be = makeBackend({ injectStatusLines: false });
       const done = vi.fn();
       be.onTaskDone(done);
@@ -311,21 +321,24 @@ describe('RiffBackend', () => {
         (be as any).taskDone = false;
         (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', `task-${i}`);
       }
+      await flush(); await flush();
       expect(done).toHaveBeenCalledTimes(70);
       // 第 70 轮的 duplicate done（~500ms 后到达）必须仍被吞掉
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-70');
+      await flush(); await flush();
       expect(done).toHaveBeenCalledTimes(70);
       expect(((be as any).completedTaskIds as Set<string>).size).toBeLessThanOrEqual(64);
     });
   });
 
   describe('onTaskDone turn boundary', () => {
-    it('fires when the done SSE event arrives', () => {
+    it('fires when the done SSE event arrives', async () => {
       const be = makeBackend({ injectStatusLines: false });
       const done = vi.fn();
       be.onTaskDone(done);
       (be as any).currentTaskId = 'task-1';
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed","exitCode":0}', 'task-1');
+      await flush(); await flush();
       expect(done).toHaveBeenCalledTimes(1);
       expect((be as any).taskDone).toBe(true);
     });
@@ -430,6 +443,88 @@ describe('RiffBackend', () => {
       await flush();
       const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
       expect(JSON.parse(String(exec.init?.body)).config.repos).toBeUndefined();
+    });
+  });
+
+  describe('close race with in-flight create/follow-up (finding L-race)', () => {
+    it('close during create: the late task is cancelled, never streamed or adopted', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+      be.write('hello');
+      await flush();
+      // create HTTP 尚未返回时 /close
+      const destroyP = be.destroySession();
+      await flush();
+      resolvers.shift()!(taskResponse('task-late'));
+      await new Promise((r) => setTimeout(r, 20));
+      await destroyP;
+      const cancels = calls.filter(c => c.url.includes('/api/task-cancel'));
+      expect(cancels.length).toBeGreaterThanOrEqual(1);
+      expect(JSON.parse(String(cancels[cancels.length - 1]!.init?.body ?? '{}')).id ?? JSON.parse(String(cancels[0]!.init?.body)).id).toBe('task-late');
+      expect(calls.filter(c => c.url.includes('/api2/task-stream')).length).toBe(0);
+      expect((be as any).currentTaskId).not.toBe('task-late');
+    });
+
+    it('close during follow-up: the late follow-up task is cancelled', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+      be.write('first');
+      await flush();
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-1');
+      await flush(); await flush();
+      be.write('second');
+      await flush();
+      const destroyP = be.destroySession();
+      await flush();
+      resolvers.shift()!(taskResponse('task-late-2'));
+      await new Promise((r) => setTimeout(r, 20));
+      await destroyP;
+      const cancelIds = calls.filter(c => c.url.includes('/api/task-cancel')).map(c => JSON.parse(String(c.init?.body)).id);
+      expect(cancelIds).toContain('task-late-2');
+      // late follow-up 不得成为 current，也不得开流
+      expect((be as any).currentTaskId).not.toBe('task-late-2');
+    });
+  });
+
+  describe('final report ordering (F-edge)', () => {
+    it('emits the completed task report BEFORE firing the turn boundary', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const order: string[] = [];
+      be.onData((d) => { if (d.includes('REPORT-A')) order.push('report'); });
+      be.onTaskDone(() => order.push('boundary'));
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api/task-detail')) {
+          await new Promise((r) => setTimeout(r, 10)); // 模拟 detail 延迟
+          return Response.json({ success: true, data: { task: { resultOutput: { displayReport: { content: 'REPORT-A' } } } } });
+        }
+        return pendingSseResponse();
+      });
+      (be as any).currentTaskId = 'task-A';
+      (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-A');
+      await new Promise((r) => setTimeout(r, 30));
+      expect(order).toEqual(['report', 'boundary']);
+    });
+  });
+
+  describe('prompt single @-rule (finding K/2)', () => {
+    it('payload prompt forbids mention-back and keeps mandatory routing under a custom systemPrompt', async () => {
+      const be = makeBackend({ injectStatusLines: false, systemPrompt: '你是 QA 专家，回答尽量简短。' });
+      be.spawn('', [], {} as any);
+      be.write('hi');
+      await flush();
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+      const prompt = String(JSON.parse(String(exec.init?.body)).config.userPrompt);
+      expect(prompt).toContain('NEVER use `--mention-back`');       // 禁用规则在
+      expect(prompt).not.toMatch(/--mention-back（|→ ?--mention-back/); // 无推荐语
+      expect(prompt).toContain('COMPLETION CONTRACT');               // mandatory 未被替换
+      expect(prompt).toContain('你是 QA 专家');                      // 自定义作为追加
+      expect(prompt.indexOf('COMPLETION CONTRACT')).toBeLessThan(prompt.indexOf('你是 QA 专家'));
     });
   });
 

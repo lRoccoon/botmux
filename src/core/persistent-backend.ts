@@ -88,7 +88,8 @@ export function reconcileRiffBackendType(
   defaultType: BackendType,
 ): BackendType {
   if (cliId === 'riff') return 'riff';
-  if (resolved === 'riff') return defaultType;
+  // defaultType 本身被误配成 riff 时兜底到确定可用的本地后端（pty 无外部依赖）。
+  if (resolved === 'riff') return defaultType !== 'riff' ? defaultType : 'pty';
   return resolved;
 }
 

@@ -309,6 +309,9 @@ export class RiffBackend implements SessionBackend {
   private accessUrlIsDirect = false;
   private abortController: AbortController | null = null;
   private killed = false;
+  /** /close teardown in progress — new writes are rejected and an in-flight
+   *  create/follow-up must cancel its late task instead of streaming it. */
+  private closing = false;
   private taskDone = false;
   /** Tasks whose done event already fired the turn boundary — a duplicate
    *  done (observed live) or a stale stream must never re-fire it. Bounded:
@@ -395,7 +398,7 @@ export class RiffBackend implements SessionBackend {
   }
 
   write(data: string): void {
-    if (this.killed) return;
+    if (this.killed || this.closing) return;
 
     const { text, attachments } = this.extractAttachments(data);
 
@@ -447,6 +450,15 @@ export class RiffBackend implements SessionBackend {
     // /close（及 /restart 的替换路径）必须把远端任务真正取消掉——fire-and-forget
     // 在 worker 紧接 process.exit 时大概率发不出去，已关闭话题的远端 agent 会
     // 继续拿着注入的凭证发消息。有界 await + 一次重试，失败也明确留痕。
+    //
+    // L-race：/close 可能落在 create/follow-up HTTP 未返回的窗口——此时
+    // currentTaskId 还是 null/旧值，直接 cancel 会漏掉 late task。先立 closing
+    // 门（拒新写 + 令 in-flight 完成后自取消），再有界等 writeChain 沉降，最后
+    // cancel 沉降后的 current task。
+    this.closing = true;
+    try {
+      await Promise.race([this.writeChain, new Promise((r) => setTimeout(r, 6000))]);
+    } catch { /* writeChain never rejects (caught internally) */ }
     if (this.currentTaskId && !this.taskDone) {
       const id = this.currentTaskId;
       try {
@@ -585,8 +597,7 @@ export class RiffBackend implements SessionBackend {
 
     try {
       const taskId = await this.uploadAndCreate(url, payload, attachments);
-      this.currentTaskId = taskId;
-      this.taskIdCb?.(taskId);
+      if (!this.adoptLateTask(taskId)) return;
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
@@ -606,8 +617,7 @@ export class RiffBackend implements SessionBackend {
 
     try {
       const taskId = await this.uploadAndCreate(url, payload, attachments);
-      this.currentTaskId = taskId;
-      this.taskIdCb?.(taskId);
+      if (!this.adoptLateTask(taskId)) return;
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
@@ -631,8 +641,13 @@ export class RiffBackend implements SessionBackend {
    * they are sent to the riff API via config.setupCommands for reliability.
    */
   private injectSystemPrompt(prompt: string): string {
-    const sys = this.config.systemPrompt?.trim() ?? DEFAULT_RIFF_SYSTEM_PROMPT;
-    if (!sys) return prompt;
+    // 自定义 systemPrompt 是「追加」而非「替换」：mandatory 路由规则（身份锁定 /
+    // STEP 0 安装 / @ 硬门禁 mention-back / 完成契约）无论如何都在——否则用户
+    // 一填自定义提示词就悄悄丢掉回投能力。
+    const custom = this.config.systemPrompt?.trim();
+    const sys = custom
+      ? `${DEFAULT_RIFF_SYSTEM_PROMPT}\n\n<additional_instructions>\n${custom}\n</additional_instructions>`
+      : DEFAULT_RIFF_SYSTEM_PROMPT;
     return `<system>\n${sys}\n</system>\n\n${prompt}`;
   }
 
@@ -701,6 +716,28 @@ export class RiffBackend implements SessionBackend {
     const { readFile } = await import('node:fs/promises');
     const buf = await readFile(path);
     return new Blob([buf]);
+  }
+
+  /**
+   * Post-await adoption gate for a freshly created/followed-up task id.
+   * - closing（/close 竞态窗口）：这个 late task 已经没有会话可服务——立即取消
+   *   （有界+一次重试），绝不 stream/登记，防远端 orphan；
+   * - killed（detach：重启/休眠）：登记 id 让 daemon 持久化血缘，但不 stream
+   *   （任务合法续跑，重启后 follow-up 接上）；
+   * - 正常：登记 + 由调用方启动 stream。
+   */
+  private adoptLateTask(taskId: string): boolean {
+    if (this.closing) {
+      logger.info(`[riff] task ${taskId} created during close — cancelling late task`);
+      void this.cancelTask(taskId).catch(() =>
+        this.cancelTask(taskId).catch((err) =>
+          logger.warn(`[riff] late-task cancel failed (task ${taskId} may keep running remotely): ${err}`)));
+      return false;
+    }
+    this.currentTaskId = taskId;
+    this.taskIdCb?.(taskId);
+    if (this.killed) return false;
+    return true;
   }
 
   /** Repos come exclusively from config.repos (worker-derived from the session
@@ -886,13 +923,17 @@ export class RiffBackend implements SessionBackend {
           if (this.config.injectStatusLines !== false) {
             this.emitLine(`[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}`, status === 'failed' ? 'warn' : 'ok');
           }
-          // Fetch final output from task-detail API (SSE has no output events for runner tasks)
+          // Fetch final output from task-detail API (SSE has no output events
+          // for runner tasks) BEFORE firing the turn boundary: the boundary
+          // flushes queued follow-ups → currentTaskId flips to the next task →
+          // the stale guard would (correctly) drop THIS task's only report.
           if (status === 'completed' || status === 'failed') {
-            this.fetchAndEmitOutput(taskId);
+            void this.fetchAndEmitOutput(taskId)
+              .catch(() => { /* logged inside */ })
+              .finally(() => { this.taskDoneCb?.(); });
+          } else {
+            this.taskDoneCb?.();
           }
-          // Turn boundary: let the worker re-arm prompt-ready and flush queued
-          // follow-ups — riff has no PTY/idle detector to do it otherwise.
-          this.taskDoneCb?.();
           // NOTE: task done does NOT trigger onExit — session stays alive
           // for follow-up messages. Only /close or unrecoverable errors exit.
           break;
@@ -959,7 +1000,7 @@ export class RiffBackend implements SessionBackend {
       const headers: Record<string, string> = {};
       const jwt = this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
-      const resp = await fetch(url, { headers });
+      const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (!resp.ok) return;
       const result = (await resp.json()) as {
         success: boolean;
@@ -992,7 +1033,7 @@ export class RiffBackend implements SessionBackend {
       const jwt = this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
 
-      const resp = await fetch(url, { headers });
+      const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (!resp.ok) {
         logger.warn(`[riff] task-detail fetch failed: HTTP ${resp.status}`);
         return;

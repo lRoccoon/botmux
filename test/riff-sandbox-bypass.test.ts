@@ -39,6 +39,10 @@ describe('reconcileRiffBackendType (finding G — pairing invariant at the spawn
     expect(reconcileRiffBackendType('claude-code', 'riff', 'pty')).toBe('pty');
   });
 
+  it('degrades to pty when the daemon default itself is misconfigured as riff', () => {
+    expect(reconcileRiffBackendType('codex', 'riff', 'riff' as any)).toBe('pty');
+  });
+
   it('passes through manual non-riff overrides', () => {
     expect(reconcileRiffBackendType('codex', 'tmux', 'pty')).toBe('tmux');
     expect(reconcileRiffBackendType('claude-code', 'herdr', 'tmux')).toBe('herdr');

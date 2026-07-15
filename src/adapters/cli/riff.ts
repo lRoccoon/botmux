@@ -26,10 +26,11 @@ export function createRiffAdapter(_pathOverride?: string): CliAdapter {
       pty.write(content);
     },
 
-    systemHints: [
-      'You are running inside riff (agent-services platform), not a local terminal.',
-      'Your output is streamed to Lark/Feishu cards.',
-    ],
+    // riff 的路由/身份/@ 规则由 RiffBackend 统一前置到 userPrompt（见
+    // DEFAULT_RIFF_SYSTEM_PROMPT）。置位后 session-manager 不再往消息里塞共用
+    // <botmux_routing>——那份规则推荐 --mention-back，与 riff 的禁用规则互相矛盾。
+    injectsSessionContext: true,
+    systemHints: [],
 
     altScreen: false,
 

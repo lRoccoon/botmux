@@ -1132,7 +1132,11 @@ export function killWorker(ds: DaemonSession): void {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
   } catch { /* IPC already closed */ }
   const w = ds.worker;
-  armWorkerKillBackstop(w, tag(ds));
+  // riff：worker close 分支要有界 await 远端 task-cancel（destroySession 5s×2 重试，
+  // 外层 race 8s）。默认 2s SIGTERM backstop 会在取消发出前掐死进程，已关闭话题
+  // 的远端任务照跑——冻结为 riff 的会话放宽到 15s（正常路径 worker 自行 exit）。
+  const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
+  armWorkerKillBackstop(w, tag(ds), closeFrozenType === 'riff' ? 15_000 : WORKER_SIGTERM_BACKSTOP_MS);
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -1244,18 +1248,18 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   return true;
 }
 
-function armWorkerKillBackstop(w: ChildProcess, label: string): void {
+function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
     if (w.exitCode === null && w.signalCode === null) {
       try { w.kill('SIGTERM'); } catch { /* already gone */ }
     }
-  }, WORKER_SIGTERM_BACKSTOP_MS);
+  }, sigtermMs);
   const sigkill = setTimeout(() => {
     if (w.exitCode === null && w.signalCode === null) {
       logger.warn(`[${label}] worker did not exit after SIGTERM; escalating to SIGKILL`);
       try { w.kill('SIGKILL'); } catch { /* already gone */ }
     }
-  }, WORKER_SIGKILL_BACKSTOP_MS);
+  }, Math.max(WORKER_SIGKILL_BACKSTOP_MS, sigtermMs + 5000));
   sigterm.unref?.();
   sigkill.unref?.();
   w.once('exit', () => {
@@ -2518,8 +2522,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         if (rc.count > 3) {
           logger.warn(`[${t}] ${getCliDisplayName(effectiveCliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
-          // Freeze the last streaming card so it doesn't stay at "working" forever
-          if (ds.streamCardId && (ds.workerPort || ds.riffAccessUrl)) {
+          // Freeze the last streaming card so it doesn't stay at "working" forever.
+          // 读链接严格要求 workerPort（riffAccessUrl 是写能力且 worker 退出后不清，
+          // 用它放行会构造 host:undefined 的坏读链接）。
+          if (ds.streamCardId && ds.workerPort) {
             const readUrl = buildTerminalUrl(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const frozenCard = buildStreamingCard(
