@@ -11,7 +11,7 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { RiffBackend, parseRiffRepoName, deriveRiffRepoFromWorkingDir } from '../src/adapters/backend/riff-backend.js';
+import { RiffBackend, parseRiffRepoName, deriveRiffRepoFromWorkingDir, deriveRiffReposFromWorkingDir } from '../src/adapters/backend/riff-backend.js';
 
 const BASE = 'https://riff-infra-boe.bytedance.net';
 
@@ -189,6 +189,33 @@ describe('RiffBackend', () => {
       expect(derived!.repo).toEqual({ repoName: 'g/r' });
       expect(derived!.warnings.some(w => w.includes('未推送到远端'))).toBe(true);
       expect(derived!.warnings.some(w => w.includes('未提交改动'))).toBe(true);
+    });
+
+    it('multi-repo: derives every child worktree under a non-git parent dir', () => {
+      const perDir: Record<string, { repo: any; warnings: string[] } | null> = {
+        '/parent': null,
+        '/parent/a': { repo: { repoName: 'g/a', repoBranch: 'wt/x' }, warnings: [] },
+        '/parent/b': { repo: { repoName: 'g/b' }, warnings: ['本地分支 wt/y 未推送到远端，沙箱将使用默认分支'] },
+        '/parent/junk': null,
+      };
+      const derived = deriveRiffReposFromWorkingDir('/parent', {
+        deriveOne: (dir: string) => perDir[dir] ?? null,
+        listChildDirs: () => ['/parent/a', '/parent/b', '/parent/junk'],
+      });
+      expect(derived!.repos).toEqual([{ repoName: 'g/a', repoBranch: 'wt/x' }, { repoName: 'g/b' }]);
+      expect(derived!.warnings).toEqual(['[g/b] 本地分支 wt/y 未推送到远端，沙箱将使用默认分支']);
+    });
+
+    it('multi-repo: direct git workingDir still yields a single repo without child scan', () => {
+      const derived = deriveRiffReposFromWorkingDir('/repo', {
+        deriveOne: (dir: string) => dir === '/repo' ? { repo: { repoName: 'g/r', repoBranch: 'main' }, warnings: [] } : null,
+        listChildDirs: () => { throw new Error('must not scan children'); },
+      });
+      expect(derived!.repos).toEqual([{ repoName: 'g/r', repoBranch: 'main' }]);
+    });
+
+    it('multi-repo: returns null when neither the dir nor its children derive', () => {
+      expect(deriveRiffReposFromWorkingDir('/x', { deriveOne: () => null, listChildDirs: () => ['/x/a'] })).toBeNull();
     });
 
     it('returns null for non-internal origins and non-git dirs', () => {

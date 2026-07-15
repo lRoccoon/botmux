@@ -1045,7 +1045,7 @@ function WorkingDirSection(props: {
           <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux" value={workingDir} disabled={busy} onChange={event => setWorkingDir(event.currentTarget.value)} />
         </label>
       </div>
-      <label className="toggle-row" data-wd-worktree-row hidden={mode !== 'default' || props.bot.cliId === 'riff'}>
+      <label className="toggle-row" data-wd-worktree-row hidden={mode !== 'default'}>
         <input type="checkbox" data-input="autoWorktree" checked={autoWorktree} disabled={busy} onChange={event => setAutoWorktree(event.currentTarget.checked)} />
         <span className="switch" aria-hidden="true" />
         <span className="toggle-tx"><strong><FieldTitle help={tr('botDefaults.autoWorktreeHelp')}>{tr('botDefaults.autoWorktree')}</FieldTitle></strong></span>

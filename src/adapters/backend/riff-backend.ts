@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { logger } from '../../utils/logger.js';
@@ -168,6 +169,52 @@ export function deriveRiffRepoFromWorkingDir(
     warnings.push('本地工作区有未提交改动，沙箱只能看到已推送内容');
   }
   return { repo, warnings };
+}
+
+/**
+ * Multi-repo aware derivation. The repo-select card's 多仓库 mode puts the
+ * session in a PARENT dir containing one worktree per selected repo — the
+ * parent itself is not a git repo, so probe its immediate child dirs and
+ * derive each. A direct git workingDir still yields a single repo. The first
+ * repo becomes riff's `primary`, the rest `workspace` (server-assigned).
+ * Returns null when nothing derivable is found.
+ */
+export function deriveRiffReposFromWorkingDir(
+  workingDir: string,
+  deps: {
+    deriveOne?: typeof deriveRiffRepoFromWorkingDir;
+    listChildDirs?: (dir: string) => string[];
+  } = {},
+): { repos: RiffRepoRef[]; warnings: string[] } | null {
+  const deriveOne = deps.deriveOne ?? deriveRiffRepoFromWorkingDir;
+  const direct = deriveOne(workingDir);
+  if (direct) return { repos: [direct.repo], warnings: direct.warnings };
+
+  const listChildDirs = deps.listChildDirs ?? defaultListChildDirs;
+  const repos: RiffRepoRef[] = [];
+  const warnings: string[] = [];
+  const seen = new Set<string>();
+  for (const child of listChildDirs(workingDir)) {
+    const derived = deriveOne(child);
+    if (!derived || seen.has(derived.repo.repoName)) continue;
+    seen.add(derived.repo.repoName);
+    repos.push(derived.repo);
+    const label = derived.repo.repoName;
+    warnings.push(...derived.warnings.map(w => `[${label}] ${w}`));
+  }
+  return repos.length > 0 ? { repos, warnings } : null;
+}
+
+/** Immediate child directories (skip hidden), capped to keep the scan cheap. */
+function defaultListChildDirs(dir: string, cap = 16): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+      .slice(0, cap)
+      .map(e => join(dir, e.name));
+  } catch {
+    return [];
+  }
 }
 
 function defaultRunGit(cwd: string): (args: string[]) => string | null {

@@ -117,7 +117,7 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
-import { deriveRiffRepoFromWorkingDir } from './adapters/backend/riff-backend.js';
+import { deriveRiffReposFromWorkingDir } from './adapters/backend/riff-backend.js';
 import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
@@ -4421,16 +4421,18 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...cfg.backendConfig.env };
     riffBackendConfig = Object.assign({}, cfg.backendConfig, { env: mergedEnv });
     // 复用本地仓库+分支：从会话 workingDir 推导内部 repoName + 当前分支，
-    // riff 沙箱据此克隆同一份代码。显式 repos 优先（预留给未来调用方）；
-    // workingDir 不是 git 仓或 origin 非内部仓时静默跳过。
+    // riff 沙箱据此克隆同一份代码。多仓 worktree 父目录（仓库选择卡多选）会
+    // 逐个子目录推导，首个为 primary 其余为 workspace。显式 repos 优先（预留
+    // 给未来调用方）；workingDir 推不出任何内部仓时静默跳过。
     if (!cfg.backendConfig.repos || cfg.backendConfig.repos.length === 0) {
-      const derived = deriveRiffRepoFromWorkingDir(cfg.workingDir);
+      const derived = deriveRiffReposFromWorkingDir(cfg.workingDir);
       if (derived) {
         riffBackendConfig = Object.assign({}, riffBackendConfig, {
-          repos: [derived.repo],
+          repos: derived.repos,
           repoWarnings: derived.warnings,
         });
-        log(`Riff local repo reuse: ${derived.repo.repoName}${derived.repo.repoBranch ? `@${derived.repo.repoBranch}` : ' (default branch)'}${derived.warnings.length ? ` — ${derived.warnings.join('；')}` : ''}`);
+        const desc = derived.repos.map(r => `${r.repoName}${r.repoBranch ? `@${r.repoBranch}` : ' (default branch)'}`).join(', ');
+        log(`Riff local repo reuse: ${desc}${derived.warnings.length ? ` — ${derived.warnings.join('；')}` : ''}`);
       }
     }
   }
