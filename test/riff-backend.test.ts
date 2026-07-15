@@ -214,15 +214,15 @@ describe('RiffBackend', () => {
       expect(lines.join('')).toContain('⚠️ 本地工作区有未提交改动');
     });
 
-    it('maps defaultRepo URL form to repoName', async () => {
-      const be = makeBackend({ defaultRepo: 'https://code.byted.org/g/r.git', defaultBranch: 'dev', injectStatusLines: false });
+    it('ignores stale defaultRepo config — repos come only from config.repos', async () => {
+      const be = makeBackend({ defaultRepo: 'https://code.byted.org/g/r.git', defaultBranch: 'dev', injectStatusLines: false } as any);
       be.spawn('', [], {} as any);
       be.write('hi');
       await flush();
       resolvers.shift()!(taskResponse('task-1'));
       await flush();
       const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
-      expect(JSON.parse(String(exec.init?.body)).config.repos).toEqual([{ repoName: 'g/r', repoBranch: 'dev' }]);
+      expect(JSON.parse(String(exec.init?.body)).config.repos).toBeUndefined();
     });
   });
 

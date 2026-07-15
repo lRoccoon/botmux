@@ -4420,10 +4420,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // explicit riff config.env takes precedence over both.
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...cfg.backendConfig.env };
     riffBackendConfig = Object.assign({}, cfg.backendConfig, { env: mergedEnv });
-    // 复用本地仓库+分支：bot 没有显式仓库配置时，从会话 workingDir 推导内部
-    // repoName + 当前分支，riff 沙箱据此克隆同一份代码。显式 repos/defaultRepo
-    // 始终优先；workingDir 不是 git 仓或 origin 非内部仓时静默跳过。
-    if ((!cfg.backendConfig.repos || cfg.backendConfig.repos.length === 0) && !cfg.backendConfig.defaultRepo) {
+    // 复用本地仓库+分支：从会话 workingDir 推导内部 repoName + 当前分支，
+    // riff 沙箱据此克隆同一份代码。显式 repos 优先（预留给未来调用方）；
+    // workingDir 不是 git 仓或 origin 非内部仓时静默跳过。
+    if (!cfg.backendConfig.repos || cfg.backendConfig.repos.length === 0) {
       const derived = deriveRiffRepoFromWorkingDir(cfg.workingDir);
       if (derived) {
         riffBackendConfig = Object.assign({}, riffBackendConfig, {

@@ -62,8 +62,6 @@ export interface RiffBackendConfig {
   /** Name of env var containing the JWT token (default: RIFF_JWT). */
   jwtEnv?: string;
   sandboxCluster?: string;
-  defaultRepo?: string;
-  defaultBranch?: string;
   /**
    * Repos to clone into the riff sandbox, in the API's native shape
    * ({ repoName: 'group/repo', repoBranch? }). Takes precedence over
@@ -587,20 +585,12 @@ export class RiffBackend implements SessionBackend {
     return new Blob([buf]);
   }
 
-  /** Build the repos payload: explicit repos > defaultRepo/defaultBranch. */
+  /** Repos come exclusively from config.repos (worker-derived from the session
+   *  workingDir). The old defaultRepo/defaultBranch bot config was removed —
+   *  a stale bots.json value would silently shadow the workingDir derivation
+   *  with no UI left to clear it. */
   private buildRepos(): RiffRepoRef[] {
-    if (this.config.repos && this.config.repos.length > 0) return this.config.repos;
-    if (this.config.defaultRepo) {
-      const repoName = parseRiffRepoName(this.config.defaultRepo);
-      if (!repoName) {
-        logger.warn(`[riff] defaultRepo 无法解析为内部仓库名，已忽略: ${this.config.defaultRepo}`);
-        return [];
-      }
-      const ref: RiffRepoRef = { repoName };
-      if (this.config.defaultBranch) ref.repoBranch = this.config.defaultBranch;
-      return [ref];
-    }
-    return [];
+    return this.config.repos && this.config.repos.length > 0 ? this.config.repos : [];
   }
 
   private async cancelTask(taskId: string): Promise<void> {
