@@ -1531,6 +1531,19 @@ describe('buildResumeCommand', () => {
 
 });
 
+describe('native session rename capability', () => {
+  it('is declared only by the verified Codex and Claude Code adapters', () => {
+    expect(createCodexAdapter('/bin/codex').buildSessionRenameCommand?.('新的标题'))
+      .toBe('/rename 新的标题');
+    expect(createClaudeCodeAdapter('/bin/claude').buildSessionRenameCommand?.('new title'))
+      .toBe('/rename new title');
+
+    expect(createCliAdapterSync('seed', '/bin/true').buildSessionRenameCommand).toBeUndefined();
+    expect(createCodexAppAdapter('/bin/codex').buildSessionRenameCommand).toBeUndefined();
+    expect(createCocoAdapter('/bin/coco').buildSessionRenameCommand).toBeUndefined();
+  });
+});
+
 describe('grok buildArgs', () => {
   const adapter = createGrokAdapter('/usr/bin/grok');
   const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';

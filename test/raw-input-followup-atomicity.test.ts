@@ -32,12 +32,19 @@ function caseRegion(src: string, marker: string, span = 3000): string {
 describe('worker raw_input handler', () => {
   const region = caseRegion(workerSrc, "case 'raw_input':");
 
+  it('keeps busy delivery but defers commands while native rename owns the TUI', () => {
+    expect(region).toContain('if (sessionRenameInFlight)');
+    expect(region).toContain('pendingRawInputs.push(msg)');
+    expect(region).toContain('await deliverRawInput(msg)');
+    expect(region).not.toContain('sendRawCommandLine(');
+  });
+});
+
+describe('worker raw_input delivery', () => {
+  const region = caseRegion(workerSrc, 'async function deliverRawInput', 2600);
+
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
-    // The Enter now lives inside the shared sendRawCommandLine helper (also used
-    // by runStartupCommands). The handler AWAITS it before touching the follow-up,
-    // so the contract still holds: the full text → 200ms beat → Enter completes
-    // before followUpContent is enqueued.
-    const sendIdx = region.indexOf('await sendRawCommandLine(backend, msg.content)');
+    const sendIdx = region.indexOf('await sendRawCommandLineSerially(targetBackend, msg.content)');
     const followIdx = region.indexOf('msg.followUpContent');
     expect(sendIdx).toBeGreaterThanOrEqual(0);
     expect(followIdx).toBeGreaterThanOrEqual(0);
@@ -46,6 +53,25 @@ describe('worker raw_input handler', () => {
 
   it('routes the follow-up through sendToPty (normal busy-queue semantics)', () => {
     expect(region).toContain('sendToPty(msg.followUpContent)');
+  });
+
+  it('holds ordinary prompt flushes only for the text-to-Enter critical window', () => {
+    const flush = caseRegion(workerSrc, 'async function flushPending()', 9000);
+    expect(flush).toContain('if (commandLineWritesPending > 0) return');
+    expect(region).not.toContain('if (!isPromptReady)');
+    expect(region).not.toContain('if (isPromptReady)');
+  });
+});
+
+describe('worker command-line write mutex', () => {
+  const serialized = caseRegion(workerSrc, 'async function sendRawCommandLineSerially', 1200);
+
+  it('serializes concurrent raw command keystrokes without waiting for turn idle', () => {
+    expect(serialized).toContain('const previous = commandLineWriteTail');
+    expect(serialized).toContain('commandLineWritesPending += 1');
+    expect(serialized).toContain('await previous');
+    expect(serialized).toContain('await sendRawCommandLine(be, content)');
+    expect(serialized).toContain('release()');
   });
 });
 

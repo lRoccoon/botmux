@@ -581,6 +581,26 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
   }
 }
 
+/** Serialize only the literal command-line write window (text -> beat -> Enter).
+ * raw_input deliberately keeps its legacy "send while busy" behaviour; this
+ * narrow mutex merely prevents concurrent IPC handlers (or native /rename)
+ * from splicing keystrokes into one another. */
+let commandLineWriteTail: Promise<void> = Promise.resolve();
+let commandLineWritesPending = 0;
+async function sendRawCommandLineSerially(be: NonNullable<typeof backend>, content: string): Promise<void> {
+  const previous = commandLineWriteTail;
+  let release!: () => void;
+  commandLineWriteTail = new Promise<void>(resolve => { release = resolve; });
+  commandLineWritesPending += 1;
+  await previous;
+  try {
+    await sendRawCommandLine(be, content);
+  } finally {
+    commandLineWritesPending -= 1;
+    release();
+  }
+}
+
 /** Resolve once the PTY has been quiet for `quietMs`, or after `capMs` total.
  *  Spaces out startup commands so each is processed before the next is typed. */
 function awaitPtyQuiescence(quietMs: number, capMs: number): Promise<void> {
@@ -618,7 +638,7 @@ async function runStartupCommands(): Promise<void> {
   for (const cmd of cmds) {
     if (!backend) break;
     try {
-      await sendRawCommandLine(backend, cmd);
+      await sendRawCommandLineSerially(backend, cmd);
       await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
       log(`Startup command sent: ${cmd}`);
     } catch (e: any) {
@@ -631,6 +651,84 @@ async function runStartupCommands(): Promise<void> {
 }
 
 const pendingMessages: PendingCliInput[] = [];
+/** Literal commands that arrived while native /rename owned the TUI. Normal
+ * raw_input commands are still delivered immediately (including while busy). */
+const pendingRawInputs: Array<Extract<DaemonToWorker, { type: 'raw_input' }>> = [];
+/** Latest requested canonical session title. Unlike a normal prompt this is an
+ * administrative TUI command: never type-ahead while the agent is busy, never
+ * open a model turn, and latest-wins if several renames arrive before idle. */
+let pendingSessionRename: string | null = null;
+/** True after the rename command's Enter lands and until the TUI returns to its
+ * prompt. Blocks type-ahead user messages from racing into the command UI. */
+let sessionRenameInFlight = false;
+const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
+let sessionRenameIdleTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearSessionRenameInFlight(): void {
+  if (sessionRenameIdleTimer) {
+    clearTimeout(sessionRenameIdleTimer);
+    sessionRenameIdleTimer = null;
+  }
+  sessionRenameInFlight = false;
+}
+
+/** Fail open if a CLI executes /rename without emitting enough redraw output
+ * for IdleDetector to rediscover the prompt. The verified Codex/Claude paths
+ * normally settle immediately; this cap prevents one administrative command
+ * from wedging all later Lark messages forever. */
+function armSessionRenameIdleTimeout(): void {
+  if (!sessionRenameInFlight) return;
+  if (sessionRenameIdleTimer) clearTimeout(sessionRenameIdleTimer);
+  sessionRenameIdleTimer = setTimeout(() => {
+    sessionRenameIdleTimer = null;
+    if (!sessionRenameInFlight) return;
+    sessionRenameInFlight = false;
+    // The timeout specifically means prompt redraw detection failed. Fail open
+    // by restoring the gate explicitly; otherwise a deferred raw_input is the
+    // only queued work and flushPending would keep waiting for the very signal
+    // this timer exists to replace.
+    isPromptReady = true;
+    log(`Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`);
+    void flushPending();
+  }, SESSION_RENAME_IDLE_TIMEOUT_MS);
+  sessionRenameIdleTimer.unref?.();
+}
+
+/** Deliver passthrough exactly as before: it may be injected while the CLI is
+ * busy (notably Codex /btw). Only the short keystroke sequence is serialized.
+ * Commands received while /rename owns the TUI are deferred by the IPC handler
+ * and come through this same function after the prompt returns. */
+async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>): Promise<void> {
+  renderer?.markNewTurn();
+  usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+  if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
+  const targetBackend = backend;
+  if (!targetBackend) return;
+
+  let sent = false;
+  try {
+    await sendRawCommandLineSerially(targetBackend, msg.content);
+    sent = true;
+    isPromptReady = false;
+    idleDetector?.reset();
+    log(`Passthrough slash command: ${msg.content}`);
+  } catch (err: any) {
+    // Do not send another queued command against a backend whose write failed.
+    isPromptReady = false;
+    log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
+  }
+
+  // Follow-up rides on the same IPC and is enqueued only after this command's
+  // Enter lands. sendToPty also observes commandLineWritesPending, so another
+  // raw command's text -> Enter window cannot be interrupted by the follow-up.
+  if (sent && msg.followUpContent) {
+    sendToPty(msg.followUpContent);
+    log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
+  }
+  // A pending /rename may have been held by the command-write mutex. It still
+  // waits for a genuine prompt because isPromptReady was cleared above.
+  void flushPending();
+}
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
 const inflightInputs = new InflightInputTracker();
@@ -3408,6 +3506,7 @@ function markPromptReady(): void {
     return;
   }
   isPromptReady = true;
+  clearSessionRenameInFlight();
   // CLI 实际启动成功（回到 prompt）：复位连续重启计数。
   // 任何能到这一步的 spawn 都算"成功"——后续即便再崩溃（不是 resume 目标不存在
   // 的问题），下一轮也该有新的 2 次重试预算，而不是被历史重启计数卡住。
@@ -3430,7 +3529,7 @@ function markPromptReady(): void {
   // make the CLI busy, so the idle state is transient and shouldn't appear
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
-  if (renderer && pendingMessages.length === 0 && !isFlushing) {
+  if (renderer && pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId });
   }
@@ -3672,7 +3771,9 @@ function detectBareShellLaunch(): boolean {
 async function flushPending(): Promise<void> {
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
-  if (pendingMessages.length === 0) return;  // nothing to flush — keep isPromptReady
+  if (pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
+  if (sessionRenameInFlight) return;  // wait for /rename to finish before any user input
+  if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
   if (bareShellLaunchBlocked) return;  // launch failed into a bare shell — don't type prompts into it
   // Ready-gate: hold the FIRST prompt until the SessionStart hook fires a true-
   // ready signal. A cjadk-style startup selector's ❯ falsely matches readyPattern
@@ -3715,6 +3816,19 @@ async function flushPending(): Promise<void> {
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
   const typeAheadAllowed = cliAdapter.supportsTypeAhead;
+  // Native /rename is an administrative command, not a steer/queued model
+  // message. It must wait for a real prompt even on type-ahead CLIs. Normal
+  // pending messages can still drain while busy; the rename stays queued.
+  const sessionRenameReady = isPromptReady && pendingSessionRename !== null;
+  const rawInputReady = isPromptReady && pendingRawInputs.length > 0;
+  let supportedSessionRenameReady = sessionRenameReady;
+  if (sessionRenameReady && (!cliAdapter.buildSessionRenameCommand || effectiveBackendType === 'riff')) {
+    pendingSessionRename = null;
+    supportedSessionRenameReady = false;
+    log(`Ignoring native session rename — unsupported by ${cliName()}${effectiveBackendType === 'riff' ? ' on riff backend' : ''}`);
+    if (pendingMessages.length === 0 && pendingRawInputs.length === 0) return;
+  }
+  if (!isPromptReady && pendingMessages.length === 0) return;
   if (!isPromptReady && !typeAheadAllowed) return;
 
   isFlushing = true;
@@ -3748,6 +3862,37 @@ async function flushPending(): Promise<void> {
     if (!hasRunStartupCommands) {
       hasRunStartupCommands = true;
       await runStartupCommands();
+    }
+    // Commands deferred behind a previous rename run before the latest pending
+    // rename. Some passthroughs (/clear, /new) can rotate the native session;
+    // applying the canonical title last keeps the resume-picker label aligned.
+    if (rawInputReady && pendingRawInputs.length > 0 && backend) {
+      const raw = pendingRawInputs.shift()!;
+      await deliverRawInput(raw);
+      return;
+    }
+    if (supportedSessionRenameReady && pendingSessionRename !== null && backend && cliAdapter) {
+      const title = pendingSessionRename;
+      const buildRename = cliAdapter.buildSessionRenameCommand!;
+      pendingSessionRename = null;
+      sessionRenameInFlight = true;
+      try {
+        await sendRawCommandLineSerially(backend, buildRename(title));
+        armSessionRenameIdleTimeout();
+        idleDetector?.reset();
+        log(`Native session rename command sent (${cliName()}): ${title}`);
+      } catch (err: any) {
+        // Local title persistence is authoritative; native sync is best-effort.
+        // Do not blindly replay a partially typed command after a backend error.
+        // Keep the rename gate for the same bounded fail-open window: the write
+        // may have stopped after typing only part of the command, so immediately
+        // appending a deferred raw_input could corrupt both commands.
+        armSessionRenameIdleTimeout();
+        log(`Native session rename command failed (${cliName()}): ${err?.message ?? err}; waiting for prompt or fail-open timeout`);
+      }
+      // Wait for the command to finish and the TUI to become idle again before
+      // sending queued user prompts; otherwise they can land in its picker.
+      return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const item = pendingMessages.shift()!;
@@ -3865,7 +4010,7 @@ function sendToPty(content: string, turnId?: string): void {
   // type-ahead write is dropped (no input box yet) — markPromptReady()'s flush
   // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
   // brief reaching Codex before its first idle and never landing.
-  if (shouldWriteNow({ isPromptReady, isFlushing, supportsTypeAhead: cliAdapter.supportsTypeAhead === true, awaitingFirstPrompt })) {
+  if (!sessionRenameInFlight && commandLineWritesPending === 0 && shouldWriteNow({ isPromptReady, isFlushing, supportsTypeAhead: cliAdapter.supportsTypeAhead === true, awaitingFirstPrompt })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
@@ -4210,6 +4355,7 @@ function scheduleBusyPatternIdleProbe(source: string): void {
 }
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  clearSessionRenameInFlight();
   // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
   // prediction — only a genuinely fresh CLI process replays them; see
   // willReattachPersistent.)
@@ -5648,7 +5794,11 @@ function killCli(): void {
     sandboxCleanup = null;
   }
   isPromptReady = false;
+  clearSessionRenameInFlight();
   pendingMessages.length = 0;
+  // pendingRawInputs contains only commands that were accepted but never typed
+  // because /rename owned the TUI. Preserve them across restart; unlike an
+  // in-flight raw command, replaying these cannot duplicate a side effect.
   scrollback = '';
   altBufferActive = false;
   trustHandled = false;
@@ -6880,35 +7030,25 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'raw_input': {
-      // Slash-command passthrough (e.g. /compact, /model, /usage). Write the
-      // literal string + Enter without bracketed paste — otherwise Claude Code
-      // treats `/…` as pasted prompt text and the slash-command parser never
-      // fires. Also skip adapter.writeInput() / pendingMessages queueing so
-      // the prompt wrapping (Session ID, mention hints) is not prepended.
-      renderer?.markNewTurn();
-      usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
-      if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
-      if (backend) {
-        // sendRawCommandLine: literal text → 200ms beat (so the CLI's slash-
-        // command picker registers the match before submit; without it Codex /
-        // other Ink TUIs fire Enter while the picker is still building, dismiss
-        // the match, and submit the literal `/clear` as a regular user prompt —
-        // visible to the user as "/clear + 换行" stuck in history; the 200ms
-        // mirrors the codex adapter's own writeInput paste-detection delay) →
-        // Enter. Shared with runStartupCommands so both stay in lockstep.
-        await sendRawCommandLine(backend, msg.content);
-        isPromptReady = false;
-        idleDetector?.reset();
-        log(`Passthrough slash command: ${msg.content}`);
-        // Follow-up rides on the SAME IPC (see DaemonToWorker.raw_input) so it
-        // cannot race the 200ms text→Enter window above. Enqueue only after the
-        // Enter landed: sendToPty queues it as the next turn (type-ahead /
-        // pendingMessages), exactly like a Lark message arriving while busy.
-        if (msg.followUpContent) {
-          sendToPty(msg.followUpContent);
-          log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
-        }
+      // Preserve legacy busy delivery (/btw and other steering commands). A
+      // native /rename already submitted to the TUI is the sole exception: its
+      // command UI must return to the prompt before another slash command lands.
+      if (sessionRenameInFlight) {
+        pendingRawInputs.push(msg);
+        log(`Deferred passthrough slash command until native rename settles: ${msg.content}`);
+      } else {
+        await deliverRawInput(msg);
       }
+      break;
+    }
+
+    case 'rename_session': {
+      // IPC handlers are concurrent with async init, so queue first even when
+      // the adapter/backend has not finished initializing. flushPending will
+      // capability-check and deliver the latest title once a real prompt is idle.
+      pendingSessionRename = msg.title;
+      log(`Queued native session rename: ${msg.title}`);
+      void flushPending();
       break;
     }
 

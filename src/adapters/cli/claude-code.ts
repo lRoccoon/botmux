@@ -837,6 +837,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // 收到信号前不投首条 prompt，绕开 cjadk 启动选择器吞首条消息的 bug。
     injectsReadyHook: true,
     defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
+    // Seed shares most of this adapter but has not been verified to expose the
+    // same native session-rename command. Keep the capability exact to Claude.
+    buildSessionRenameCommand: variant.id === 'claude-code'
+      ? (title) => `/rename ${title}`
+      : undefined,
     systemHints: [],
     altScreen: false,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT

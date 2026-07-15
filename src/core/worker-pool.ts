@@ -2475,17 +2475,10 @@ function setupWorkerHandlers(
           })),
           multiSelect: msg.multiSelect,
         });
-        const prevTuiTurnTitle = ds.currentTurnTitle;
-        ds.currentTurnTitle = msg.description;  // store for card PATCH on toggle
-        if (prevTuiTurnTitle !== ds.currentTurnTitle) {
-          dashboardEventBus.publish({
-            type: 'session.update',
-            body: {
-              sessionId: ds.session.sessionId,
-              patch: { title: ds.currentTurnTitle },
-            },
-          });
-        }
+        // Card-only turn label. The dashboard's title is the canonical
+        // session.title; publishing this prompt description as `patch.title`
+        // would temporarily overwrite a user-issued /rename until refresh.
+        ds.currentTurnTitle = msg.description;
         try {
           const cardJson = buildTuiPromptCard(
             sessionAnchorId(ds),

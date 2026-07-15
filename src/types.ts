@@ -340,6 +340,11 @@ export type DaemonToWorker =
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
   | { type: 'raw_input'; content: string; followUpContent?: string }
+  /** Rename the current CLI-native interactive session. The worker queues this
+   *  administrative slash command until the TUI is idle and does not treat it
+   *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
+   *  it; all other CLIs ignore it. */
+  | { type: 'rename_session'; title: string }
   | { type: 'close' }
   | { type: 'suspend' }
   | { type: 'restart' }
