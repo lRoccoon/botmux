@@ -234,6 +234,30 @@ describe('runtime service', () => {
     expect(afterUpgrade).toMatchObject({ status: 'stopped', runtimeVersion: '3.0.0' });
   });
 
+  it('preserves the local dashboard fallback from the current dashboard endpoint', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      externalRuntime: globalCli(),
+      dashboardEndpoint: vi.fn().mockResolvedValue({
+        ok: true,
+        url: 'https://m-test.botmux.bytedance.net/?t=platform-token',
+        localUrl: 'http://10.92.89.226:7891/?t=local-token',
+      }),
+    });
+
+    const result = await svc.currentDashboard();
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(result.stdout).toBe([
+      'https://m-test.botmux.bytedance.net/?t=platform-token',
+      '本地直连(平台异常时可用): http://10.92.89.226:7891/?t=local-token',
+    ].join('\n'));
+  });
+
   it('adopts a controllable CLI runtime during legacy takeover without stopping it', async () => {
     const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
     const svc = createRuntimeService({

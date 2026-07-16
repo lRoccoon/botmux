@@ -13,6 +13,7 @@ export interface RunResult {
 }
 
 type RunCommand = (cmd: BotmuxCommand) => Promise<RunResult>;
+type DashboardEndpointCaller = (path: '/__cli/current') => Promise<DashboardResult>;
 const defaultCommandTimeoutMs = 30_000;
 
 export interface ExternalRuntimeCandidate {
@@ -76,7 +77,12 @@ function defaultRun(cmd: BotmuxCommand, timeoutMs = defaultCommandTimeoutMs): Pr
 }
 
 function dashboardEndpointResultToRunResult(result: DashboardResult): RunResult {
-  if (result.ok) return { code: 0, stdout: result.url, stderr: '', signal: null };
+  if (result.ok) {
+    const stdout = result.localUrl
+      ? `${result.url}\n本地直连(平台异常时可用): ${result.localUrl}`
+      : result.url;
+    return { code: 0, stdout, stderr: '', signal: null };
+  }
   const detail = result.detail ? `: ${result.detail}` : '';
   return { code: 1, stdout: '', stderr: `${result.reason}${detail}`, signal: null };
 }
@@ -91,6 +97,7 @@ export interface RuntimeServiceDeps {
     readFileSync(path: string, encoding: BufferEncoding): string;
   };
   run?: RunCommand;
+  dashboardEndpoint?: DashboardEndpointCaller;
   commandTimeoutMs?: number;
   externalRuntime?: ExternalRuntimeCandidate | null;
   discoverExternalRuntime?: () => ExternalRuntimeCandidate | null;
@@ -323,12 +330,14 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       // Desktop embeds the existing authenticated dashboard session by default.
       // Falling back to rotation is decided by the IPC locator only when the
       // dashboard explicitly reports that no active token exists yet.
-      const result = await callDashboard({
-        configDir: deps.paths.botmuxHome,
-        defaultPort: 7891,
-        envPort: deps.env.BOTMUX_DASHBOARD_PORT,
-        path: '/__cli/current',
-      });
+      const result = deps.dashboardEndpoint
+        ? await deps.dashboardEndpoint('/__cli/current')
+        : await callDashboard({
+            configDir: deps.paths.botmuxHome,
+            defaultPort: 7891,
+            envPort: deps.env.BOTMUX_DASHBOARD_PORT,
+            path: '/__cli/current',
+          });
       return dashboardEndpointResultToRunResult(result);
     },
   };
