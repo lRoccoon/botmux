@@ -39,11 +39,17 @@ export function validateRoleLibraryPath(
   // 终端转义序列）、backspace 等同样能在 sendRawCommandLine 的 text→Enter 窗口里
   // 污染 TUI 输入行。
   if (/[\x00-\x1f\x7f]/.test(raw)) return { ok: false, error: 'invalid_path_chars' };
+  // `~` 展开，与 IM /cd 的 validateWorkingDir 行为一致：调用方（模型）常写带引号的
+  // "~/botmux-roles/..."（shell 不展开），不该因此误报 dir_not_found。裸 `~` 展开后
+  // 是 home 本身，仍会被下面的包含性判断拒绝。
+  const expanded = raw === '~' ? homedir()
+    : raw.startsWith('~/') ? join(homedir(), raw.slice(2))
+    : raw;
   let rootReal: string;
   try { rootReal = realpathSync(rootOverride ?? roleLibraryRoot()); }
   catch { return { ok: false, error: 'role_library_missing' }; }
   let real: string;
-  try { real = realpathSync(raw); }
+  try { real = realpathSync(expanded); }
   catch { return { ok: false, error: 'dir_not_found' }; }
   // 库内符号链接可能指向含换行等控制字符的目录名，把 raw 处的干净校验洗掉——
   // resolvedPath 是最终写回调用方（进而可能被注入）的值，必须同样校验。

@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { validateRoleLibraryPath } from '../src/core/role-library.js';
 
@@ -44,6 +44,24 @@ describe('validateRoleLibraryPath', () => {
   it('拒绝根目录本身', () => {
     const { root } = setup();
     expect(validateRoleLibraryPath(root, root)).toEqual({ ok: false, error: 'outside_role_library' });
+  });
+  it('展开前导 ~（引号内 shell 不展开时不误报 dir_not_found，与 IM /cd 行为一致）', () => {
+    // 在真实 $HOME 下建临时角色库（mkdtemp 随机后缀避免撞名），以 root 为
+    // rootOverride，用 ~/<相对路径> 调用——只有 expandHome 生效才能命中。
+    const home = realpathSync(homedir());
+    const base = mkdtempSync(join(home, '.rolelib-tilde-'));
+    try {
+      const root = join(base, 'botmux-roles');
+      const role = join(root, 'pm');
+      mkdirSync(role, { recursive: true });
+      const viaTilde = `~/${relative(home, role)}`;
+      const r = validateRoleLibraryPath(viaTilde, root);
+      expect(r).toEqual({ ok: true, resolvedPath: realpathSync(role) });
+      // 裸 ~ 展开后是 home 本身——在库外，照拒。
+      expect(validateRoleLibraryPath('~', root)).toEqual({ ok: false, error: 'outside_role_library' });
+    } finally {
+      try { rmSync(base, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   });
   it('拒绝空串与空白串', () => {
     const { root } = setup();

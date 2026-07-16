@@ -239,7 +239,7 @@ bot 每条回复卡片左下角的 brand 位（现为蓝色「botmux」链接）
 | 权限是软约束 | 「只能用自己的角色」由协议按 sender open_id 过滤，属 prompt 级约束，刻意诱导可能绕过 | 内部信任环境下可接受；v1 卡片层升级为 daemon 硬过滤（复用同一条 IPC cd 路由） |
 | 切换的时机与注入 | 会话内 /cd 仅在 idle 时可执行；首次进入未信任目录会弹信任框；/cd 不自动注入新角色已有的 MEMORY.md | daemon 复用 idle-detector 排队注入；部署时把角色库根目录预置为受信目录（复用现有信任种子机制）；协议规定切换后先读新角色 memory/MEMORY.md |
 | 角色改名/挪目录 | 记忆桶按目录路径 slug 分桶，改名后旧记忆失联 | v0 协议禁止改名（提示用户用「新建+沉淀迁移」替代）；后续出改名工具顺带搬记忆桶（第 13 节） |
-| botmux cd 被滥用 | AI 可发起 cwd 重钉，被诱导可能钉到任意目录 | daemon 侧校验：**仅允许切到角色库根目录之下**；沿用 IPC 既有的签名鉴权头 |
+| botmux cd 被滥用 | AI 可发起 cwd 重钉，被诱导可能钉到任意目录 | daemon 侧校验：**仅允许切到角色库根目录之下**；沿用 IPC 既有鉴权（trusted-host HMAC 签名；沙箱/读隔离 CLI 走每轮轮换的 origin capability，/api/asks 同款姿势） |
 | 发送者名字缺失 | open_id 必有，name 依赖通讯录权限 | 目录按 open_id 归属，名字仅用于展示 |
 | 读隔离 bot | 角色库在 BOT_HOME 之外 | 读隔离只 deny 敏感路径，普通目录默认可读写；按验证清单实测 |
 
@@ -257,7 +257,7 @@ bot 每条回复卡片左下角的 brand 位（现为蓝色「botmux」链接）
 
 调用形式：`botmux cd <目标目录> [--silent] [--session <id>]`。与 botmux send/schedule 一样**自识别**所在会话，正常调用不需要 session/chat/bot 参数。
 
-**分层：cd 是通用「TUI 注入」能力的特化**。实现时把「idle 注入队列」抽为 daemon 共享模块（复用 idle-detector + 各适配器现成敲键机制，统一 startupCommands / tui_keys / voice_summary 三个既有注入先例的归口），并顺带暴露通用命令 `botmux slash "<斜杠命令>"`：模型可请求向自己的 CLI 注入任意原生斜杠命令（自我 /compact、聊天中 /model 换模型等；v1 卡片层回调直接复用）。安全栏：仅限自己所在 session；只接受 `/` 开头的单行输入（防伪造用户消息自我循环）；bots.json 可选 allowlist 字段（如 tuiSlashAllow）门禁；/cd 固定排除在 slash 可注入范围之外（即使被加进 allowlist 也拒绝）——凡改变 daemon 记录所描述状态的命令必须走带同步逻辑的专用路由（botmux cd），防止事实源被绕过；**默认空=通用命令关闭**；复用 IPC 签名头。`botmux cd` 在此之上加三件特有的事：路径校验（角色库根）、session 记录同步落盘（唯一事实源）、CLI 不存活时冷启动兜底——所以 cd 不能退化为纯注入。通用层成本约 +50-80 行。读隔离兼容红线：allowlist 校验只在 daemon 侧（沙箱外）做；cmdCd/cmdSlash 客户端一律走 botmux send 同款自识别（env + 自己 BOT_HOME 的 send-cred + 自己的 sessions 文件），任何分支不得读 bots.json——规避仓库已知的「读隔离打断 CLI 子命令」坑。
+**分层：cd 是通用「TUI 注入」能力的特化**。实现时把「idle 注入队列」抽为 daemon 共享模块（复用 idle-detector + 各适配器现成敲键机制，统一 startupCommands / tui_keys / voice_summary 三个既有注入先例的归口），并顺带暴露通用命令 `botmux slash "<斜杠命令>"`：模型可请求向自己的 CLI 注入任意原生斜杠命令（自我 /compact、聊天中 /model 换模型等；v1 卡片层回调直接复用）。安全栏：仅限自己所在 session；只接受 `/` 开头的单行输入（防伪造用户消息自我循环）；bots.json 可选 allowlist 字段（如 tuiSlashAllow）门禁；/cd 固定排除在 slash 可注入范围之外（即使被加进 allowlist 也拒绝）——凡改变 daemon 记录所描述状态的命令必须走带同步逻辑的专用路由（botmux cd），防止事实源被绕过；**默认空=通用命令关闭**；复用 IPC 既有鉴权（trusted-host HMAC 签名 / 沙箱内 origin capability 双路径）。`botmux cd` 在此之上加三件特有的事：路径校验（角色库根）、session 记录同步落盘（唯一事实源）、CLI 不存活时冷启动兜底——所以 cd 不能退化为纯注入。通用层成本约 +50-80 行。读隔离兼容红线：allowlist 校验只在 daemon 侧（沙箱外）做；cmdCd/cmdSlash 客户端一律走 botmux send 同款自识别（env + 自己 BOT_HOME 的 send-cred + 自己的 sessions 文件），任何分支不得读 bots.json——规避仓库已知的「读隔离打断 CLI 子命令」坑。
 
 | 参数 | 必填 | 说明 |
 |-|-|-|
@@ -327,7 +327,7 @@ bot 每条回复卡片左下角的 brand 位（现为蓝色「botmux」链接）
 
 - [ ] 中途切换角色：对话上下文保留（新角色能引用切换前的讨论）；切换后能引用新角色已有记忆（MEMORY.md 补读生效）
 
-- [ ] 若 bot 开了读隔离：角色库与 .botmux-dir.json 读写正常、记忆桶正常；botmux cd / botmux slash 全链路可用（自识别→findDaemon→签名→POST，全程未触碰 bots.json）
+- [ ] 若 bot 开了读隔离：角色库与 .botmux-dir.json 读写正常、记忆桶正常；botmux cd / botmux slash 全链路可用（自识别→findDaemon→鉴权→POST，全程未触碰 bots.json。鉴权双路径：非隔离进程用 .dashboard-secret 做 trusted-host HMAC 签名；沙箱/读隔离 CLI 读不到 secret，改带本会话每轮轮换的 origin capability（/api/asks 同款），daemon 侧与活跃会话记录比对）
 
 - [ ] 回复卡片左下角显示当前角色名；配置了 .botmux-dir.json url 时点击跳转正确；切换角色后脚注随之变化；非角色目录会话仍显示原 brand
 

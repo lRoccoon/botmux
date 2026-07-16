@@ -133,7 +133,7 @@ pnpm switch:here && botmux restart
 
 - [ ] 中途切换角色：对话上下文保留（新角色能引用切换前的讨论）；切换后能引用新角色已有记忆（MEMORY.md 补读生效）
 
-- [ ] 若 bot 开了读隔离：角色库与 .botmux-dir.json 读写正常、记忆桶正常；botmux cd / botmux slash 全链路可用（自识别→findDaemon→签名→POST，全程未触碰 bots.json）
+- [ ] 若 bot 开了读隔离：角色库与 .botmux-dir.json 读写正常、记忆桶正常；botmux cd / botmux slash 全链路可用（自识别→findDaemon→鉴权→POST，全程未触碰 bots.json。鉴权双路径：非隔离进程用 .dashboard-secret 做 trusted-host HMAC 签名；沙箱/读隔离 CLI 读不到 secret，改带本会话每轮轮换的 origin capability（/api/asks 同款），daemon 侧与活跃会话记录比对）
 
 - [ ] 回复卡片左下角显示当前角色名；配置了 .botmux-dir.json url 时点击跳转正确；切换角色后脚注随之变化；非角色目录会话仍显示原 brand
 
