@@ -4720,6 +4720,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
   let isolationBotHome: string | undefined;
+  let isolatedCodexHome: string | undefined;
   if (willReadIsolate) {
     isolationBotHome = ownBotHome!;
     const isClaudeFam = !!claudeDataDir;
@@ -4736,6 +4737,17 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         mcpGateway: { ...cliAdapter.mcpGateway, configPath: isolatedConfigPath },
       });
       if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+    }
+    if (!isClaudeFam) {
+      isolatedCodexHome = join(isolationBotHome, 'codex');
+      // The CLI child and its dedicated worker must resolve the same Codex data
+      // root. Adapter submit confirmation, resume fallback, and transcript bridge
+      // discovery all run in the worker and consult process.env.CODEX_HOME
+      // dynamically. Setting only childEnv made successful submissions look
+      // unconfirmed because the worker kept watching the global ~/.codex history.
+      // A worker owns one session, so this process-local redirect cannot leak
+      // between bots or sessions.
+      process.env.CODEX_HOME = isolatedCodexHome;
     }
   }
   // Predict reattach vs fresh BEFORE the resume pre-flight. On a persistent
@@ -5106,7 +5118,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // Seatbelt wrapper denies → it can't read its own data and won't start.
   if (isolationBotHome) {
     if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = claudeDataDir; // = <BOT_HOME>/claude
-    else childEnv.CODEX_HOME = join(isolationBotHome, 'codex');
+    else childEnv.CODEX_HOME = isolatedCodexHome!;
   }
 
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
