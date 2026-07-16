@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   blocksSetupBotStart,
   classifySetupOpenPlatformOutcome,
+  scriptedSetupOpenPlatformReuseOnly,
   setupOpenPlatformOutcomeJson,
+  setupOpenPlatformRetryCommand,
 } from '../src/setup/open-platform-outcome.js';
 import type { OpenPlatformAutomationResult } from '../src/setup/open-platform-automation.js';
 
@@ -28,6 +30,10 @@ describe('classifySetupOpenPlatformOutcome', () => {
     expect(classifySetupOpenPlatformOutcome(success({ scopeWarning: 'partial scope grant' })).status)
       .toBe('ready_with_warnings');
     expect(classifySetupOpenPlatformOutcome(success({ scopeCount: 0 })).status)
+      .toBe('ready_with_warnings');
+    expect(classifySetupOpenPlatformOutcome(success({ skippedScopeCount: 1 })).status)
+      .toBe('ready_with_warnings');
+    expect(classifySetupOpenPlatformOutcome(success({ versionId: undefined })).status)
       .toBe('ready_with_warnings');
   });
 
@@ -58,5 +64,52 @@ describe('classifySetupOpenPlatformOutcome', () => {
       sessionFile: '/tmp/session.json',
       eventModeReady: false,
     });
+    expect(setupOpenPlatformRetryCommand('cli_x', outcome)).toBe('botmux setup configure cli_x');
+  });
+
+  it('does not offer a deterministic retry loop for manual Lark setup', () => {
+    const outcome = classifySetupOpenPlatformOutcome({
+      ok: false,
+      reason: 'unsupported_brand',
+      message: 'only feishu is automated',
+    });
+    expect(setupOpenPlatformRetryCommand('cli_lark', outcome)).toBeUndefined();
+  });
+
+  it('adds --switch-account when a cached web session cannot make progress', () => {
+    const outcome = classifySetupOpenPlatformOutcome({
+      ok: false,
+      reason: 'invalid_session',
+      message: 'cache expired',
+    });
+    expect(setupOpenPlatformRetryCommand('cli_x', outcome))
+      .toBe('botmux setup configure cli_x --switch-account');
+  });
+
+  it('keeps every scripted JSON automation path QR-free by default', () => {
+    expect(scriptedSetupOpenPlatformReuseOnly({
+      json: true,
+      createApp: false,
+      compatibilityMode: false,
+      brand: 'feishu',
+    })).toBe(true);
+    expect(scriptedSetupOpenPlatformReuseOnly({
+      json: false,
+      createApp: true,
+      compatibilityMode: false,
+      brand: 'feishu',
+    })).toBe(true);
+    expect(scriptedSetupOpenPlatformReuseOnly({
+      json: false,
+      createApp: false,
+      compatibilityMode: false,
+      brand: 'feishu',
+    })).toBe(false);
+    expect(scriptedSetupOpenPlatformReuseOnly({
+      json: true,
+      createApp: false,
+      compatibilityMode: false,
+      brand: 'lark',
+    })).toBe(false);
   });
 });

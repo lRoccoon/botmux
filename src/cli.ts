@@ -56,7 +56,9 @@ import { resolveSetupAppName } from './setup/app-name.js';
 import {
   blocksSetupBotStart,
   classifySetupOpenPlatformOutcome,
+  scriptedSetupOpenPlatformReuseOnly,
   setupOpenPlatformOutcomeJson,
+  setupOpenPlatformRetryCommand,
   type SetupOpenPlatformOutcome,
 } from './setup/open-platform-outcome.js';
 import {
@@ -1448,7 +1450,6 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     }
     const bot = bots[index];
     const processName = botProcessName(bot, index, PM2_NAME);
-    const continueCommand = `botmux setup configure ${bot.larkAppId}`;
     const openPlatform = await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
       // Machine-readable callers must never be surprised by an interactive QR.
       reuseOnly: cmd.json && !cmd.switchAccount,
@@ -1456,6 +1457,8 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       quiet: cmd.json,
     });
     if (openPlatform.status === 'failed' || openPlatform.status === 'manual') {
+      const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform);
+      const next = continueCommand ?? 'manual_open_platform_setup';
       failSetupScripted(
         cmd.json,
         openPlatform.status === 'manual'
@@ -1467,7 +1470,8 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
           bot: botJsonView(bot, index),
           appId: bot.larkAppId,
           openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
-          continueCommand,
+          ...(continueCommand ? { continueCommand } : {}),
+          next,
         },
       );
       return;
@@ -1708,14 +1712,19 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     let openPlatform: SetupOpenPlatformOutcome = { status: 'skipped' };
     if (cmd.openPlatformAuto) {
       openPlatform = await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
-        reuseOnly: cmd.createApp && !cmd.compatibilityMode && botBrand(bot) === 'feishu',
+        reuseOnly: scriptedSetupOpenPlatformReuseOnly({
+          json: cmd.json,
+          createApp: cmd.createApp,
+          compatibilityMode: cmd.compatibilityMode,
+          brand: botBrand(bot),
+        }),
         quiet: cmd.json,
       });
     }
 
     const index = existing.length;
     if (blocksSetupBotStart(openPlatform)) {
-      const continueCommand = `botmux setup configure ${bot.larkAppId}`;
+      const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform)!;
       failSetupScripted(
         cmd.json,
         `机器人配置已写入，但开放平台自动配置未完成，未自动上线。修复后运行 ${continueCommand}；不会重复创建应用。`,
