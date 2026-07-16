@@ -13,8 +13,36 @@ import { createGroupWithBots } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
+import * as backendTypeStore from '../services/backend-type-store.js';
+import { isValidRiffBaseUrl } from '../adapters/backend/riff-backend.js';
+import { ensureBackendAvailable } from '../services/backend-availability.js';
+import type { BackendType } from '../adapters/backend/types.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
+import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
+
+/** Whether read isolation can actually be ENFORCED for this bot right now — the
+ *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
+ *  The dashboard uses it to disable the toggle and to reject persisting an
+ *  unenforceable flag, so flipping it on can never brick the bot's next session
+ *  (the worker would otherwise refuse to start). Turning it OFF is always allowed. */
+function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string }): boolean {
+  let adapterSupports = false;
+  try {
+    adapterSupports = createCliAdapterSync(cfg.cliId as never, cfg.cliPathOverride).supportsReadIsolation === true;
+  } catch { /* CLI missing / unknown adapter → treat as unenforceable */ }
+  return evaluateReadIsolationGate({
+    configured: true,
+    adapterSupports,
+    wrapperCliSet: !!cfg.wrapperCli,
+    platform: process.platform,
+    sessionDataDirSet: true,
+  }).enabled;
+}
+function readIsolationEnforceable(larkAppId: string): boolean {
+  try { return readIsolationEnforceableFor(getBot(larkAppId).config); } catch { return false; }
+}
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
@@ -37,7 +65,7 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -60,6 +88,7 @@ import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
+import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
@@ -682,6 +711,11 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
   if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Riff backend: the sandbox URL is the writable link — no local worker needed.
+  if (ds.riffAccessUrl) {
+    jsonRes(res, 200, { ok: true, url: ds.riffAccessUrl });
+    return;
+  }
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
   jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { write: true }) });
@@ -1521,8 +1555,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
+    readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
+    // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
+    // disables the toggle wherever the worker would fail-close on it.
+    readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
+    backendType: backendTypeStore.getBotBackendType(cachedLarkAppId) ?? null,
     disableStreamingCard: cardPrefs.disableStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
+    codexAppCleanInput: cardPrefs.codexAppCleanInput,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
     botToBotSameDir: cardPrefs.botToBotSameDir,
@@ -1549,6 +1589,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     startupCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
+    riff: redactRiffForClient(getBot(cachedLarkAppId).config.riff),
     summaryRange: summaryRangeFromBotConfig(getBot(cachedLarkAppId).config),
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
@@ -1559,7 +1600,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
-    disableStreamingCard?: unknown; silentTurnReactions?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
+    disableStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
@@ -1568,7 +1609,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const patch: {
-    disableStreamingCard?: boolean; silentTurnReactions?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
+    disableStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
@@ -1577,6 +1618,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
   if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;
+  if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
@@ -1755,13 +1797,44 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
+  const currentBotConfig = getBot(cachedLarkAppId).config;
+  const availability = checkCliAvailability({
+    cliId: selected.cliId,
+    wrapperCli: selected.wrapperCli,
+    cliPathOverride: currentBotConfig.cliPathOverride,
+  });
+  // Existing Bot edits remain saveable (operators may intentionally configure
+  // first and install second), but the response is explicit so Dashboard never
+  // claims a missing Agent was saved successfully without qualification.
+  const availabilityWarning = availability.available
+    ? undefined
+    : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
 
+  // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
+  // auto-clear the flag here so the next session doesn't fail-close on it. (The
+  // read-isolation toggle validates at enable time; changing the agent afterwards
+  // is the other way a bot could end up configured-but-unenforceable.)
+  let readIsolationCleared = false;
   const r = await rmwBotEntry(cachedLarkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
     if (model) entry.model = model;
     else delete entry.model;
+    if (entry.readIsolation === true &&
+        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: entry.cliPathOverride, wrapperCli: selected.wrapperCli })) {
+      delete entry.readIsolation;
+      readIsolationCleared = true;
+    }
+    // cliId=riff → backendType 自动设为 riff（否则 spawn 走 pty 后端找不到本地二进制）。
+    if (selected.cliId === 'riff') {
+      entry.backendType = 'riff';
+    } else if (entry.backendType === 'riff') {
+      // 从 riff 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+      // 默认后端——否则新 CLI 会跑在 RiffBackend 上（PTY 分块输入被当成一串 riff
+      // 任务）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不会是 riff）。
+      delete entry.backendType;
+    }
     return { write: true, result: null };
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
@@ -1771,6 +1844,12 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
   else bot.config.wrapperCli = undefined;
   bot.config.model = model || undefined;
+  if (readIsolationCleared) bot.config.readIsolation = false;
+  if (selected.cliId === 'riff') {
+    bot.config.backendType = 'riff';
+  } else if (bot.config.backendType === 'riff') {
+    bot.config.backendType = undefined;
+  }
 
   // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
   // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
@@ -1784,6 +1863,15 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     model: model || null,
     selectionKey,
     closedMismatchedSessions,
+    // Report the (possibly auto-cleared) read-isolation state + whether the new
+    // agent can still enforce it, so the dashboard updates its toggle immediately
+    // instead of showing a stale enabled/supported state until a full refetch.
+    readIsolation: bot.config.readIsolation === true,
+    readIsolationSupported: readIsolationEnforceableFor(bot.config),
+    readIsolationCleared,
+    agentAvailable: availability.available,
+    availabilityWarning,
+    requiredCommand: availability.command,
   });
 });
 
@@ -1904,6 +1992,51 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
   jsonRes(res, 200, { ok: true, env: value ? JSON.stringify(value, null, 2) : '' });
 });
 
+// Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
+// `{"baseUrl":"https://...","agent":"aiden","model":"...","injectStatusLines":true}`）：
+// 空白 → 清除；否则按 json kind 解析后落盘。走 applyConfigField（与 /botconfig
+// 同一写盘 + 内存热更新路径），next-session 生效。仅 backendType=riff 时使用。
+/** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'agent', 'model', 'jwtEnv', 'sandboxCluster', 'injectStatusLines', 'systemPrompt', 'setupCommands']);
+
+/** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
+function redactRiffForClient(riff: unknown): Record<string, unknown> | null {
+  if (!riff || typeof riff !== 'object') return null;
+  const { jwt: _jwt, env: _env, ...safe } = riff as Record<string, unknown>;
+  return safe;
+}
+
+ipcRoute('PUT', '/api/bot-riff', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { riff?: unknown };
+  try { body = await readJsonBody<{ riff?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('riff');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.riff === 'string' ? body.riff : '';
+  let value: Record<string, unknown> | null;
+  if (!raw.trim()) {
+    value = null;  // 清除（显式清空整份 riff 配置，含隐藏字段）
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as Record<string, unknown>;
+    // 合并保存：dashboard 只回写 UI 展示的字段；接口支持但 UI 未展示的字段
+    // （templateId / jwt / env / logLevel / repos…）必须原样保留，否则用户只改
+    // 一个 model 就会静默删掉认证等隐藏配置。
+    const prev = (getBot(cachedLarkAppId).config.riff ?? {}) as Record<string, unknown>;
+    const preserved = Object.fromEntries(Object.entries(prev).filter(([k]) => !RIFF_UI_EDITABLE_KEYS.has(k)));
+    value = { ...preserved, ...value };
+    if (!isValidRiffBaseUrl(value.baseUrl)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_base_url' });
+    }
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, riff: value ? JSON.stringify(redactRiffForClient(value), null, 2) : '' });
+});
+
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:
 //   • 正整数  → 设上限；超过后 idle-worker sweeper 把最久未用的会话休眠到上限内
 //   • null    → 清除（回落到内置默认 30）
@@ -1988,6 +2121,63 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
+});
+
+// Per-bot read-isolation toggle. Body `{ enabled: boolean }`. When on, this bot's
+// CLI sessions run under macOS Seatbelt read-deny (siblings' creds/sessions/content
+// unreadable). The macOS counterpart of the file sandbox above.
+ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { enabled?: unknown };
+  try { body = await readJsonBody<{ enabled?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const enable = body.enabled === true;
+  // The worker FAIL-CLOSES (refuses to start the session) for a configured
+  // readIsolation that can't be enforced: non-darwin, an adapter without
+  // supportsReadIsolation, or a wrapperCli gateway. Reject enabling it in exactly
+  // those cases so the toggle can never brick the bot's next session. (Turning it
+  // OFF is always allowed — recovers a flag that became unenforceable.)
+  if (enable && !readIsolationEnforceable(cachedLarkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'read_isolation_unenforceable' });
+  }
+  const r = await sandboxStore.updateBotReadIsolation(cachedLarkAppId, enable);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  // Read isolation only takes effect at COLD spawn (provisionIsolatedBotHome +
+  // Seatbelt wrapper run then). Suspend this bot's active sessions so the next
+  // message cold-restarts under the new state — otherwise close+resume would keep
+  // running the old, un-provisioned state and the toggle would silently no-op.
+  const suspendedSessions = await suspendActiveSessionsForBot(cachedLarkAppId);
+  jsonRes(res, 200, { ok: true, readIsolation: r.readIsolation, suspendedSessions });
+});
+
+// Per-bot session backend override (pty | tmux | herdr | zellij), or clear it
+// ('' / 'auto' / null → follow the daemon default). next-session 生效：running
+// sessions keep their spawn-time backend (Session.backendType stamp), only new
+// spawns read the new value — so switching here can't strand live sessions.
+ipcRoute('PUT', '/api/bot-backend-type', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { backendType?: unknown };
+  try { body = await readJsonBody<{ backendType?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const raw = body.backendType;
+  let next: BackendType | null;
+  if (raw == null || raw === '' || raw === 'auto') next = null;
+  else if (backendTypeStore.isEditableBackendType(raw)) next = raw;
+  else return jsonRes(res, 400, { ok: false, error: 'invalid_backendType' });
+  const effectiveBackendType = next ?? config.daemon.backendType;
+  const availability = await ensureBackendAvailable(effectiveBackendType);
+  if (!availability.ok) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'backend_unavailable',
+      backendType: effectiveBackendType,
+      reason: availability.reason,
+      manualCommand: availability.manualCommand,
+    });
+  }
+  const r = await backendTypeStore.updateBotBackendType(cachedLarkAppId, next);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, backendType: r.backendType, effectiveBackendType, version: availability.version });
 });
 
 // 实时切换 UI 语言（locale），无需重启 daemon。`botmux lang` / Dashboard 语言开关

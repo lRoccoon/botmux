@@ -65,6 +65,7 @@ describe('dashboard sessions filters', () => {
     expect(CLI_FILTER_OPTIONS).toContain('codex-app');
     expect(CLI_FILTER_OPTIONS).toContain('mira');
     expect(CLI_FILTER_OPTIONS).toContain('pi');
+    expect(CLI_FILTER_OPTIONS).toContain('kiro-cli');
     expect(CLI_FILTER_OPTIONS).toContain('unknown');
     expect(new Set(CLI_FILTER_OPTIONS).size).toBe(CLI_FILTER_OPTIONS.length);
   });
@@ -108,10 +109,11 @@ describe('dashboard sessions filters', () => {
       .not.toBe(historySenderKey({ senderType: 'bot', senderId: 'ou_bot' }));
   });
 
-  it('defaults terminal entry to writable unless public read-only sharing is enabled', () => {
+  it('prioritizes dashboard auth over public read-only sharing', () => {
     expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: false })).toBe(true);
-    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(false);
+    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(true);
     expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: true })).toBe(false);
+    expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: false })).toBe(false);
   });
 
   it('renders the CLI filter as a multi-select checkbox group, not a dropdown', () => {

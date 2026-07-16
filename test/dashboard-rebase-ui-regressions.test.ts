@@ -12,6 +12,18 @@ function labelsContainingCustomDropdown(source: string): string[] {
 }
 
 describe('dashboard master feature integration', () => {
+  it('keeps the default-off Codex App clean-history switch wired into Bot defaults', () => {
+    const page = dashboardSource('bot-defaults-page.tsx');
+    const types = dashboardSource('bot-defaults.ts');
+    const messages = dashboardSource('i18n.ts');
+
+    expect(types).toContain('codexAppCleanInput?: boolean');
+    expect(page).toContain('<CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />');
+    expect(page).toContain('dataAction="toggle-codex-app-clean-input"');
+    expect(messages).toContain('默认关闭，保持原有兼容行为');
+    expect(messages).toContain('still reach the model, but move to hidden context');
+  });
+
   it('keeps substitute mode configurable from the React bot defaults page', () => {
     const page = dashboardSource('bot-defaults-page.tsx');
     const types = dashboardSource('bot-defaults.ts');
@@ -40,6 +52,19 @@ describe('dashboard master feature integration', () => {
     expect(page).toContain('className="settings-feishu-login"');
     expect(css).toContain('.settings-lark-cli-status');
     expect(css).toContain('.settings-feishu-login');
+  });
+
+  it('submits TraeX source/ref through one explicit path and reconciles lost PUT responses', () => {
+    const page = dashboardSource('settings-page.tsx');
+    const editor = page.slice(page.indexOf('function TraexPluginEditor'));
+
+    expect(editor).toContain("void props.onSave({ source: normalizedSource, ref: normalizedRef })");
+    expect(editor).not.toContain('onBlur=');
+    expect(editor).toContain('setSource(props.value.recommendedSource)');
+    expect(editor).toContain('setRef(props.value.recommendedRef)');
+    expect(page).toContain("await fetch('/api/settings')");
+    expect(page).toContain("tr('settings.saveReconciled')");
+    expect(page).not.toContain('herdrTraexPlugin.spec');
   });
 
   it('does not recenter the v3 DAG for status-only poll updates', () => {

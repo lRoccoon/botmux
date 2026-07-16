@@ -53,20 +53,29 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
+import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
-import { openLocalTerminalForSession } from '../../core/local-terminal-opener.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
+import { withCodexAppContext } from '../../utils/codex-app-context.js';
+import { resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
+import {
+  isLocalCliOpenCapable,
+  isLocalCliOpenConfigured,
+  isLocalCliOpenReady,
+  localCliOpenMode,
+  openLocalCliInIterm,
+  preflightLocalCliOpen,
+} from '../../services/local-cli-opener.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -244,6 +253,21 @@ function sessionCliId(ds: DaemonSession) {
   return ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
 }
 
+/** Worktree selection always creates or starts a fresh session. Decide whether
+ * that next session will use Riff from the live bot pairing after applying the
+ * same invalid-pair reconciliation as forkWorker, rather than from the old
+ * session stamp or the raw backendType alone. */
+function nextSessionUsesRiffBackend(ds: DaemonSession): boolean {
+  const botCfg = getBot(ds.larkAppId).config;
+  const pendingSession = ds.pendingRepo === true;
+  return resolvePairedSpawnBackendType(
+    pendingSession ? sessionCliId(ds) : botCfg.cliId,
+    pendingSession ? ds.session.backendType : undefined,
+    botCfg.backendType,
+    config.daemon.backendType,
+  ) === 'riff';
+}
+
 function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string>): boolean {
   const expected = value?.cli_id;
   if (!expected) return true;
@@ -328,7 +352,7 @@ export async function commitRepoSelection(
   // The worktree flow already posted a precise "worktree 已创建：path 分支 …"
   // line before funnelling in here — suppress the redundant "已选择/已切换"
   // confirmation so the user sees a single message, not two.
-  opts?: { suppressConfirmReply?: boolean },
+  opts?: { suppressConfirmReply?: boolean; riffRepoDirs?: string[] },
 ): Promise<void> {
   const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
   const locTarget = localeForBot(ds.larkAppId);
@@ -343,6 +367,9 @@ export async function commitRepoSelection(
     // First spawn: pin the new cwd onto the CURRENT session before forking.
     ds.workingDir = dirPath;
     ds.session.workingDir = dirPath;
+    // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
+    // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
+    ds.session.riffRepoDirs = opts?.riffRepoDirs;
     sessionStore.updateSession(ds.session);
     const selfBot = getBot(ds.larkAppId);
     const botCfg = selfBot.config;
@@ -359,8 +386,8 @@ export async function commitRepoSelection(
       (ds.pendingAttachments?.length ?? 0) > 0 ||
       (ds.pendingFollowUps?.length ?? 0) > 0;
     if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
-    const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
-      ? buildNewTopicPrompt(
+    const wrappedInput = (!pendingRawInput || hasBufferedInput)
+      ? buildNewTopicCliInput(
           pendingPrompt,
           ds.session.sessionId,
           effectiveCliId,
@@ -372,10 +399,20 @@ export async function commitRepoSelection(
           { name: selfBot.botName, openId: selfBot.botOpenId },
           locTarget,
           ds.pendingSender,
-          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
+          {
+            larkAppId: ds.larkAppId,
+            chatId: ds.chatId,
+            whiteboardId: ds.session.whiteboardId,
+            substituteTrigger: ds.pendingSubstituteTrigger,
+            codexAppText: ds.pendingCodexAppText,
+            codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
+            codexAppMessageContext: ds.pendingCodexAppMessageContext,
+            codexAppFollowUps: ds.pendingCodexAppFollowUps,
+            codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+          },
         )
-      : '';
-    const prompt = pendingRawInput ? '' : wrappedPrompt;
+      : { content: '' };
+    const prompt = pendingRawInput ? '' : wrappedInput;
     // Last-line defence: prompt prep awaited above — if anything replaced
     // OR closed the session in that window, forking now would clobber it
     // (or resurrect a /close'd session).
@@ -385,17 +422,28 @@ export async function commitRepoSelection(
     }
     if (pendingRawInput && hasBufferedInput) {
       ds.pendingFollowUpInput = {
-        userPrompt: pendingPrompt || (ds.pendingFollowUps?.join('\n\n') ?? ''),
-        cliInput: wrappedPrompt,
+        userPrompt: ds.pendingCodexAppText !== undefined || ds.pendingCodexAppFollowUps
+          ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
+          : pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
+        cliInput: wrappedInput.content,
+        ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
+          ? { codexAppInput: wrappedInput.codexAppInput }
+          : {}),
+        codexAppInputGateFrozen: true,
       };
     }
-    rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? prompt);
+    rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
     ds.pendingPrompt = undefined;
+    ds.pendingCodexAppText = undefined;
+    ds.pendingCodexAppApplicationContext = undefined;
+    ds.pendingCodexAppMessageContext = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
     ds.pendingSubstituteTrigger = undefined;
     ds.pendingSender = undefined;
     ds.pendingFollowUps = undefined;
+    ds.pendingCodexAppFollowUps = undefined;
+    ds.pendingCodexAppFollowUpContexts = undefined;
     forkWorker(ds, prompt);
     // A card click has no turn of its own — anchor the confirmation to the
     // session's current reply-target turn so a shared fold-back topic keeps
@@ -454,6 +502,9 @@ export async function commitRepoSelection(
     ds.session.ownerOpenId = oldSession.ownerOpenId;
     ds.session.creatorOpenId = oldSession.creatorOpenId;
     ds.session.lastCallerOpenId = oldSession.lastCallerOpenId;
+    // Stamp the newly-created session, not the displaced session that was just
+    // closed. Plain/single-repo switches pass undefined and clear stale state.
+    ds.session.riffRepoDirs = opts?.riffRepoDirs;
     sessionStore.updateSession(ds.session);
     ds.hasHistory = false;
     // Re-persist the parked card under the NEW sessionId so a daemon crash
@@ -1193,7 +1244,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return await handleV3LoopGrantAction(value as unknown as V3LoopGrantActionValue, operatorOpenId, deps.v3LoopGrantDeps);
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1228,10 +1279,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
         // 用户主动点的取权动作，静默会让人以为按钮坏了——给一条明确的「无操作权限」toast。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal') {
+        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
-            : 'card.action.write_link_no_permission';
+            : value.action === 'open_local_cli'
+              ? 'card.action.local_cli_no_permission'
+              : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(effectiveAppId)) } };
         }
         return;
@@ -1248,10 +1301,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
         // 与上面 non-operator 分支同理：仅 get_write_link 破例给 toast，其余保持静默。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal') {
+        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
-            : 'card.action.write_link_no_permission';
+            : value.action === 'open_local_cli'
+              ? 'card.action.local_cli_no_permission'
+              : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(larkAppId)) } };
         }
         return;
@@ -1294,7 +1349,89 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
       : activeSessions.get(rootId);
 
-    if (ds && !validateCardCliBinding(ds, value)) return;
+    const launchLocalCli = (target: DaemonSession, locDs: Locale) => {
+      const cliId = sessionCliId(target);
+      const mode = localCliOpenMode();
+      const preflight = preflightLocalCliOpen(target, { cliId, mode });
+      if (!preflight.ok) {
+        logger.warn(`[${tag(target)}] Rejected ${actionType} preflight: ${preflight.error}: ${preflight.message}`);
+        if (preflight.error === 'missing_resume_id') {
+          return { toast: { type: 'warning', content: t('card.action.local_cli_not_ready', undefined, locDs) } };
+        }
+        if (preflight.error === 'unsupported_cli' || preflight.error === 'unsupported_backend' || preflight.error === 'missing_attach_target') {
+          return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(cliId) }, locDs) } };
+        }
+        return { toast: { type: 'error', content: t('card.action.local_cli_failed', { reason: preflight.message }, locDs) } };
+      }
+      const reportFailure = (reason: string) => {
+        if (value.visibility === 'private') {
+          logger.warn(`[${tag(target)}] ${actionType} failed for private card; suppressing public fallback: ${reason}`);
+          return;
+        }
+        void sessionReply(rootId, t('card.action.local_cli_failed', { reason }, locDs))
+          .catch((err) => logger.warn(`[${tag(target)}] ${actionType} failure reply failed: ${err instanceof Error ? err.message : String(err)}`));
+      };
+      void openLocalCliInIterm(target, { cliId, mode })
+        .then((result) => {
+          if (!result.ok) {
+            logger.warn(`[${tag(target)}] ${actionType} failed: ${result.error}: ${result.message}`);
+            reportFailure(result.message);
+            return;
+          }
+          logger.info(`[${tag(target)}] ${actionType} launched local terminal for ${cliId} (${mode})`);
+        })
+        .catch((err) => {
+          const reason = err instanceof Error ? err.message : String(err);
+          logger.warn(`[${tag(target)}] ${actionType} crashed: ${reason}`);
+          reportFailure(reason);
+        });
+      return {
+        toast: {
+          type: 'success',
+          content: t('card.action.local_cli_opened', { cliName: getCliDisplayName(cliId) }, locDs),
+        },
+      };
+    };
+
+    const guardLocalCliOpen = (target: DaemonSession, locDs: Locale) => {
+      if (!isLocalCliOpenConfigured()) {
+        logger.info(`[${tag(target)}] Rejected ${actionType}: native CLI opening is disabled`);
+        return { toast: { type: 'warning', content: t('card.action.local_cli_disabled', undefined, locDs) } };
+      }
+      if (!isLocalCliOpenCapable()) {
+        logger.info(`[${tag(target)}] Rejected ${actionType}: daemon host cannot open the native CLI`);
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(sessionCliId(target)) }, locDs),
+          },
+        };
+      }
+    };
+
+    if (ds && actionType === 'open_local_cli') {
+      const actualCliId = sessionCliId(ds);
+      const locDs = localeForBot(ds.larkAppId);
+      if (!value?.cli_id) {
+        return { toast: { type: 'error', content: t('card.action.local_cli_missing_cli_id', undefined, locDs) } };
+      }
+      if (value.cli_id !== actualCliId) {
+        logger.warn(
+          `[${tag(ds)}] Rejected open_local_cli from mismatched CLI card: expected=${value.cli_id} actual=${actualCliId}`,
+        );
+        return { toast: { type: 'error', content: t('card.action.local_cli_cli_mismatch', undefined, locDs) } };
+      }
+    } else if (ds && !validateCardCliBinding(ds, value)) return;
+
+    if (actionType === 'open_local_cli') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      const blocked = guardLocalCliOpen(ds, locDs);
+      if (blocked) return blocked;
+      return launchLocalCli(ds, locDs);
+    }
 
     // 🔊 语音总结 — no permission gate (任意人可点). Inject a condense-and-speak
     // instruction into the session; the model emits the voice via
@@ -1325,11 +1462,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       voicedCardIds.add(dedupeKey);
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
-      if (ds.worker && !ds.worker.killed) {
-        ds.worker.send({ type: 'message', content: voiceSummaryInstruction(locDs) } as DaemonToWorker);
-      } else {
-        forkWorker(ds, voiceSummaryInstruction(locDs), ds.hasHistory);
-      }
+      const instruction = voiceSummaryInstruction(locDs);
+      const voiceInput = {
+        content: instruction,
+        codexAppInput: withCodexAppContext(
+          { text: t('card.voice.user_message', undefined, locDs) },
+          'botmux_voice_summary_instruction',
+          instruction,
+          'application',
+        ),
+      };
+      if (ds.worker && !ds.worker.killed) sendWorkerInput(ds, voiceInput);
+      else forkWorker(ds, voiceInput, ds.hasHistory);
       logger.info(`[${tag(ds)}] voice_summary triggered by ${operatorOpenId ?? '?'}`);
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
     }
@@ -1479,15 +1623,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           locDs,
           undefined,
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: sessionCliId(ds) }),
         );
         scheduleCardPatch(ds, cardJson);
       }
 
-      if (ds.worker && !ds.worker.killed) {
-        ds.worker.send({ type: 'message', content: cliInput } as DaemonToWorker);
-      } else {
-        forkWorker(ds, cliInput, ds.hasHistory);
-      }
+      const retryCodexAppInput = ds.lastCodexAppInput
+        ? (({ clientUserMessageId: _priorMessageId, ...input }) => input)(ds.lastCodexAppInput)
+        : undefined;
+      const retryInput = {
+        content: cliInput,
+        ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
+      };
+      if (ds.worker && !ds.worker.killed) sendWorkerInput(ds, retryInput);
+      else forkWorker(ds, retryInput, ds.hasHistory);
       logger.info(`[${tag(ds)}] Retrying last task after usage limit`);
       if (cardJson) {
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
@@ -1600,34 +1749,26 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       } catch { /* fall through */ }
     }
 
-    // ⚠️ 生成「💻 打开 <CLI>」按钮的入口已在 card-builder 的 HIDE_OPEN_LOCAL_CLI_BUTTON
-    //    处暂时隐藏（会破坏飞书对话连续性，打磨好前不放出来）。此处理保留：一是兼容用户
-    //    点到隐藏前已发出的旧卡片，二是重新启用按钮时无需再改这里。
+    // Compatibility path for cards emitted before open_local_cli was introduced.
+    // The opt-in/capability guard still applies so old cards cannot bypass the
+    // default-off continuity protection. Clicks read the current mode: attach
+    // mode uses exact backend attach with no fallback; resume mode uses the same
+    // precise resume preflight and also fails closed when unsupported.
     if (actionType === 'open_local_terminal') {
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
-      const result = openLocalTerminalForSession(ds);
-      if (result.ok) {
-        logger.info(`[${tag(ds)}] Local terminal open requested via card (${result.launcher}, ${result.backend})`);
-        return { toast: { type: 'success', content: t('card.action.local_terminal_opened', { cliName: getCliDisplayName(sessionCliId(ds)) }, locDs) } };
-      }
-      logger.warn(`[${tag(ds)}] Local terminal open failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`);
-      if (result.error === 'cli_unavailable') {
-        return { toast: { type: 'warning', content: t('card.action.local_cli_missing', { cliName: getCliDisplayName(sessionCliId(ds)), executable: result.executable ?? sessionCliId(ds) }, locDs) } };
-      }
-      if (result.error === 'resume_unavailable' || result.error === 'unsupported_platform' || result.error === 'launcher_unavailable') {
-        return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(sessionCliId(ds)) }, locDs) } };
-      }
-      return { toast: { type: 'error', content: t('card.action.local_terminal_failed', { reason: result.detail ?? result.error }, locDs) } };
+      const blocked = guardLocalCliOpen(ds, locDs);
+      if (blocked) return blocked;
+      return launchLocalCli(ds, locDs);
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
       const botCfg = getBot(ds.larkAppId).config;
       const effectiveCliId = sessionCliId(ds);
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.workerPort && ds.workerToken) {
+      if (ds.riffAccessUrl || (ds.workerPort && ds.workerToken)) {
         const writeUrl = buildTerminalUrl(ds, { write: true });
         const cardJson = buildSessionCard(
           ds.session.sessionId,
@@ -1638,6 +1779,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           true, // showManageButtons — write-link card includes restart & close
           !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
           locDs,
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -1705,6 +1847,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               localeForBot(ds.larkAppId),
               cardUsageLimit(ds),
               writableTerminalLinkFor(ds),
+              isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -1747,6 +1890,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -1787,6 +1931,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -1852,6 +1997,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -1892,6 +2038,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
@@ -1917,8 +2064,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           (ds.pendingAttachments?.length ?? 0) > 0 ||
           (ds.pendingFollowUps?.length ?? 0) > 0;
         if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
-        const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
-          ? buildNewTopicPrompt(
+        const wrappedInput = (!pendingRawInput || hasBufferedInput)
+          ? buildNewTopicCliInput(
               pendingPrompt,
               ds.session.sessionId,
               effectiveCliId,
@@ -1930,23 +2077,44 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               { name: selfBot.botName, openId: selfBot.botOpenId },
               locDs,
               ds.pendingSender,
-              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
+              {
+                larkAppId: ds.larkAppId,
+                chatId: ds.chatId,
+                whiteboardId: ds.session.whiteboardId,
+                substituteTrigger: ds.pendingSubstituteTrigger,
+                codexAppText: ds.pendingCodexAppText,
+                codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
+                codexAppMessageContext: ds.pendingCodexAppMessageContext,
+                codexAppFollowUps: ds.pendingCodexAppFollowUps,
+                codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+              },
             )
-          : '';
-        const prompt = pendingRawInput ? '' : wrappedPrompt;
+          : { content: '' };
+        const prompt = pendingRawInput ? '' : wrappedInput;
         if (pendingRawInput && hasBufferedInput) {
           ds.pendingFollowUpInput = {
-            userPrompt: pendingPrompt || (ds.pendingFollowUps?.join('\n\n') ?? ''),
-            cliInput: wrappedPrompt,
-          };
-        }
-        rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? prompt);
+              userPrompt: ds.pendingCodexAppText !== undefined || ds.pendingCodexAppFollowUps
+                ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
+                : pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
+              cliInput: wrappedInput.content,
+              ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
+                ? { codexAppInput: wrappedInput.codexAppInput }
+                : {}),
+              codexAppInputGateFrozen: true,
+            };
+          }
+        rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
         ds.pendingPrompt = undefined;
+        ds.pendingCodexAppText = undefined;
+        ds.pendingCodexAppApplicationContext = undefined;
+        ds.pendingCodexAppMessageContext = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
         ds.pendingSubstituteTrigger = undefined;
         ds.pendingSender = undefined;
         ds.pendingFollowUps = undefined;
+        ds.pendingCodexAppFollowUps = undefined;
+        ds.pendingCodexAppFollowUpContexts = undefined;
         forkWorker(ds, prompt);
         const cwd = getSessionWorkingDir(ds);
         await sessionReply(rootId, t('cmd.skip.opened', { cwd }, locDs));
@@ -2337,6 +2505,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           return;
         }
         if (sessionChanged()) return notSwitched(creation, 'mid-flight');
+        // riff：新建的 worktree 分支只存在于本地，远程沙箱克隆不到 → 先推送
+        // 分支指针到远端，riff 任务才能钉住这个新分支。推送失败不阻塞（worker
+        // 推导会按现状回退默认分支并在卡片注入告警），只提示用户。
+        if (nextSessionUsesRiffBackend(targetDs)) {
+          for (const c of created) {
+            try {
+              await pushWorktreeBranch(c.result.path, c.result.branch);
+            } catch (e) {
+              const errMsg = e instanceof Error ? e.message : String(e);
+              logger.warn(`[${tag(targetDs)}] riff worktree branch push failed (${c.result.branch}): ${errMsg}`);
+              await sessionReply(rootId, t('card.repo.riff_worktree_push_failed', { branch: c.result.branch, error: errMsg }, locTarget));
+            }
+          }
+        }
         await sessionReply(rootId, t('cmd.repo.worktree_created', {
           path: creation.path, branch: creation.branch, base: creation.baseRef,
         }, locTarget));
@@ -2347,7 +2529,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         try {
           // The "worktree 已创建：…" notice above already confirms the switch —
           // suppress commitRepoSelection's own "已选择/已切换" to avoid a dup.
-          await commitRepoSelection(commitCtx, creation.path, `${pathBasename(creation.path)} (${creation.branch})`, { suppressConfirmReply: true });
+          await commitRepoSelection(commitCtx, creation.path, `${pathBasename(creation.path)} (${creation.branch})`, {
+            suppressConfirmReply: true,
+            // 多仓：把按用户选择顺序创建的 worktree 目录 stamp 到 session，
+            // riff 按此显式列表（而非目录扫描）推导 repos，首仓为 primary。
+            riffRepoDirs: created.length > 1 ? created.map(c => c.result.path) : undefined,
+          });
         } catch (e) {
           // The worktree DOES exist at this point — only the switch failed.
           // Don't report it as a creation failure, or the user retries and

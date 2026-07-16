@@ -3,6 +3,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
+import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
@@ -12,6 +13,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
+import { normalizePluginIdList } from './core/plugins/ids.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
@@ -507,6 +509,11 @@ export interface BotConfig {
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
    */
   disableCliBypass?: boolean;
+  /** Experimental Codex App input split. When true, newly accepted turns send
+   * the real user text as app-server `input` and keep Botmux metadata in
+   * `additionalContext`, so the desktop user bubble stays clean. Missing/false
+   * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
+  codexAppCleanInput?: boolean;
   /**
    * Run this bot's CLI inside a per-session file sandbox (bubblewrap, Linux):
    * the agent sees only a clone of the project + a de-identified config dir,
@@ -549,6 +556,12 @@ export interface BotConfig {
    *  credential set. Only meaningful when `readIsolation` is true. */
   readDenyExtraPaths?: string[];
   backendType?: BackendType;
+  /**
+   * Configuration for the riff backend (agent-services platform). Required
+   * when `backendType` is `'riff'`. Contains base URL, template ID, agent/model
+   * selection, and auth settings for riff's HTTP API.
+   */
+  riff?: RiffBackendConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
@@ -620,6 +633,8 @@ export interface BotConfig {
    * 性质不变。可由 /grant 卡片「全局」按钮写入，也可在 bots.json 手配 open_id。
    */
   globalGrants?: string[];
+  /** Additional plugin ids enabled only for this bot. */
+  plugins?: string[];
   /**
    * 消息额度机制（默认关闭）。`defaultLimit` 的"是否配置"本身就是开关：
    *   • 未配置（undefined）→ 关闭：无显式数字的 /grant 仍是"无限授权"（当前行为）。
@@ -836,12 +851,20 @@ export interface BotConfig {
    */
   substituteMode?: SubstituteModeConfig;
   /**
-   * 飞书文档订阅入口（/subscribe-lark-doc）新订阅的默认评论触发范围：
+   * 飞书文档评论监听（/watch-comment；/subscribe-lark-doc 也复用）新绑定的默认触发范围：
    *   • 'mention-only'（或 undefined）— 仅评论里 @bot 才触发（默认，防噪声）
    *   • 'all'                        — 该文档所有新评论都触发
    * 单条订阅的触发范围之后可在 dashboard 逐文档改（doc-subscriptions 表）。
    */
   docSubscribeDefaultMode?: 'mention-only' | 'all';
+  /**
+   * 文档 → 本地仓库/目录映射。当文档评论触发且无活跃 session 时，auto-create
+   * session 会按 fileToken 查此表确定 agent 的 workingDir。
+   * 键是飞书文档的 file_token（wiki 已解析为底层 obj_token），值是本地绝对路径。
+   * 例：{ "KszRdLt6MoNtBFxNjBmm3jlhyWd": "/home/me/my-repo" }
+   * 也可以在 `/watch-comment <doc> --dir /path` 时逐文档指定。
+   */
+  docRepoMap?: Record<string, string>;
   /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */
   summaryRange?: SummaryRangeConfig;
   /**
@@ -1352,6 +1375,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
     const skills = readBotSkillPolicy(entry.skills);
+    // Presence is semantic for plugins: [] is an exact "none" override, while
+    // an absent field inherits the machine defaults.
+    const plugins = Array.isArray(entry.plugins)
+      ? normalizePluginIdList(entry.plugins) ?? []
+      : undefined;
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
@@ -1396,6 +1424,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.model.trim()
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
+      codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       sandbox: entry.sandbox === true,
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
@@ -1403,6 +1432,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
+      riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
@@ -1434,6 +1464,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       startupCommands,
       env,
       skills,
+      plugins,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       skillInjection: entry.skillInjection === 'global' || entry.skillInjection === 'prompt' || entry.skillInjection === 'off'
         ? entry.skillInjection : undefined,
@@ -1485,6 +1516,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。
       docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,
+      // 文档 → 本地仓库映射。file_token → 绝对路径。
+      docRepoMap: entry.docRepoMap && typeof entry.docRepoMap === 'object' && !Array.isArray(entry.docRepoMap)
+        ? Object.fromEntries(
+            Object.entries(entry.docRepoMap as Record<string, unknown>)
+              .filter(([, v]) => typeof v === 'string' && v.trim())
+              .map(([k, v]) => [k, (v as string).trim()])
+          )
+        : undefined,
       summaryRange,
       contentTriggers,
       voice,

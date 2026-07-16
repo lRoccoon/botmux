@@ -101,6 +101,54 @@ describe('dashboard IPC server', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
+  it('is default-off and persists explicit on/off changes immediately', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-clean-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-codex-clean-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.codexAppCleanInput).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexAppCleanInput: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, codexAppCleanInput: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexAppCleanInput).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexAppCleanInput: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, codexAppCleanInput: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexAppCleanInput).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('GET /api/sessions', () => {
   it('returns array shape (sessions: Row[])', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -766,6 +814,161 @@ describe('PUT /api/bot-agent', () => {
         wrapperCli: 'ttadk codex',
         model: 'kimi-k2.5',
       });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-riff config safety (finding H)', () => {
+  async function withRiffBot(fn: (base: string, configPath: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-riff-cfg-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-riff-cfg-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'riff',
+        backendType: 'riff',
+        riff: {
+          baseUrl: 'https://riff-old.example',
+          agent: 'aiden',
+          templateId: 'tpl-1',
+          jwt: 'SECRET-JWT',
+          env: { API_KEY: 'SECRET-ENV' },
+          logLevel: 'verbose',
+        },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await fn(`http://127.0.0.1:${handle.port}`, configPath);
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('preserves hidden fields (jwt/templateId/env/logLevel) on a UI-field save and redacts the response', async () => {
+    await withRiffBot(async (base, configPath) => {
+      const res = await fetch(`${base}/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', agent: 'codex', injectStatusLines: false }) }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // 响应绝不携带明文 secret
+      expect(String(body.riff)).not.toContain('SECRET-JWT');
+      expect(String(body.riff)).not.toContain('SECRET-ENV');
+      // 落盘：UI 字段更新、隐藏字段原样保留
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0].riff;
+      expect(stored).toMatchObject({
+        baseUrl: 'https://riff-new.example',
+        agent: 'codex',
+        injectStatusLines: false,
+        templateId: 'tpl-1',
+        jwt: 'SECRET-JWT',
+        env: { API_KEY: 'SECRET-ENV' },
+        logLevel: 'verbose',
+      });
+    });
+  });
+
+  it('rejects a save without a valid http(s) baseUrl', async () => {
+    await withRiffBot(async (base) => {
+      const res = await fetch(`${base}/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ riff: JSON.stringify({ agent: 'codex' }) }),
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'invalid_base_url' });
+    });
+  });
+
+  it('bot-defaults response never contains riff jwt/env', async () => {
+    await withRiffBot(async (base) => {
+      const res = await fetch(`${base}/api/bot-default-oncall`);
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).not.toContain('SECRET-JWT');
+      expect(text).not.toContain('SECRET-ENV');
+    });
+  });
+});
+
+describe('PUT /api/bot-agent riff backend pairing', () => {
+  it('clears the auto-paired backendType=riff when switching back to a non-riff CLI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-riff-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-riff-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'riff',
+        backendType: 'riff',
+        riff: { baseUrl: 'https://riff.example' },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+      expect(res.status).toBe(200);
+
+      // riff→codex：自动配对的 backendType 必须清掉，否则 Codex adapter 会跑在
+      // RiffBackend 上（PTY 分块输入被当成一串 riff 任务）。
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.cliId).toBe('codex');
+      expect(stored.backendType).toBeUndefined();
+      const { getBot } = await import('../src/bot-registry.js');
+      expect(getBot(appId).config.backendType).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a manual non-riff backend override when switching CLIs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-tmux-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-tmux-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        backendType: 'tmux',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+      expect(res.status).toBe(200);
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.backendType).toBe('tmux');
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;

@@ -3,7 +3,7 @@ import { createServer, get as httpGet, request as httpRequest, type IncomingMess
 import { createServer as createTcpServer, connect as netConnect } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
-  readFileSync, existsSync, mkdirSync, statSync, createReadStream,
+  readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -41,8 +41,9 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
+import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
@@ -59,6 +60,7 @@ import {
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from './utils/global-install.js';
+import { listCliRuntimeUpdateEntries } from './core/cli-runtime-update.js';
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
@@ -87,12 +89,14 @@ import {
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
   installLocalSkillLinks,
   readSkillRegistry,
   removeInstalledSkill,
+  removeInstalledSkills,
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
@@ -113,11 +117,21 @@ import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import { handleDesktopCompat } from './dashboard/compat.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
-import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
+import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
+import { readPluginRegistry } from './services/plugin-registry-store.js';
+import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
+import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
+import { listPluginServiceStatus, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
+import { materializePlugin } from './core/plugins/materializer.js';
+import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
+import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
+import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -299,8 +313,14 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  enableLocalCliOpen: boolean;
+  localCliOpenMode: 'attach' | 'resume';
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
   chatBotDiscovery: boolean;
+  /** Machine-wide opt-in TraeX herdr plugin bootstrap. Default OFF.
+   *  `recommendedSource`/`recommendedRef` are a non-default, author-recommended
+   *  source the SPA can offer as a one-click fill; never persisted unless picked. */
+  herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -558,13 +578,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
               };
             }
           }
-          // Event subscription is also critical: if all 3 event update endpoints
-          // failed (eventWarning set, subscribedEventCount === 0), the bot won't
-          // receive vc.bot.meeting_*_v1 push events → meeting invite black hole.
-          if (result.eventWarning && result.subscribedEventCount === 0) {
+          // Event subscription is also critical: listener 缺任一 VC 事件都收不到
+          // 会议邀请(missingVcEvents 判定,总 count 无法区分缺的是不是 VC)。
+          const eventGateError = vcListenerEventGateError(result);
+          if (eventGateError) {
             return {
               ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅全部失败(${result.eventWarning})，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
             };
           }
         } else {
@@ -606,13 +626,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
               };
             }
           }
-          // Also check event subscription status — if event update failed (all 3
-          // endpoints) before the downstream api_error hit, the bot still won't
-          // receive meeting invite events → listener black hole.
-          if (result.eventWarning && (result.subscribedEventCount ?? 0) === 0) {
+          // Also check event subscription status — automation 走到订阅阶段时
+          // missingVcEvents 会带回来;listener 缺任一 VC 事件都不能保存。
+          const eventGateError = vcListenerEventGateError(result);
+          if (eventGateError) {
             return {
               ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅失败(${result.eventWarning})，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
             };
           }
         }
@@ -696,7 +716,16 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
+    enableLocalCliOpen: dashboard.enableLocalCliOpen === true,
+    localCliOpenMode: dashboard.localCliOpenMode ?? 'attach',
     chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
+    herdrTraexPlugin: {
+      enabled: dashboard.herdrTraexPlugin?.enabled === true,
+      source: dashboard.herdrTraexPlugin?.source ?? '',
+      ref: dashboard.herdrTraexPlugin?.ref ?? '',
+      recommendedSource: TRAEX_RECOMMENDED_SOURCE,
+      recommendedRef: TRAEX_RECOMMENDED_REF,
+    },
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
@@ -1047,6 +1076,301 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
   } catch {
     return false;
   }
+}
+
+function dashboardEntriesForRecord(record: InstalledPluginRecord): PluginDashboardEntry[] {
+  return record.contributions?.dashboard ?? [];
+}
+
+function listDashboardPluginEntries(): Array<{ pluginId: string; id: string; route: string; entry: string; url: string; displayName?: string; pinned: boolean }> {
+  const pinned = new Set(normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? []);
+  const out: Array<{ pluginId: string; id: string; route: string; entry: string; url: string; displayName?: string; pinned: boolean }> = [];
+  for (const record of Object.values(readPluginRegistry().plugins)) {
+    const dashboardEntries = dashboardEntriesForRecord(record);
+    for (const entry of dashboardEntries) {
+      out.push({
+        pluginId: record.id,
+        id: entry.id,
+        route: entry.route,
+        entry: entry.entry,
+        url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
+        pinned: pinned.has(record.id),
+        ...(record.manifest.displayName ? { displayName: record.manifest.displayName } : {}),
+      });
+    }
+  }
+  return out.sort((a, b) => a.pluginId.localeCompare(b.pluginId) || a.id.localeCompare(b.id));
+}
+
+function servePluginStatic(res: ServerResponse, pathname: string): boolean {
+  const match = pathname.match(/^\/plugins\/([^/]+)\/(.+)$/);
+  if (!match) return false;
+  const pluginId = decodeURIComponent(match[1]);
+  const relPath = decodeURIComponent(match[2]);
+  const record = readPluginRegistry().plugins[pluginId];
+  if (!record) return false;
+  const dashboardEntries = dashboardEntriesForRecord(record);
+  const allowed = dashboardEntries.some((entry) => {
+    const base = entry.entry.replace(/\/[^/]*$/, '/');
+    return relPath === entry.entry || relPath.startsWith(base);
+  });
+  if (!allowed) return false;
+  try {
+    return serveFileAbs(res, resolvePluginPath(pluginRuntimeDir(pluginId), relPath, 'dashboard_asset'));
+  } catch {
+    return false;
+  }
+}
+
+function addPluginId(list: unknown, pluginId: string): string[] {
+  const current = normalizePluginIdList(list) ?? [];
+  return current.includes(pluginId) ? current : [...current, pluginId];
+}
+
+function removePluginId(list: unknown, pluginId: string): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => id !== pluginId);
+}
+
+function pluginEnabledPatch(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const enabled = (body as { enabled?: unknown }).enabled;
+  return typeof enabled === 'boolean' ? enabled : null;
+}
+
+function pluginPinnedPatch(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const pinned = (body as { pinned?: unknown }).pinned;
+  return typeof pinned === 'boolean' ? pinned : null;
+}
+
+function writeDashboardPluginPin(pluginId: string, pinned: boolean): void {
+  const current = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
+  const next = pinned ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeDashboardConfig({ pinnedPlugins: next });
+}
+
+function requireInstalledPlugin(pluginId: string): InstalledPluginRecord | null {
+  if (!isValidPluginId(pluginId)) return null;
+  return readPluginRegistry().plugins[pluginId] ?? null;
+}
+
+function cleanPluginListForInstalled(list: unknown, installed: Set<string>): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => installed.has(id));
+}
+
+function latestGatewayDiagnostics(): Map<string, unknown[]> {
+  const root = join(config.session.dataDir, 'mcp-gateway');
+  const byPlugin = new Map<string, unknown[]>();
+  if (!existsSync(root)) return byPlugin;
+  let files: string[] = [];
+  try {
+    files = readdirSync(root)
+      .filter(file => file.endsWith('.json'))
+      .sort((a, b) => statSync(join(root, b)).mtimeMs - statSync(join(root, a)).mtimeMs)
+      .slice(0, 50);
+  } catch { return byPlugin; }
+  const seen = new Set<string>();
+  for (const file of files) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(root, file), 'utf-8'));
+      for (const server of Array.isArray(parsed?.servers) ? parsed.servers : []) {
+        const pluginId = typeof server?.pluginId === 'string' ? server.pluginId : '';
+        const serverName = typeof server?.serverName === 'string' ? server.serverName : '';
+        if (!pluginId || !serverName) continue;
+        const key = `${pluginId}\0${serverName}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const bucket = byPlugin.get(pluginId) ?? [];
+        bucket.push({ ...server, sessionId: parsed.sessionId, generatedAt: parsed.generatedAt });
+        byPlugin.set(pluginId, bucket);
+      }
+    } catch { /* one corrupt diagnostic must not hide the plugin page */ }
+  }
+  return byPlugin;
+}
+
+async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
+  const registryFile = readPluginRegistry();
+  const installed = new Set(Object.keys(registryFile.plugins));
+  const globalPlugins = cleanPluginListForInstalled(readGlobalConfig().plugins, installed);
+  const globalSet = new Set(globalPlugins);
+  const pinnedSet = new Set(normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? []);
+  let botConfigs: BotConfig[] = [];
+  try { botConfigs = loadBotConfigs(); } catch { /* setup can render before bots.json exists */ }
+  const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+  const bots = botConfigs.map((bot, index) => {
+    return {
+      id: bot.larkAppId,
+      name: bot.displayName || onlineByAppId.get(bot.larkAppId)?.botName || bot.name || `Bot ${index + 1}`,
+      plugins: resolveEffectivePluginIds(bot, { plugins: globalPlugins }),
+    };
+  });
+  const gatewayAdapters = [...new Map(botConfigs.map(bot => {
+    const adapter = createCliAdapterSync(bot.cliId, bot.cliPathOverride);
+    return [adapter.id, inspectGatewayEntry(adapter)] as const;
+  })).values()];
+  const gatewayDiagnostics = latestGatewayDiagnostics();
+  const serviceReports = await listPluginServiceStatus();
+  const serviceByPlugin = new Map<string, typeof serviceReports>();
+  for (const report of serviceReports) {
+    const bucket = serviceByPlugin.get(report.pluginId) ?? [];
+    bucket.push(report);
+    serviceByPlugin.set(report.pluginId, bucket);
+  }
+  const plugins = Object.values(registryFile.plugins)
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map(record => ({
+      id: record.id,
+      packageName: record.packageName,
+      version: record.version,
+      source: record.source,
+      installedAt: record.installedAt,
+      updatedAt: record.updatedAt,
+      displayName: record.manifest.displayName,
+      dependencies: record.manifest.dependencies?.plugins ?? [],
+      contributions: record.contributions ?? {},
+      skillsCount: record.contributions?.skills?.length ?? (record.manifest as any).skills?.length ?? 0,
+      mcpCount: record.contributions?.mcp ? 1 : 0,
+      dashboard: dashboardEntriesForRecord(record).map(entry => ({
+        ...entry,
+        url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
+      })),
+      service: record.manifest.service,
+      serviceReport: serviceByPlugin.get(record.id)?.[0],
+      pinnedToSidebar: pinnedSet.has(record.id) && dashboardEntriesForRecord(record).length > 0,
+      enabledGlobal: globalSet.has(record.id),
+      enabledByBot: Object.fromEntries(bots.map(bot => [bot.id, bot.plugins.includes(record.id)])),
+      gatewayAdapters,
+      mcpDiagnostics: gatewayDiagnostics.get(record.id) ?? [],
+    }));
+  return { plugins, globalPlugins, bots, gatewayAdapters };
+}
+
+function writeGlobalPluginBinding(pluginId: string, enabled: boolean): void {
+  const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  assertPluginBindingTransition(pluginId, enabled, current);
+  if (enabled) materializePlugin(pluginId);
+  const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+}
+
+async function writeBotPluginBinding(pluginId: string, larkAppId: string, enabled: boolean): Promise<boolean> {
+  try { loadBotConfigs(); } catch { return false; }
+  const path = requireConfigPath();
+  const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  return withFileLock(path, async () => {
+    const raw = await readRawConfig(path);
+    const index = findEntryIndex(raw, larkAppId);
+    if (index < 0) return false;
+    const entry = raw[index];
+    const current = Object.prototype.hasOwnProperty.call(entry, 'plugins') ? entry.plugins : undefined;
+    const effective = resolveEffectivePluginIds(
+      { plugins: normalizePluginIdList(current) ?? [] },
+      { plugins: defaults },
+    );
+    assertPluginBindingTransition(pluginId, enabled, effective);
+    if (enabled) materializePlugin(pluginId);
+    const next = updateBotPluginOverride(current, pluginId, enabled);
+    if (next.length > 0) entry.plugins = next;
+    else delete entry.plugins;
+    await writeRawConfigAtomic(path, raw);
+    return true;
+  });
+}
+
+function pluginJson(res: ServerResponse, status: number, body: unknown): true {
+  jsonRes(res, status, body);
+  return true;
+}
+
+async function handlePluginManagementApi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+): Promise<boolean> {
+  if (req.method === 'GET' && url.pathname === '/api/plugins') {
+    return pluginJson(res, 200, await listDashboardPluginsPayload());
+  }
+
+  let match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/pin$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const record = requireInstalledPlugin(pluginId);
+    if (!record) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    if (dashboardEntriesForRecord(record).length === 0) {
+      return pluginJson(res, 409, { ok: false, error: 'plugin_dashboard_not_found' });
+    }
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const pinned = pluginPinnedPatch(body);
+    if (pinned === null) return pluginJson(res, 400, { ok: false, error: 'invalid_pinned' });
+    writeDashboardPluginPin(pluginId, pinned);
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/global$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const enabled = pluginEnabledPatch(body);
+    if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    try {
+      writeGlobalPluginBinding(pluginId, enabled);
+    } catch (error) {
+      const message = describePluginDependencyError(error);
+      if (message) return pluginJson(res, 409, { ok: false, error: message });
+      throw error;
+    }
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/bots\/([^/]+)$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const larkAppId = decodeURIComponent(match[2]);
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const enabled = pluginEnabledPatch(body);
+    if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    if ((normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)) {
+      return pluginJson(res, 409, {
+        ok: false,
+        error: `插件 ${pluginId} 已全局启用；请先关闭全局启用，再按 Bot 配置。`,
+      });
+    }
+    try {
+      if (!await writeBotPluginBinding(pluginId, larkAppId, enabled)) {
+        return pluginJson(res, 404, { ok: false, error: 'bot_not_found' });
+      }
+    } catch (error) {
+      const message = describePluginDependencyError(error);
+      if (message) return pluginJson(res, 409, { ok: false, error: message });
+      throw error;
+    }
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/services\/(start|stop|restart)$/);
+  if (match) {
+    if (req.method !== 'POST') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const action = match[2];
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    const reports = action === 'start'
+      ? await startPluginServices([pluginId])
+      : action === 'restart'
+        ? [...await stopPluginServices([pluginId]), ...await startPluginServices([pluginId])]
+        : await stopPluginServices([pluginId]);
+    return pluginJson(res, 200, { ok: true, reports, ...(await listDashboardPluginsPayload()) });
+  }
+
+  return false;
 }
 
 // ─── HTTP routing ────────────────────────────────────────────────────────────
@@ -1461,39 +1785,45 @@ function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: Skill
   current.direct ||= ref.direct;
 }
 
-async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
-  const refs = new Map<string, SkillReferenceBot>();
+async function dashboardSkillReferencesMany(skillNames: readonly string[]): Promise<Map<string, SkillReferenceSummary>> {
+  const uniqueNames = [...new Set(skillNames)];
+  const refsBySkill = new Map(uniqueNames.map(name => [name, new Map<string, SkillReferenceBot>()]));
   try {
-    for (const ref of analyzeSkillReferences(skillName, {
-      bots: loadBotConfigs(),
-    }).bots) mergeSkillReferenceBot(refs, ref);
+    const configuredBots = loadBotConfigs();
+    for (const name of uniqueNames) {
+      const refs = refsBySkill.get(name)!;
+      for (const ref of analyzeSkillReferences(name, { bots: configuredBots }).bots) mergeSkillReferenceBot(refs, ref);
+    }
   } catch {
     // Fall back to online daemon data below when the dashboard process cannot
     // read persistent bot config.
   }
 
   const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
-  const onlineRefs = await Promise.all(onlineBots.map(async d => {
+  const onlineConfigs = await Promise.all(onlineBots.map(async d => {
     try {
       const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`, {
         signal: AbortSignal.timeout(1_500),
       });
       if (!r.ok) return null;
       const j = await r.json() as any;
-      const [ref] = analyzeSkillReferences(skillName, {
-        bots: [{ larkAppId: d.larkAppId, botName: d.botName ?? j.botName ?? d.larkAppId, skills: j.skills as BotSkillPolicy | null | undefined }],
-      }).bots;
-      return ref ?? null;
+      return { larkAppId: d.larkAppId, botName: d.botName ?? j.botName ?? d.larkAppId, skills: j.skills as BotSkillPolicy | null | undefined };
     } catch {
       return null;
     }
   }));
-  for (const ref of onlineRefs) {
-    if (ref) mergeSkillReferenceBot(refs, ref);
+  const availableOnlineConfigs = onlineConfigs.filter(config => config !== null);
+  for (const name of uniqueNames) {
+    const refs = refsBySkill.get(name)!;
+    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs }).bots) mergeSkillReferenceBot(refs, ref);
   }
-  return {
+  return new Map([...refsBySkill].map(([name, refs]) => [name, {
     bots: [...refs.values()].sort((a, b) => a.botName.localeCompare(b.botName)),
-  };
+  }]));
+}
+
+async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
+  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [] };
 }
 
 /** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
@@ -1686,6 +2016,20 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if ((url.pathname === '/api/plugins' || url.pathname.startsWith('/api/plugins/'))
+      && await handlePluginManagementApi(req, res, url)) {
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/plugins/dashboard') {
+      return jsonRes(res, 200, { plugins: listDashboardPluginEntries() });
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/plugins/')) {
+      if (servePluginStatic(res, url.pathname)) return;
+      res.writeHead(404); res.end(); return;
+    }
+
     // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
     if (
       (req.method === 'GET' || req.method === 'HEAD') &&
@@ -1865,7 +2209,18 @@ const server = createServer(async (req, res) => {
         if ('feishuLoginQr' in result && result.feishuLoginQr) body.feishuLoginQr = result.feishuLoginQr;
         return jsonRes(res, 400, body);
       }
-      return jsonRes(res, 200, { ok: true, settings: result.settings });
+      // Opt-in TraeX herdr plugin: when this write enabled it (with a spec),
+      // install right away instead of waiting for the next daemon restart, and
+      // echo the outcome back so the SPA can toast success/failure. No-op for
+      // any settings write that didn't touch herdrTraexPlugin (or left it off /
+      // spec-less). Runs in-daemon (herdr on PATH here); never throws.
+      const herdrTraexInstall = await maybeInstallTraexPluginOnSettingsChange(
+        typeof parsed === 'object' && parsed !== null && 'herdrTraexPlugin' in parsed,
+        result.settings.herdrTraexPlugin,
+      );
+      return jsonRes(res, 200, herdrTraexInstall
+        ? { ok: true, settings: result.settings, herdrTraexInstall }
+        : { ok: true, settings: result.settings });
     }
 
     // ─── Version & manual update ─────────────────────────────────────────────
@@ -1883,10 +2238,22 @@ const server = createServer(async (req, res) => {
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
       // 2.86.0) is NOT flagged behind — exactly the canary case we want.
       const latest = await cachedLatestVersion();
+      const cliUpdates = listCliRuntimeUpdateEntries(config.session.dataDir).map((entry) => ({
+        cliId: entry.cliId,
+        binPath: entry.binPath,
+        current: entry.current,
+        latest: entry.latest,
+        updateAvailable: entry.updateAvailable,
+        updateCommand: entry.updateCommand,
+        ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
+        lastCheckedAt: entry.lastCheckedAt,
+      }));
       return jsonRes(res, 200, {
         current,
         latest,
         behind: !!latest && isNewerVersion(latest, current),
+        cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
+        cliUpdates,
         localDevInstall: isLocalDevInstall(),
         updateSupported: installPlan !== null,
         updateManager: installPlan?.manager ?? installManager,
@@ -1979,6 +2346,41 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/skills') {
       return jsonRes(res, 200, dashboardSkillsPayload());
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/skills') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      const rawNames = Array.isArray(body.names) ? body.names : [];
+      if (rawNames.some(name => typeof name !== 'string')) return jsonRes(res, 400, { ok: false, error: 'invalid_skill_names' });
+      const names = [...new Set((rawNames as string[]).map(name => name.trim()).filter(Boolean))];
+      if (names.length === 0) return jsonRes(res, 400, { ok: false, error: 'skills_required' });
+      if (names.length > 500) return jsonRes(res, 400, { ok: false, error: 'too_many_skills' });
+      const registrySkills = readSkillRegistry().skills;
+      const missing = names.filter(name => !registrySkills[name]);
+      if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
+
+      const referencesBySkill = await dashboardSkillReferencesMany(names);
+      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
+      const affectedSkills = references
+        .filter(item => item.refs.bots.length > 0)
+        .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
+      if (body.force !== true && affectedSkills.length > 0) {
+        return jsonRes(res, 409, {
+          ok: false,
+          error: 'skills_in_use',
+          affectedSkills,
+        });
+      }
+
+      const result = removeInstalledSkills(names);
+      if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason, missing: result.missing });
+      return jsonRes(res, 200, { ok: true, removed: result.removed, affectedSkills });
     }
 
     if (req.method === 'PUT' && url.pathname === '/api/skills/global') {
@@ -2145,23 +2547,47 @@ const server = createServer(async (req, res) => {
     // 含 aiden×claude / aiden×codex 网关项——前端打开"添加机器人"表单时拉取填充下拉.
     // id 既可能是普通 cliId, 也可能是 'aiden-x-claude' 这类选择键, 由 resolveCliSelection 解析.
     if (req.method === 'GET' && url.pathname === '/api/cli-options') {
+      const webSession = await botOnboarding.sessionStatus();
       return jsonRes(res, 200, {
-        options: CLI_SELECT_OPTIONS.map((o) => ({
-          id: o.key,
-          label: o.label,
-          // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
-          ...(isTtadkWrapper(o.wrapperCli)
-            ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
-            : {}),
-        })),
+        options: CLI_SELECT_OPTIONS.map((o) => {
+          // Keep the all-options scan shell-free so opening the form remains
+          // instant even when most of the 20+ CLIs are absent. The selected
+          // option is checked again with shell/rc resolution on submit/save.
+          const availability = checkCliAvailability({
+            cliId: o.cliId,
+            wrapperCli: o.wrapperCli,
+          }, { shellFallback: false });
+          return {
+            id: o.key,
+            label: o.label,
+            available: availability.available,
+            command: availability.command,
+            availabilityReason: availability.reason,
+            // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
+            ...(isTtadkWrapper(o.wrapperCli)
+              ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
+              : {}),
+          };
+        }),
         // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
+        suggestedAppName: botOnboarding.suggestedAppName(),
+        webSession,
       });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
-      let parsed: { cliId?: unknown; workingDir?: unknown; dirMode?: unknown; model?: unknown };
+      let parsed: {
+        appName?: unknown;
+        registrationMode?: unknown;
+        sessionMode?: unknown;
+        expectedIdentity?: unknown;
+        cliId?: unknown;
+        workingDir?: unknown;
+        dirMode?: unknown;
+        model?: unknown;
+      };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -2172,7 +2598,7 @@ const server = createServer(async (req, res) => {
       }
       // CLI: 把下拉传来的选择键 (普通 cliId 或 aiden-x-claude/codex) 解析成
       // { cliId, wrapperCli }——空 → 默认 claude-code; 非法键 → 400.
-      let cliId: CliId | undefined;
+      let cliId: CliId;
       let wrapperCli: string | undefined;
       try {
         const key = typeof parsed.cliId === 'string' && parsed.cliId.trim() ? parsed.cliId.trim() : 'claude-code';
@@ -2181,6 +2607,15 @@ const server = createServer(async (req, res) => {
         wrapperCli = sel.wrapperCli;
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
+      }
+      const availability = checkCliAvailability({ cliId, wrapperCli });
+      if (!availability.available) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'cli_not_found',
+          command: availability.command,
+          message: `所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 dashboard 所在机器安装后重试。`,
+        });
       }
       // 工作目录: 留空 → '~'; 在 daemon 主机上校验目录确实存在 (对齐 setup 的
       // ensureBotWorkingDirsExist). 失败 fail-fast, 让用户在扫码前就改对.
@@ -2199,7 +2634,40 @@ const server = createServer(async (req, res) => {
       }
       const dirMode = dirModeRaw === 'fixed' ? 'fixed' as const : dirModeRaw === 'card' ? 'card' as const : undefined;
       const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : undefined;
-      const job = botOnboarding.start({ cliId, wrapperCli, workingDir, dirMode, model });
+      const appName = typeof parsed.appName === 'string' && parsed.appName.trim() ? parsed.appName.trim() : undefined;
+      if (appName && Array.from(appName).length > 64) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
+      }
+      const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
+      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
+      }
+      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
+      if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });
+      }
+      const identityRecord = parsed.expectedIdentity && typeof parsed.expectedIdentity === 'object' && !Array.isArray(parsed.expectedIdentity)
+        ? parsed.expectedIdentity as Record<string, unknown>
+        : {};
+      const expectedIdentity = typeof identityRecord.userId === 'string' && identityRecord.userId
+        && typeof identityRecord.tenantId === 'string' && identityRecord.tenantId
+        ? { userId: identityRecord.userId, tenantId: identityRecord.tenantId }
+        : undefined;
+      if (registrationMode === 'web' && sessionModeRaw === 'reuse' && !expectedIdentity) {
+        return jsonRes(res, 400, { ok: false, error: 'missing_expected_identity', message: '免扫码添加前必须确认当前账号与企业' });
+      }
+      const sessionMode = sessionModeRaw === 'reuse' ? 'reuse' as const : 'qr' as const;
+      const job = botOnboarding.start({
+        appName,
+        registrationMode,
+        ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
+        cliId,
+        wrapperCli,
+        workingDir,
+        dirMode,
+        model,
+      });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
     let mOwner: RegExpMatchArray | null;
@@ -2832,6 +3300,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/riff — proxy to that bot's daemon. Body
+    // `{ riff: string }` (raw JSON text; '' = clear).
+    let mBotRiff: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotRiff = url.pathname.match(/^\/api\/bots\/([^/]+)\/riff$/))) {
+      const appId = decodeURIComponent(mBotRiff[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/sandbox — proxy to that bot's daemon. Body `{ enabled: boolean }`.
     let mBotSandbox: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotSandbox = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox$/))) {
@@ -2840,6 +3326,41 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-sandbox`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/read-isolation — proxy to that bot's daemon. Body `{ enabled: boolean }`.
+    let mBotReadIso: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotReadIso = url.pathname.match(/^\/api\/bots\/([^/]+)\/read-isolation$/))) {
+      const appId = decodeURIComponent(mBotReadIso[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/backend-type — proxy to that bot's daemon. Body
+    // `{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'' }` ('' / 'auto' clears the override).
+    let mBotBackendType: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotBackendType = url.pathname.match(/^\/api\/bots\/([^/]+)\/backend-type$/))) {
+      const appId = decodeURIComponent(mBotBackendType[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-backend-type`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
