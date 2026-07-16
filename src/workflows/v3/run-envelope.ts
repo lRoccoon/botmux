@@ -318,20 +318,38 @@ export type ReadRunEnvelopeResult =
  *
  * Only a true ENOENT is `missing`. An existing path that is a symlink, FIFO,
  * directory, device, or otherwise non-regular file is always `invalid` — even
- * when a dangling symlink would make existsSync/stat follow-and-miss. Reads use
- * O_NOFOLLOW + fstat so a TOCTOU swap cannot turn a checked regular file into
- * an out-of-tree symlink.
+ * when a dangling symlink would make existsSync/stat follow-and-miss. The type
+ * check runs on lstat BEFORE any open: a plain open(2) on a writerless FIFO
+ * blocks forever, and this reader sits on daemon-side integrity paths. The
+ * open then uses O_NOFOLLOW + O_NONBLOCK and re-confirms via fstat dev+ino so
+ * a lstat→open TOCTOU swap can neither block nor substitute another file.
  */
 export function readRunEnvelope(runDir: string, expectedRunId: string = basename(runDir)): ReadRunEnvelopeResult {
   const path = join(runDir, V3_RUN_ENVELOPE_FILE);
   let fd: number | undefined;
   let bytes: Buffer;
   try {
-    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    // lstat first — never open an unverified path: open(O_RDONLY) on a FIFO
+    // with no writer blocks indefinitely regardless of O_NOFOLLOW.
+    const linkStat = lstatSync(path);
+    if (!linkStat.isFile()) {
+      return {
+        kind: 'invalid',
+        path,
+        problems: ['run.json must be a regular file'],
+      };
+    }
+    // O_NONBLOCK makes an open on a race-swapped FIFO return immediately
+    // instead of blocking (it is a no-op for regular files); O_NOFOLLOW
+    // rejects a swap to a symlink.
+    fd = openSync(
+      path,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    );
     const st = fstatSync(fd);
-    // Reject symlinks (O_NOFOLLOW already fails open on Linux with ELOOP),
-    // directories, FIFOs, devices, and anything else that is not a plain file.
-    if (!st.isFile()) {
+    // Re-confirm on the open fd and pin the inode identity: anything that is
+    // not the exact regular file lstat approved fails closed.
+    if (!st.isFile() || st.dev !== linkStat.dev || st.ino !== linkStat.ino) {
       return {
         kind: 'invalid',
         path,
@@ -413,7 +431,44 @@ function readRegularArtifact(runDir: string, path: V3RunArtifactPath): Buffer {
       path,
     );
   }
-  return readFileSync(absolutePath);
+  // Same TOCTOU discipline as readRunEnvelope: O_NONBLOCK so a race-swapped
+  // FIFO cannot block the open, O_NOFOLLOW against symlink swaps, then fstat
+  // dev+ino must match the inode lstat approved.
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      absolutePath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    );
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.dev !== stat.dev || st.ino !== stat.ino) {
+      throw new RunEnvelopeIntegrityError(
+        'artifact_not_regular_file',
+        `v3 run artifact ${path} must be a regular file`,
+        path,
+      );
+    }
+    return readFileSync(fd);
+  } catch (err) {
+    if (err instanceof RunEnvelopeIntegrityError) throw err;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      throw new RunEnvelopeIntegrityError(
+        'artifact_missing',
+        `v3 run artifact ${path} is missing: ${err instanceof Error ? err.message : String(err)}`,
+        path,
+      );
+    }
+    throw new RunEnvelopeIntegrityError(
+      'artifact_not_regular_file',
+      `v3 run artifact ${path} must be a regular file (${code ?? String(err)})`,
+      path,
+    );
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+  }
 }
 
 /** Build an exact-byte artifact ref for an already-materialized run file. */

@@ -11,6 +11,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import {
   RunEnvelopeConflictError,
@@ -358,6 +359,48 @@ describe('v3 run envelope — create-once publication + read states', () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  it.runIf(process.platform !== 'win32')(
+    'returns invalid immediately for a writerless FIFO run.json instead of blocking',
+    () => {
+      const { base, runDir } = freshRun();
+      try {
+        const envelopePath = join(runDir, V3_RUN_ENVELOPE_FILE);
+        execFileSync('mkfifo', [envelopePath]);
+        // Before the lstat-first fix, open(O_RDONLY) on a writerless FIFO
+        // blocked forever and this test would hit the suite timeout.
+        const startedAt = Date.now();
+        const read = readRunEnvelope(runDir);
+        expect(Date.now() - startedAt).toBeLessThan(1000);
+        expect(read.kind).toBe('invalid');
+        if (read.kind === 'invalid') {
+          expect(read.problems.join(' ')).toMatch(/regular file/i);
+        }
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'fails artifact verification immediately for a writerless FIFO artifact instead of blocking',
+    () => {
+      const { base, runDir, runId } = freshRun();
+      try {
+        const envelope = adHocEnvelope(runDir, runId);
+        publishRunEnvelopeOnce(runDir, envelope);
+        rmSync(join(runDir, 'dag.json'), { force: true });
+        execFileSync('mkfifo', [join(runDir, 'dag.json')]);
+        const startedAt = Date.now();
+        expect(() => loadAuthorizedV3Run(runDir)).toThrowError(expect.objectContaining({
+          code: 'artifact_not_regular_file',
+        }));
+        expect(Date.now() - startedAt).toBeLessThan(1000);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('publishes once, accepts an exact semantic retry, and leaves no temp file', () => {
     const { base, runDir, runId } = freshRun();
