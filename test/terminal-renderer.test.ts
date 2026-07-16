@@ -100,3 +100,23 @@ describe('TerminalRenderer width matches source pane', () => {
     r.dispose();
   });
 });
+
+describe('TerminalRenderer cursor composer evidence', () => {
+  it('returns only the rendered cells to the left of the cursor', async () => {
+    const r = new TerminalRenderer(80, 5);
+    await writeAndFlush(r, '│ ❯ ');
+    expect(r.cursorLinePrefix()).toBe('│ ❯ ');
+
+    await writeAndFlush(r, '/rename retained');
+    expect(r.cursorLinePrefix()).toContain('/rename retained');
+    r.dispose();
+  });
+
+  it('excludes placeholder text rendered after a saved empty-composer cursor', async () => {
+    const r = new TerminalRenderer(80, 5);
+    await writeAndFlush(r, '› \x1b[sAsk anything\x1b[u');
+    expect(r.cursorLinePrefix()).toBe('› ');
+    expect(r.rawSnapshot()).toContain('Ask anything');
+    r.dispose();
+  });
+});

@@ -6,9 +6,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // transiently disappears and comes back.
 const calls: string[][] = [];
 let listPanesResult: () => string = () => JSON.stringify([{ id: 2, is_plugin: false }]);
+let failingAction: string | null = null;
 vi.mock('node:child_process', () => ({
   execFileSync: (bin: string, args: string[]) => {
     calls.push([bin, ...args]);
+    if (failingAction && args.includes('action') && args.includes(failingAction)) {
+      throw new Error(`${failingAction} failed`);
+    }
     if (args.includes('dump-screen')) return 'line one\nline two\nline three\n';
     if (args.includes('list-panes')) return listPanesResult();
     return '';
@@ -26,6 +30,7 @@ describe('ZellijObserveBackend input encoding', () => {
   let be: ZellijObserveBackend;
   beforeEach(() => {
     calls.length = 0;
+    failingAction = null;
     be = new ZellijObserveBackend(S, P, { cliPid: 999 });
   });
 
@@ -42,6 +47,13 @@ describe('ZellijObserveBackend input encoding', () => {
   it('sendSpecialKeys(C-c) → action write with ETX byte (3)', () => {
     be.sendSpecialKeys('C-c');
     expect(actionArgs('write')).toEqual(['write', '--pane-id', P, '3']);
+  });
+
+  it('returns false when a targeted action fails', () => {
+    failingAction = 'write-chars';
+    expect(be.sendText('hello')).toBe(false);
+    failingAction = 'write';
+    expect(be.sendSpecialKeys('Enter')).toBe(false);
   });
 
   it('pasteText wraps text in bracketed-paste markers', () => {

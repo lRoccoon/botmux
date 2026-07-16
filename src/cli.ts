@@ -6871,6 +6871,7 @@ async function cmdSessionReady(): Promise<void> {
 
   const sessionId = process.env.BOTMUX_SESSION_ID;
   const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+  const generation = process.env.BOTMUX_READY_GENERATION;
   // env 缺失 → adopt / 非 botmux 会话；就绪门控对它们不适用，静默放行。
   if (!sessionId || !larkAppId) process.exit(0);
 
@@ -6880,7 +6881,7 @@ async function cmdSessionReady(): Promise<void> {
       await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/session-ready`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId, source }),
+        body: JSON.stringify({ sessionId, source, generation }),
       });
     } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
   }

@@ -41,7 +41,7 @@ export interface SpawnOpts {
 
 export interface SessionBackend {
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
-  write(data: string): void;
+  write(data: string): void | boolean;
   resize(cols: number, rows: number): void;
   onData(cb: (data: string) => void): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;

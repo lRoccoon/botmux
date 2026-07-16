@@ -2903,7 +2903,7 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
 // 选择器吞首条消息）。找不到会话 / worker 仍返回 200（best-effort）：worker 侧
 // 有超时兜底，信号丢失不致命，没必要让 hook 客户端报错。
 ipcRoute('POST', '/api/session-ready', async (req, res) => {
-  let raw: { sessionId?: unknown; source?: unknown };
+  let raw: { sessionId?: unknown; source?: unknown; generation?: unknown };
   try {
     raw = await readJsonBody(req);
   } catch {
@@ -2912,6 +2912,7 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
   if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
   const source = typeof raw.source === 'string' ? raw.source : undefined;
+  const generation = typeof raw.generation === 'string' ? raw.generation : undefined;
 
   let ds: DaemonSession | undefined;
   for (const s of activeSessions.values()) {
@@ -2919,7 +2920,7 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   }
   if (ds?.worker) {
     try {
-      ds.worker.send({ type: 'session_ready', source } as DaemonToWorker);
+      ds.worker.send({ type: 'session_ready', source, generation } as DaemonToWorker);
       logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
       logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);

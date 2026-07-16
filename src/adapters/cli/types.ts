@@ -1,7 +1,7 @@
 import type { CodexAppTurnInput } from '../../types.js';
 
 export interface PtyHandle {
-  write(data: string): void;
+  write(data: string): void | boolean;
   /** Send text literally via tmux send-keys -l (tmux mode only).
    *  Returns `false` when the write was dropped (e.g. send-keys failed while the
    *  pane is still alive) so callers can surface a non-submission; `void`/`true`
@@ -412,6 +412,18 @@ export interface CliAdapter {
    *  by the daemon. Undefined means this adapter has no proven native rename
    *  command and must never receive a best-guess slash command. */
   buildSessionRenameCommand?(title: string): string;
+
+  /** Native slash commands that rotate this CLI onto a new session when they
+   *  are forwarded by Botmux. The worker only uses this explicit capability
+   *  to re-apply an in-memory desired title within the same worker lifecycle;
+   *  it does not observe terminal-local rotations or replay across restarts. */
+  readonly nativeSessionRotationCommands?: readonly string[];
+
+  /** Match the rendered text to the left of the terminal cursor when the
+   *  native composer is empty. Native admin commands use this stronger proof
+   *  before releasing queued input; a broad readyPattern alone may also match
+   *  command echoes or pickers. */
+  readonly nativeSessionEmptyComposerPattern?: RegExp;
 }
 
 export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli' | 'riff';

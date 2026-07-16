@@ -33,7 +33,7 @@ describe('worker raw_input handler', () => {
   const region = caseRegion(workerSrc, "case 'raw_input':");
 
   it('keeps busy delivery but defers commands while native rename owns the TUI', () => {
-    expect(region).toContain('if (sessionRenameInFlight)');
+    expect(region).toContain('|| pendingRawInputs.length > 0');
     expect(region).toContain('pendingRawInputs.push(msg)');
     expect(region).toContain('await deliverRawInput(msg)');
     expect(region).not.toContain('sendRawCommandLine(');
@@ -41,7 +41,7 @@ describe('worker raw_input handler', () => {
 });
 
 describe('worker raw_input delivery', () => {
-  const region = caseRegion(workerSrc, 'async function deliverRawInput', 2600);
+  const region = caseRegion(workerSrc, 'async function deliverRawInput', 3200);
 
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
     const sendIdx = region.indexOf('await sendRawCommandLineSerially(targetBackend, msg.content)');
@@ -61,22 +61,38 @@ describe('worker raw_input delivery', () => {
     expect(region).not.toContain('if (!isPromptReady)');
     expect(region).not.toContain('if (isPromptReady)');
   });
+
+  it('re-queues a zero-byte command in original IPC arrival order and wakes the queue', () => {
+    expect(region).toContain('err instanceof CommandLineWriteError && !err.mayHavePartialInput');
+    expect(region).toContain('requeueRawInputInArrivalOrder(msg)');
+    const requeueIdx = region.indexOf('requeueRawInputInArrivalOrder(msg)');
+    const wakeIdx = region.indexOf('void flushPending()', requeueIdx);
+    expect(wakeIdx).toBeGreaterThan(requeueIdx);
+
+    const ordered = caseRegion(workerSrc, 'function requeueRawInputInArrivalOrder', 1000);
+    expect(ordered).toContain('rawInputArrivalOrder.get(msg)');
+    expect(ordered).toContain('pendingRawInputs.findIndex');
+    expect(ordered).toContain('pendingRawInputs.splice(insertionIndex, 0, msg)');
+    expect(caseRegion(workerSrc, "case 'raw_input':")).toContain('rememberRawInputArrival(msg)');
+  });
 });
 
 describe('worker command-line write mutex', () => {
-  const serialized = caseRegion(workerSrc, 'async function sendRawCommandLineSerially', 1200);
+  const serialized = caseRegion(workerSrc, 'async function runCommandLineWriteSerially', 1200);
 
   it('serializes concurrent raw command keystrokes without waiting for turn idle', () => {
     expect(serialized).toContain('const previous = commandLineWriteTail');
     expect(serialized).toContain('commandLineWritesPending += 1');
     expect(serialized).toContain('await previous');
-    expect(serialized).toContain('await sendRawCommandLine(be, content)');
+    expect(serialized).toContain('return await write()');
     expect(serialized).toContain('release()');
+    expect(serialized).not.toContain('void flushPending()');
+    expect(serialized).toContain('runCommandLineWriteSerially(() => sendRawCommandLine(be, content))');
   });
 });
 
 describe('worker sendRawCommandLine helper', () => {
-  const helper = caseRegion(workerSrc, 'async function sendRawCommandLine', 2200);
+  const helper = caseRegion(workerSrc, 'async function sendRawCommandLine', 3200);
 
   it('generic CLIs: literal text → 200ms beat → Enter in order (slash-picker safe)', () => {
     const textIdx = helper.indexOf('sendText(content)');
@@ -87,6 +103,12 @@ describe('worker sendRawCommandLine helper', () => {
     const enterIdx = helper.indexOf("sendSpecialKeys('Enter')", beatIdx);
     expect(beatIdx).toBeGreaterThan(textIdx);
     expect(enterIdx).toBeGreaterThan(beatIdx);
+  });
+
+  it('refuses to finish a delayed write against a replaced backend', () => {
+    expect(helper).toContain("new CommandLineWriteError('command target backend is unavailable', mayHavePartialInput)");
+    expect(helper).toContain('new CommandLineWriteError(`${operation} was rejected by the backend`, mayHavePartialInput)');
+    expect(helper).toContain('assertCurrentBackend()');
   });
 
   it('CoCo: types char-by-char (throttled) before a single Enter (paste-coalescing safe)', () => {

@@ -329,8 +329,10 @@ export class TmuxBackend implements SessionBackend {
    *  file's cwd field so a recycled PID can't mislead the resolver. */
   cliCwd?: string;
 
-  write(data: string): void {
-    this.process?.write(data);
+  write(data: string): boolean {
+    if (!this.process) return false;
+    this.process.write(data);
+    return true;
   }
 
   /**
@@ -586,6 +588,7 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_LARK_APP_ID',
   'BOTMUX_ROOT_MESSAGE_ID',
   'BOTMUX_TURN_ID',
+  'BOTMUX_READY_GENERATION',
   // Experimental Lark chat bot discovery. The daemon injects a canonical
   // true/false value so `botmux bots list` inside long-lived panes matches the
   // daemon's `<available_bots>` behavior instead of reading stale rcfile/tmux env.

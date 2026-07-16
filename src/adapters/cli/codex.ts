@@ -298,6 +298,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /›(?!\s*\d+\.)|\d+% left/,
     defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
+    nativeSessionRotationCommands: ['/clear', '/new'],
+    nativeSessionEmptyComposerPattern: /^\s*›\s*$/,
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:
     // it parks it ("Messages to be submitted after next tool call") via an

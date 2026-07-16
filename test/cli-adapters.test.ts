@@ -1533,14 +1533,29 @@ describe('buildResumeCommand', () => {
 
 describe('native session rename capability', () => {
   it('is declared only by the verified Codex and Claude Code adapters', () => {
-    expect(createCodexAdapter('/bin/codex').buildSessionRenameCommand?.('新的标题'))
+    const codex = createCodexAdapter('/bin/codex');
+    const claudeCode = createClaudeCodeAdapter('/bin/claude');
+    expect(codex.buildSessionRenameCommand?.('新的标题'))
       .toBe('/rename 新的标题');
-    expect(createClaudeCodeAdapter('/bin/claude').buildSessionRenameCommand?.('new title'))
+    expect(claudeCode.buildSessionRenameCommand?.('new title'))
       .toBe('/rename new title');
+    expect(codex.nativeSessionRotationCommands).toEqual(['/clear', '/new']);
+    expect(claudeCode.nativeSessionRotationCommands).toEqual(['/clear']);
+    expect(codex.nativeSessionEmptyComposerPattern?.test('  › ')).toBe(true);
+    expect(codex.nativeSessionEmptyComposerPattern?.test('› /rename title')).toBe(false);
+    expect(claudeCode.nativeSessionEmptyComposerPattern?.test('  ❯ ')).toBe(true);
+    expect(claudeCode.nativeSessionEmptyComposerPattern?.test('❯ /clear')).toBe(false);
 
-    expect(createCliAdapterSync('seed', '/bin/true').buildSessionRenameCommand).toBeUndefined();
-    expect(createCodexAppAdapter('/bin/codex').buildSessionRenameCommand).toBeUndefined();
-    expect(createCocoAdapter('/bin/coco').buildSessionRenameCommand).toBeUndefined();
+    const unsupported = [
+      createCliAdapterSync('seed', '/bin/true'),
+      createCodexAppAdapter('/bin/codex'),
+      createCocoAdapter('/bin/coco'),
+    ];
+    for (const adapter of unsupported) {
+      expect(adapter.buildSessionRenameCommand).toBeUndefined();
+      expect(adapter.nativeSessionRotationCommands).toBeUndefined();
+      expect(adapter.nativeSessionEmptyComposerPattern).toBeUndefined();
+    }
   });
 });
 

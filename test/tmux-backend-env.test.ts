@@ -107,9 +107,11 @@ describe('buildBotmuxEnvAssignments()', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
       BOTMUX_READY_COMMAND: '"/usr/local/bin/node" "/opt/botmux/dist/cli.js" session-ready',
+      BOTMUX_READY_GENERATION: 'worker-2-token',
       PATH: '/usr/bin',
     });
     expect(out).toContain('BOTMUX_READY_COMMAND="/usr/local/bin/node" "/opt/botmux/dist/cli.js" session-ready');
+    expect(out).toContain('BOTMUX_READY_GENERATION=worker-2-token');
     expect(out).not.toContain('PATH=/usr/bin');
   });
 

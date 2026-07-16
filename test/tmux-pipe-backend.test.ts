@@ -663,7 +663,7 @@ describe('TmuxPipeBackend send failure handling', () => {
     // …and the liveness probe (execSync display-message) also fails ⇒ pane GONE.
     mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
 
-    expect(() => be.sendSpecialKeys('Enter')).not.toThrow();
+    expect(be.sendSpecialKeys('Enter')).toBe(false);
     expect(exits).toEqual([[1, null]]);
   });
 
@@ -680,7 +680,7 @@ describe('TmuxPipeBackend send failure handling', () => {
     });
     // Liveness probe succeeds ⇒ pane ALIVE ⇒ transient error, just dropped.
 
-    expect(() => be.sendText('hi')).not.toThrow();
+    expect(be.sendText('hi')).toBe(false);
     expect(exits).toEqual([]);
   });
 
@@ -698,7 +698,7 @@ describe('TmuxPipeBackend send failure handling', () => {
       return '' as any;
     });
 
-    expect(() => be.sendText('hi')).not.toThrow();
+    expect(be.sendText('hi')).toBe(false);
     expect(exits).toEqual([]);
   });
 
@@ -784,8 +784,8 @@ describe('TmuxPipeBackend.kill', () => {
     be.spawn('', [], spawnOpts());
     be.kill();
     mockedExecFileSync.mockClear();
-    be.sendText('after-kill');
-    be.sendSpecialKeys('Enter');
+    expect(be.sendText('after-kill')).toBe(false);
+    expect(be.sendSpecialKeys('Enter')).toBe(false);
     expect(mockedExecFileSync).not.toHaveBeenCalled();
   });
 });

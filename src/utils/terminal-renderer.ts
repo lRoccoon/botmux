@@ -104,6 +104,15 @@ export class TerminalRenderer {
     return this.readViewport(false);
   }
 
+  /** Text rendered to the left of the active terminal cursor on its row.
+   * Native administrative commands use this to distinguish an empty composer
+   * cursor from a prompt-shaped command echo or picker row. */
+  cursorLinePrefix(): string | null {
+    const buffer = this.terminal.buffer.active;
+    const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+    return line?.translateToString(false, 0, buffer.cursorX) ?? null;
+  }
+
   private readViewport(filter: boolean): string {
     return readViewportText(this.terminal, { filter });
   }

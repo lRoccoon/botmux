@@ -842,6 +842,8 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     buildSessionRenameCommand: variant.id === 'claude-code'
       ? (title) => `/rename ${title}`
       : undefined,
+    nativeSessionRotationCommands: variant.id === 'claude-code' ? ['/clear'] : undefined,
+    nativeSessionEmptyComposerPattern: variant.id === 'claude-code' ? /^\s*❯\s*$/ : undefined,
     systemHints: [],
     altScreen: false,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT

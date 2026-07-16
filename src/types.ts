@@ -410,7 +410,7 @@ export type DaemonToWorker =
   // Claude-family「真就绪」信号：CLI 的 SessionStart hook 经 `botmux session-ready`
   // 调到 daemon，daemon 转发给本会话 worker，放行被 ready-gate 门控的首条 prompt
   // （绕开 cjadk 启动选择器吞首条消息）。source = SessionStart 的 startup/resume/… 。
-  | { type: 'session_ready'; source?: string };
+  | { type: 'session_ready'; source?: string; generation?: string };
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
