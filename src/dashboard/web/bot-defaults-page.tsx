@@ -89,8 +89,10 @@ function DropdownField<T extends string>(props: {
   disabled?: boolean;
   ariaLabel?: string;
   className?: string;
+  searchable?: boolean;
   onChange(value: T): void;
 }) {
+  const tr = useT();
   return (
     <>
       <DropdownMenu
@@ -101,6 +103,9 @@ function DropdownField<T extends string>(props: {
         label={dropdownLabel(props.options, props.value)}
         value={props.value}
         options={props.options}
+        searchable={props.searchable}
+        searchPlaceholder={props.searchable ? tr('common.dropdownSearch') : undefined}
+        searchEmptyLabel={props.searchable ? tr('common.dropdownSearchEmpty') : undefined}
         onChange={props.onChange}
       />
       <input type="hidden" data-input={props.dataInput} value={props.value} readOnly />
@@ -892,12 +897,15 @@ export function BotAgentSection(props: {
   }
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
-  const cliOptions = cliState.options.map(option => ({
-    value: option.id,
-    label: option.available === false
-      ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
-      : `${option.label}（${option.id}）`,
-  }));
+  // 与添加机器人弹窗一致：按名称首字母排序，便于在 20+ 个 CLI 里定位。
+  const cliOptions = [...cliState.options]
+    .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+    .map(option => ({
+      value: option.id,
+      label: option.available === false
+        ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
+        : `${option.label}（${option.id}）`,
+    }));
   const dynamicSkillOptions = [
     { value: 'dynamic', label: tr('botDefaults.skillInjectionDynamic') },
   ];
@@ -923,6 +931,7 @@ export function BotAgentSection(props: {
             value={cliKey}
             disabled={agentBusy}
             options={cliOptions}
+            searchable
             onChange={updateCli}
           />
           {option?.available === false ? (

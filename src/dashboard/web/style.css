@@ -8113,6 +8113,37 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   text-align: left;
   cursor: pointer;
 }
+/* 长列表下拉的过滤框：滚动时钉在弹层顶部（负 margin 盖住弹层 padding）。 */
+.sect-sort-pop input.sect-sort-search[type="search"] {
+  position: sticky;
+  top: -6px;
+  z-index: 1;
+  box-sizing: border-box;
+  width: calc(100% + 12px);
+  margin: -6px -6px 0;
+  height: var(--button-height) !important;
+  min-height: var(--button-height) !important;
+  max-height: var(--button-height) !important;
+  padding: 0 var(--button-padding-x) !important;
+  border: none !important;
+  border-bottom: 1px solid var(--border-soft) !important;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0 !important;
+  background: var(--surface) !important;
+  background-clip: padding-box;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  box-shadow: none;
+}
+.sect-sort-pop input.sect-sort-search[type="search"]:focus {
+  border-bottom-color: var(--accent) !important;
+}
+.sect-sort-pop .sect-sort-empty {
+  margin: 0;
+  padding: 8px var(--button-padding-x);
+  color: var(--muted);
+  font-size: 12px;
+}
 .sect-sort-pop button[aria-current="true"] {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
