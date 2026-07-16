@@ -43,6 +43,8 @@ type OnboardingJob = {
   liveStartMessage?: string;
   permission?: OnboardingPermission;
   remainingSteps?: RemainingStep[];
+  /** needs_owner 时的预填建议（创建应用所用账号的邮箱）。 */
+  suggestedOwner?: string;
   error?: string;
   message?: string;
 };
@@ -52,6 +54,9 @@ type CliOption = {
   label: string;
   gateway?: 'ttadk';
   acceptsModel?: boolean;
+  available?: boolean;
+  command?: string;
+  availabilityReason?: string;
 };
 
 type CliOptionsState = {
@@ -108,6 +113,13 @@ function defaultFormState(): OnboardingFormState {
     workingDir: '~',
     model: '',
   };
+}
+
+export function isOnboardingSubmitDisabled(
+  submitting: boolean,
+  sessionMode: 'checking' | 'reuse' | 'qr',
+): boolean {
+  return submitting || sessionMode === 'checking';
 }
 
 function caughtErrorText(error: unknown): string {
@@ -419,10 +431,15 @@ function OnboardingForm(props: {
   const dirPlaceholder = props.form.dirMode === 'card'
     ? t('botOnboarding.dirPlaceholderCard')
     : t('botOnboarding.dirPlaceholderFixed');
-  const cliOptions = props.cliState.options.map(option => ({
-    value: option.id,
-    label: option.label,
-  }));
+  // 按名称首字母排序，方便在 20+ 个 CLI 里定位；排序用原始 label（缺失告警前缀不参与）。
+  const cliOptions = [...props.cliState.options]
+    .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+    .map(option => ({
+      value: option.id,
+      label: option.available === false
+        ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
+        : option.label,
+    }));
   const dirModeOptions: Array<{ value: OnboardingFormState['dirMode']; label: string }> = [
     { value: 'fixed', label: t('botOnboarding.dirModeFixed') },
     { value: 'card', label: t('botOnboarding.dirModeCard') },
@@ -490,11 +507,18 @@ function OnboardingForm(props: {
           label={onboardingOptionLabel(cliOptions, props.form.cliId)}
           value={props.form.cliId}
           options={cliOptions}
+          searchable
+          searchPlaceholder={t('common.dropdownSearch')}
+          searchEmptyLabel={t('common.dropdownSearchEmpty')}
           onChange={cliId => {
             props.onFormChange(syncModelForCli(props.form, cliId, props.cliState));
           }}
         />
-        <small className="onboarding-field-hint">{props.form.cliId}</small>
+        {selectedCli?.available === false ? (
+          <small className="hint-warn">
+            {t('botOnboarding.cliMissingHint', { command: selectedCli.command ?? props.form.cliId })}
+          </small>
+        ) : <small className="onboarding-field-hint">{props.form.cliId}</small>}
       </div>
       <div className="onboarding-field">
         <span>{t('botOnboarding.dirModeLabel')}</span>
@@ -541,7 +565,15 @@ function OnboardingForm(props: {
       {props.error ? <p className="form-error">{props.error}</p> : null}
       <div className="actions onboarding-actions">
         <button type="button" id="ob-cancel" disabled={props.submitting} onClick={props.onClose}>{t('botOnboarding.cancel')}</button>
-        <button type="submit" className="primary onboarding-submit" disabled={props.submitting || props.sessionMode === 'checking'}>
+        <button
+          type="submit"
+          className="primary onboarding-submit"
+          // The option-list probe is intentionally PATH-only so opening the
+          // form never blocks the dashboard event loop on shell rc files. It is
+          // a useful warning, not an authoritative gate: submit runs the full
+          // shell-aware server check and returns cli_not_found when necessary.
+          disabled={isOnboardingSubmitDisabled(props.submitting, props.sessionMode)}
+        >
           {props.submitting
             ? t('botOnboarding.starting')
             : props.sessionMode === 'reuse'
@@ -580,7 +612,8 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   const applyJob = useCallback((job: OnboardingJob) => {
     setView({ kind: 'job', job });
     if (job.status === 'needs_owner') {
-      setOwnerInput('');
+      // 预填创建账号的邮箱（后端自动确认失败时给出），用户复核/修改后提交。
+      setOwnerInput(job.suggestedOwner ?? '');
       setOwnerIdInput('');
     }
     if (shouldStopPolling(job)) stopPolling();

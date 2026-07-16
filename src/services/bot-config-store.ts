@@ -77,12 +77,15 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
+  { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；chat=扁平连续会话，thread/unset 回默认（每条 DM 独立会话）' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
+  { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'riff'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜riff=远程 riff agent 服务；选 riff 时需配置 riff 字段；unset 回 pty' },
+  { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；unset 清除' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -118,6 +121,21 @@ function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
       ? (value as Record<string, unknown>) : null;
     const keys = obj ? Object.keys(obj) : [];
     return keys.length ? keys.map(k => `${k}=••••`).join(', ') : '∅';
+  }
+  // riff 配置可含 secret（jwt / env 值）。聊天可见渲染（/config get、配置卡）
+  // 与 applyConfigField 的变更日志都走本函数——结构可见、值打码。
+  if (spec.configKey === 'riff') {
+    const obj = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>) : null;
+    if (!obj || Object.keys(obj).length === 0) return '∅';
+    return Object.entries(obj).map(([k, v]) => {
+      if (k === 'jwt') return 'jwt=••••';
+      if (k === 'env') {
+        const keys = v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v as object) : [];
+        return `env={${keys.map(x => `${x}=••••`).join(', ')}}`;
+      }
+      return `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`;
+    }).join(', ');
   }
   if (spec.kind === 'json') {
     return value === undefined || value === null ? '∅' : JSON.stringify(value);

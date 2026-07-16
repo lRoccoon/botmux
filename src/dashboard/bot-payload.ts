@@ -50,6 +50,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
     disableStreamingCard: j?.disableStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
+    codexAppCleanInput: j?.codexAppCleanInput === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
@@ -79,6 +80,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     dormantSessionCount: typeof j?.dormantSessionCount === 'number' ? j.dormantSessionCount : 0,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     env: typeof j?.env === 'string' ? j.env : '',
+    riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

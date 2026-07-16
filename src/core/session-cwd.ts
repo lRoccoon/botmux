@@ -15,5 +15,9 @@ import * as sessionStore from '../services/session-store.js';
 export function repinSessionWorkingDir(ds: DaemonSession, resolvedPath: string): void {
   ds.workingDir = resolvedPath;
   ds.session.workingDir = resolvedPath;
+  // cwd 变了，riff 多仓 stamp（选择卡多选时写入）随之失效——保留会让下次
+  // refork 仍按旧仓库组合推导、无视新目录。IM /cd 与 IPC cd 路由共用本函数，
+  // 两条改 cwd 的路径都必须清。
+  ds.session.riffRepoDirs = undefined;
   sessionStore.updateSession(ds.session);
 }
