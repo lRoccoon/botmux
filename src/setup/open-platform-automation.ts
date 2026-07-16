@@ -6,6 +6,7 @@
  * create and publish a version. The official SDK registerApp device flow stays
  * available as a fallback (notably for Lark international tenants).
  */
+import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -470,34 +471,25 @@ function extractEventIdsFromDetails(value: unknown): string[] {
   return uniqueStrings(value.flatMap(group => extractEventIds(asRecord(group).items)));
 }
 
+/**
+ * 应用版本创建 payload,与 console launcher「一键创建智能体」同款极简结构
+ * (CDP 抓包确认)。⚠️不要重新加回 applyReasonConfig / isAutoAudit:false ——
+ * 那会让版本进入人工审核、发布后应用停在「未上架/未启用」(tenantAppStatus=0),
+ * 事件配置进了草稿也无法在企业内生效。visibleSuggest.members 必须含创建者,
+ * 否则同样不会自动上架启用。
+ */
 export function buildAppVersionCreatePayload(appVersion: string, visibleMemberIds: string[] = []) {
   return {
     appVersion,
     mobileDefaultAbility: 'bot',
     pcDefaultAbility: 'bot',
-    changeLog: 'Init version',
+    changeLog: 'Initial bot release.',
     visibleSuggest: {
       departments: [],
       members: visibleMemberIds,
       groups: [],
       isAll: 0,
     },
-    applyReasonConfig: {
-      apiPrivilegeNeedReason: true,
-      contactPrivilegeNeedReason: true,
-      dataPrivilegeReasonMap: {},
-      visibleScopeNeedReason: true,
-      apiPrivilegeReasonMap: {},
-      contactPrivilegeReason: '',
-      isDataPrivilegeExpandMap: {},
-      visibleScopeReason: '',
-      dataPrivilegeNeedReason: true,
-      isAutoAudit: false,
-      isContactExpand: false,
-    },
-    b2cShareSuggest: false,
-    autoPublish: false,
-    remark: 'Personal AI assistant for self use',
     blackVisibleSuggest: {
       departments: [],
       members: [],
@@ -861,6 +853,11 @@ export async function automateOpenPlatformSetup(
   try {
     await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId));
     const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
+    // 镜像应用原有 contact range 作为版本可见范围——绝不注入「当前 Web session
+    // 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 / 选择
+    // 已有应用等路径调用,那里操作者不一定是创建者/现有可见成员,注入会悄悄扩大
+    // 已有 bot 的可见范围。新建应用的「上架启用」由 createOpenPlatformAppWithClient
+    // 的首次发布(含创建者可见)完成,与本处无关。
     const visibleMemberIds = extractContactRangeMemberIds(contactRange);
     const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
     const appVersion = nextAppVersion(versionList);
@@ -1114,18 +1111,68 @@ function pickPayloadString(payload: unknown, keys: string[]): string | undefined
   return pickString(record, keys) ?? pickString(asRecord(record.data), keys);
 }
 
+/** 「一键创建智能体」(backend_oneclick launcher) 使用的应用清单模板 ID。 */
+export const ONECLICK_APP_MANIFEST_TEMPLATE_ID = 'developer_console';
+
+/**
+ * Build the payload for `POST /developers/v1/manifest/upsert_by_template` —
+ * the console launcher's one-click agent creation endpoint (CDP 抓包确认)。
+ * 该模板建出的应用开箱自带 bot 能力、长连接事件/回调模式、基础事件订阅与
+ * card.action.trigger 回调,正是「正常申请默认带的权限」。
+ */
+export function buildManifestTemplateCreatePayload(
+  name: string,
+  description: string,
+  avatar: string,
+  cid: string,
+) {
+  return {
+    appManifestTemplateID: ONECLICK_APP_MANIFEST_TEMPLATE_ID,
+    createAppUserCustomField: {
+      i18n: { zh_cn: { name, description } },
+      avatar,
+      primaryLang: 'zh_cn',
+    },
+    cid,
+    HTTPHead: {},
+  };
+}
+
+/**
+ * 模板创建是否属于服务端「明确拒绝」——即可确定应用没有建出来,允许安全
+ * 回退 app/create。业务错误码(code!==0,服务端解析请求后拒绝)与 HTTP 404
+ * (端点不存在)算明确拒绝;传输错误(ECONNRESET/timeout,非
+ * OpenPlatformApiError)、HTTP 5xx、code=0 缺 ClientID 都属「结果未知」——
+ * 服务端可能已 commit,跨端点重建会产生孤儿 + 重复应用,必须 fail-closed。
+ */
+function isDefiniteTemplateRejection(err: unknown): boolean {
+  if (!(err instanceof OpenPlatformApiError)) return false;
+  const code = (asRecord(err.payload) as { code?: unknown }).code;
+  if (typeof code === 'number' && code !== 0) return true;
+  return /^HTTP 404\b/.test(err.message);
+}
+
 /**
  * 用已经登录的开放平台 Web session 创建一个企业自建应用并读取凭证。
  *
- * 当前 console 前端（2026-07）同款链路：上传 512px botmux 图标 → app/create
- * → 只读 secret 接口。所有 Secret 只存在返回值中，不打印、不写日志。
+ * 首选 console launcher 的「一键创建智能体」模板接口
+ * (manifest/upsert_by_template):模板应用出生即带 bot 能力、长连接、基础
+ * 事件与卡片回调,新建 bot 不再依赖后续订阅补齐。模板 ID 属内部契约,被
+ * 服务端明确拒绝时自动回退旧 app/create(裸自建应用,事件/回调由
+ * automateOpenPlatformSetup 增量补齐并 fail-closed 兜底);创建结果未知时
+ * 不回退(见 isDefiniteTemplateRejection)。Secret 只存在返回值中,不打印、
+ * 不写日志。
  */
 export async function createOpenPlatformAppWithClient(
   client: OpenPlatformApiClient,
-  options: { name: string; description?: string; iconFilePath?: string },
+  // creatorUserId 必填:首次「启用发布」的版本可见范围必须含创建者,否则发布后
+  // 应用不会自动上架启用。调用方(createFeishuOpenPlatformApp)已保证 session
+  // identity 可用才会走到这里。
+  options: { name: string; description?: string; iconFilePath?: string; creatorUserId: string },
 ): Promise<{ appId: string; appSecret: string }> {
   const name = options.name.trim();
   if (!name) throw new Error('应用名称不能为空');
+  if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
   const iconFile = options.iconFilePath ?? defaultBotmuxAppIconPath();
   if (!iconFile || !existsSync(iconFile)) throw new Error('找不到 botmux 默认应用图标');
 
@@ -1140,22 +1187,60 @@ export async function createOpenPlatformAppWithClient(
   if (!avatar) throw new Error('开放平台上传图标后没有返回 url');
 
   const description = options.description?.trim() || 'AI coding assistant powered by botmux';
-  const created = await client.postJson('/developers/v1/app/create', {
-    appSceneType: 0, // SelfBuild
-    name,
-    desc: description,
-    avatar,
-    i18n: { zh_cn: { name, description } },
-    primaryLang: 'zh_cn',
-  });
-  const appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+  let appId: string | undefined;
+  try {
+    const created = await client.postJson(
+      '/developers/v1/manifest/upsert_by_template',
+      buildManifestTemplateCreatePayload(name, description, avatar, randomUUID()),
+    );
+    const templateAppId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+    if (!templateAppId?.startsWith('cli_')) {
+      // code=0 却没有 ClientID:应用可能已建成(响应结构变化),结果未知——
+      // 不能落入 fallback 再 create,让下面的 catch 按「非明确拒绝」抛出。
+      throw new Error('一键智能体模板创建返回成功但没有 ClientID(结果未知);请到开放平台确认是否已创建同名应用后重试');
+    }
+    appId = templateAppId;
+  } catch (err) {
+    if (!isDefiniteTemplateRejection(err)) throw err;
+    console.warn(`一键智能体模板创建被拒,回退普通自建应用: ${safeErrorMessage(err)}`);
+    appId = undefined;
+  }
+  if (!appId) {
+    const created = await client.postJson('/developers/v1/app/create', {
+      appSceneType: 0, // SelfBuild
+      name,
+      desc: description,
+      avatar,
+      i18n: { zh_cn: { name, description } },
+      primaryLang: 'zh_cn',
+    });
+    appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+  }
   if (!appId?.startsWith('cli_')) throw new Error('开放平台创建应用后没有返回 ClientID');
 
   try {
-    // 普通企业自建应用不像 SDK PersonalAgent 那样默认带 bot + 长连接事件能力。
-    // 这两步是“一扫即用”的必要条件，必须在返回凭证前完成。
+    // 模板应用出生已带 bot + 长连接(重复调用幂等);fallback 的裸自建应用
+    // 则必须显式开启——这两步是「一扫即用」的必要条件,在返回凭证前完成。
     await client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
     await client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 }); // WebSocket
+
+    // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
+    // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
+    // 收发消息」的应用——等价于旧 SDK registerApp 直接产出可用 PersonalAgent 的效果。
+    // 这一步 fail-closed:拿到 versionId 后 commit 失败、或 code=0 却没 versionId
+    // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示),
+    // 不宣称「后续 setup 会软兜底」——setup 的 nextAppVersion 不复用未发布草稿,
+    // 版本号可能撞车导致二次发版继续失败,应用永远停在未启用。
+    const versionCreated = await client.postJson(
+      `/developers/v1/app_version/create/${appId}`,
+      buildAppVersionCreatePayload('1.0.0', [options.creatorUserId]),
+    );
+    const enableVersionId = extractVersionId(versionCreated);
+    if (!enableVersionId) {
+      throw new Error('上架启用版本创建返回成功但没有 versionId(可能已留下未发布草稿);请到开放平台确认后重试');
+    }
+    await client.postJson(`/developers/v1/publish/commit/${appId}/${enableVersionId}`, { clientId: appId });
+
     const appSecret = await fetchOpenPlatformAppSecret(client, appId);
     return { appId, appSecret };
   } catch (err) {
@@ -1210,7 +1295,10 @@ export async function createFeishuOpenPlatformApp(
 
   try {
     await options.onSessionReady?.({ source: prepared.source, identity: clientResult.identity });
-    const credentials = await createOpenPlatformAppWithClient(clientResult.client, options);
+    const credentials = await createOpenPlatformAppWithClient(clientResult.client, {
+      ...options,
+      creatorUserId: clientResult.identity.userId,
+    });
     return {
       ok: true,
       ...credentials,
@@ -1574,17 +1662,22 @@ function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bu
 export function nextAppVersion(payload: unknown): string {
   const data = asRecord(asRecord(payload).data);
   const versions = Array.isArray(data.versions) ? data.versions : [];
-  const published = versions
-    .map(item => asRecord(item))
-    .filter(item => item.versionStatus === 2)
-    .map(item => pickString(item, ['appVersion']))
-    .filter((version): version is string => Boolean(version));
-  if (published.length === 0) return '0.0.1';
-  const latest = published[0];
-  const parts = latest.split('.').map(part => Number.parseInt(part, 10));
-  if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return '0.0.1';
-  parts[parts.length - 1] += 1;
-  return parts.join('.');
+  // 取所有版本(含未发布草稿)里的最大三段号 +1——不能只看已发布版本:若存在
+  // 未发布草稿(如上架启用失败留下的 1.0.0),只看已发布会算出 0.0.1 撞车,导致
+  // 二次发版被平台以「版本号未递增」拒掉,应用永远停在未启用。
+  const triples = versions
+    .map(item => pickString(asRecord(item), ['appVersion']))
+    .filter((version): version is string => Boolean(version))
+    .map(version => version.split('.').map(part => Number.parseInt(part, 10)))
+    .filter(parts => parts.length === 3 && parts.every(part => Number.isFinite(part)));
+  if (triples.length === 0) return '0.0.1';
+  const max = triples.reduce((a, b) => {
+    for (let i = 0; i < 3; i++) {
+      if (b[i] !== a[i]) return b[i] > a[i] ? b : a;
+    }
+    return a;
+  });
+  return [max[0], max[1], max[2] + 1].join('.');
 }
 
 function extractContactRangeMemberIds(payload: unknown): string[] {

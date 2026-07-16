@@ -4077,10 +4077,12 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
     纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
   bots list                            列出当前群聊中的机器人（含 open_id）
-  history [--limit N] [--scope session|thread|chat|ambient]
+  history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
-                                       thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文
-  quoted <message_id>                  拉取被引用的单条消息 (JSON)，message_id 取自 daemon 注入的引用提示行
+                                       thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文；
+                                       --with-card-json 为每张卡片附原始结构化 JSON（消息均带 resources 附件 key）
+  quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
+                                       --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
   ask buttons --options "a,b" "<问题>"  把选择题做成按钮卡片抛给飞书，等用户点选后返回其选择
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
   skill list                           列出本会话可用的技能（用户自定义 + botmux 内置）及其描述
@@ -4652,8 +4654,9 @@ async function cmdHistory(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
+  const withCardJson = rest.includes('--with-card-json');
   const { getMessageDetail, listAmbientChatMessages, listThreadMessages, listChatMessages } = await import('./im/lark/client.js');
-  const { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } = await import('./im/lark/message-parser.js');
+  const { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, extractResources, createImgNumberer } = await import('./im/lark/message-parser.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
   try {
     // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
@@ -4698,24 +4701,50 @@ async function cmdHistory(rest: string[]): Promise<void> {
           })
         : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
     // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
-    // path in daemon.ts. Each merge_forward gets its own numberer (we don't
-    // download resources here — only [图片 N] placeholders matter).
+    // path in daemon.ts. Each message gets its own numberer with resources
+    // assigned BEFORE text extraction, so in-body [图片 N] placeholders match
+    // the surfaced `resources` order (same contract as parseEventMessage).
+    // Resources carry key+name only — no download here; `botmux quoted <om_id>`
+    // fetches any message's full text AND downloads its attachments locally.
     const messages = await Promise.all(raw.map(async (m: any) => {
-      let parsed = parseApiMessage(m);
+      const numberer = createImgNumberer();
+      let resources = extractResources(m.msg_type ?? 'text', m.body?.content ?? '', numberer);
+      const parsed = parseApiMessage(m, numberer);
+      let cardJson: unknown;
       // `im.v1.message.list` returns Lark's simplified "请升级客户端" fallback for
       // complex cards — the whole body (user-forwarded) or nested sub-cards
       // buried mid-body (Argos alarms). Those are the cards where the list view
       // alone is incomplete, so resolve them by unioning both `im.message.get`
       // representations (server-rendered + full structured). Failures keep the
-      // list text. Simple cards (no fallback) already render fully here.
-      if (parsed.msgType === 'interactive' && cardContentHasUpgradeFallback(parsed.content)) {
-        const merged = await resolveMergedCardContent(appId, parsed.messageId).catch(() => null);
-        if (merged) parsed.content = merged.text;
+      // list text. Simple cards (no fallback) already render fully here —
+      // --with-card-json resolves ALL cards since the structured JSON only
+      // exists on the `im.message.get` representation.
+      if (parsed.msgType === 'interactive' && (withCardJson || cardContentHasUpgradeFallback(parsed.content))) {
+        // Fresh numberer: the resolve REPLACES both content and resources, so
+        // its [图片 N] numbering must restart at 1 alongside merged.resources.
+        // Keeping the list-view resources would leak the upgrade-fallback
+        // shell's phantom image (a "请升级" placeholder, absent from the real
+        // card) into every complex card's resource list.
+        const cardNumberer = createImgNumberer();
+        const merged = await resolveMergedCardContent(appId, parsed.messageId, cardNumberer).catch(() => null);
+        if (merged) {
+          parsed.content = merged.text;
+          resources = merged.resources;
+          if (withCardJson) {
+            try { cardJson = JSON.parse(merged.structuredContent); }
+            catch { cardJson = merged.structuredContent; }
+          }
+        }
       }
       if (parsed.msgType === 'merge_forward') {
-        await expandMergeForward(appId, parsed.messageId, parsed);
+        const { extraResources } = await expandMergeForward(appId, parsed.messageId, parsed, numberer);
+        if (extraResources.length) resources = [...resources, ...extraResources];
       }
-      return parsed;
+      return {
+        ...parsed,
+        ...(resources.length ? { resources } : {}),
+        ...(cardJson !== undefined ? { cardJson } : {}),
+      };
     }));
     console.log(JSON.stringify({
       sessionId: sid,
@@ -4732,6 +4761,11 @@ async function cmdHistory(rest: string[]): Promise<void> {
       } : {}),
       messages,
       total: messages.length,
+      // Discoverability: agents reading history often need the actual image
+      // bytes (alert charts) or the raw card JSON — both live one command away.
+      ...(messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
+        hint: '查看某条消息的附件图片/文件或卡片全文：botmux quoted <messageId>（任意消息 id 均可，附件会下载到本地）；需要原始卡片 JSON：botmux quoted <messageId> --raw 或本命令加 --with-card-json',
+      } : {}),
     }, null, 2));
   } catch (err: any) {
     console.error(`获取消息失败: ${err.message}`);
@@ -4748,8 +4782,9 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   // its value so `botmux quoted --session-id <uuid> om_xxx` doesn't pick up
   // the uuid as the message id.
   const messageId = firstPositional(rest, ['--session-id']);
+  const rawFlag = rest.includes('--raw');
   if (!messageId) {
-    console.error('用法: botmux quoted <message_id> [--session-id <id>]');
+    console.error('用法: botmux quoted <message_id> [--raw] [--session-id <id>]');
     process.exit(1);
   }
 
@@ -4771,16 +4806,24 @@ async function cmdQuoted(rest: string[]): Promise<void> {
       console.error(`未找到消息 ${messageId}`);
       process.exit(1);
     }
-    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward);
-    // Interactive cards: union both im.message.get representations so the quoted
-    // view matches history/live (recovers names + sub-card content + options).
-    // This single-message path always merges — unlike history (which starts
-    // from the hole-bearing list view), the quoted base is the hole-free B view
-    // so there's no cheap local signal that a merge would add anything.
-    if (rendered.msgType === 'interactive') {
-      const merged = await resolveMergedCardContent(appId, messageId).catch(() => null);
-      if (merged) rendered.content = merged.text;
+    // Interactive cards are re-resolved inside the render pipeline (both
+    // im.message.get representations unioned, content + resources replaced
+    // wholesale with fresh [图片 N] numbering — see renderQuotedMessage).
+    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward, resolveMergedCardContent);
+    if (rawFlag) {
+      if (rendered.mergedStructuredContent !== undefined) {
+        // --raw: surface the full structured card JSON (v2 body/elements) so
+        // automation can read exact field values, button URLs and image keys
+        // instead of re-parsing the rendered text (告警自动化场景).
+        try { (rendered as { cardJson?: unknown }).cardJson = JSON.parse(rendered.mergedStructuredContent); }
+        catch { (rendered as { cardJson?: unknown }).cardJson = rendered.mergedStructuredContent; }
+      } else {
+        // Non-card messages (and cards whose merge failed): expose the
+        // original body content verbatim for the same automation use case.
+        (rendered as { rawContent?: string }).rawContent = msg.body?.content ?? '';
+      }
     }
+    delete rendered.mergedStructuredContent;
     // The referenced message's file/media resources arrive as key+name only. A
     // read-isolated agent can't call the Lark resource API itself (bots.json
     // creds are deny-read), so download the bytes HERE — via the bot client
@@ -4815,6 +4858,23 @@ function readStdin(): Promise<string> {
     });
     process.stdin.on('error', () => resolve(''));
   });
+}
+
+/** Extract text from the legacy post-JSON shape some CLIs emit by accident. */
+function extractCardText(content: string): string {
+  try {
+    const parsed = JSON.parse(content);
+    const inner = parsed.zh_cn ?? parsed.en_us ?? parsed;
+    if (!Array.isArray(inner?.content)) return content;
+    const lines: string[] = [];
+    for (const para of inner.content) {
+      if (!Array.isArray(para)) continue;
+      lines.push(para.filter((node: any) => node.tag === 'text').map((node: any) => node.text).join(''));
+    }
+    return lines.join('\n').trim();
+  } catch {
+    return content;
+  }
 }
 
 // decodeStdinBytes lives in ./cli/stdin-encoding.ts (imported above) so it
@@ -4861,7 +4921,7 @@ function withCustomCardMentionFooter(
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
-import { buildImageCardElements, brandFooterSegment } from './im/lark/md-card.js';
+import { buildImageCardElements, brandFooterSegment, prepareCardMarkdown, type LocalHomeLinkMode } from './im/lark/md-card.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
@@ -4907,6 +4967,9 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
+  const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
+    ? prepareCardMarkdown(extractCardText(content), process.cwd(), 'filesystem')
+    : undefined;
   const id = randomBytes(8).toString('hex');
   // Structured request: the daemon-side watcher rebuilds the argv from these
   // validated fields (it NEVER executes raw argv — see buildRelayHostArgs).
@@ -4917,6 +4980,13 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   const contentBase = `${id}.content`;
   const cfile = join(relayDir, contentBase);
   writeFileSync(cfile, content);
+  let preparedContentBase: string | undefined;
+  let preparedContentOutfile: string | undefined;
+  if (preparedCardContent !== undefined) {
+    preparedContentBase = `${id}.card-content`;
+    preparedContentOutfile = join(relayDir, preparedContentBase);
+    writeFileSync(preparedContentOutfile, preparedCardContent);
+  }
   let cardBase: string | undefined;
   let cardOutfile: string | undefined;
   if (cardJsonArg !== undefined || cardFile !== undefined) {
@@ -4958,7 +5028,15 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   }
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
   // watcher 永远不会读到半截 JSON（tmp 后缀不匹配 .req.json 过滤）。
-  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, cardFile: cardBase, attachments, videos, videoCovers, flags }));
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({
+    contentFile: contentBase,
+    preparedContentFile: preparedContentBase,
+    cardFile: cardBase,
+    attachments,
+    videos,
+    videoCovers,
+    flags,
+  }));
 
   const resPath = join(relayDir, `${id}.res.json`);
   const deadlineMs = Date.now() + 120_000;
@@ -4968,6 +5046,7 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
         const res = JSON.parse(readFileSync(resPath, 'utf-8')) as { code?: number; stdout?: string; stderr?: string };
         try { unlinkSync(resPath); } catch { /* */ }
         try { unlinkSync(cfile); } catch { /* */ }
+        if (preparedContentOutfile) { try { unlinkSync(preparedContentOutfile); } catch { /* */ } }
         if (cardOutfile) { try { unlinkSync(cardOutfile); } catch { /* */ } }
         if (res.stdout) process.stdout.write(res.stdout);
         if (res.stderr) process.stderr.write(res.stderr);
@@ -5554,20 +5633,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       imageKeys.push(...results);
     }
 
-    // Try to extract plain text if Claude accidentally sent post JSON as content
-    let text = content;
-    try {
-      const parsed = JSON.parse(text);
-      const inner = parsed.zh_cn ?? parsed.en_us ?? parsed;
-      if (Array.isArray(inner?.content)) {
-        const lines: string[] = [];
-        for (const para of inner.content) {
-          if (!Array.isArray(para)) continue;
-          lines.push(para.filter((n: any) => n.tag === 'text').map((n: any) => n.text).join(''));
-        }
-        text = lines.join('\n').trim();
-      }
-    } catch { /* not JSON, use as-is */ }
+    // A file-sandbox relay supplies a host-private copy normalized inside the
+    // sandbox namespace. Voice/doc-comment paths returned above and therefore
+    // continue using the untouched raw content.
+    let text = extractCardText(content);
+    const preparedContentFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+    if (preparedContentFile) {
+      try { text = readFileSync(preparedContentFile, 'utf-8'); } catch { /* fall back safely below */ }
+    }
 
     // Auto-detect @BotName in text and inject as mentions, using the sender
     // app's cross-ref file for per-app-scoped open_ids. Without this, a plain
@@ -5750,7 +5823,19 @@ async function cmdSend(rest: string[]): Promise<void> {
       // `![alt](img:N)` inlines a full-width image; a grouped `![](img:0,1[,2…])`
       // renders one row of images side by side (2/row, 3/row …); any image not
       // referenced by a placeholder is appended full-width at the end.
-      const elements = (md || imageKeys.length > 0) ? buildImageCardElements(md, imageKeys) : [];
+      // A normal sandbox relay supplies content already normalized inside its
+      // own namespace and disables host probing. An incomplete/manual relay
+      // falls back to probe-free lexical repair; direct sends use filesystem
+      // disambiguation in their own process namespace.
+      const configuredLinkMode = process.env.BOTMUX_CARD_LOCAL_LINK_MODE;
+      const localHomeLinkMode: LocalHomeLinkMode = configuredLinkMode === 'disabled'
+        ? 'disabled'
+        : configuredLinkMode === 'lexical'
+          ? 'lexical'
+          : 'filesystem';
+      const elements = (md || imageKeys.length > 0)
+        ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode)
+        : [];
 
       // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
       // text size + grey font tag so it reads like a footnote below the hr.
