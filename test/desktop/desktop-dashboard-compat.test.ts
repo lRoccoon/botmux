@@ -28,6 +28,8 @@ describe('desktop dashboard compat validation', () => {
       reason: 'incompatible',
       message: expect.stringContaining('/__desktop/compat'),
     });
+    expect(result.message).toContain('升级或切换全局 botmux CLI');
+    expect(result.message).not.toContain('src/desktop/install-local.sh');
   });
 
   it('degrades safely when the compat manifest is malformed', async () => {

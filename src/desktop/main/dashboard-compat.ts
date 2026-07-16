@@ -2,7 +2,7 @@ import type { DashboardLocateResult } from '../shared/types.js';
 
 const supportedDashboardProtocolVersion = 1;
 const defaultCompatTimeoutMs = 3000;
-const sourceInstallHint = '请更新源码后重新运行 src/desktop/install-local.sh，或在外部浏览器打开控制台。';
+const cliUpgradeHint = '请升级或切换全局 botmux CLI 后重启运行时；源码开发可执行 pnpm switch:here && botmux restart。也可以先在外部浏览器打开控制台。';
 
 type DashboardCompatFailureReason = Extract<DashboardLocateResult, { ok: false }>['reason'];
 
@@ -60,7 +60,7 @@ export async function validateDashboardCompat(
       return {
         ok: false,
         reason: 'incompatible',
-        message: `当前 CLI 未提供 Desktop 兼容协议 ${new URL(compatUrl).pathname}（HTTP ${response.status}），${sourceInstallHint}`,
+        message: `当前 CLI 未提供 Desktop 兼容协议 ${new URL(compatUrl).pathname}（HTTP ${response.status}），${cliUpgradeHint}`,
       };
     }
 
@@ -71,7 +71,7 @@ export async function validateDashboardCompat(
       return {
         ok: false,
         reason: 'incompatible',
-        message: `当前 CLI 返回的 Desktop 兼容信息格式不正确，${sourceInstallHint}`,
+        message: `当前 CLI 返回的 Desktop 兼容信息格式不正确，${cliUpgradeHint}`,
       };
     }
     return validateCompatManifest(manifest);
@@ -93,7 +93,7 @@ function validateCompatManifest(manifest: unknown): DashboardCompatResult {
     return {
       ok: false,
       reason: 'incompatible',
-      message: `当前 CLI 返回的 Desktop 兼容信息格式不正确，${sourceInstallHint}`,
+      message: `当前 CLI 返回的 Desktop 兼容信息格式不正确，${cliUpgradeHint}`,
     };
   }
 
@@ -101,7 +101,7 @@ function validateCompatManifest(manifest: unknown): DashboardCompatResult {
     return {
       ok: false,
       reason: 'incompatible',
-      message: `当前 CLI dashboard 协议 v${manifest.dashboardProtocolVersion} 高于 Desktop 支持的 v${supportedDashboardProtocolVersion}，${sourceInstallHint}`,
+      message: `当前 CLI dashboard 协议 v${manifest.dashboardProtocolVersion} 高于 Desktop 支持的 v${supportedDashboardProtocolVersion}，${cliUpgradeHint}`,
     };
   }
 
@@ -109,7 +109,7 @@ function validateCompatManifest(manifest: unknown): DashboardCompatResult {
     return {
       ok: false,
       reason: 'incompatible',
-      message: `当前 CLI dashboard 不支持 Desktop shell，${sourceInstallHint}`,
+      message: `当前 CLI dashboard 不支持 Desktop shell，${cliUpgradeHint}`,
     };
   }
 

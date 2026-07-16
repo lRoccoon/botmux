@@ -240,7 +240,7 @@ describe('desktop dashboard locate IPC', () => {
     const runtime = {
       getState: vi.fn().mockResolvedValue({
         status: 'degraded',
-        message: '请更新源码后重新运行 src/desktop/install-local.sh 后再继续。',
+        message: '请升级或切换全局 botmux CLI，当前 CLI 与 Desktop 兼容协议不匹配。',
       }),
       start: vi.fn(),
       stop: vi.fn(),
@@ -258,7 +258,7 @@ describe('desktop dashboard locate IPC', () => {
     await expect(handlers.get('desktop:locate-dashboard')?.({} as any)).resolves.toEqual({
       ok: false,
       reason: 'incompatible',
-      message: '请更新源码后重新运行 src/desktop/install-local.sh 后再继续。',
+      message: '请升级或切换全局 botmux CLI，当前 CLI 与 Desktop 兼容协议不匹配。',
     });
     expect(runtime.dashboard).not.toHaveBeenCalled();
   });

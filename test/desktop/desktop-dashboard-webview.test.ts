@@ -80,6 +80,24 @@ describe('desktop dashboard embed', () => {
     expect(rendererSource).toContain('runtimeMeta.hidden = true');
   });
 
+  it('labels desktop summary counts by their runtime-state sources', () => {
+    const html = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
+      'utf-8',
+    );
+    const rendererSource = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
+      'utf-8',
+    );
+
+    expect(html).toContain('data-i18n="summary.onlineDaemons">在线 Daemon</span><strong id="online-count"');
+    expect(html).toContain('data-i18n="summary.needsAttention">需要处理</span><strong id="attention-count"');
+    expect(html).toContain('data-i18n="summary.configuredBots">已配置 Bot</span><strong id="bot-count"');
+    expect(rendererSource).toContain("'summary.onlineDaemons': 'Online daemons'");
+    expect(rendererSource).toContain('onlineCount.textContent = String(state?.onlineDaemonCount ?? 0)');
+    expect(rendererSource).toContain('botCount.textContent = String(state?.botCount ?? 0)');
+  });
+
   it('uses an isolated webview instead of a file-page iframe', () => {
     const html = readFileSync(
       fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
