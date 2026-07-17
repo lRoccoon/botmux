@@ -21,6 +21,7 @@ import {
   createDashboardRouteState,
   loadAndRenderDashboardRoute,
 } from './route-lifecycle.js';
+import { maybeReloadBrowserForStaleRouteChunk } from './stale-chunk-reload.js';
 import { buildBotCards, loadGroupsSnapshot } from './overview.js';
 import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
@@ -809,6 +810,12 @@ async function route(): Promise<void> {
     if (seq === routeState.seq && isAuthed) consumeDesktopShellRouteAction();
   } catch (err) {
     if (seq !== routeState.seq) return;
+    if (maybeReloadBrowserForStaleRouteChunk(err, {
+      href: window.location.href,
+      hash,
+      getSessionStorage: () => window.sessionStorage,
+      reload: () => window.location.reload(),
+    })) return;
     getRouteRoot().innerHTML = `<section class="page"><div class="empty">Dashboard route failed: ${escapeHtml(String(err))}</div></section>`;
     routeState.pageDispose = null;
     routeState.rerenderOnUiChange = true;
