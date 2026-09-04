@@ -14162,6 +14162,9 @@ async function spawnCli(
     // adapters (claude-code/genius/grok build it via buildBotmuxSystemPromptText).
     // Reuses the same predicate computed above for the persistent-pane guard.
     noTransport: noTransportSession,
+    // replyDelivery=transcript + solo：daemon 冻结在 init 上的值，系统提示改口用。
+    replyDelivery: cfg.replyDelivery,
+    solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelBackendVariant: cfg.modelBackendVariant,

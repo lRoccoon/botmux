@@ -10,7 +10,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
@@ -93,7 +93,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, silentIdleCardFlag, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -3144,7 +3144,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds)),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
         );
         scheduleCardPatch(ds, cardJson);
@@ -3657,7 +3657,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              silentIdleCardFlag(ds),
+              idleCardLabel(ds),
               dshRuntimeForSession(ds),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3705,7 +3705,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
-          frozen.silentIdle === true,
+          frozenIdleLabel(frozen),
           dshRuntimeForSession(ds),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
@@ -3751,7 +3751,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
@@ -3822,7 +3822,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
@@ -3885,7 +3885,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
         );
         return {
@@ -3977,7 +3977,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }

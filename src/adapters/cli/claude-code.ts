@@ -830,7 +830,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir, noTransport }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir, noTransport, replyDelivery, solo }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -890,7 +890,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport }));
+      // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
+      // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, replyDelivery: effectiveReplyDelivery, solo }));
       return args;
     },
 

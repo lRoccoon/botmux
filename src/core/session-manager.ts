@@ -17,6 +17,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -953,7 +954,7 @@ export function ensureSessionWhiteboard(ds: DaemonSession): void {
   }
 }
 
-function renderWhiteboardBlock(opts?: { whiteboardId?: string; noTransport?: boolean }): string {
+function renderWhiteboardBlock(opts?: { whiteboardId?: string; noTransport?: boolean; replyDelivery?: ReplyDelivery }): string {
   if (!whiteboardEnabled() || !opts?.whiteboardId) return '';
   const meta = getWhiteboard(opts.whiteboardId);
   if (!meta || meta.archived) return '';
@@ -968,9 +969,13 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string; noTransport?: boo
     // 要消除的那条矛盾指令的又一个出口——send 在这类会话里被 assertTurnTransportOrExit
     // 硬拦（exit 2），而 <botmux_http_response_mode> 又明说不要 send。白板块在首轮与
     // 续轮都无条件注入，所以这里必须同样 gate；隐私/本地文件两条与传输无关，保留。
+    // replyDelivery=transcript：最终回复由 daemon 从转写自动转发，「仍必须 send」同样
+    // 与改口后的系统提示矛盾，换成「写进最终回复即可」；noTransport 优先级更高。
     opts.noTransport
       ? '不要直接读写本地文件；不要写密钥/隐私。'
-      : '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
+      : opts.replyDelivery === 'transcript'
+        ? '不要直接读写本地文件；不要写密钥/隐私；用户可见结论写进最终回复即可。'
+        : '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
     '</whiteboard>',
   ].join('\n');
 }
@@ -1092,6 +1097,14 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
+/** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
+ *  core/reply-delivery.ts）。缺参 / bot 未加载 / 任何异常 → 'send'（fail-closed：
+ *  信封字节等于今天）。noTransport 的优先级由各调用点自己叠加。 */
+function replyDeliveryFor(larkAppId?: string, cliId?: string): ReplyDelivery {
+  if (!larkAppId || !cliId) return 'send';
+  try { return effectiveReplyDelivery(larkAppId, cliId); } catch { return 'send'; }
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -1104,7 +1117,19 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; chatContext?: ChatContext },
+  opts?: {
+    larkAppId?: string;
+    chatId?: string;
+    whiteboardId?: string;
+    substituteTrigger?: SubstituteTrigger;
+    chatContext?: ChatContext;
+    /** replyDelivery=transcript 且本轮是 solo 会话（daemon 算好的 ds.soloSession）：
+     *  去掉 <user_message> 壳与 sender/attachments/mentions 块，改用裸文本 +
+     *  `[附件]`/`[@提及]` 行（buildBridgeInputContent）。send 模式下忽略。 */
+    solo?: boolean;
+    /** solo 裸文本时用于剥掉开头的自 @（同 buildBridgeInputContent）。 */
+    selfMention?: { name?: string | null; openId?: string | null };
+  },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   if (adapter.inputEnvelope === 'service-user') {
@@ -1116,9 +1141,14 @@ export function buildNewTopicPrompt(
   // static `adapter.systemHints` array that was baked at module load.
   // No-transport sessions (apiOnly bot / HTTP virtual chat) get the collapsed
   // hints (hidden-context defense only) — same gate as buildBotmuxSystemPromptText.
+  // replyDelivery=transcript 只在有传输的会话上生效（noTransport 优先）；bare =
+  // transcript + solo，首轮同样去壳。
+  const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
+  const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId);
+  const bare = replyDelivery === 'transcript' && opts?.solo === true;
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, sessionIsNoTransport(opts?.larkAppId, opts?.chatId));
+    : buildBotmuxShellHints(locale, noTransport, replyDelivery);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1152,12 +1182,12 @@ export function buildNewTopicPrompt(
     // the routing block above and the system-prompt identity path in
     // buildBotmuxSystemPromptText. botIdentity is passed even for a NORMAL bot
     // running an HTTP task (R1), so this block reaches HTTP turns and must gate too.
-    const identityNoTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
+    // transcript + solo（bare）同样只留 name/open_id：solo 会话里没有别的 bot 可路由。
     identityBlock = [
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      ...(identityNoTransport
+      ...(noTransport || bare
         ? []
         : [`  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`]),
       '</identity>',
@@ -1167,7 +1197,8 @@ export function buildNewTopicPrompt(
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
-    noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
+    noTransport,
+    replyDelivery,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
@@ -1185,7 +1216,11 @@ export function buildNewTopicPrompt(
   const mergedMessage = followUps && followUps.length > 0
     ? [userMessage, ...followUps].join('\n\n')
     : userMessage;
-  const userBlock = `<user_message>\n${mergedMessage}\n</user_message>`;
+  // bare（transcript + solo）：裸文本 + `[附件]`/`[@提及]` 行，附件/提及已折进正文，
+  // 下面的 sender / senderNote / attachHint / mentionBlock 一并跳过。
+  const userBlock = bare
+    ? buildBridgeInputContent(mergedMessage, { attachments, mentions, selfMention: opts?.selfMention, locale })
+    : `<user_message>\n${mergedMessage}\n</user_message>`;
   const parts: string[] = [];
 
   // Put stable, instruction-like context before the user's first turn. This
@@ -1208,21 +1243,21 @@ export function buildNewTopicPrompt(
 
   parts.push(userBlock);
 
-  const senderBlock = renderSenderTag(sender, opts?.larkAppId);
+  const senderBlock = bare ? '' : renderSenderTag(sender, opts?.larkAppId);
   if (senderBlock) parts.push(senderBlock);
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
   if (substituteBlock) parts.push(substituteBlock);
 
-  const senderNote = renderCursorSenderNote(cliId, !!senderBlock, locale);
+  const senderNote = bare ? '' : renderCursorSenderNote(cliId, !!senderBlock, locale);
   if (senderNote) parts.push(senderNote);
 
-  const attachHint = formatAttachmentsHint(attachments, locale);
+  const attachHint = bare ? '' : formatAttachmentsHint(attachments, locale);
   if (attachHint) parts.push(attachHint);
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
   // and session ID via system prompt, so skip those blocks here.
-  if (mentionBlock) parts.push(mentionBlock);
+  if (mentionBlock && !bare) parts.push(mentionBlock);
   if (botBlock) parts.push(botBlock);
   // The per-session skill catalog block is appended later in the worker-pool
   // fork path (prepareSessionSkillPrompt), which also writes the manifest and
@@ -1262,6 +1297,9 @@ export function buildNewTopicCliInput(
     /** Host-resolved identity for this turn. Only the caller knows where the
      *  turn came from, so it is passed in rather than derived here. */
     trustedCaller?: CliTurnPayload['trustedCaller'];
+    /** 见 buildNewTopicPrompt 同名字段。 */
+    solo?: boolean;
+    selfMention?: { name?: string | null; openId?: string | null };
   },
 ): CliTurnPayload {
   const content = buildNewTopicPrompt(
@@ -1277,6 +1315,7 @@ export function buildNewTopicCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
+    replyDelivery: replyDeliveryFor(opts?.larkAppId, cliId),
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
@@ -1347,6 +1386,12 @@ type FollowUpOpts = {
   turnId?: string;
   /** Host-resolved identity for this turn (see buildNewTopicCliInput). */
   trustedCaller?: CliTurnPayload['trustedCaller'];
+  /** replyDelivery=transcript 且本轮 solo（daemon 的 ds.soloSession）：去掉
+   *  <user_message> 壳与 sender/attachments/mentions 块，裸文本 + `[附件]`/`[@提及]`
+   *  行（buildBridgeInputContent）。send 模式下忽略。 */
+  solo?: boolean;
+  /** solo 裸文本时剥掉开头的自 @（同 buildBridgeInputContent）。 */
+  selfMention?: { name?: string | null; openId?: string | null };
 };
 
 function buildFollowUpBlocks(
@@ -1356,10 +1401,17 @@ function buildFollowUpBlocks(
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
+  // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
+  // 转发，续轮不再注入 <botmux_reminder>；noTransport 优先（HTTP 虚拟会话照旧走
+  // reminder_no_transport）。bare = transcript + solo → 信封去壳。
+  const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
+  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId) === 'transcript';
+  const bare = transcript && opts?.solo === true;
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
-    noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
+    noTransport,
+    replyDelivery: transcript ? 'transcript' : 'send',
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
@@ -1374,7 +1426,9 @@ function buildFollowUpBlocks(
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
-  if (opts?.cliId !== 'mira') {
+  // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空
+  // → buildFollowUpCliInput 回退 inline 且不写 sidecar）。
+  if (opts?.cliId !== 'mira' && !transcript) {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
     // anti-resend variant only when the experimental dashboard toggle is on
@@ -1390,7 +1444,6 @@ function buildFollowUpBlocks(
     // 同样调本函数、但把 reminder 走 per-turn sidecar；只在 inline 分支 gate 会让 hook
     // 模式的续轮 reminder 从 sidecar 漏出去。哨兵语义只在本轮内容的
     // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它）。
-    const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
     const reminderKey = noTransport
       ? 'ai.followup.reminder_no_transport'
       : hookMode
@@ -1401,23 +1454,35 @@ function buildFollowUpBlocks(
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
-  blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
+  // bare（transcript + solo）：裸文本 + `[附件]`/`[@提及]` 行，附件/提及已折进正文，
+  // 下面的 sender / senderNote / attachments / mentions 块一并跳过；substitute 保留。
+  blocks.push({
+    key: 'userMessage',
+    text: bare
+      ? buildBridgeInputContent(content, {
+        attachments: opts?.attachments,
+        mentions: opts?.mentions,
+        selfMention: opts?.selfMention,
+        locale: opts?.locale,
+      })
+      : `<user_message>\n${content}\n</user_message>`,
+  });
 
-  const senderBlock = renderSenderTag(opts?.sender, opts?.larkAppId);
+  const senderBlock = bare ? '' : renderSenderTag(opts?.sender, opts?.larkAppId);
   if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
   if (substituteBlock) blocks.push({ key: 'substitute', text: substituteBlock });
 
-  const senderNote = renderCursorSenderNote(opts?.cliId, !!senderBlock, opts?.locale);
+  const senderNote = bare ? '' : renderCursorSenderNote(opts?.cliId, !!senderBlock, opts?.locale);
   if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
-  const attachHint = opts?.attachments && opts.attachments.length > 0
+  const attachHint = !bare && opts?.attachments && opts.attachments.length > 0
     ? formatAttachmentsHint(opts.attachments, opts.locale)
     : '';
   if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
-  const mentionBlock = renderMentionBlock(opts?.mentions);
+  const mentionBlock = bare ? '' : renderMentionBlock(opts?.mentions);
   if (mentionBlock) blocks.push({ key: 'mentions', text: mentionBlock });
 
   return blocks;
@@ -1560,6 +1625,7 @@ export function buildFollowUpCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
+    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId),
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId);
   const senderBlock = renderSenderTag(opts.sender, opts.larkAppId);
@@ -1721,6 +1787,8 @@ export function buildReforkPrompt(
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
     sessionBackendType: ds.session.backendType,
+    solo: ds.soloSession,
+    selfMention: opts?.selfMention,
   });
 }
 
@@ -1772,6 +1840,8 @@ export function buildReforkCliInput(
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
     codexAppMessageContext: opts?.codexAppMessageContext,
+    solo: ds.soloSession,
+    selfMention: opts?.selfMention,
   });
 }
 

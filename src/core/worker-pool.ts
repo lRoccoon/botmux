@@ -28,9 +28,10 @@ import {
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
+import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
@@ -879,7 +880,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
@@ -934,7 +935,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
@@ -952,7 +953,18 @@ function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
  *  「已处理 · 判定无需回复」 instead of 「等待输入」 until beginNewTurn clears
  *  the flag, or an unrelated patch would silently revert the label. */
 export function silentIdleCardFlag(ds: DaemonSession): boolean {
-  return !!ds.silentIdleTurnId;
+  return idleCardLabel(ds) === 'silent';
+}
+
+/** idle 卡头的替代标签（所有 buildStreamingCard 调用点统一从这里取）：
+ *  'completed' = transcript 模式下本轮最终回复卡已投递（`completedIdleTurnId`）；
+ *  'silent' = 本轮判定无需回复（`silentIdleTurnId`）；两者都无 → undefined，
+ *  卡头照旧「等待输入」。两个 turnId 在每个新轮次入口一起清理，正常不会同时
+ *  存在；万一同时存在，「已完成」更贴近事实（回复确实发出去了）。 */
+export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
+  if (ds.completedIdleTurnId) return 'completed';
+  if (ds.silentIdleTurnId) return 'silent';
+  return undefined;
 }
 
 const TURN_EXPLICIT_MENTION_MAX = 64;
@@ -1049,7 +1061,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
@@ -1129,7 +1141,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // path fires every 12s while a turn works, so omitting it would drop the
     // ⚡ badge until the next status-edge PATCH.
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
@@ -1213,7 +1225,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
@@ -1941,7 +1953,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, bot.config),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
@@ -2088,7 +2100,11 @@ export function parkStreamCard(ds: DaemonSession): void {
     title: ds.currentTurnTitle ?? '',
     displayMode: ds.displayMode ?? 'hidden',
     imageKey: ds.currentImageKey,
-    ...(silentIdleCardFlag(ds) ? { silentIdle: true } : {}),
+    ...(() => {
+      // 新字段 idleLabel 为准；'silent' 同时写旧字段 silentIdle，旧版 daemon 读盘不退化。
+      const label = idleCardLabel(ds);
+      return label ? { idleLabel: label, ...(label === 'silent' ? { silentIdle: true } : {}) } : {};
+    })(),
     ...(() => {
       const badge = codexServiceTierBadge(
         sessionCliId(ds, getBot(ds.larkAppId).config),
@@ -3025,7 +3041,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: status === 'idle' }),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson, turnId);
@@ -3091,7 +3107,7 @@ export async function postTurnStartingCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
 
@@ -3231,7 +3247,7 @@ export async function postFreshStreamingCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
@@ -6385,7 +6401,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    silentIdleCardFlag(ds),
+    idleCardLabel(ds),
     dshRuntimeForSession(ds),
   );
 }
@@ -10813,6 +10829,11 @@ export function forkWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    // replyDelivery=transcript 的冻结值（core/reply-delivery.ts）：worker 只用它给
+    // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
+    // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
+    replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId),
+    solo: ds.soloSession === true,
     feedback: feedbackPolicy,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
     // no-transport worker's fs-policy denies it from a HOST-owned fact, not a
@@ -11724,7 +11745,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              silentIdleCardFlag(ds),
+              idleCardLabel(ds),
               dshRuntimeForSession(ds),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
@@ -11833,7 +11854,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            silentIdleCardFlag(ds),
+            idleCardLabel(ds),
             dshRuntimeForSession(ds),
           );
           const postedCardId = await scopedReply(
@@ -12327,7 +12348,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            silentIdleCardFlag(ds),
+            idleCardLabel(ds),
             dshRuntimeForSession(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
@@ -12441,7 +12462,7 @@ function setupWorkerHandlers(
             }),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            silentIdleCardFlag(ds),
+            idleCardLabel(ds),
             dshRuntimeForSession(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
@@ -12517,7 +12538,7 @@ function setupWorkerHandlers(
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: ds.lastScreenStatus === 'idle' }),
           sessionRuntimeDisplayName(ds, botCfg),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
         );
         scheduleCardPatch(ds, cardJson);
@@ -12946,7 +12967,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              silentIdleCardFlag(ds),
+              idleCardLabel(ds),
               dshRuntimeForSession(ds),
             );
             scheduleCardPatch(ds, frozenCard);
@@ -13020,7 +13041,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              silentIdleCardFlag(ds),
+              idleCardLabel(ds),
               dshRuntimeForSession(ds),
             );
             scheduleCardPatch(ds, frozenCard);
@@ -14419,6 +14440,28 @@ async function persistFinalOutputFeedback(
   }
 }
 
+/** transcript 模式（replyDelivery=transcript）：最终回复卡投递成功后给本轮打
+ *  「已完成」标签，idle 时卡头不再显示「等待输入」。
+ *  - 只对 bridge 类 final_output 生效：local-turn 系列是终端本地对话同步到飞书，
+ *    不是对某个飞书轮次的回复；VC 会议 receiver 的输出走审计 sink，与状态卡无关。
+ *  - send 模式（缺省）在此直接 return，行为与今天逐字节相同。
+ *  - lineage 守卫与 `silentIdleTurnId` 同款：type-ahead 下更新的轮次已开启时，
+ *    本次投递属于旧轮次，不得把正在工作的卡改成「已完成」。 */
+function markTurnReplyDelivered(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  effectiveCliId: string | undefined,
+): void {
+  if (msg.kind && msg.kind !== 'bridge') return;
+  if (ds.session.vcMeetingReceiver) return;
+  if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId) !== 'transcript') return;
+  if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) return;
+  ds.completedIdleTurnId = msg.turnId;
+  // 卡已 idle 就立即重刷卡头；仍在 working 则等下一次状态边沿自然带上标签。
+  // 卡已冻结 / 禁用流式卡时 scheduleActiveRuntimePatch 自行 no-op。
+  if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+}
+
 function deliverFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
@@ -14905,6 +14948,7 @@ function deliverFinalOutput(
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      markTurnReplyDelivered(ds, msg, effectiveCliId);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
       if (feedbackPolicy && baseFeedbackCard && messageId) {
         await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
