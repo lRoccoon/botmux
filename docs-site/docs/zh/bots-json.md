@@ -190,7 +190,7 @@
 | 字段 | 说明 |
 |------|------|
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
-| `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
+| `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计。claude-code 会额外桥接 Claude Code 的 statusline：有数据时上下文段改显示纯百分比 `ctx 23%`，并追加账号级配额 `5h 18% · 7d 5%`（无数据即省略，不推断） |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
 | `pinStreamingCard` | `true` 时为该 bot **置顶当前公开的实时状态卡片**；默认关闭，只有显式 `true` 才开启。只认当前公开 live-status 的真实 `streamCardId`，repo 选择卡、私有 `/card`、最终回复卡、CoT、关闭卡、以及其它交互卡都不参与。开关支持热更新：通过 dashboard 或 `/botconfig set pinStreamingCard on/off` 成功写盘且有效值发生变化后，会对这个 bot 的**现有活跃会话**做 best-effort 热重算；daemon 重启后还会在 `restoreActiveSessions` 完成后，为当前 bot 额外安排一次 fire-and-forget 恢复。配置响应和 daemon readiness **都不会等待**飞书 Pin/Unpin 完成。失败不会中断发卡、转移、恢复、关闭、启动或配置本身；异常期间可能暂时出现 0 个或多个 Pin。该功能**不维护持久重试日志，也不会做宽泛的远端清理**：重启恢复只信任飞书返回里 `app_id === 当前 larkAppId` 的操作来源，然后再与本进程入队瞬间已知的本地候选 ID 做严格交集。人工、其它应用、混合或来源字段不完整的同 ID 当前 Pin 既不会被认领，也不会被重复 Pin；只有列表中不存在当前卡时才创建，且 create 返回必须精确匹配消息 ID 与同应用来源。显式关闭只清理进程内已拥有的 ID 与远端刚证明属于同应用的本地候选；普通 disable、关闭会话和转移只清理进程内已拥有的 ID |
 | `noPinStreamingCardChats` | 一个 `chatId` 数组，表示即使 bot 已开启 `pinStreamingCard`，这些群里也**不要自动置顶**流式卡片。它就是 `/card pin off|on` 背后的 negative set。实时流式卡片本身仍照常发送，只是当前群不再触发 Pin 副作用；为空或缺省表示没有按群关闭 |
@@ -206,6 +206,7 @@
 |------|------|
 | `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
 | `replyDelivery` | `"send"`（默认）或 `"transcript"`。最终回复怎么送到飞书：`send` = 模型必须自己 `botmux send`；`transcript` = daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，模型只在中途推送、附件、跨 bot @ 时才需要 `botmux send`。只有 `transcript` 会写盘；缺省或 `send` 与历史行为逐字节一致 |
+| `thinkingCardToolResult` | 布尔，默认 `true`（开）。思考气泡（bot 级总开关 `thinkingCard`，默认开）的工具节点是否附带命令输出 / 文件内容代码块。设为 `false` 后气泡只保留思考段落与工具节点标题（工具名 · 命令 / 路径），与 Claude Code 自身界面一致；`/botconfig set thinkingCardToolResult off` 或 dashboard「卡片」子开关切换，立即生效 |
 
 ### `replyDelivery: "transcript"`
 
