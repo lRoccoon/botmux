@@ -53,7 +53,7 @@
 
 | 提交 | 工作流 | 内容 |
 | --- | --- | --- |
-| `e0effcda` feat(session) | W2 | `replyDelivery: 'send' \| 'transcript'`：转写 fallback 升为主通道；不注入每轮 `<botmux_reminder>`；solo 会话（p2p / 仅 owner 的 1v1 群）裸文本信封；最终回复卡投递后流式卡标「已完成」；`/botconfig`、dashboard、bots-json 文档 |
+| `e0effcda` feat(session) | W2 | `replyDelivery: 'send' \| 'transcript'`：转写 fallback 升为主通道；不注入每轮 `<botmux_reminder>`；solo 会话（p2p / 仅 owner 的 1v1 群）裸文本信封；最终回复卡投递后流式卡标「已完成」；`/botconfig`、dashboard、bots-json 文档。后续调整：claude-code 默认 transcript，提示中不再出现 botmux send（显式 `send` 才退回旧行为） |
 | `bc577b64` feat(cot) | W3 | `CotEntry.tool_call.subject` 在 args 截断前提取（`services/cot-subject.ts` 共享）；bot 级 `thinkingCardToolResult` 开关（默认 on） |
 | `60ae6467` feat(card) | W1 | `botmux statusline` 子命令 + 进程级 `--settings` 注入（refreshInterval 60s，链式转发用户自己的 statusline）；卡片用量段 `ctx 23% · 5h 18% · 7d 5%` |
 
