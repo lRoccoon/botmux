@@ -20,6 +20,7 @@ import {
   writeManagedOriginAttestationProof,
 } from './managed-origin-attestation.js';
 import * as sessionStore from '../services/session-store.js';
+import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import {
   cliModelSupportsReasoningEffort,
@@ -29,6 +30,23 @@ import {
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import { queryScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import {
+  resolveSchedulePrecondition,
+  schedulePreconditionTrustedFilesRoot,
+  validateSchedulePreconditionSource,
+  type SchedulePreconditionDefinition,
+  type SchedulePreconditionSource,
+} from '../services/schedule-precondition-store.js';
+import {
+  assertSchedulePreconditionFilePathTrusted,
+  readSchedulePreconditionFile,
+  SchedulePreconditionFileError,
+} from '../services/schedule-precondition-file.js';
+import {
+  runSchedulePrecondition,
+  SchedulePreconditionError,
+} from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
@@ -100,13 +118,23 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId } from './worker-pool.js';
+import {
+  createTaskWithOptionalPrecondition,
+  removeTaskWithPrecondition,
+  toggleTaskDeliveryWithPrecondition,
+  updateTaskWithOptionalPrecondition,
+  type SchedulePreconditionMutation,
+} from './schedule-precondition-config.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
+import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
@@ -116,6 +144,7 @@ import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
+import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -147,7 +176,7 @@ import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
-import { getMessageListenerConfig, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import { getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
 import { getCommandTriggerConfig, setCommandTriggerChatEnabled, updateCommandTriggerConfig } from '../services/command-trigger-store.js';
 import { reservedCommandKind } from '../services/command-trigger.js';
 import { resolvePassthroughCommands } from './command-handler.js';
@@ -269,6 +298,7 @@ import {
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { executeChatRename } from './chat-rename-operation.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession } from './persistent-backend.js';
@@ -1169,6 +1199,46 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   jsonRes(res, 404, { error: 'not_found' });
 });
 
+const topicIdResolveInFlight = new Map<string, Promise<{ ok: boolean; status: string }>>();
+const topicIdResolveCooldownUntil = new Map<string, number>();
+const TOPIC_ID_RESOLVE_COOLDOWN_MS = 5 * 60_000;
+
+ipcRoute('POST', '/api/sessions/:sessionId/resolve-thread-id', async (_req, res, params) => {
+  const sessionId = params.sessionId;
+  const existing = topicIdResolveInFlight.get(sessionId);
+  if (existing) return jsonRes(res, 200, await existing);
+  const task = (async () => {
+    const session = findOwnedSessionRecord(sessionId);
+    if (!session) return { ok: false, status: 'not_found' };
+    if (session.scope !== 'thread' || !/^om_[A-Za-z0-9_-]+$/.test(session.rootMessageId)) {
+      return { ok: true, status: 'ineligible' };
+    }
+    if (isNativeTopicId(session.larkThreadId)) return { ok: true, status: 'already_present' };
+    if ((topicIdResolveCooldownUntil.get(sessionId) ?? 0) > Date.now()) return { ok: true, status: 'unresolved' };
+    let nativeId: string | null;
+    try {
+      nativeId = await getMessageThreadId(session.larkAppId || cachedLarkAppId, session.rootMessageId);
+    } catch {
+      topicIdResolveCooldownUntil.set(sessionId, Date.now() + TOPIC_ID_RESOLVE_COOLDOWN_MS);
+      return { ok: false, status: 'unresolved' };
+    }
+    // Re-read after the remote call: a normal inbound event may have filled it.
+    const current = findOwnedSessionRecord(sessionId);
+    if (!current) return { ok: false, status: 'not_found' };
+    if (isNativeTopicId(current.larkThreadId)) return { ok: true, status: 'already_present' };
+    if (!fillNativeTopicId(current, 'thread', nativeId)) {
+      topicIdResolveCooldownUntil.set(sessionId, Date.now() + TOPIC_ID_RESOLVE_COOLDOWN_MS);
+      return { ok: true, status: 'unresolved' };
+    }
+    sessionStore.updateSession(current);
+    publishNativeTopicLinkPatchForSession(current);
+    topicIdResolveCooldownUntil.delete(sessionId);
+    return { ok: true, status: 'resolved' };
+  })();
+  topicIdResolveInFlight.set(sessionId, task);
+  try { return jsonRes(res, 200, await task); } finally { topicIdResolveInFlight.delete(sessionId); }
+});
+
 /** Low-frequency card-display read used by `botmux send`. Keeping the
  * transcript reader and per-bot visibility decision in the resident daemon
  * preserves its incremental cache and live config instead of making every
@@ -2003,7 +2073,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   const trigger = proactive ? 'ai_proactive' : 'user_explicit';
   const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
   await chatRenameSerialQueue.run(cooldownKey, async () => {
-    const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name, {
+    const response = await executeChatRename({
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      name: normalized.name,
+      trigger,
+      sessionId: ds.session.sessionId,
+      botOpenId: getBotOpenId(ds.larkAppId),
       beforeUpdate: proactive
         ? () => {
             const cooldown = proactiveChatRenameCooldown.check(cooldownKey);
@@ -2012,43 +2088,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
               : { ...cooldown, error: 'rate_limited' as const };
           }
         : undefined,
+    }, {
+      renameChat: groupsStore.renameChat,
+      activeSessions: () => getActiveSessionsRegistry()?.values() ?? [],
+      persistSession: sessionStore.updateSession,
+      logger,
     });
-    const botOpenId = getBotOpenId(ds.larkAppId) ?? '-';
-    if (!result.ok) {
-      const status = result.error === 'bot_not_in_chat' ? 403
-        : result.error === 'permission_denied' ? 403
-          : result.error === 'rate_limited' ? 429
-            : 502;
-      logger.warn(
-        `[chat-rename:audit] result=failed session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName ?? null)} new=${JSON.stringify(result.newName ?? normalized.name)} `
-        + `error=${result.error} larkCode=${result.larkCode ?? '-'} detail=${result.detail ?? '-'}`,
-      );
-      return jsonRes(res, status, result);
+    if (proactive && response.body.ok && response.body.changed) {
+      proactiveChatRenameCooldown.record(cooldownKey);
     }
-    if (result.changed) {
-      if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
-      // FR-7: the Lark write already succeeded, so a local cache-refresh
-      // failure (ENOSPC/EACCES on the session store) must NOT reverse the
-      // outcome into an HTTP 500 — best-effort per session, warn and keep the
-      // rename a success. Catch per-session so one bad write can't skip the rest.
-      for (const active of getActiveSessionsRegistry()?.values() ?? []) {
-        if (active.chatId !== ds.chatId) continue;
-        active.session.chatDisplayName = result.newName;
-        try {
-          sessionStore.updateSession(active.session);
-        } catch (e) {
-          logger.warn(`[chat-rename:audit] cache_refresh_failed session=${active.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} detail=${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      logger.info(
-        `[chat-rename:audit] result=success session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)} larkCode=0`,
-      );
-    }
-    return jsonRes(res, 200, { ...result, chatId: ds.chatId });
+    return jsonRes(res, response.status, response.body);
   });
 });
 
@@ -2388,15 +2437,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   return withBotTurnAdmission(larkAppId, async () => {
     const current = findSessionRecord(params.sessionId);
     if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    if (expect !== undefined && current.whiteboardId !== expect) {
+    // The same command a host applies offline (services/session-commands.ts);
+    // here it runs on the daemon's own live row.
+    const applied = applySessionRowCommand(current, {
+      type: 'whiteboard',
+      whiteboardId: unbind ? null : bindId,
+      ...(expect !== undefined ? { expectWhiteboardId: expect } : {}),
+    }, { now: new Date() });
+    if (applied.outcome === 'refused') {
       return jsonRes(res, 409, {
         ok: false,
         error: 'whiteboard_changed',
         whiteboardId: current.whiteboardId ?? null,
       });
     }
-    if (unbind) current.whiteboardId = undefined;
-    else current.whiteboardId = bindId;
     sessionStore.updateSession(current);
     jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId ?? null });
   });
@@ -2840,6 +2894,15 @@ function workingDirForSession(sessionId: string): string | undefined {
  * the original Lark thread so users see why the session is alive again.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
+  const parsedBody = await readJsonBody<unknown>(req, 4_096).catch(() => ({}));
+  // JSON accepts null, arrays, and scalars. Treat all non-record input as an
+  // empty option bag before resuming, so a malformed optional body can never
+  // turn a successful state transition into a 500 below.
+  const body: { reconcileStreamingCard?: unknown } = parsedBody !== null
+    && typeof parsedBody === 'object'
+    && !Array.isArray(parsedBody)
+    ? parsedBody as { reconcileStreamingCard?: unknown }
+    : {};
   const sessionId = params.sessionId;
   const sourceSession = findSessionRecord(sessionId);
   if (!sourceSession) return jsonRes(res, 404, { ok: false, error: 'not_found' });
@@ -2884,17 +2947,47 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
   const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
-  if (ds.larkAppId && !sessionTransportDisabled(ds)) {
-    if (ds.scope === 'chat' && ds.chatId) {
-      getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-        .then((mode) => mode === 'topic' && ds.session.rootMessageId
-          ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-          : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-        .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
-    } else if (ds.session.rootMessageId) {
-      replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
+  const postResumeNotice = async (): Promise<void> => {
+    if (!ds.larkAppId) return;
+    if (!sessionTransportDisabled(ds)) {
+      if (ds.scope === 'chat' && ds.chatId) {
+        await getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
+          .then((mode) => mode === 'topic' && ds.session.rootMessageId
+            ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+            : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
+          .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
+      } else if (ds.session.rootMessageId) {
+        await replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+          .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
+      }
     }
+  };
+
+  // `/sessions` resumes from a card outside the original topic, so there is no
+  // clicked in-topic card callback to replace the stale "session closed" card.
+  // Opt in explicitly from that caller: publish the fresh waiting card first,
+  // then withdraw its predecessor. Keep CLI/dashboard resume behavior stable.
+  const staleCardId = ds.streamCardId;
+  const shouldReconcileStreamingCard = body.reconcileStreamingCard === true
+    && ds.scope === 'thread'
+    && !!ds.session.rootMessageId
+    && !!staleCardId
+    && staleCardId !== CARD_POSTING_SENTINEL
+    && botCfg?.privateCard !== true;
+  if (shouldReconcileStreamingCard) {
+    const rootMessageId = ds.session.rootMessageId!;
+    void reconcileResumedStreamingCard(
+      ds,
+      staleCardId,
+      cardJson => replyMessage(ds.larkAppId, rootMessageId, cardJson, 'interactive', true),
+    ).then(async (result) => {
+      if (result.status === 'committed') await postResumeNotice();
+    }).catch(async (err) => {
+      logger.warn(`[resume] failed to reconcile original streaming card: ${err instanceof Error ? err.message : String(err)}`);
+      await postResumeNotice();
+    });
+  } else {
+    void postResumeNotice();
   }
 
   // Report the EFFECTIVE action, not the raw request flag: only fork when wake
@@ -3039,8 +3132,21 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   jsonRes(res, 200, { ok: true, sessionId: ds.session.sessionId });
 });
 
-ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/locate', async (req, res, params) => {
   const sid = params.sessionId;
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, 8 * 1024);
+  } catch (err) {
+    return jsonRes(res, err instanceof JsonBodyTooLargeError ? 413 : 400, {
+      ok: false,
+      error: err instanceof JsonBodyTooLargeError ? 'body_too_large' : 'invalid_json',
+    });
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+  }
+  const expected = body as SessionLocateExpectedScope;
   const acq = locateLimiter.tryAcquire(sid);
   if (!acq.ok) {
     res.writeHead(429, {
@@ -3059,18 +3165,31 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
   const ctx = ds
     ? {
         larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        scope: ds.session.scope,
+        status: ds.session.status,
         rootMessageId: ds.session.rootMessageId,
         ownerOpenId: ds.session.ownerOpenId,
       }
     : closed
       ? {
           larkAppId: closed.larkAppId ?? '',
+          chatId: closed.chatId,
+          scope: closed.scope,
+          status: closed.status,
           rootMessageId: closed.rootMessageId,
           ownerOpenId: closed.ownerOpenId,
         }
       : null;
   if (!ctx || !ctx.larkAppId) {
     return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  // Optional compare-before-locate guard used by the public `/sessions` card.
+  // Existing dashboard callers send `{}` and keep their historical behavior.
+  // When present, every field is checked against the daemon's latest row so a
+  // transfer/close racing the card handler's fresh GET fails closed here.
+  if (!matchesExpectedSessionLocateScope(ctx, expected)) {
+    return jsonRes(res, 409, { ok: false, error: 'session_scope_changed' });
   }
   if (!ctx.ownerOpenId) {
     return jsonRes(res, 422, { ok: false, error: 'no_owner' });
@@ -3094,6 +3213,99 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
 
 // ─── Schedules ─────────────────────────────────────────────────────────────
 
+type SchedulePreconditionWriteParseResult =
+  | {
+      ok: true;
+      supplied: boolean;
+      create?: SchedulePreconditionDefinition;
+      update?: SchedulePreconditionMutation;
+    }
+  | { ok: false; field: 'preconditionEnabled' | 'preconditionScript' | 'preconditionFilePath' };
+
+/** Parse the authenticated schedule precondition write DTO. Source values go
+ * directly to protected storage; authenticated management reads receive a
+ * validated flat projection from that sidecar rather than from the task row. */
+function parseSchedulePreconditionWrite(
+  body: Record<string, unknown>,
+  operation: 'create' | 'update',
+): SchedulePreconditionWriteParseResult {
+  const enabledPresent = Object.hasOwn(body, 'preconditionEnabled');
+  const scriptPresent = Object.hasOwn(body, 'preconditionScript');
+  const filePresent = Object.hasOwn(body, 'preconditionFilePath');
+  const supplied = enabledPresent || scriptPresent || filePresent;
+
+  if (enabledPresent && typeof body.preconditionEnabled !== 'boolean') {
+    return { ok: false, field: 'preconditionEnabled' };
+  }
+  if (scriptPresent && filePresent) {
+    return { ok: false, field: 'preconditionFilePath' };
+  }
+
+  const enabled = enabledPresent ? body.preconditionEnabled as boolean : undefined;
+  let source: SchedulePreconditionSource | undefined;
+  if (scriptPresent) {
+    if (body.preconditionScript === null) {
+      if (operation === 'create' || enabledPresent) {
+        return { ok: false, field: 'preconditionScript' };
+      }
+      return { ok: true, supplied, update: { action: 'clear' } };
+    }
+    try {
+      source = validateSchedulePreconditionSource({
+        kind: 'inline',
+        script: body.preconditionScript,
+      });
+    } catch {
+      return { ok: false, field: 'preconditionScript' };
+    }
+  } else if (filePresent) {
+    try {
+      source = validateSchedulePreconditionSource({
+        kind: 'file',
+        path: body.preconditionFilePath,
+      });
+      if (source.kind !== 'file') throw new TypeError('invalid_schedule_precondition_file_source');
+      assertSchedulePreconditionFilePathTrusted(source.path);
+    } catch {
+      return { ok: false, field: 'preconditionFilePath' };
+    }
+  }
+
+  if (source) {
+    if (operation === 'create') {
+      return {
+        ok: true,
+        supplied,
+        create: { enabled: enabled ?? true, source },
+      };
+    }
+    return {
+      ok: true,
+      supplied,
+      update: enabled === undefined
+        ? { action: 'replace', source }
+        : { action: 'replace', source, enabled },
+    };
+  }
+
+  if (enabled !== undefined) {
+    if (operation === 'create') {
+      // The create form defaults off. With no source, false is a no-op and
+      // true is incomplete rather than a phantom configured condition.
+      return enabled
+        ? { ok: false, field: 'preconditionEnabled' }
+        : { ok: true, supplied };
+    }
+    return {
+      ok: true,
+      supplied,
+      update: { action: 'set-enabled', enabled },
+    };
+  }
+
+  return { ok: true, supplied };
+}
+
 export interface ScheduleRow {
   id: string;
   name: string;
@@ -3102,6 +3314,8 @@ export interface ScheduleRow {
   prompt: string;
   workingDir: string;
   chatId: string;
+  /** Effective target chats. Legacy single-chat tasks are projected as one item. */
+  chatIds: string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
@@ -3112,13 +3326,101 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
+  hasPrecondition: boolean;
+  preconditionEnabled?: boolean;
+  /** Authenticated management projection of the protected source. Internal
+   * sidecar references and hashes are never exposed. */
+  preconditionSource?: SchedulePreconditionSource['kind'];
+  preconditionScript?: string;
+  preconditionFilePath?: string;
   feishuChatLink: string;
+}
+
+type ScheduleChatTargetsParseResult =
+  | { ok: true; chatId: string; chatIds: string[] }
+  | { ok: false; field: 'chatId' | 'chatIds' };
+
+/** Accept the legacy singular target and the Dashboard's multi-target array.
+ * The array is authoritative when supplied; requiring an agreeing legacy field
+ * avoids two different "primary" targets in one request. */
+function parseScheduleChatTargets(
+  body: Record<string, unknown>,
+  required: boolean,
+): ScheduleChatTargetsParseResult | undefined {
+  const hasChatId = body.chatId !== undefined;
+  const hasChatIds = body.chatIds !== undefined;
+  if (!hasChatId && !hasChatIds) {
+    return required ? { ok: false, field: 'chatId' } : undefined;
+  }
+
+  const legacyChatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+  if (hasChatId && !legacyChatId) return { ok: false, field: 'chatId' };
+
+  const rawTargets = hasChatIds ? body.chatIds : [legacyChatId];
+  if (!Array.isArray(rawTargets) || rawTargets.length === 0) {
+    return { ok: false, field: 'chatIds' };
+  }
+  const chatIds: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawTargets) {
+    if (typeof raw !== 'string' || !raw.trim()) return { ok: false, field: 'chatIds' };
+    const chatId = raw.trim();
+    if (seen.has(chatId)) continue;
+    seen.add(chatId);
+    chatIds.push(chatId);
+  }
+  if (chatIds.length === 0) return { ok: false, field: 'chatIds' };
+  if (hasChatId && legacyChatId !== chatIds[0]) return { ok: false, field: 'chatId' };
+  return { ok: true, chatId: chatIds[0], chatIds };
+}
+
+function schedulePreconditionProjection(
+  task: ScheduledTask,
+): Pick<
+  ScheduleRow,
+  | 'hasPrecondition'
+  | 'preconditionEnabled'
+  | 'preconditionSource'
+  | 'preconditionScript'
+  | 'preconditionFilePath'
+> {
+  const effectiveAppId = task.larkAppId ?? cachedLarkAppId;
+  if (!effectiveAppId) {
+    return task.preconditionRef === undefined
+      ? { hasPrecondition: false }
+      : { hasPrecondition: true, preconditionEnabled: true };
+  }
+  try {
+    const resolved = resolveSchedulePrecondition(task, effectiveAppId);
+    if (resolved.kind === 'none') return { hasPrecondition: false };
+    return resolved.source.kind === 'inline'
+      ? {
+          hasPrecondition: true,
+          preconditionEnabled: resolved.enabled,
+          preconditionSource: 'inline',
+          preconditionScript: resolved.source.script,
+        }
+      : {
+          hasPrecondition: true,
+          preconditionEnabled: resolved.enabled,
+          preconditionSource: 'file',
+          preconditionFilePath: resolved.source.path,
+        };
+  } catch {
+    // A damaged/mismatched protected record blocks execution. Keep the list
+    // usable without leaking storage details, and represent that state as an
+    // active gate rather than incorrectly claiming no condition exists.
+    logger.error(
+      `[schedule-precondition] management projection unavailable for task ${task.id}; projecting fail-closed gate`,
+    );
+    return { hasPrecondition: true, preconditionEnabled: true };
+  }
 }
 
 function composeScheduleRow(t: ScheduledTask): ScheduleRow {
@@ -3130,6 +3432,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     prompt: t.prompt,
     workingDir: t.workingDir,
     chatId: t.chatId,
+    chatIds: scheduleStore.effectiveScheduleChatIds(t),
     rootMessageId: t.rootMessageId,
     scope: t.scope,
     executionPosition: scheduler.resolveTaskExecutionPosition(t),
@@ -3146,6 +3449,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
     followActive: t.followActive === true ? true : undefined,
+    ...schedulePreconditionProjection(t),
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -3158,6 +3462,126 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
   jsonRes(res, 200, { schedules: all.map(composeScheduleRow) });
 });
 
+ipcRoute('GET', '/api/schedules/:id/logs', (req, res, p) => {
+  const task = scheduleStore.getTask(p.id);
+  if (!task || !scheduler.belongsToOwner(task)) {
+    return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
+  }
+  const appId = task.larkAppId ?? cachedLarkAppId;
+  if (!appId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+
+  const searchParams = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  const rawLimit = Number.parseInt(searchParams.get('limit') ?? '', 10);
+  const rawOffset = Number.parseInt(searchParams.get('offset') ?? '', 10);
+  try {
+    const result = queryScheduleRunLogs(p.id, {
+      limit: Number.isFinite(rawLimit) ? rawLimit : 50,
+      offset: Number.isFinite(rawOffset) ? rawOffset : 0,
+    }, appId);
+    return jsonRes(res, 200, result);
+  } catch (err) {
+    logger.error(
+      `[schedule-run-log] query failed for task ${p.id}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return jsonRes(res, 500, { ok: false, error: 'schedule_run_logs_query_failed' });
+  }
+});
+
+// Execute the current unsaved Dashboard draft without creating/updating a
+// schedule. This route deliberately has no task id: it only reads the selected
+// file (if any) and invokes the existing bounded Bash runner. Consequently it
+// cannot dispatch a model, advance repeat/once accounting, or write task logs.
+ipcRoute('POST', '/api/schedules/precondition/test', async (req, res) => {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_json',
+      error: 'Request body must be valid JSON',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_request',
+      error: 'Request body must be an object',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  const draft = body as Record<string, unknown>;
+  if (typeof draft.workingDir !== 'string' || draft.workingDir.trim().length === 0) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_working_dir',
+      error: 'Scheduled task precondition requires a non-empty task working directory',
+      field: 'workingDir',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  const checkedWorkingDir = validateWorkingDir(draft.workingDir);
+  if (!checkedWorkingDir.ok) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_working_dir',
+      error: checkedWorkingDir.error,
+      field: 'workingDir',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+
+  let source: SchedulePreconditionSource;
+  try {
+    source = validateSchedulePreconditionSource(draft.source);
+    if (source.kind === 'file') assertSchedulePreconditionFilePathTrusted(source.path);
+  } catch (error) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: error instanceof SchedulePreconditionFileError ? error.code : 'invalid_source',
+      error: error instanceof Error ? error.message : String(error),
+      field: 'source',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+
+  const startedAt = Date.now();
+  try {
+    const script = source.kind === 'inline'
+      ? source.script
+      : readSchedulePreconditionFile(source.path, checkedWorkingDir.resolvedPath);
+    const result = await runSchedulePrecondition(script, checkedWorkingDir.resolvedPath);
+    return jsonRes(res, 200, {
+      ok: true,
+      result: result.decision,
+      durationMs: Date.now() - startedAt,
+      additionalPrompt: result.decision === 'pass' && result.additionalPrompt !== undefined,
+    });
+  } catch (error) {
+    const expected = error instanceof SchedulePreconditionError
+      || error instanceof SchedulePreconditionFileError;
+    return jsonRes(res, expected ? 200 : 500, {
+      ok: false,
+      result: 'error',
+      errorCode: expected ? error.code : 'precondition_test_failed',
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+      additionalPrompt: false,
+    });
+  }
+});
+
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
@@ -3167,6 +3591,10 @@ ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200
 ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const task = scheduleStore.getTask(p.id);
+  if (!task) return jsonRes(res, 200, { ok: false, error: 'not_found' });
+  const effectiveAppId = task.larkAppId ?? cachedLarkAppId;
+  if (!effectiveAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   const requested = body && typeof body === 'object'
     ? (body as Record<string, unknown>).executionPosition
     : undefined;
@@ -3174,14 +3602,19 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
     if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
-    const result = scheduler.updateTask(p.id, { executionPosition: requested });
+    const result = updateTaskWithOptionalPrecondition(
+      p.id,
+      { executionPosition: requested },
+      effectiveAppId,
+    );
     return jsonRes(res, 200, result.ok ? { ...result, executionPosition: requested } : result);
   }
-  return jsonRes(res, 200, scheduler.toggleDelivery(p.id));
+  return jsonRes(res, 200, toggleTaskDeliveryWithPrecondition(p.id, effectiveAppId));
 });
 
-// Create a new scheduled task from the dashboard. chatId selects which chat
-// the task fires into; workingDir defaults to the daemon's cwd.
+// Create a new scheduled task from the dashboard. chatIds selects one or more
+// chats owned by this bot; legacy clients may keep sending only chatId.
+// workingDir defaults to the daemon's cwd.
 ipcRoute('POST', '/api/schedules', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   let body: unknown;
@@ -3194,8 +3627,12 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   const name = typeof b.name === 'string' ? b.name.trim() : '';
   const schedule = typeof b.schedule === 'string' ? b.schedule.trim() : '';
   const prompt = typeof b.prompt === 'string' ? b.prompt : '';
-  const chatId = typeof b.chatId === 'string' ? b.chatId.trim() : '';
+  const chatTargets = parseScheduleChatTargets(b, true)!;
   const rootMessageId = typeof b.rootMessageId === 'string' ? b.rootMessageId.trim() : '';
+  const precondition = parseSchedulePreconditionWrite(b, 'create');
+  if (!precondition.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: precondition.field });
+  }
   // Validate silent type — if present, must be boolean (no silent degradation).
   let silent = false;
   if (b.silent !== undefined) {
@@ -3241,7 +3678,17 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   if (!name) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'name' });
   if (!schedule) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'schedule' });
   if (!prompt.trim()) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'prompt' });
-  if (!chatId) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'chatId' });
+  if (!chatTargets.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: chatTargets.field });
+  }
+  const { chatId, chatIds } = chatTargets;
+  if (executionPosition === 'topic' && chatIds.length > 1) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'multiple_chats_topic_unsupported',
+      field: 'chatIds',
+    });
+  }
   if (executionPosition === 'topic' && !rootMessageId) {
     return jsonRes(res, 400, { ok: false, error: 'topic_root_required', field: 'rootMessageId' });
   }
@@ -3253,12 +3700,13 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
-    const task = scheduler.addTask({
+    const task = createTaskWithOptionalPrecondition({
       name,
       schedule,
       prompt,
       workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
       chatId,
+      chatIds: chatIds.length > 1 ? chatIds : undefined,
       // Only topic execution retains a root anchor; at top-level/new-topic the
       // root is dropped so it can never pull execution back into the topic the
       // schedule was created from (e.g. an adopted one).
@@ -3275,7 +3723,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       deliver,
       silent,
       followActive: followActive || undefined,
-    });
+    }, cachedLarkAppId, precondition.create);
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
   } catch (err) {
@@ -3297,7 +3745,20 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     name?: string; prompt?: string; schedule?: string;
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
+    chatId?: string; chatIds?: readonly string[] | null;
   } = {};
+  const chatTargets = parseScheduleChatTargets(b, false);
+  if (chatTargets && !chatTargets.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: chatTargets.field });
+  }
+  if (chatTargets?.ok) {
+    updates.chatId = chatTargets.chatId;
+    updates.chatIds = chatTargets.chatIds.length > 1 ? chatTargets.chatIds : null;
+  }
+  const precondition = parseSchedulePreconditionWrite(b, 'update');
+  if (!precondition.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: precondition.field });
+  }
   // If a field is present, it must be the correct type and (for strings)
   // non-empty after trim — otherwise 400, never silently ignore.
   if (b.name !== undefined) {
@@ -3352,15 +3813,69 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     }
     updates.silent = b.silent;
   }
-  const result = scheduler.updateTask(p.id, updates);
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let result;
+  try {
+    result = updateTaskWithOptionalPrecondition(
+      p.id,
+      updates,
+      cachedLarkAppId,
+      precondition.update,
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message === 'schedule_precondition_not_configured') {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionEnabled',
+      });
+    }
+    if (err instanceof SchedulePreconditionFileError) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+    }
+    logger.error(`[schedule-precondition] authenticated update failed for task ${p.id}`);
+    return jsonRes(res, 500, {
+      ok: false,
+      error: 'schedule_precondition_update_failed',
+    });
+  }
   if (!result.ok) return jsonRes(res, 400, result);
-  const task = scheduleStore.getTask(p.id);
+  const task = result.task ?? scheduleStore.getTask(p.id);
+  if (precondition.supplied) {
+    const projection: ReturnType<typeof schedulePreconditionProjection> = task
+      ? schedulePreconditionProjection(task)
+      : { hasPrecondition: false as const };
+    dashboardEventBus.publish({
+      type: 'schedule.updated',
+      body: {
+        id: p.id,
+        // JSON `null` clear markers are event-only: merge-based consumers must
+        // drop the previous source when a condition is cleared or changes kind.
+        // Snapshot rows omit fields that do not apply.
+        patch: {
+          ...projection,
+          preconditionSource: projection.preconditionSource ?? null,
+          preconditionScript: projection.preconditionScript ?? null,
+          preconditionFilePath: projection.preconditionFilePath ?? null,
+        },
+      },
+    });
+  }
   jsonRes(res, 200, { ok: true, task: task ? composeScheduleRow(task) : undefined });
 });
 
 // Delete a scheduled task.
 ipcRoute('DELETE', '/api/schedules/:id', (_req, res, p) => {
-  jsonRes(res, 200, scheduler.removeTaskForDashboard(p.id));
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    jsonRes(res, 200, removeTaskWithPrecondition(p.id, cachedLarkAppId));
+  } catch (err) {
+    jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 ipcRoute('POST', '/api/trigger', async (req, res) => {
@@ -3562,6 +4077,40 @@ ipcRoute('GET', '/api/groups/:chatId/membership', async (_req, res, p) => {
   } catch (e) {
     jsonRes(res, 502, { error: String(e) });
   }
+});
+
+/** Host-only rename through this daemon's exact bot identity. */
+ipcRoute('PUT', '/api/groups/:chatId/name', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some(key => key !== 'name')) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  }
+  const normalized = normalizeLarkChatName(body.name);
+  if (!normalized.ok) return jsonRes(res, 400, normalized);
+
+  const larkAppId = cachedLarkAppId;
+  await chatRenameSerialQueue.run(`${larkAppId}:${p.chatId}`, async () => {
+    const response = await executeChatRename({
+      larkAppId,
+      chatId: p.chatId,
+      name: normalized.name,
+      trigger: 'host_api',
+      botOpenId: getBotOpenId(larkAppId),
+    }, {
+      renameChat: groupsStore.renameChat,
+      activeSessions: () => getActiveSessionsRegistry()?.values() ?? [],
+      persistSession: sessionStore.updateSession,
+      logger,
+    });
+    return jsonRes(res, response.status, response.body);
+  });
 });
 
 ipcRoute('POST', '/api/groups/:chatId/add-bots', async (req, res, p) => {
@@ -3844,16 +4393,19 @@ async function collectMessageListenerPreviewMatches(
   limit: number,
 ): Promise<MessageListenerPreviewMatch[]> {
   const bot = getBot(larkAppId);
-  const previewListener: MessageListenerConfig = {
-    enabled: true,
-    ...(listener.name ? { name: listener.name } : {}),
-    ...(listener.replyCardTitle ? { replyCardTitle: listener.replyCardTitle } : {}),
-    ...(listener.workingDir ? { workingDir: listener.workingDir } : {}),
-    prompt: listener.prompt,
-    ...(listener.senderPolicy && Object.keys(listener.senderPolicy).length > 0 ? { senderPolicy: listener.senderPolicy } : {}),
-    ...(listener.messagePolicy ? { messagePolicy: { ...listener.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
-    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
-  };
+  // Build the preview listener with the SAME builder the save path uses, so
+  // preview can never drift from what the saved listener actually does. This
+  // used to be a hand-copied object literal that silently omitted
+  // contentPolicy: preview then ran with "no content filter" and reported
+  // every message as a match (and run-preview forked real sessions for
+  // messages the live listener would never wake on). Reusing the builder makes
+  // the preview leg structurally immune to the next field added to the config.
+  // Only `enabled` is overridden: an off draft is still previewable.
+  const configured = messageListenerConfigFromUpdate(listener);
+  // Blank prompt => nothing worth previewing (findMessageListenerForChat would
+  // reject it anyway); mirrors the save path treating it as a clear.
+  if (!configured) return [];
+  const previewListener: MessageListenerConfig = { ...configured, enabled: true };
   const previewBot = {
     ...bot,
     config: {
@@ -4382,6 +4934,12 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     dshRuntime,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
+    // Dashboard-created schedules default to this daemon process directory.
+    // It remains the Bash execution cwd, not a file-path resolution base.
+    scheduleWorkingDir: process.cwd(),
+    // Private Dashboard payload only. File-backed preconditions must live under
+    // this daemon-owned host directory; it is never derived from workingDir.
+    schedulePreconditionFileRoot: schedulePreconditionTrustedFilesRoot(),
     defaultWorkingDir,
     defaultWorkingDirAutoWorktree,
     autoboundChatCount: autoboundChats.length,

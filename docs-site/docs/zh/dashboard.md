@@ -34,7 +34,7 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 ## 功能
 
 - **Sessions**：跨所有 bot 列出活跃 + 已关闭会话，可按 CLI / 状态 / adopt / 文本过滤。点进 detail 可复制各种 ID、关闭会话、多选批量关闭；「定位话题」会让机器人在原话题发一条 **@会话 owner** 的提醒（纯 @、无其它正文）帮你跳回上下文。chat-scope 的会话行还带一个飞书群 AppLink 直达群聊。
-- **Schedules**：列出所有定时任务，可 Run now / Pause / Resume。
+- **Schedules**：新建、编辑和管理定时任务，支持立即运行、暂停/恢复、多个目标群、执行日志，以及可测试的 [Bash 前置条件](/schedule#bash-前置条件dashboard)。
 - **Groups**：一键拉新群（自动 @ 通知被邀请人）、拉 bot 入群、自动转让群主；解散群聊、bot 退群（关联会话自动清理）。
 - **团队 / Roles / Bot Defaults**：团队面板做[跨部署协作](/roles)（邀请别人的部署进团队、跨部署拉群）；Roles 管理各 bot 按群人设；Bot Defaults（Bot 配置）配默认行为（新群 oncall、卡片签名、**默认角色**等）。
 - **Workflows 管控面**：Run List 轮询；Run Detail 看 summary / dangling 红区 / node-activity / event timeline / 并发执行 timeline；可直接 **cancel run**。
@@ -47,6 +47,23 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 已认证管理员可在「设置 → 系统与维护」中管理 botmux 后台服务的开机自启；匿名用户不能查看或修改这项设置。
 
 该开关复用现有 `botmux autostart` 能力，只管理下次开机/登录时使用的启动项，不会启动、停止或重启当前 daemon。
+
+## 需认证的集成操作
+
+已认证的宿主集成可以指定一个明确的机器人身份更新飞书群名：
+
+```http
+PUT /api/groups/{chatId}/name/{larkAppId}
+Content-Type: application/json
+
+{"name":"新的群名称"}
+```
+
+两个路径参数都必须做 URL 编码。指定机器人必须当前就在该群内；botmux
+不会失败后改用其它已配置机器人。群名遵循飞书的 100 个 Unicode 码点上限，
+并拒绝控制字符与不可见格式字符。请求体上限为 4 KiB，且只接受 `name`
+字段。鉴权沿用下文所述的 Dashboard 管理权限边界；`publicReadOnly` 不会让该
+写操作变成匿名可用。
 
 ## 对外只读查询
 
@@ -127,7 +144,7 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 
 `publicReadOnly` 默认开启。开启时，`GET /api/dashboard/v1/summary`、`GET /api/sessions` 和 `GET /events` 等只读白名单接口在 Dashboard 监听地址上可以**无 token** 访问。summary 只含上述强脱敏聚合；会话名称、标题、后端和 session / event row 中的其它元数据都应按可公开信息对待。
 
-- 全部 POST / PATCH / DELETE 写操作、不在只读白名单中的 GET，以及原始 PTY / 诊断日志，始终需要 `botmux dashboard` 生成的当前 token。白名单是 fail-closed 的：新增 GET 不会因公开只读开启就自动暴露。
+- 全部 POST / PUT / PATCH / DELETE 写操作、不在只读白名单中的 GET，以及原始 PTY / 诊断日志，始终需要 `botmux dashboard` 生成的当前 token。白名单是 fail-closed 的：新增 GET 不会因公开只读开启就自动暴露。
 - 关闭 `publicReadOnly` 后，无 token 的 summary 请求会返回 401；持当前 token 的请求仍可访问，且不受上面的匿名限流。错误或已轮换的旧 token 在公开只读开启时按匿名请求处理。
 - `botmux dashboard` 和 `botmux dashboard current` 会复用当前 token（尚无时创建第一个）；`botmux dashboard rotate` 才会显式替换 token、让之前的链接失效。token 只提供 Dashboard 应用层访问权，不代替主机防火墙、VPN 或反向代理鉴权。
 - 不需要无 token 观测时，在 Dashboard 「设置」中关闭「公开只读」。也可先设 `BOTMUX_DASHBOARD_PUBLIC_READONLY=false`；但设置页一旦保存过该开关，`~/.botmux/config.json` 的持久值会优先于环境变量。

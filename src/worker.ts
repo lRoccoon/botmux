@@ -61,7 +61,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -164,6 +164,10 @@ import {
   type BotConfig,
 } from './bot-registry.js';
 import { readGlobalConfig, isWorkflowFeatureEnabled } from './global-config.js';
+import {
+  stopSessionScope,
+  wrapCommandInSessionScope,
+} from './core/session-scope.js';
 import {
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
@@ -4253,6 +4257,12 @@ const bridgeRestoreGate = new BridgeRestoreGate();
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
+/** Claude Code's automatic model switches for this bridge. The tracker owns the
+ *  binding to the CURRENT Claude session id, the record-uuid dedupe and the
+ *  "only report the serving model when it changed" rule; every transcript drain
+ *  reaches it through observeModelFallbackEvents. The worker reports
+ *  observations only — the daemon owns the state and decides. */
+const modelFallbackTracker = new ClaudeModelFallbackTracker();
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -4857,6 +4867,7 @@ function bridgeAbsorbBaseline(): void {
   bridgeOffset = result.newOffset;
   bridgePendingTail = result.pendingTail;
   bridgeQueue.absorb(result.events);
+  observeModelFallbackEvents(bridgeJsonlPath, result.events);
   bridgeBaselineDone = true;
   // After absorb (uuids registered as seen so they won't re-emit as a Lark
   // turn), surface the last completed user/assistant exchange to Lark as a
@@ -4927,6 +4938,7 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, bridgeJsonlPath);
+  observeModelFallbackEvents(bridgeJsonlPath, drained.events);
   bridgeBaselineDone = true;
   log(`Bridge restored ${restorable.length} interrupted turn(s) from journal (drain ${fromOffset}→${bridgeOffset}, absorbed=${history.length}, live=${live.length})`);
   return true;
@@ -4999,6 +5011,11 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, matched);
+  // The switch moved us onto another Claude session: rebind the fallback
+  // tracker to it (seed always publishes, so the daemon drops whatever the
+  // previous session left behind) before folding this file's own events in.
+  seedModelFallbackFromTranscript();
+  observeModelFallbackEvents(matched, drained.events);
   bridgeBaselineDone = true;
   log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
   bridgeRememberSessionIdForPath(matched);
@@ -5268,6 +5285,10 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   const { history, live } = splitTranscriptEventsByCutoff(result.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, newPath);
+  // Same as the fingerprint switch: rebind the fallback tracker to the Claude
+  // session we just rotated onto, then fold this file's own events in.
+  seedModelFallbackFromTranscript();
+  observeModelFallbackEvents(newPath, result.events);
   bridgeBaselineDone = true;
   log(`Bridge rotation split: ${history.length} historical events absorbed, ${live.length} live events ingested`);
 
@@ -5440,6 +5461,14 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
   bridgeOffset = 0;
   bridgePendingTail = '';
   bridgeBaselineDone = true;
+  // Same as the fingerprint and fd-rotation switches: the bridge is now on
+  // another Claude conversation, so re-declare which one before any of its
+  // bytes are folded in. Waiting for the next ingest to rebind would leave the
+  // daemon showing the PREVIOUS session's notice for as long as the new
+  // transcript holds nothing observable (a rotation onto a file with no
+  // assistant reply yet), and would let the secondary-path sweep fold the old
+  // session's trailing bytes in as if they were the bound session's.
+  seedModelFallbackFromTranscript();
   try {
     bridgeWatcher = fsWatch(resolved.path, { persistent: false }, () => {
       try { performBridgeIngestAndScheduleQuietEmit(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
@@ -5527,6 +5556,12 @@ function bridgeIngest(): void {
     // Lazy baseline: file didn't exist at attach, baseline the moment it does.
     if (!existsSyncSafe(bridgeJsonlPath)) return;
     bridgeAbsorbBaseline();
+    // Seed for the same reason startBridgeWatcher seeds after ITS baseline:
+    // the non-adopt branch cursors straight to EOF, so a switch already written
+    // to the file is never drained and only the tail scan can recover it. It
+    // also binds the tracker to this file's Claude session. Idempotent with the
+    // adopt branch's own observe: the same record is deduped by uuid.
+    seedModelFallbackFromTranscript();
     return;
   }
   const result = drainTranscript(bridgeJsonlPath, bridgeOffset);
@@ -5539,6 +5574,7 @@ function bridgeIngest(): void {
   // signal — read it here (event-driven, once per record) instead of scraping
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
+  observeModelFallbackEvents(bridgeJsonlPath, result.events);
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
@@ -5572,6 +5608,79 @@ function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void 
     log(`Structured rate-limit detected in Claude transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
     return; // one limited emit per ingest is enough; state key is stable
   }
+}
+
+/** THE single entry every Claude transcript drain feeds — history and live
+ *  alike. bridgeIngest is only ONE of the drains that reach the bridge queue:
+ *  the adopt baseline, the journal restore, the fingerprint switch, the
+ *  fd-rotation switch, drainPathInto and the secondary-path sweep all pull
+ *  transcript events too, and a switch record that arrives through any of them
+ *  is just as real. Routing them all through here is what stops a `/clear` or a
+ *  rotation from silently swallowing one.
+ *
+ *  Routing is by the PATH's Claude session id, never by which drain called:
+ *    - the bound session → observe;
+ *    - a different session that IS the current primary path → the bridge moved
+ *      to another Claude conversation, so rebind (dropping the previous
+ *      session's dedupe state) and observe;
+ *    - a different session on a secondary / already-retired path → ignore.
+ *      Those are trailing bytes of a conversation this session no longer runs
+ *      on; folding them in would resurrect its notice or its serving model.
+ *
+ *  The notice is a claude-code-only product affordance, so the cliId gate is
+ *  explicit rather than implied by the call sites. */
+function observeModelFallbackEvents(
+  path: string | null | undefined,
+  events: readonly TranscriptEvent[],
+): void {
+  if (lastInitConfig?.cliId !== 'claude-code') return;
+  if (!path || events.length === 0) return;
+  const claudeSessionId = sessionIdFromJsonlPath(path);
+  if (!claudeSessionId) return;
+  if (claudeSessionId !== modelFallbackTracker.boundClaudeSessionId) {
+    if (path !== bridgeJsonlPath) return;
+    modelFallbackTracker.bind(claudeSessionId);
+  }
+  reportModelFallbackObservation(modelFallbackTracker.observe(events));
+}
+
+/** Bind the tracker to the CURRENT primary path's Claude session and publish
+ *  one observation from its tail. Called at every bind/switch of
+ *  bridgeJsonlPath (watcher start, lazy baseline, fingerprint switch, rotation
+ *  switch): baseline cursors to EOF, so a switch recorded before `--resume`, a
+ *  daemon restart or the switch itself is never drained, and a bounded backward
+ *  scan is the only way to recover it (same shape as Codex/TRAE runtime
+ *  seeding).
+ *
+ *  This ALWAYS sends, including when the scan found nothing. The empty message
+ *  is not a claim that the daemon's notice is stale — it names the Claude
+ *  session the bridge is now on, which is how the daemon drops a notice that
+ *  belonged to a different conversation. An empty message for the SAME session
+ *  changes nothing there, so a plain worker restart still costs nothing. */
+function seedModelFallbackFromTranscript(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !bridgeJsonlPath) return;
+  const claudeSessionId = sessionIdFromJsonlPath(bridgeJsonlPath);
+  if (!claudeSessionId) return;
+  let seeded: ModelFallbackObservation;
+  try { seeded = modelFallbackTracker.seed(bridgeJsonlPath, claudeSessionId); }
+  catch (err: any) { log(`Model fallback seed skipped: ${err?.message ?? err}`); return; }
+  reportModelFallbackObservation(seeded);
+}
+
+/** Ship one observation. Facts only: the worker never decides that a notice is
+ *  over. The two shapes that CAN clear are both positive evidence — a
+ *  `claudeSessionId` naming a different Claude conversation, and `fallback:
+ *  null` from a newest session-scoped record that is not a live Fable
+ *  fallback — and the daemon applies them, not us. */
+function reportModelFallbackObservation(observed: ModelFallbackObservation | null): void {
+  if (!observed) return;
+  const rec = observed.fallback;
+  if (rec) {
+    log(`Claude model fallback observed (kind=${rec.kind}, ${rec.originalModel} → ${rec.fallbackModel}, trigger=${rec.trigger ?? 'n/a'})`);
+  } else if (rec === null) {
+    log(`Claude model fallback cleared by the newest session switch record (session=${observed.claudeSessionId})`);
+  }
+  send({ type: 'model_fallback', ...observed });
 }
 
 function performBridgeIngestAndScheduleQuietEmit(): void {
@@ -5663,6 +5772,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   } else {
     log(`Bridge transcript not yet present at ${bridgeJsonlPath}; will baseline on first appearance`);
   }
+  seedModelFallbackFromTranscript();
   // fs.watch is best-effort wakeup — actual data source is the byte offset.
   // The fallback poller covers fs.watch's gaps (NFS, rename-rotation, etc.)
   // and also drives lazy baseline when the file shows up after attach.
@@ -6041,6 +6151,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
 function drainPathInto(path: string, fromOffset: number): { offset: number; tail: string } {
   const result = drainTranscript(path, fromOffset);
   bridgeQueue.ingest(result.events, path);
+  // Drain-before-switch runs while `path` is still the primary, so these are
+  // the bound session's own trailing bytes — a switch record Claude wrote just
+  // before the rotation lands here and nowhere else.
+  observeModelFallbackEvents(path, result.events);
   return { offset: result.newOffset, tail: result.pendingTail };
 }
 
@@ -7680,6 +7794,10 @@ function drainSecondaryPaths(): void {
     try {
       const result = drainTranscript(path, offset);
       if (result.events.length > 0) bridgeQueue.ingest(result.events, path);
+      // Retired paths belong to a Claude session we already left, so the router
+      // drops them; routed anyway so the "every queue-feeding drain goes
+      // through one entry" rule has no exception to reason about.
+      observeModelFallbackEvents(path, result.events);
       bridgeSecondaryPaths.set(path, result.newOffset);
     } catch (err: any) {
       log(`Bridge secondary-path drain failed (${path}): ${err.message}`);
@@ -8434,6 +8552,7 @@ let pendingShotTimer: ReturnType<typeof setTimeout> | null = null;
 let lastShotHash = '';
 // Throttle for the happy-path upload log in captureAndUpload (one line/min).
 let lastUploadLogAtMs = 0;
+let screenshotCaptureInFlight = false;
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 let larkBrandForUpload: 'feishu' | 'lark' = 'feishu';
@@ -8495,64 +8614,80 @@ async function captureAndUpload(): Promise<void> {
   if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
   if (apiOnlyForUpload)             { logScreenshotSkip('no Feishu transport (apiOnly bot or HTTP virtual session)'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
+  if (screenshotCaptureInFlight)    { logScreenshotSkip('capture/upload already in flight'); return; }
 
-  let png: Buffer;
-  let usageLimitContent = '';
+  screenshotCaptureInFlight = true;
   try {
-    // Preferred path: pipe-pane backends ask tmux for a fresh viewport
-    // snapshot and render it through a transient xterm-headless. This
-    // avoids the accumulated-buffer drift that produced duplicated /
-    // staircase content under the legacy long-lived renderer.
-    const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
-    if (pipeResult) {
-      if (pipeResult.ansi === lastShotHash) return;
-      lastShotHash = pipeResult.ansi;
-      png = pipeResult.png;
-      usageLimitContent = pipeResult.content;
-    } else {
-      // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
-      // still drive the long-lived renderer.
-      if (!renderer) { logScreenshotSkip('renderer=null'); return; }
-      const term = renderer.xterm;
-      const startY = term.buffer.active.baseY;
-      const snap = renderer.rawSnapshot();
-      const hash = createHash('md5').update(snap).digest('hex');
-      if (hash === lastShotHash) return;
-      lastShotHash = hash;
-      usageLimitContent = snap;
-      const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
-      const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
-      png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+    let png: Buffer;
+    let usageLimitContent = '';
+    const previousShotHash = lastShotHash;
+    let attemptedShotHash: string | null = null;
+    try {
+      // Preferred path: pipe-pane backends ask tmux for a fresh viewport
+      // snapshot and render it through a transient xterm-headless. This
+      // avoids the accumulated-buffer drift that produced duplicated /
+      // staircase content under the legacy long-lived renderer.
+      const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
+      if (pipeResult) {
+        if (pipeResult.ansi === lastShotHash) return;
+        attemptedShotHash = pipeResult.ansi;
+        lastShotHash = attemptedShotHash;
+        png = pipeResult.png;
+        usageLimitContent = pipeResult.content;
+      } else {
+        // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
+        // still drive the long-lived renderer.
+        if (!renderer) { logScreenshotSkip('renderer=null'); return; }
+        const term = renderer.xterm;
+        const startY = term.buffer.active.baseY;
+        const snap = renderer.rawSnapshot();
+        const hash = createHash('md5').update(snap).digest('hex');
+        if (hash === lastShotHash) return;
+        attemptedShotHash = hash;
+        lastShotHash = attemptedShotHash;
+        usageLimitContent = snap;
+        const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
+        const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+        png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+      }
+    } catch (err: any) {
+      logError(`Screenshot render failed: ${err?.message ?? err}`);
+      return;
     }
-  } catch (err: any) {
-    logError(`Screenshot render failed: ${err?.message ?? err}`);
-    return;
-  }
 
-  let imageKey: string;
-  try {
-    imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
-  } catch (err: any) {
-    logError(`Screenshot upload failed: ${err?.message ?? err}`);
-    return;
-  }
+    let imageKey: string;
+    try {
+      imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
+    } catch (err: any) {
+      // Do not clobber a newer reset (display-mode change/manual refresh) that
+      // happened while the request was pending. Otherwise restore the prior
+      // hash so the next regular tick retries this unchanged frame.
+      if (attemptedShotHash !== null && lastShotHash === attemptedShotHash) {
+        lastShotHash = previousShotHash;
+      }
+      logError(`Screenshot upload failed: ${err?.message ?? err}`);
+      return;
+    }
 
-  const status = projectedRuntimeScreenStatus();
-  // Success is otherwise completely silent (skips and failures log above), which
-  // made "loop alive and uploading" indistinguishable from "loop never started"
-  // in the daemon log. One throttled line keeps the happy path observable.
-  const nowMs = Date.now();
-  if (nowMs - lastUploadLogAtMs >= 60_000) {
-    lastUploadLogAtMs = nowMs;
-    log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+    const status = projectedRuntimeScreenStatus();
+    // Success is otherwise completely silent (skips and failures log above), which
+    // made "loop alive and uploading" indistinguishable from "loop never started"
+    // in the daemon log. One throttled line keeps the happy path observable.
+    const nowMs = Date.now();
+    if (nowMs - lastUploadLogAtMs >= 60_000) {
+      lastUploadLogAtMs = nowMs;
+      log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+    }
+    send({
+      type: 'screenshot_uploaded',
+      imageKey,
+      ...classifyScreenUsageLimit(usageLimitContent, status),
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+  } finally {
+    screenshotCaptureInFlight = false;
   }
-  send({
-    type: 'screenshot_uploaded',
-    imageKey,
-    ...classifyScreenUsageLimit(usageLimitContent, status),
-    turnId: currentBotmuxTurnId,
-    dispatchAttempt: currentBotmuxDispatchAttempt,
-  });
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
@@ -14719,6 +14854,7 @@ async function spawnCli(
       sandboxHome,
     );
     const mandatoryDenyPaths: string[] = [];
+    const hostOnlyDenyPaths: string[] = [join(canonical(dataDir), 'schedule-preconditions')];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
@@ -14976,6 +15112,7 @@ async function spawnCli(
       userPaths,
       serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
+      hostOnlyDenyPaths,
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
       net: cfg.sandboxNetwork !== false,
@@ -15006,6 +15143,9 @@ async function spawnCli(
     // it's diagnosable rather than a silent hole (codex).
     if (policy.suppressedAuthorityPaths?.length) {
       log(`[file-sandbox] no-transport suppressed ${policy.suppressedAuthorityPaths.length} allow path(s) inside a Feishu-authority root: ${policy.suppressedAuthorityPaths.join(', ')}`);
+    }
+    if (policy.suppressedHostOnlyPaths?.length) {
+      log(`[file-sandbox] suppressed ${policy.suppressedHostOnlyPaths.length} allow path(s) inside daemon-owned host-only roots: ${policy.suppressedHostOnlyPaths.join(', ')}`);
     }
     // Existence-filter only the ALLOW rules (baseline entries are candidates,
     // not guarantees): a non-existent allow path has nothing to expose, and
@@ -15507,6 +15647,33 @@ async function spawnCli(
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
     if (codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
+    }
+    if (!cfg.adoptMode && !willReattachPersistent && !isRemoteBackendType(effectiveBackendType)) {
+      // Wrap the command executed INSIDE the pane, not `tmux new-session`.
+      // The shared tmux server keeps its own cgroup while the owned CLI and all
+      // of its command descendants enter this per-session scope.
+      // If a prior worker crashed after its pane vanished, retire any detached
+      // descendant still held by this exact logical session's old scope before
+      // reusing the deterministic unit name.
+      stopSessionScope(cfg.sessionId);
+      const scoped = wrapCommandInSessionScope(
+        cfg.sessionId,
+        spawnBin,
+        spawnArgs,
+        readGlobalConfig().worker,
+      );
+      spawnBin = scoped.bin;
+      spawnArgs = scoped.args;
+      if (scoped.unitName) {
+        log(
+          `Launching owned CLI in ${scoped.unitName}`
+          + (scoped.capabilities.memoryControllerSupported
+            ? ' (memory controller verified)'
+            : ' (scope cleanup only; MemoryMax not enforceable)'),
+        );
+      } else if (scoped.capabilities.reason) {
+        log(`Session scope unavailable; using backend lifecycle cleanup: ${scoped.capabilities.reason}`);
+      }
     }
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
@@ -16594,6 +16761,19 @@ function killCli(opts: {
   appRunnerControlDecoder.reset();
 }
 
+function stopOwnedSessionScope(reason: string): void {
+  const cfg = lastInitConfig;
+  if (!cfg || cfg.adoptMode || isRemoteBackendType(effectiveBackendType)) return;
+  try {
+    const stopped = stopSessionScope(cfg.sessionId);
+    log(stopped
+      ? `Stopped owned session scope (${reason})`
+      : `Owned session scope was absent or could not be stopped (${reason})`);
+  } catch (error) {
+    log(`Failed to stop owned session scope (${reason}): ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function restartCliProcess(
   reason: string,
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
@@ -16683,6 +16863,7 @@ async function restartCliProcess(
         ));
         return;
       }
+      stopOwnedSessionScope('restart');
       killCli({
         preservePending: opts.preservePending,
         preservePolicyCapability: true,
@@ -17331,23 +17512,34 @@ body.touch.has-token #terminal .xterm{
   padding-bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px))}
 #mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
 #mobile-bar-keys::-webkit-scrollbar{display:none}
+/* A long press on a bar key must repeat that key (see the repeat handler below),
+   never raise the iOS selection handles / callout menu. user-select alone is not
+   enough in a WKWebView — the -webkit- pair is what suppresses both, same as the
+   xterm content area above. */
 #mobile-bar-keys button{
   flex:none;min-width:44px;height:34px;padding:0 12px;border:1px solid #2a2b3d;border-radius:8px;
   background:#1c1c24;color:#9d9fb0;font:500 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;white-space:nowrap}
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;white-space:nowrap}
 #mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
 #mobile-bar-row{display:flex;align-items:flex-end;gap:8px}
 #mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
+/* 16px is a hard floor, not a taste call: iOS Safari / WKWebView auto-zooms the
+   page whenever a focused form control renders below 16px, and it never zooms
+   back out — the terminal is left scaled up with its right-hand columns off
+   screen. -webkit-text-size-adjust does NOT prevent that (it only stops the
+   text-inflation algorithm), so the size itself has to be 16px. */
 #mobile-input{
   flex:1;min-width:0;min-height:42px;max-height:120px;resize:none;overflow-y:auto;
   padding:10px 12px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
-  font:14px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font:16px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   -webkit-text-size-adjust:100%;text-size-adjust:100%}
 #mobile-input::placeholder{color:#565f89}
 #mobile-bar-row button{
   flex:none;width:42px;min-height:42px;height:42px;padding:0;border:1px solid #2a2b3d;border-radius:8px;
   background:#1c1c24;color:#9d9fb0;font:500 15px/1 -apple-system,BlinkMacSystemFont,sans-serif;
-  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
 #mobile-bar-row button:active{background:#3a3b4d;color:#e4e6f0}
 #mobile-input-bar button:disabled,#mobile-input-bar textarea:disabled{opacity:.45;cursor:not-allowed}
 #mobile-send{min-width:52px;border-radius:8px;font:600 13px/1 -apple-system,BlinkMacSystemFont,sans-serif;background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7}
@@ -17408,7 +17600,7 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
       <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="输入命令…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
       <span id="mobile-live-hint" aria-hidden="true">实时输入 · 点击显示键盘</span>
     </div>
-    <button id="mobile-send" type="submit">发送</button>
+    <button id="mobile-send" type="submit">上屏</button>
   </div>
 </form>
 <div id="status" class="err">connecting...</div>
@@ -18412,9 +18604,17 @@ if(isTouch&&hasToken){(function(){
     if(payload&&!sendInput(payload))return false;
     mirror.sent=mirror.held='';ta.value='';resizeTa();return true;}
 
+  // Buffer mode types the text into the CLI's own input box WITHOUT submitting
+  // (it sends the text and nothing else — no trailing newline, which a TUI would
+  // insert as a literal line break rather than run), so the button is labelled
+  // 上屏 there and the user presses the Enter key once the text looks right. Live
+  // mode's button really does submit (it appends a carriage return), so it keeps
+  // 发送 — same reason the mode button spells out the extra Enter step.
   function setMode(m){mode=m;bar.setAttribute('data-mode',m);
     modeBtn.textContent=m===LIVE?'实时':'缓冲';
-    modeBtn.setAttribute('aria-label',m===LIVE?'当前为实时输入，点击切换为缓冲':'当前为缓冲输入，点击切换为实时');}
+    sendBtn.textContent=m===LIVE?'发送':'上屏';
+    sendBtn.setAttribute('aria-label',m===LIVE?'发送并执行':'把文本送上终端，随后按 Enter 执行');
+    modeBtn.setAttribute('aria-label',m===LIVE?'当前为实时输入，点击切换为缓冲':'当前为缓冲输入（上屏后需按 Enter 提交），点击切换为实时');}
   var measuredBarHeight=-1;
   function measureBar(){
     var rect=bar.getBoundingClientRect?bar.getBoundingClientRect():null;
@@ -18428,23 +18628,41 @@ if(isTouch&&hasToken){(function(){
     measureBar();}
   function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
 
-  function sendBuffered(appendEnter){
+  // 上屏 puts the text into the CLI's own input box and stops there — the user
+  // eyeballs it and presses Enter themselves. It must append NOTHING: a newline
+  // lands inside that box as a literal line break (a TUI reads it as "insert"),
+  // so the text showed up with a stray empty line after it. Only the Enter key
+  // (or live mode's own commit) sends the \\r that actually runs the command.
+  function sendBuffered(){
     var text=ta.value;
-    var payload=appendEnter?text+'\\n':text;
-    if(!payload)return;
-    if(!sendInput(payload.replace(/\\x1b/g,'')))return;
+    if(!text)return;
+    if(!sendInput(text.replace(/\\x1b/g,'')))return;
     ta.value='';resizeTa();
     if(mode===LIVE){mirror.sent=mirror.held='';}
     showKeyboard();}
   function sendLiveCommit(appendEnter){
     if(sendLiveKey(appendEnter?'\\r':''))showKeyboard();}
-  function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
+  // An EMPTY box in buffer mode still has to submit: after 上屏 the text is on the
+  // terminal and the box was cleared, and pressing Enter is literally step 3 of
+  // the 上屏 → 检查 → Enter flow this bar is built around. sendBuffered() bails on
+  // empty text, and the keydown handler has already called preventDefault(), so
+  // routing there would make the key vanish entirely. Send the \\r the key-row ⏎
+  // button already sends in this exact state — same reasoning as the empty-box
+  // Backspace below: an empty box has no draft, so the key belongs to the terminal.
+  function submit(){if(mode===LIVE)sendLiveCommit(true);else if(ta.value)sendBuffered();else sendInput('\\r');}
 
   // shortcut keys row
   var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',up:'\\x1b[A',down:'\\x1b[B',bs:'\\x7f',enter:'\\r',stab:'\\x1b[Z'};
+  // Keys whose effect is safe to apply repeatedly while the finger stays down.
+  var REPEATABLE={bs:1,left:1,right:1,up:1,down:1};
+  var REPEAT_DELAY=450,REPEAT_EVERY=60;
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
+    // Set once a repeat tick has actually fired, so the click the browser sends
+    // when the finger lifts can be swallowed instead of adding one more hit.
+    var suppressTrailingClick=false;
     btn.addEventListener('click',function(){btn.blur();
+      if(suppressTrailingClick){suppressTrailingClick=false;return;}
       var act=btn.getAttribute('data-sk');
       if(act==='paste'){
         // Commit pending live text before the async clipboard result lands.
@@ -18455,11 +18673,74 @@ if(isTouch&&hasToken){(function(){
           navigator.clipboard.readText().then(function(t){if(t)sendInput(t);}).catch(function(){showKeyboard();});
         }else{showKeyboard();}
         return;}
-      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);});})(keyBtns[i]);}
+      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);});
+    // Hold-to-repeat, but ONLY for keys that are safe to apply N times: cursor
+    // moves and backspace. Enter/Ctrl-C/Esc/Tab/Shift-Tab/Paste are one-shot —
+    // repeating Enter would fire the command several times, repeating Ctrl-C
+    // would spray interrupts. A plain tap is still served by the click handler
+    // above (mouse included); this adds the follow-up ticks once the finger has
+    // stayed down past REPEAT_DELAY. Note a click event fires when the finger
+    // LIFTS, so on a long press it lands AFTER the ticks — it is swallowed above
+    // so a 1.2s hold deletes exactly as many characters as it showed ticks.
+    if(REPEATABLE[btn.getAttribute('data-sk')]){
+      var holdT=null,holdIv=null;
+      var stopHold=function(){if(holdT)clearTimeout(holdT);if(holdIv)clearInterval(holdIv);holdT=holdIv=null;};
+      btn.addEventListener('pointerdown',function(){
+        suppressTrailingClick=false;
+        stopHold();
+        holdT=setTimeout(function(){
+          holdIv=setInterval(function(){
+            // Stop as soon as this key can no longer be pressed — either the bar
+            // was disabled (write permission lost / socket dropped mid-hold) or
+            // the send itself was refused — instead of spinning until release.
+            if(btn.disabled){stopHold();return;}
+            var seq=sk[btn.getAttribute('data-sk')];
+            var ok=mode===LIVE?sendLiveKey(seq):sendInput(seq);
+            if(!ok){stopHold();return;}
+            suppressTrailingClick=true;
+          },REPEAT_EVERY);
+        },REPEAT_DELAY);
+      });
+      // pointerup fires on release, pointercancel when the gesture is stolen
+      // (scroll/system), pointerleave when the finger slides off the button.
+      ['pointerup','pointercancel','pointerleave'].forEach(function(ev){
+        btn.addEventListener(ev,stopHold);
+      });
+    }
+  })(keyBtns[i]);}
+
+  // Tapping ANY bar button must not blur the textarea. iOS retracts the
+  // software keyboard the moment the focused element loses focus, and this bar
+  // rides above the keyboard (transform: -var(--keyboard-inset)) — so the
+  // keyboard closing yanks the whole bar down by ~300px while the finger is
+  // still on the glass. The button the user aims at next has moved, which is
+  // exactly the mis-tap being reported. Cancelling pointerdown suppresses the
+  // pointer-initiated focus transfer; click, form submit, :active feedback and
+  // the key row's horizontal scroll all still work (verified in a real
+  // browser — Backspace/Ctrl-C/mode/上屏 all kept focus on #mobile-input).
+  // Buttons only: the textarea itself must keep focusing and placing its caret,
+  // and Tab focus is unaffected because only pointer-driven focus is cancelled.
+  // Static NodeList, captured once: the bar's buttons must stay in the initial
+  // markup. A button added later would miss this handler AND the disable pass
+  // over 'controls' below, so both regress together rather than silently apart.
+  var barBtns=bar.querySelectorAll('button');
+  for(var bbi=0;bbi<barBtns.length;bbi++){
+    barBtns[bbi].addEventListener('pointerdown',function(e){e.preventDefault();});
+  }
 
   modeBtn.addEventListener('click',function(){modeBtn.blur();
     // switching away from live flushes pending held text
     if(mode===LIVE&&!sendLiveKey(''))return;
+    // Entering live must flush the staged buffer text too, for the same reason:
+    // live means "what the box holds is already in the terminal", and the mirror
+    // is reset to empty just below. Leaving text in the textarea breaks that
+    // invariant AND is invisible (live renders the textarea transparent), so the
+    // next keystroke would diff '' → 'hello…' and INSERT the stale text into the
+    // terminal instead of editing it. Flush it the way 上屏 does — insert without
+    // submitting — rather than silently discarding what the user typed.
+    if(mode!==LIVE&&ta.value){
+      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      ta.value='';resizeTa();}
     setMode(mode===LIVE?BUFFER:LIVE);
     if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
     showKeyboard();});
@@ -18477,6 +18758,22 @@ if(isTouch&&hasToken){(function(){
     if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
       e.preventDefault();
       sendLiveKey({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowLeft:'\\x1b[D',ArrowRight:'\\x1b[C'}[e.key]);return;}
+    // Backspace on an EMPTY textarea has to be forwarded by hand, in BOTH modes.
+    // Live mode otherwise only ever sends what the 'input' listener diffs, and
+    // buffer mode does not send keystrokes at all — but deleting from an empty
+    // box changes nothing, so the browser fires beforeinput and NO input event
+    // (verified in a real browser). Either way the keystroke evaporates.
+    // An empty box has no draft to edit, so the only thing Backspace can
+    // sensibly mean there is "delete on the terminal" — which is exactly what
+    // the bottom bar's ⌫ (aria-label 删除终端字符) already does in both modes.
+    // Leaving it mode-gated made the two disagree in the same visible state:
+    // after 上屏 the box is empty and the text is on the terminal, yet the
+    // system keyboard could not erase it while ⌫ could.
+    // Non-empty is still left alone so a pending IME draft edits locally
+    // instead of eating terminal characters.
+    if(!mirror.composing&&!e.isComposing&&e.key==='Backspace'&&!ta.value){
+      e.preventDefault();
+      sendInput('\\x7f');return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
 
   setMode(BUFFER);resizeTa();setWriteState(wsHasWrite);
@@ -19833,6 +20130,7 @@ process.on('message', async (raw: unknown) => {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
       }
+      stopOwnedSessionScope('close');
       killCli();
       // Bridge marker + turn-journal files outlive a single CLI process (kept
       // across restarts so a mid-flight send is still credited and an
@@ -20106,6 +20404,7 @@ process.on('message', async (raw: unknown) => {
         if (isRemoteBackendType(effectiveBackendType)) backend?.kill();
         else (backend?.destroySession ?? backend?.kill)?.call(backend);
       } catch { /* best-effort */ }
+      stopOwnedSessionScope('suspend');
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: keep the per-session sandbox tree (the

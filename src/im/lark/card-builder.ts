@@ -9,7 +9,7 @@ import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
+import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -20,6 +20,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -848,10 +849,6 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
  *  card limit, leaving room for JSON escaping + the card's structural overhead. */
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
-const STREAM_TEMPLATE_MAP = {
-  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green', interrupted: 'orange',
-} as const;
-
 /** idle 状态下卡头的替代标签：
  *  - 'silent'：本轮判定无需回复（worker terminal outputDisposition 'nothing_to_send'）；
  *  - 'completed'：transcript 模式下最终回复卡已投递成功。
@@ -902,6 +899,10 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
 
 /** Push the shared "output body" elements (usage-limit notice + screenshot) used
  *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
+/** Smallest built-in Feishu card font (10px): the fallback notice is a
+ *  footnote, one step below the 12px usage line. */
+const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
+
 function pushStreamBody(
   elements: any[],
   opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
@@ -1194,11 +1195,23 @@ export function buildStreamingCard(
     });
   }
 
+  // Model auto-fallback notice — pinned as small yellow text at the very bottom of
+  // the session card (never a separate message) for as long as the session
+  // keeps running on the fallback model.
+  const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
+  if (modelFallbackNotice) {
+    elements.push({
+      tag: 'markdown',
+      text_size: MODEL_FALLBACK_NOTICE_TEXT_SIZE,
+      content: `<font color='yellow'>${modelFallbackNotice}</font>`,
+    });
+  }
+
   const card = {
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
-      template: STREAM_TEMPLATE_MAP[displayStatus],
+      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     },
     elements,
   };
@@ -1303,7 +1316,7 @@ export function buildPrivateSnapshotCard(
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
-      template: STREAM_TEMPLATE_MAP[displayStatus],
+      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     },
     elements,
   };

@@ -277,6 +277,41 @@ describe('executeScheduledTask — silent thread fire', () => {
     ds.session.workerGeneration = 1;
     expect(recordDispatchInputCommit(ds.session, forkedTurnId(), 1)).toBe(true);
   });
+
+  it('loud fresh session appends per-fire context without mutating the scheduled task', async () => {
+    const active = new Map<string, DaemonSession>();
+    const task = baseTask({ rootMessageId: ROOT, scope: 'thread' });
+
+    await executeScheduledTask(task, active, refreshCliVersion, '本次仅检查支付集群');
+
+    const effectivePrompt = '检查服务状态，挂了才报警\n\n本次仅检查支付集群';
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(forkedCliInput()).toContain(effectivePrompt);
+    expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
+    expect(ds.lastUserPrompt).toBe(task.prompt);
+    expect(ds.session.lastUserPrompt).toBe(task.prompt);
+    expect(ds.lastCliInput).toContain(effectivePrompt);
+    expect(task.prompt).toBe('检查服务状态，挂了才报警');
+  });
+
+  it('silent fresh session appends per-fire context after the silent hint boundary', async () => {
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+      '本次仅汇总异常项',
+    );
+
+    const effectivePrompt = '检查服务状态，挂了才报警\n\n本次仅汇总异常项';
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(forkedCliInput()).toContain('<botmux_silent_schedule trusted="true">');
+    expect(forkedCliInput()).toContain(effectivePrompt);
+    expect(ds.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+    expect(ds.session.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+    expect(ds.lastCliInput).toContain(effectivePrompt);
+  });
 });
 
 describe('executeScheduledTask — fresh-topic execution', () => {
@@ -674,6 +709,47 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({});
   });
 
+  it('loud continuation appends per-fire context to the injected and remembered prompt', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    const task = baseTask({ rootMessageId: ROOT, scope: 'thread' });
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(task, active, refreshCliVersion, '本次重点检查数据库连接池');
+
+    const effectivePrompt = '检查服务状态，挂了才报警\n\n本次重点检查数据库连接池';
+    const injected = sendWorkerInputMock.mock.calls[0][1];
+    const content = typeof injected === 'string' ? injected : injected.content;
+    expect(content).toContain(effectivePrompt);
+    expect(content).not.toContain('<botmux_silent_schedule');
+    expect(existing.lastUserPrompt).toBe(task.prompt);
+    expect(existing.session.lastUserPrompt).toBe(task.prompt);
+    expect(existing.lastCliInput).toContain(effectivePrompt);
+    expect(task.prompt).toBe('检查服务状态，挂了才报警');
+  });
+
+  it('silent continuation appends per-fire context while retaining the silent hint', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+      '本次无异常时保持静默',
+    );
+
+    const effectivePrompt = '检查服务状态，挂了才报警\n\n本次无异常时保持静默';
+    const injected = sendWorkerInputMock.mock.calls[0][1];
+    const content = typeof injected === 'string' ? injected : injected.content;
+    expect(content).toContain('<botmux_silent_schedule');
+    expect(content).toContain(effectivePrompt);
+    expect(existing.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+    expect(existing.session.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+    expect(existing.lastCliInput).toContain(effectivePrompt);
+  });
+
   it('riff-backed claude-code session: scheduled fire stays inline（锁 sessionBackendType 传参）', async () => {
     // review 要求：executeScheduledTask → buildFollowUpCliInput 必须传 sessionBackendType。
     // 删掉该实参，旧代码（&& 短路）会让 riff 会话误进 hook 模式（reminder 不在 PTY 文本里，
@@ -719,7 +795,8 @@ describe('executeScheduledTask — live-session injection', () => {
       const content = typeof injected === 'string' ? injected : injected.content;
       // 本地后端 + auto → hook 模式：reminder 进 sidecar，PTY 文本里没有
       expect(content).not.toContain('<botmux_reminder>');
-      expect(content).toContain('<user_message>');
+      // #794 后续：hook 模式连 <user_message> 外壳也剥掉，PTY 文本只剩正文
+      expect(content).not.toContain('<user_message>');
     } finally {
       (BOT.config as Record<string, unknown>).envelopeInjection = prev;
     }

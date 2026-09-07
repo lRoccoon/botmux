@@ -351,6 +351,16 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // tmux `new-session` rejects launch command strings well below OS ARG_MAX
+    // (~12 KB ok, ~16 KB "command too long" on Linux + tmux 3.3a).  OpenCode
+    // bakes the full first-round prompt into `--prompt <content>`, so a long
+    // routing/role/user prompt blows the tmux limit before OpenCode starts.
+    // Budget set to 8 KB: the botmux routing envelope alone is ~5.8–6.2 KB
+    // (zh/en) for a typical new topic, so 8 KB keeps short user messages on
+    // the reliable `--prompt` cold-start path while leaving ~6 KB headroom
+    // below the measured tmux ceiling.  Over-limit prompts defer to the
+    // normal post-start input queue.
+    maxInitialPromptArgBytes: 8192,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,
@@ -388,11 +398,12 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       // 提交验证基线先于写入采样（traex 同款）。斜杠命令是 TUI 命令面板输入，
       // 不产生 user message 行，跳过验证（重试 Enter 还可能误触面板项）。
       const isSlashCommand = content.startsWith('/');
+      const needsPaste = !isSlashCommand && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'));
       const baseline = isSlashCommand ? null : snapPartBaseline();
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          if (!isSlashCommand && pty.pasteText && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'))) {
+          if (needsPaste && pty.pasteText) {
             pty.pasteText(content);
           } else {
             pty.sendText(content);
@@ -400,7 +411,10 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {
-          pty.write(content);
+          // Raw PTY has no tmux paste-buffer to add these markers. Without
+          // them, long/deferred or multiline prompts are parsed as individual
+          // key events and can be dropped instead of submitted as one message.
+          pty.write(needsPaste ? `\x1b[200~${content}\x1b[201~` : content);
           await delay(1000);
           pty.write('\r');
         }

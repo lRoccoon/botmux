@@ -98,9 +98,24 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
+import { ensureSchedulePreconditionRoot } from './services/schedule-precondition-store.js';
+import {
+  executeScheduledTaskWithPrecondition,
+  type ScheduledTaskPreconditionObservation,
+} from './services/schedule-precondition-gate.js';
+import { SchedulePreconditionError } from './services/schedule-precondition-runner.js';
+import {
+  appendScheduleRunLog,
+  type ScheduleRunOutcome,
+  type ScheduleRunTargetResult,
+} from './services/schedule-run-log-store.js';
+import {
+  executeScheduledTaskForTargets,
+  ScheduleTargetExecutionError,
+} from './services/schedule-target-executor.js';
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
-import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
+import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
@@ -131,6 +146,31 @@ import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
+
+interface ScheduleRunLogErrorDetails {
+  errorCode: string;
+  error?: string;
+}
+
+function resolveScheduleRunLogErrorDetails(
+  precondition: ScheduledTaskPreconditionObservation['precondition'],
+  error: unknown,
+): ScheduleRunLogErrorDetails {
+  if (precondition !== 'error') {
+    return {
+      errorCode: 'model_dispatch_error',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return {
+    errorCode: error instanceof SchedulePreconditionError
+      ? error.code
+      : 'precondition_error',
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
+export const __testOnly_resolveScheduleRunLogErrorDetails = resolveScheduleRunLogErrorDetails;
 
 function trustedCallerForTurn(
   larkAppId: string,
@@ -3791,9 +3831,47 @@ export async function enforceMessageQuotaForCliInput(
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
-  opts?: { listenerAuthorized?: boolean; skipCharge?: boolean; alreadyAuthorizedAndCharged?: boolean },
+  opts?: {
+    listenerAuthorized?: boolean;
+    skipCharge?: boolean;
+    alreadyAuthorizedAndCharged?: boolean;
+    /** 本轮要喂给 CLI 的用户文本，交给 prompt.submit 同步校验闸做内容级判断。
+     *  不传 = 调用方没有可判定的正文（纯控制路径），闸仍会跑但 content 为空。 */
+    promptContent?: string;
+    /** 本轮附带的图片/文件**元信息**（type + name，不含内容）。
+     *  闸跑在附件下载之前（下载必须排在授权之后，否则未授权者也能让 bot 拉文件），
+     *  所以闸看不到文件内容——但至少能看到「这轮带了什么附件」，让
+     *  「禁止上传 .env / 只许图片」这类策略可写。见 hooks.md 的边界说明。 */
+    promptAttachments?: Array<{ type: string; name: string }>;
+  },
 ): Promise<boolean> {
-  if (opts?.listenerAuthorized) return true;
+  if (opts?.listenerAuthorized) {
+    // Listener matches skip the talk/quota model (a third-party alert bot is
+    // not a "sender" with a grant), but they DO reach a CLI — and their content
+    // is attacker-influenceable third-party text, which is exactly what a
+    // pre-submit gate exists to inspect. Ask the gate before returning; there
+    // is no charge on this path, so the charge-order invariant is not in play.
+    const listenerGate = await evaluatePromptGate('prompt.submit', {
+      larkAppId,
+      chatId,
+      chatType,
+      anchor,
+      messageId,
+      senderOpenId,
+      botSender: !!botSender,
+      talkReason: 'messageListener',
+      content: opts.promptContent,
+      attachments: opts.promptAttachments,
+    });
+    if (!listenerGate.allowed) {
+      logger.info(
+        `[hooks:${larkAppId}] prompt.submit gate denied listener message ${messageId.substring(0, 12)}`
+        + `${listenerGate.reason ? `: ${listenerGate.reason}` : ''}`,
+      );
+      return false;
+    }
+    return true;
+  }
   // 会话群出生轮：**同一条消息**的授权判定与扣费，刚刚由本函数在原 DM 上下文里
   // 一起做完（handleNewTopicAdmitted 的建群前扣费点：扣费被拒必须零外部副作用，
   // 所以它必须排在 createGroupWithBots 之前）。这一轮绝不能再复查一次：
@@ -3827,6 +3905,51 @@ export async function enforceMessageQuotaForCliInput(
   // Control/setup messages still need the authorization decision above, but
   // they never reach a CLI and therefore must not spend or dedupe a quota unit.
   if (opts?.skipCharge) return true;
+
+  // ─── prompt.submit 同步前置校验闸 ────────────────────────────────────────
+  // 位置是被两条既有不变量夹死的，不能随意挪：
+  //   • 必须在 evaluateTalk 之后——内置权限模型仍是第一道；外部 hook 只能
+  //     在它放行之后再收紧，永远不能把内置闸拒掉的人放进来。
+  //   • 必须在 beginCharge 之前——本文件的硬不变量是「扣了费就不能丢任务，
+  //     丢任务就不能扣费」。放在扣费后被拒 = 用户额度少一格却什么也没发生。
+  // 没配 sync hook 时 evaluatePromptGate 直接返回 allow，零 spawn 零开销。
+  const gate = await evaluatePromptGate('prompt.submit', {
+    larkAppId,
+    chatId,
+    chatType,
+    anchor,
+    messageId,
+    senderOpenId,
+    senderUnionId,
+    memberUnionId,
+    botSender: !!botSender,
+    talkReason: ev.reason,
+    content: opts?.promptContent,
+    attachments: opts?.promptAttachments,
+  });
+  if (!gate.allowed) {
+    logger.info(
+      `[hooks:${larkAppId}] prompt.submit gate denied message ${messageId.substring(0, 12)} `
+      + `from ${senderOpenId?.substring(0, 12) ?? '?'}${gate.reason ? `: ${gate.reason}` : ''}`,
+    );
+    // 明确告诉用户被拦了。静默丢弃在这里是最坏选项：用户有权限、消息也没超额，
+    // 却凭空消失，只能反复重发。（内置权限模型的静默丢弃是另一回事——那里
+    // 沉默本身是为了不向未授权者泄露 bot 的存在。）
+    try {
+      await sessionReply(
+        anchor,
+        gate.reason
+          ? tr('daemon.prompt_gate_denied_reason', { reason: gate.reason }, localeForBot(larkAppId))
+          : tr('daemon.prompt_gate_denied', undefined, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+    } catch (err) {
+      logger.warn(`[hooks:${larkAppId}] prompt gate denial notify failed: ${err}`);
+    }
+    return false;
+  }
+
   if (!ev.quotaKey) return true;
   if (!senderOpenId) return false;
   // 去重三态：'done' = 同条已成功扣费 → 放行（不重复扣）；'pending' = 同条扣费 in-flight 未定论
@@ -4949,6 +5072,24 @@ function fireSessionlessCommandDetached(
   void handleCommand(cmd, anchor, message, deps, larkAppId).catch((err) =>
     logger.error(`[sessionless ${cmd}] ${anchor.substring(0, 12)} failed: ${err?.message ?? err}`),
   );
+}
+
+/** `/sessions` is read-only group discovery and intentionally uses the talk
+ * gate rather than the daemon-management gate. Keep human and bot senders on
+ * the same predicates used by ordinary message admission. The command handler
+ * still rejects p2p before reading any session rows. */
+function canTalkForGroupSessions(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  botTrustUnionId: string | undefined,
+  memberUnionId: string | undefined,
+  chatType: 'p2p' | 'group' | undefined,
+  botSender: boolean,
+): boolean {
+  return botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, botTrustUnionId).allowed
+    : evaluateTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, memberUnionId, chatType).allowed;
 }
 
 // Dependencies passed to card-handler
@@ -16894,6 +17035,15 @@ function buildReservedInitialInput(
       // transcript + solo（resolveSoloSessionForTurn 在注册会话后算好）：首轮去壳。
       solo: ds.soloSession,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+      // #794 后续：opening 也走 hook 注入（sender/mentions 进 envelope，PTY 文本
+      // 只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
+      // 权威 turnId 一致（= 最终 managedTurnOrigin.turnId），sidecar 才能被 claim。
+      // raw 命令冷启动（pendingRawInput）的 buffered follow-up 走 raw_input IPC
+      // 延迟发送，turnId 权威流不同，暂不启用 hook，保持 inline。
+      turnId: ds.pendingRawInput
+        ? undefined
+        : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
+      sessionBackendType: ds.session.backendType,
     },
   );
   // R5-B1-1: COPY the frozen new-topic steer authorization onto the opening
@@ -17413,6 +17563,8 @@ async function startInitialPassthroughSession(args: {
   messageId: string;
   replyRootId?: string;
   parsed: LarkMessage;
+  /** 本轮附件元信息，转给 prompt.submit 校验闸（内容不在此传）。 */
+  promptResources?: MessageResource[];
   cmd: string;
   commandContent: string;
   senderOpenId?: string;
@@ -17447,12 +17599,15 @@ async function startInitialPassthroughSession(args: {
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId,
+    parsed, promptResources, cmd, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
     routeToCanonicalOwner,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
+    promptContent: commandContent || parsed.content,
+    promptAttachments: promptResources?.map(r => ({ type: r.type, name: r.name })),
+  })) {
     return;
   }
   // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
@@ -17785,6 +17940,24 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const quotaTeamTrustUnionId = (data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot')
       ? quotaSenderUnionId
       : undefined;
+    // 出生轮的闸也必须看到正文与附件，否则 p2pMode='group' 下**每个会话群的
+    // 第一条消息**（正是开场 prompt）只按元信息判定：sender 级规则还在，内容级
+    // 规则（DLP / 高危指令 / .env 拦截）全盲。改写后的那一轮带
+    // alreadyAuthorizedAndCharged 提前 return，不会补上这一课。
+    //
+    // 这里用**一次性 numberer** 单独解析一遍：parseEventMessage 是纯函数（无网络
+    // 无磁盘无共享状态），而 numberer 的计数器是闭包私有的，所以这次解析不会扰动
+    // 下面 17874 行那次真正的解析（图片/文件编号仍从 1 开始）。解析失败不能拖垮
+    // 收信主路——退回只给元信息，与本次改动前的行为一致。
+    let birthPromptContent: string | undefined;
+    let birthPromptAttachments: Array<{ type: string; name: string }> | undefined;
+    try {
+      const preview = parseEventMessage(data, createImgNumberer());
+      birthPromptContent = preview.parsed.content;
+      birthPromptAttachments = preview.resources.map(r => ({ type: r.type, name: r.name }));
+    } catch (err) {
+      logger.debug(`[hooks:${larkAppId}] birth-turn prompt preview failed, gating on metadata only: ${err}`);
+    }
     if (!await enforceMessageQuotaForCliInput(
       larkAppId,
       chatId,
@@ -17794,6 +17967,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       quotaTeamTrustUnionId,
       quotaSenderUnionId,
       chatType,
+      undefined,
+      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments },
     )) return;
     quotaConsumedBeforeSessionGroupBirth = true;
     const reborn = await maybeBirthSessionGroup(data, ctx);
@@ -18060,6 +18235,45 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
+    // Unlike daemon-management commands, `/sessions` is a read-only view of
+    // metadata already visible in this group. Authorize it at canTalk level so
+    // ordinary permitted members can use the MVP without a per-bot downgrade
+    // list, while keeping every other daemon command on canOperate by default.
+    if (cmd === '/sessions') {
+      // `/sessions` is group-level, sessionless UI. In a regular group whose
+      // conversation mode is `new-topic`, routing has already rewritten this
+      // top-level command to a fresh thread. Put this one reply back at the
+      // group top level; real topic/thread invocations keep their own thread.
+      const sessionsAnchor = ctx.regularGroupTopLevel ? chatId : anchor;
+      const sessionsDeps = ctx.regularGroupTopLevel
+        ? commandDepsForInvocation({
+            scope: 'chat',
+            chatId,
+            anchor: chatId,
+            messageId: parsed.messageId,
+          })
+        : invocationDeps;
+      if (!canTalkForGroupSessions(
+        larkAppId,
+        chatId,
+        senderOpenId,
+        teamTrustUnionId,
+        senderUnionId,
+        chatType,
+        senderIsBotForSlashGate,
+      )) {
+        await sessionsDeps.sessionReply(sessionsAnchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return;
+      }
+      fireSessionlessCommandDetached(
+        cmd,
+        sessionsAnchor,
+        { ...parsed, content: commandContent, chatId },
+        larkAppId,
+        sessionsDeps,
+      );
+      return;
+    }
     if (cmd === '/vc-auth') {
       if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
@@ -18101,6 +18315,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
       if (isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
+          promptResources: resources,
           larkAppId,
           chatId,
           chatType,
@@ -18273,6 +18488,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     listenerAuthorized: !!messageListener,
     skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
+    promptContent: content,
+    promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
   })) {
     return;
   }
@@ -19544,6 +19761,29 @@ async function handleThreadReplyAdmitted(
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
+    if (cmd === '/sessions') {
+      const botSender = isBotSenderType || isForeignBot;
+      if (!canTalkForGroupSessions(
+        larkAppId,
+        effectiveThreadChatId,
+        threadSenderOpenId,
+        threadTeamTrustUnionId,
+        threadSenderUnionId,
+        ctxChatType,
+        botSender,
+      )) {
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return;
+      }
+      fireSessionlessCommandDetached(
+        cmd,
+        anchor,
+        { ...parsed, content: commandContent, chatId: effectiveThreadChatId },
+        larkAppId,
+        invocationDeps,
+      );
+      return;
+    }
     if (cmd === '/vc-auth') {
       if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
@@ -19572,6 +19812,7 @@ async function handleThreadReplyAdmitted(
     if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
+          promptResources: resources,
           larkAppId,
           chatId: threadChatId,
           chatType: ctxChatType,
@@ -19853,6 +20094,7 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
+    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
   )) {
     return;
   }
@@ -20545,6 +20787,10 @@ async function handleThreadReplyAdmitted(
             codexAppMessageContext,
             solo: ds.soloSession,
             selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+            // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
+            // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
+            turnId: parsed.messageId,
+            sessionBackendType: ds.session.backendType,
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
@@ -20822,6 +21068,11 @@ async function handleThreadReplyAdmitted(
           solo: ds.soloSession,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
           codexAppMessageContext: reforkCodexApp.messageContext,
+          // #794 后续：worker-null refork 的 empty-start 首轮 opening 也走 hook 注入。
+          // turnId 与下方 forkWorker 的权威 turnId 一致（非 queued 时 = parsed.messageId）；
+          // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
+          turnId: queuedHasDurableTail ? undefined : parsed.messageId,
+          sessionBackendType: ds.session.backendType,
         },
       );
     } else {
@@ -21771,6 +22022,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  // Host-executed schedule conditions are authority material. Create and
+  // validate their 0700 root before any restored worker can receive a sandbox
+  // policy; a symlink/corrupt root aborts startup instead of exposing scripts.
+  ensureSchedulePreconditionRoot(config.session.dataDir);
   // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
   // disabled still opens the shared feedback DB here for turn-completion
   // indexing, but a bootstrap failure (shared-dataDir lock storm, corruption,
@@ -23004,10 +23259,82 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
   // missing larkAppId falls through to bot-0 as a legacy fallback).
-  scheduler.setExecuteCallback((task) => withBotTurnAdmission(
-    task.larkAppId ?? cfg.larkAppId,
-    () => executeScheduledTask(task, activeSessions, refreshCliVersion),
-  ));
+  scheduler.setExecuteCallback(async (task, executionContext) => {
+    const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
+    let targetResults: ScheduleRunTargetResult[] | undefined;
+    let precondition: ScheduledTaskPreconditionObservation = {
+      precondition: 'none',
+      additionalPrompt: false,
+    };
+    const appendExecutionLog = (
+      outcome: ScheduleRunOutcome,
+      errorDetails?: ScheduleRunLogErrorDetails,
+    ): void => {
+      const finishedAt = new Date().toISOString();
+      try {
+        appendScheduleRunLog({
+          id: executionContext.runId,
+          taskId: task.id,
+          trigger: executionContext.trigger,
+          outcome,
+          precondition: precondition.precondition,
+          startedAt: executionContext.startedAt,
+          finishedAt,
+          durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(executionContext.startedAt)),
+          additionalPrompt: precondition.additionalPrompt,
+          ...(errorDetails?.errorCode ? { errorCode: errorDetails.errorCode } : {}),
+          ...(errorDetails?.error !== undefined ? { error: errorDetails.error } : {}),
+          ...(targetResults !== undefined ? { targetResults } : {}),
+        }, effectiveAppId);
+      } catch (error) {
+        logger.warn(
+          `[scheduler] Failed to append execution log for task ${task.id}: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+
+    try {
+      const outcome = await executeScheduledTaskWithPrecondition(
+        task,
+        effectiveAppId,
+        async (additionalPrompt) => {
+          const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
+          try {
+            const results = await executeScheduledTaskForTargets(
+              task,
+              targetChatIds,
+              targetTask => withBotTurnAdmission(
+                effectiveAppId,
+                () => executeScheduledTask(
+                  targetTask,
+                  activeSessions,
+                  refreshCliVersion,
+                  additionalPrompt,
+                ),
+              ),
+            );
+            if (targetChatIds.length > 1) targetResults = results;
+          } catch (error) {
+            if (error instanceof ScheduleTargetExecutionError) {
+              targetResults = error.targetResults;
+            }
+            throw error;
+          }
+        },
+        undefined,
+        observation => { precondition = observation; },
+      );
+      appendExecutionLog(outcome === 'executed' ? 'model_dispatched' : 'precondition_skipped');
+      return outcome;
+    } catch (error) {
+      appendExecutionLog(
+        'error',
+        resolveScheduleRunLogErrorDetails(precondition.precondition, error),
+      );
+      throw error;
+    }
+  });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
 
